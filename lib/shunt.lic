@@ -1,0 +1,898 @@
+# frozen_string_literal: true
+
+# SHunt is a standalone hunting script designed to be used in other scripts. It does not include
+# a hunt/rest routine.
+
+#  author: spiffyjr
+#    name: SpiffyHunt
+#    tags: hunting
+
+# changelog:
+#     2020.10.12 - Rewrite. Conform or perish.
+
+# Old version check
+if CharSettings.to_hash[:wait_stance]
+  echo('shunt v1 settings detected: cleaning up. You have 5 seconds to kill me.')
+  sleep(5)
+  # rubocop:disable Lint/UselessAssignment
+  settings = CharSettings.to_hash
+  settings = {}
+  # rubocop:enable Lint/UselessAssignment
+end
+
+# SHunt is a hunter for Gemstone that focuses on performance and customization
+module Hunt
+  # Global data used by SHunt
+  class Data
+    attr_accessor :aim, :disable_auto_stand, :last_symbol_attempt, :settings, :roll, :target, :wander_rooms
+
+    def initialize
+      @aim = ['left leg', 'head']
+      @disable_auto_stand = false
+      @last_symbol_attempt = 0
+      @roll = 0
+      @target = nil
+      @target_data = {}
+      @wander_rooms = []
+    end
+
+    def register_target_data(id, key, value)
+      tdata = target_data(id)
+      return if tdata.nil?
+
+      tdata[key] = value
+    end
+
+    def target_data(id = nil)
+      time = Time.now.to_i
+
+      # Prune cached data after 2 minutes
+      @target_data.delete_if { |_, data| data[:timestamp] && (time - data[:timestamp]) > 120 }
+
+      return nil if id.nil?
+
+      # Initialize empty data
+      unless @target_data[id.to_i]
+        @target_data[id.to_i] = {
+          last_action_at: 0,
+          moved: nil,
+          status: nil,
+          timestamp: time
+        }
+      end
+
+      @target_data[id.to_i]
+    end
+  end
+
+  # The Commands module contains all the hunting commands that SHunt uses
+  module Commands
+    def self.execute(cmd, extras, args, target = nil)
+      stand
+
+      target = GameObj.targets.first if target.nil?
+
+      if cmd == 'cast'
+        cast(target, extras[0].to_i, extras[1..-1].join(' '), args)
+      elsif cmd == 'aim'
+        aim(extras.empty? ? '' : extras.join(' '))
+      elsif cmd == 'ambush'
+        Hunt.wait_allrt
+        send('ambush @target @aim', target)
+      elsif %w[attack fire hurl kill].include?(cmd)
+        Hunt.wait_allrt
+        send("#{cmd} @target", target)
+      elsif %w[armor cman disarm shield stunman tackle warcry wtrick].include?(cmd)
+        Hunt.wait_allrt
+        return if Spell['POPed muscles'].active?
+
+        send("#{cmd}#{extras.empty? ? '' : " #{extras.join(' ')}"} @target", target)
+      elsif cmd == 'mstrike'
+        mstrike(target, args)
+      elsif cmd == 'stance'
+        change_stance(extras[0])
+      elsif cmd == 'wait'
+        wait(target, extras.empty? ? 20 : extras[0], args)
+      elsif cmd == 'exec'
+        # rubocop:disable Security/Eval
+        eval(extras.join(' '))
+        # rubocop:enable Security/Eval
+      elsif cmd == 'kneel'
+        Hunt.data.disable_auto_stand = true
+        Hunt.wait_hardrt
+        send('kneel') unless kneeling?
+      elsif cmd == 'stand'
+        Hunt.data.disable_auto_stand = false
+        stand
+      else
+        send("#{cmd}#{extras ? " #{extras.join(' ')}" : ''}", target)
+      end
+    end
+
+    def self.aim(locations)
+      locations = locations.split(';')
+      locations = ['left leg', 'head'] if locations.empty?
+
+      Hunt.data.aim = locations
+    end
+
+    def self.mstrike(target, args)
+      args[:stamina] ||= 0
+      args[:focused] ||= false
+
+      Hunt.wait_allrt
+
+      if Hunt.can_focus_mstrike?(args[:stamina]) && (GameObj.targets.length == 1 || args[:focused])
+        send('mstrike @target', target)
+      elsif Hunt.can_mstrike?(args[:stamina])
+        send('mstrike')
+      else
+        send('kill @target', target)
+      end
+    end
+
+    def self.change_stance(stance)
+      stance = 'guarded' if stance == 'defensive' && checkcastrt.positive?
+
+      return if Spell['Zealot'].active? || Spell['Frenzy'].active? || dead?
+      return if checkstance(stance)
+
+      stance_regex = /Cast Round Time|You are now|Roundtime|Wait|wait|Your rage causes you/
+
+      until checkstance(stance)
+        Hunt.wait_hardrt
+        res = dothistimeout("stance #{stance}", 3, stance_regex)
+        break if res =~ /Your rage causes you/
+
+        if res =~ /Roundtime: (\d+)|wait (\d+)/i
+          time = (Regexp.last_match(1) || Regexp.last_match(2)).strip.to_f - 1
+          sleep(time) if time.positive?
+        end
+      end
+    end
+
+    def self.cast(target, spell_num, extra, args)
+      Hunt.debug("cast: #{target}, spell_num: #{spell_num}, extra: #{extra}, args: #{args}")
+      return unless target
+
+      spell = Spell[spell_num]
+      Hunt.error("Unknown spell: #{spell_num}") unless spell
+
+      return unless spell.known?
+
+      fput('release') unless ['None', spell.name].include?(checkprep)
+
+      if args[:cast]
+        Hunt.wait_allrt
+        spell.cast(target.noun_id)
+      else
+        send('target @target', target) unless XMLData.current_target_id == target.id
+        Hunt.wait_allrt
+        send("incant #{spell.num} #{extra}")
+      end
+    end
+
+    def self.wait(target, timeout = 20, args)
+      Hunt.debug("wait: #{target}, timeout: #{timeout}")
+      return unless target
+
+      start = Time.now.to_i
+
+      loop do
+        break if Hunt.flee?
+        break if target.status =~ /^(?:dead|gone|webbed|frozen|stunned|kneeling|sitting|prone|lying|sleeping|rooted)/i
+        break if (Time.now.to_i - start) > timeout
+
+        tdata = Hunt.data.target_data(target.id)
+
+        if tdata[:last_action_at].positive? && (Time.now.to_f - tdata[:last_action_at]) <= 2
+          debug('wait: breaking because last_action_at is available')
+          tdata[:last_action_at] = 0
+          break
+        end
+
+        stand
+        change_stance(args[:stance] || 'defensive')
+        Hunt.buff
+        sleep(0.10)
+      end
+    end
+
+    def self.stand
+      return if Hunt.data.disable_auto_stand
+
+      fput('stand') until standing?
+    end
+
+    def self.send(cmd, target = nil)
+      repeat = false
+      stand
+
+      want_downstream_xml = Script.current.want_downstream_xml
+      want_downstream = Script.current.want_downstream
+
+      Script.current.want_downstream_xml = true
+      Script.current.want_downstream = false
+
+      Script.current.downstream_buffer.clear
+
+      return if Hunt.flee?
+
+      send_cmd = cmd.clone
+
+      # Command replacements
+      unless target.nil? || target.id.nil?
+        tdata = Hunt.data.target_data(target.id)
+        send_cmd = cmd.gsub('@target', "##{target.id}")
+        Hunt.data.aim.delete_if do |location|
+          if location =~ /leg$/i && (target.status =~ /prone/ || tdata[:status] == 'prone')
+            debug("removing #{location} because target is prone")
+            next true
+          end
+
+          debug("keeping location #{location}")
+
+          next false
+        end
+      end
+
+      send_cmd = send_cmd.gsub('@aim', Hunt.data.aim.empty? ? '' : Hunt.data.aim.first)
+
+      Game.puts(send_cmd)
+      wait_while { Script.current.downstream_buffer.empty? }
+
+      start = Time.now.to_i
+
+      while (line = Script.current.gets)
+        if line =~ /\[(?:Roll|SMR) result: (-?\d+)/
+          Hunt.data.roll = Regexp.last_match(1).to_i
+          break
+        elsif line =~ /roll: [+-]?\d+ = ([+-])(\d+)/
+          Hunt.data.roll = Regexp.last_match(2).to_i
+          Hunt.data.roll = -1 * Hunt.data.roll if Regexp.last_match(1) == '-'
+          break
+        elsif line =~ /already missing that|does not have|aim that high/i
+          Hunt.data.aim.shift
+          repeat = true
+          break
+        elsif line =~ /You don't seem to be able to move to do that\./
+          # Fake roll, because we're rooted.
+          Hunt.data.roll = 999
+          break
+        elsif line =~ /...wait (\d+) seconds/
+          Hunt.wait_allrt
+          repeat = true
+          break
+        end
+
+        break if line =~ /You are now target/
+        break if line =~ /Usage:  TARGET/
+        break if line =~ /<prompt/
+        break if Time.now.to_i - start > 3
+        break if Hunt.flee?
+      end
+
+      Script.current.want_downstream_xml = want_downstream_xml
+      Script.current.want_downstream = want_downstream
+
+      send(cmd, target) if repeat
+    end
+  end
+
+  def self.data
+    @data
+  end
+
+  def self.go2(room)
+    fput('unhide') if hidden?
+
+    return if Room.current.id.to_s == room.to_s
+
+    if checkarea =~ /Table/
+      Commands.stand
+      move('out')
+    end
+
+    if Script.running?('go2')
+      Script.kill('go2')
+      wait_while { Script.running?('go2') }
+    end
+
+    Script.run('go2', "#{room} _disable_confirm_")
+  end
+
+  def self.debug(msg)
+    return unless @data.settings[:debug]
+
+    echo(">> #{msg}")
+  end
+
+  def self.error(msg)
+    echo("** #{msg}")
+    exit
+  end
+
+  def self.matching_targets
+    return GameObj.targets if @data.settings[:targets].empty?
+
+    cleaned = clean_target_names.collect { |t| Regexp.new(t, Regexp::IGNORECASE) }
+    debug("matching_targets: checking for #{cleaned}")
+
+    GameObj.targets.clone.find_all { |target| target.name =~ Regexp.union(cleaned) }
+  end
+
+  def self.flee?
+    return true if GameObj.loot.any? { |obj| obj.noun =~ /cloud|void|sandstorm/i || obj.name =~ /sealed fissure/i }
+
+    # Group targets to one flee_group is set
+    targets = GameObj.targets.uniq do |t|
+      @data.settings[:flee_group].any? { |name| t.name =~ /#{name}/ } ? t.name : t.id
+    end
+
+    # Delete flee_ignore values
+    targets = targets.delete_if { |t| t.name =~ Regexp.union(@data.settings[:flee_ignore]) }
+
+    # Flee always from this stuff
+    return true if targets.any? { |t| t.name =~ Regexp.union(@data.settings[:flee_always]) }
+
+    targets.length >= @data.settings[:flee_at]
+  end
+
+  def self.wait_allrt
+    wait_castrt
+    wait_hardrt
+  end
+
+  def self.wait_hardrt
+    rt_left = XMLData.roundtime_end.to_f - Time.now.to_f + XMLData.server_time_offset.to_f
+
+    return unless rt_left.positive?
+
+    sleep(rt_left.abs)
+  end
+
+  def self.wait_castrt
+    rt_left = XMLData.cast_roundtime_end.to_f - Time.now.to_f + XMLData.server_time_offset.to_f
+
+    return unless rt_left.positive?
+
+    sleep(rt_left.abs)
+  end
+
+  def self.loot
+    return if GameObj.npcs.none? { |npc| npc.status =~ /dead/ } && GameObj.loot.to_a.none? { |loot| !loot.type.nil? }
+
+    wait_hardrt
+    Script.run(@data.settings[:looter])
+  end
+
+  # Returns targets without the prefix denoting which attack line to use
+  def self.clean_target_names
+    @data.settings[:targets].collect { |t| t.gsub(/^\d+\.(.*)$/, '\1') }.clone
+  end
+
+  # Picks a random direction to wander to: obeys portals.
+  def self.wander
+    # Ensure we can stand again
+    @data.disable_auto_stand = false
+
+    Commands.stand
+    buff
+
+    # Rift porting you around gets annoying: let's go back to where we were
+    if reget.any? { |l| l =~ /Suddenly you feel sick|Suddenly, you feel a sensation|The air whooshes by you/ }
+      prepare_hunt
+    end
+
+    count = XMLData.room_count
+
+    room = Room.current
+    next_room_options = room.wayto.keys - (@data.settings[:boundaries].nil? ? [] : @data.settings[:boundaries])
+    next_room_options.delete_if { |room_id| (room.timeto[room_id].class == Proc) && room.timeto[room_id].call.nil? }
+    next_room = next_room_options.find_all { |r| !@data.wander_rooms.include?(r) }
+    if next_room.empty?
+      next_room = @data.wander_rooms.find { |r| next_room_options.include?(r) }
+    else
+      next_room = next_room[rand(next_room.length)]
+    end
+    @data.wander_rooms.delete(next_room)
+    @data.wander_rooms.push(next_room)
+    way = room.wayto[next_room]
+
+    if way.class == String
+      move(way)
+    else
+      way.call
+    end
+
+    start = Time.now.to_i
+
+    # Wait for the room to update before leaving
+    loop do
+      break if XMLData.room_count > count
+      break if Time.now.to_i - start > 3
+
+      sleep(0.10)
+    end
+
+    # Update our wander history so we can be smart the next turn
+    @data.wander_rooms.push(next_room.to_i).uniq!
+  end
+
+  def self.wander_for_target
+    # Ensure we can stand again
+    @data.disable_auto_stand = false
+
+    Commands.stand
+    buff
+
+    # If we have prior target data we wander for it specifically, then we clean it up so it only hhppens once
+    if @data.target&.id
+      tdata = @data.target_data(@data.target.id)
+
+      debug("wander_for_target: target: #{@data.target.inspect}, data: #{tdata.inspect}")
+
+      # We have a last movement for them
+      if tdata[:moved]
+        # Go ahead and move
+        move(tdata[:moved])
+
+        # Remove the movement so it doesn't repeat
+        tdata.delete(:moved)
+
+        unless flee?
+          if GameObj.pcs && GameObj.targets.find { |obj| obj.id == @data.target.id }
+            fput("'::##{GameObj.pcs.first.id} I'm chasing that one.")
+          end
+
+          return @data.target
+        end
+      end
+    end
+
+    debug('wander_for_target: starting')
+
+    loop do
+      Commands.change_stance('guarded')
+
+      if GameObj.pcs || (GameObj.loot.find { |obj| (obj.noun == 'disk') && (obj.name !~ /#{Char.name}/) })
+        debug('skipping room: player exists')
+        wander
+        next
+      end
+
+      if flee?
+        debug('skipping room: flee? is true')
+        wander
+        next
+      end
+
+      if (targets = matching_targets).empty?
+        debug('skipping room: no targets')
+        wander
+        next
+      end
+
+      if $_SERVERBUFFER_.reverse[0..25].any? { |l| l =~ /obvious signs of someone hiding/ }
+        debug('skipping room: hider present')
+        wander
+        next
+      end
+
+      return targets.sample
+    end
+  end
+
+  def self.can_focus_mstrike?(min_stamina = 0)
+    Skills.multiopponentcombat >= 30 && can_mstrike?(min_stamina)
+  end
+
+  def self.can_mstrike?(min_stamina)
+    (Skills.multiopponentcombat >= 5 &&
+     checkstamina(1) &&
+     GameObj.npcs.to_a.none? { |obj| obj.noun =~ /nest/i } &&
+     !Spell['POPed Muscles'].active? &&
+     (!Spell['MStrike Cooldown'].active? || (min_stamina.positive? && checkstamina(min_stamina))))
+  end
+
+  def self.buff
+    buffs = @data.settings[:buffs].clone
+
+    # Only certain spells get cast while hidden
+    buffs.delete_if do |buff|
+      spell = Spell[buff]
+      next true if hidden? && spell.num > 100 && spell.num < 1200
+
+      false
+    end
+
+    buffs.each do |buff|
+      spell = Spell[buff]
+
+      if spell.name == 'Symbol of Renewal' && (Spell['Symbol of Renewal Cooldown'].active? || checkspirit(maxspirit))
+        next
+      end
+
+      unless @data.settings[:buffs_skip_cooldown]
+        skip = false
+        ['Burst of Swiftness', 'Surge of Strength', 'Shadow Mastery'].each do |name|
+          next unless spell.name == name && Spell["#{name} Cooldown"].active?
+
+          skip = true
+          break
+        end
+
+        next if skip
+      end
+
+      # Ensure we know the spell and it's affordable
+      next if !spell || !spell.affordable? || spell.active?
+
+      # Don't overextend on Spirit
+      spirit_count = 0
+      [Spell['Sign of Swords'], Spell['Sign of Shields'], Spell['Sign of Dissipation']].each do |s|
+        spirit_count += 1 if s.active?
+      end
+
+      # Ensure we have enough spirit
+      next if spell.spirit_cost.positive? && (percentspirit < 75 || spirit_count > 2)
+
+      next if !["Horland\'s Holler"].include?(spell.name) && !spell.known?
+
+      # Symbols have special logic, and if failed only try again 5 minutes later
+      if spell.name =~ /^Symbol/
+        if Time.now.to_i > (@data.last_symbol_attempt + 300)
+          res = fput(spell.name.downcase)
+          if res =~ /call forth enough power/ # failure
+            @data.last_symbol_attempt = Time.now.to_i
+          else # success
+            @data.last_symbol_attempt = 0
+          end
+        end
+
+        next
+      end
+
+      spell.cast
+
+      sleep(0.10)
+
+      # If Horland's Holler was a failure we try again in 60 seconds
+      if spell.name == "Horland's Holler" && !spell.active?
+        spell.timeleft = 60
+        spell.putup
+      end
+    end
+  end
+
+  def self.roll
+    @data.roll
+  end
+
+  def self.attack(target, command)
+    if target.nil? || target.status =~ /dead|gone/
+      debug('attack failed: target is dead or gone')
+      return
+    end
+
+    debug("attack: ##{target.id}, command: #{command.inspect}")
+    sleep(1) if @data.settings[:debug]
+
+    # Reset data for attack roll
+    @data.roll = -999
+
+    command.split(',').each do |parts|
+      # Split each command by the word and and include them all together
+      cmd, extras, args, ifs, untils, times = parse_attack_command(parts)
+      debug("command: #{cmd}, extras: #{extras}, args: #{args}, ifs: #{ifs}, untils: #{untils}, times: #{times}")
+
+      # Number of iterations for this command
+      count = 0
+
+      while target.status !~ /gone|dead/i && (count += 1) <= times
+        buff
+
+        if flee?
+          debug('attack: breaking because flee? is true')
+          break
+        end
+
+        # rubocop:disable Security/Eval
+        if ifs.length.positive? && !eval(ifs.join(' '))
+          debug('attack: breaking because ifs were false')
+          break
+        end
+        # rubocop:enable Security/Eval
+
+        Commands.execute(cmd, extras, args, target)
+
+        if target.nil? || target.status =~ /gone|dead/i
+          debug('attack: breaking because target is dead or gone')
+          break
+        end
+
+        next unless untils.length.positive?
+
+        # rubocop:disable Security/Eval
+        res = eval(untils.join(' '))
+        # rubocop:enable Security/Eval
+
+        if res
+          debug('attack: breaking because untils were false')
+          break
+        end
+
+        # If unsuccessful we try the same command again by reducing the count
+        count -= 1
+      end
+
+      break if flee?
+
+      debug("attack: finished attacked #{count} <= #{times}")
+    end
+  end
+
+  def self.parse_attack_command(command)
+    if_started = false
+    until_started = false
+
+    args = {}
+    extras = []
+    ifs = []
+    untils = []
+    times = 1
+
+    commands = command.split(/\s+/)
+    cmd = commands.shift
+
+    commands.each do |part|
+      if part =~ /^(\d+)x/
+        times = Regexp.last_match(1).to_i
+      elsif part == 'if'
+        if_started = true
+      elsif part == 'until'
+        if_started = false
+        until_started = true
+      elsif if_started
+        ifs.push(part)
+      elsif until_started
+        untils.push(part)
+      elsif part.match(/([^=\s]+)=([^=\s]+)/)
+        args[Regexp.last_match(1).to_sym] = Regexp.last_match(2)
+      else
+        extras.push(part)
+      end
+    end
+
+    [cmd, extras, args, ifs, untils, times]
+  end
+
+  def self.prepare_hunt
+    go2(@data.settings[:room])
+  end
+
+  def self.start_scripts
+    @data.settings[:scripts].each do |script|
+      next if Script.running?(script.split(' ').first)
+
+      Script.start(script)
+    end
+  end
+
+  def self.stop_scripts
+    @data.settings[:scripts].each do |script|
+      name = script.split(' ').first
+      Script.kill(name) if Script.running?(name)
+    end
+  end
+
+  def self.hunt
+    # Find a target if we need to
+    @data.target = wander_for_target if @data.target.nil? || @data.target.status =~ /gone/ || flee?
+
+    # Find the attack line that matches the target
+    cleaned = clean_target_names.collect { |name| Regexp.new(name, Regexp::IGNORECASE) }
+    idx = cleaned.index { |name| @data.target.name =~ name || @data.target.noun =~ name }
+    target = @data.settings[:targets][idx]
+    attack_num = 0
+    attack_num = Regexp.last_match(1).to_i - 1 if target =~ /(\d+)\..*$/
+
+    # Kill the thing
+    attack(@data.target, @data.settings[:attack_lines][attack_num])
+    loot
+  end
+
+  def self.help
+    echo('Help will go here, someday...')
+    exit
+  end
+
+  def self.load
+    echo('Loaded. Shunt does nothing on its own.')
+  end
+
+  def self.cli(vars, settings)
+    help if vars[1].nil?
+
+    # This allows partial matches the same way Gemstone works.
+    # e.g., ;shunt dete would match ;shunt detect
+    command = '^attack^hunt^list^load^set^'
+
+    # No match - show help message
+    load unless (index = (command =~ /\^#{vars[1]}/))
+
+    # Got a match, strip the command down to the parts in between the ^
+    start = index + 1
+    stop = command.index('^', index + 1) - 1
+
+    command = command[start..stop]
+
+    case command
+    when 'attack'
+      if vars[2][0] == '#'
+        target = GameObj.targets.find { |t| t.id == vars[2][1..-1] }
+        echo target.inspect
+        exit
+      else
+        target = GameObj.targets.find { |t| t.name =~ /#{vars[2]}/ }
+      end
+
+      if target.nil?
+        echo("Failed to find target: specified #{vars[2]}")
+        exit
+      end
+
+      Hunt.attack(target, vars[0].gsub(vars[1], '').gsub(vars[2], '').strip)
+    when 'hunt'
+      start_scripts
+      prepare_hunt
+      before_dying { stop_scripts }
+      loop { hunt }
+    when 'list'
+      settings.to_hash.each do |key, value|
+        echo("#{key}: #{value}")
+      end
+    when 'load'
+      load
+    when 'set'
+      if vars[2].nil?
+        echo('You must specify a key: ;shunt set <key> <value>')
+        exit
+      end
+
+      key = vars[2].to_sym
+      unless defined?(settings[key])
+        echo("Setting \"#{key}\" not found")
+        exit
+      end
+
+      value = vars[3..-1].join(' ').strip
+      if value.empty?
+        echo('You must specify a value: ;shunt set <key> <value>')
+        exit
+      end
+
+      value = value.to_i if settings[key].class == Integer
+      if [FalseClass, TrueClass].include?(settings[key].class)
+        value = value.downcase
+        value = value =~ /true|1|on/i ? true : false
+      elsif settings[key].class == Array
+        value = value.split(',')
+      end
+
+      settings[key] = value
+      echo("\"#{key}\" is now set to \"#{settings[key]}\"")
+
+      @data.settings = settings.to_hash
+    end
+  end
+
+  def self.start(vars, settings)
+    $shunt_data ||= Data.new
+
+    @data = $shunt_data
+
+    # Initialize default settings
+    @data.settings = settings.to_hash.clone
+
+    cli(vars, settings)
+  end
+end
+
+move_regex = %r{<a exist="(\d+)" noun="[^"]+">[^<]+</a><popBold/>[^<]+<d>(\w+)</d>}
+prone_regex = Regexp.union(
+  %r{<pushBold/>[^<]*<a exist="(\d+)" noun="[^"]+">[^<]+</a><popBold/>.*is knocked to the ground}i,
+  %r{<pushBold/>[^<]*<a exist="(\d+)" noun="[^"]+">[^<]+</a><popBold/>.*falls to the floor}i,
+  %r{<pushBold/>[^<]*<a exist="(\d+)" noun="[^"]+">[^<]+</a><popBold/>.*shrieks and falls to the ground}i
+)
+
+# Status effect hook (watches lines from server and updates targets accordingly)
+# rubocop:disable Layout/LineLength
+DownstreamHook.add('shunt', proc do |line|
+  # Check to see if target moved
+  if line =~ move_regex
+    tdata = Hunt.data.target_data(Regexp.last_match(1))
+    tdata[:moved] = Regexp.last_match(2) unless tdata.nil?
+  end
+
+  # Check target status
+  if line =~ prone_regex
+    tdata = Hunt.data.target_data(Regexp.last_match(1))
+    tdata[:status] = 'prone' unless tdata.nil?
+  end
+
+  # Enemy targets present in room as well as the current target id
+  targets = GameObj.targets.collect(&:id).join('|')
+
+  next line if targets.empty?
+
+  # Players present in room which can be targets
+  players = ['you(\.|!|r? )']
+  players.push(GameObj.pcs.to_a.join('|')) if GameObj.pcs
+  players = players.join('|')
+
+  # Check existing targets and primary target for matches
+  if line =~ /(#{targets}).*#{players}/
+    target = Regexp.last_match(1)
+
+    if line !~ /style id="".*style id="roomDesc"|(?:component|compDef) id='room objs'/
+      Hunt.data.register_target_data(target, :last_action_at, Time.now.to_i)
+      next line
+    end
+  end
+
+  # Didn't detect using targets: try some more generic checks against everyone
+  if line =~ /<a exist="([^"]+)" noun="[^"]+">[^<]+<\/a><popBold\/> (?:shoots an? .* at|positions .* to attack|stomps at|swings an? .* at|thrusts with an? .* at|tries to bite|charges at|claws at|snaps at|stabs at|rakes at|pounds at|throws an? .* at) #{players}/i
+    Hunt.data.register_target_data(Regexp.last_match(1), :last_action_at, Time.now.to_i)
+  end
+
+  line
+end)
+# rubocop:enable Layout/LineLength
+
+default_settings = {
+  # Enabling debug mode assumes you know what you're and is rather spammy
+  debug: false,
+  # Attack lines
+  attack_lines: ['wait 20 if false,stance offensive,kill 2x'],
+  # Hunting area boundaries; comma separated
+  boundaries: [],
+  # Buffs to keep up while hunting
+  buffs: [],
+  # Skip cooldown on buffs like Burst of Swiftness or Surge of Strength
+  buffs_skip_cooldown: false,
+  # Flee when the number of targets in the room hit this value
+  flee_at: 2,
+  # But these only ever count as one, no matter how many exist in the room
+  flee_group: [],
+  # But always ignore these when counting flee_at
+  flee_ignore: [],
+  # And always flee from these guys
+  flee_always: [],
+  # The loot script to use
+  looter: 'sloot',
+  # Room to hunt in
+  room: '',
+  # Scripts that run while hunting
+  scripts: ['hunt'],
+  # Targets, separated with numbers for attack routines, e.g., 1.forest troll
+  targets: [],
+  # Critters to never target
+  untargetable: []
+}
+
+default_settings.each do |k, v|
+  cls = CharSettings[k].class
+  next if [TrueClass, FalseClass].include?(cls) && [TrueClass, FalseClass].include?(v.class)
+  next if cls == v.class
+
+  CharSettings[k] = v
+end
+
+CharSettings.to_hash.delete_if { |setting, _| default_settings[setting].nil? }
+CharSettings[:attack_lines] = ['stance offensive,kill']
+
+script.want_downstream = false
+script.want_downstream_xml = true
+
+Hunt.start(script.vars, CharSettings)

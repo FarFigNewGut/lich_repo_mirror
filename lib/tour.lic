@@ -1,0 +1,404 @@
+=begin
+  Travel the world without going anywhere.
+
+  While ;tour is running, most movement commands only pretend to move you.  This allows you to look at room descriptions
+  and other attributes without actually visiting rooms.  Naturally, only rooms in the mapDB may be thus visited, and
+  you won't see anything other than what the mapDB knows about the room.
+
+  Untargetted LOOK and EXAMINE are similarly hijacked to show you information about the room you are currently touring.
+
+  Lich will be fooled into thinking you are actually in the room you are touring, so xnarost or narost can track your
+  location.  However, ;tour cannot intercept commands sent by scripts -- so ;go2 will be completely broken while ;tour
+  is running (rather than pretending to run you to some new exotic location)
+
+  Usage:
+    ;tour       - Begin touring in your current room
+    ;tour ROOM# - Begin touring in the specified room number
+
+  While ;tour is running:
+
+  GO 12345      - Teleport to room 12345.
+  NEXT          - Teleport to the next room by ID
+  PREV          - Teleport to the previous room by ID
+  INSPECT       - Inspect the current room.  (INSPECT with any arguments is sent to the game as normal)
+
+  Not tested in DR.  Should still work.
+
+  author: LostRanger (thisgenericname@gmail.com)
+	game: any
+	tags: utility
+
+  version: 0.6 (2019-10-30)
+
+  changelog:
+    version 0.6 (2019-09-27)
+     * Better handle some cases of the mapdb being broken.
+
+    version 0.5 (2019-09-27)
+     * Don't crash in rooms that have more than one set of obvious exits.
+
+    version 0.4 (2019-09-24)
+     * Properly show exits that have a StringProc for their timeto.
+
+    version 0.3 (2019-09-24)
+     * Obvious paths/exits are now based on the string recorded in the mapDB, meaning unmapped rooms will still appear
+       in faked room descriptions.  Mapdb navigation in a direction that is missing will appear in the same area as
+       GO directions are listed.
+     * Added NEXT, PREV and INSPECT commands.
+
+    version 0.2 (2019-09-24)
+     * Remove accidentally-left-in debug spam.
+
+    version 0.1 (2019-09-24)
+     * Initial release.
+=end
+
+
+class Map
+    def Map.tour_set_room_id(id)
+        @@current_room_mutex.synchronize do
+            if id
+                $room_count += 1
+                @@current_room_id = id.to_i
+                @@current_room_count = XMLData.room_count
+            else
+                @@current_room_id = nil
+                @@current_room_count = -1
+            end
+        end
+    end
+end
+
+before_dying do
+    Map.tour_set_room_id(nil)
+    Map.current
+    class <<Map
+        remove_method :tour_set_room_id
+    end
+end
+
+
+module TourModule
+    @directions_normalized = {}
+    @compass_directions = {
+        "north" => "n",
+        "northeast" => "ne",
+        "east" => "e",
+        "southeast" => "se",
+        "south" => "s",
+        "southwest" => "sw",
+        "west" => "w",
+        "northwest" => "nw",
+        "up" => "up",
+        "down" => "down",
+        "out" => "out"
+    }
+
+    @verb_autocomplete = {
+        "g" => "go",
+        "go" => "go",
+        "cli" => "climb",
+        "clim" => "climb",
+        "climb" => "climb",
+        "swi" => "swim",
+        "swim" => "swim",
+    }
+    %w(north east south west up down out).each do |dir|
+        (0..(dir.length-1)).each{|x| @directions_normalized[dir[0..x]] = dir}
+    end
+
+    %w(northeast northwest southeast southwest).each do |dir|
+        @directions_normalized[dir[0] + dir[5]] = dir
+        (5..(dir.length-1)).each{|x| @directions_normalized[dir[0..x]] = dir}
+    end
+
+    # echo directions_normalized.inspect
+    # echo compass_directions.inspect
+
+    def self.find_target(room, verb, args)
+        verb = verb.downcase
+        dir = @directions_normalized[verb.downcase]
+        if dir
+            room.wayto.each do |target, way|
+                next if way.is_a?(StringProc)
+                return target if @directions_normalized[way.downcase] == dir
+            end
+            return nil
+        end
+        verb = (@verb_autocomplete[verb] || verb)
+
+        if args
+            args = args.split(/\s+/)
+            pattern = /#{args[0..-2].map{|x| "\\b#{x}\\S*\\s+.*"}.join}\b#{args[-1]}\S*$/
+        end
+
+        room.wayto.each do |target, way|
+            next if way.is_a?(StringProc)
+            next unless way =~ /^(\S+)(?:\s+(.*))?$/
+
+            wverb = (@verb_autocomplete[$1] || $1)
+            wargs = $2
+            next unless wverb == verb
+
+            if args
+                next unless wargs
+                next unless pattern =~ wargs
+                return target
+            else
+                next if wargs
+                return target
+            end
+        end
+
+        return nil
+    end
+
+    def self.escape(what)
+        return REXML::Text.new(what, respect_whitespace: true)
+    end
+
+    def self.strip_tags(what)
+        result = what.gsub(/<[^>]+>/, '')
+        result.gsub!('&gt;', '>')
+        result.gsub!('&lt;', '>')
+        return result
+    end
+
+    def self.echo(*messages)
+        messages.each { |message| respond("[tour: #{message.to_s.chomp}]") }
+    end
+
+    def self.send_look
+        rm = Room.current
+        unless rm
+            _respond "#{monsterbold_start}[tour: Cannot identify current location.]#{monsterbold_end}"
+            return
+        end
+
+        if rm.title.length == 0
+            room_title = "!!No Room Title!!".dup
+        else
+            room_title = rm.title[0].dup
+            room_title += " (and #{rm.title.length - 1} more)" if rm.title.length > 1
+        end
+        room_title += " (#{rm.id})"
+
+        if rm.description.length == 0
+            room_description = "(No room description)"
+        else
+            room_description = "[1/#{rm.description.length}]#{rm.description[0]}"
+        end
+
+        room_unique_loot = ''
+        if rm.unique_loot
+            if rm.unique_loot.length > 1
+                room_unique_loot = "Unique loot: #{rm.unique_loot[0..-2].join(', ')} and #{rm.unique_loot[-1]}\r\n"
+            elsif rm.unique_loot.length == 1
+                room_unique_loot = "Unique loot: #{rm.unique_loot[0]}\r\n"
+            end
+        end
+
+        dir_exits = {}
+        proc_exits = []
+        go_exits = []
+        rm.wayto.each do |target, way|
+            timeto = rm.timeto[target]
+            text = "<d cmd=\"go #{target}\">##{target}</d>"
+            if timeto.nil?
+                text += " in ???s"
+            elsif timeto.is_a?(StringProc)
+                text += " in &lt;proc time&gt;"
+            elsif timeto != 0.2
+                text += " in #{timeto}s"
+            end
+
+            if way.is_a?(StringProc)
+                proc_exits << "[StringProc to #{text}]\r\n"
+                next
+            elsif not way.is_a?(String)
+                proc_exits << "#{monsterbold_start}[#{way.inspect} to #{text}]#{monsterbold_end}\r\n"
+                next
+            end
+
+            dir = @directions_normalized[way.downcase]
+            if dir
+                (dir_exits[dir] ||= []) << text
+            else
+                go_exits << "[#{escape(way.upcase)} to #{text}]\r\n"
+            end
+        end
+
+        compass = []
+        wfe_exits = []
+        if rm.paths.length > 0
+            room_exits = rm.paths[0].dup
+            room_exits += " (+ #{rm.paths.length - 1} more)" if rm.paths.length > 1
+        else
+            room_exits = "(No obvious exit information defined)"
+        end
+
+        @compass_directions.each do |dir, cdir|
+            targets = dir_exits[dir]
+            next unless targets
+            wfe_exits << DIRMAP[cdir]
+            compass << "<dir value=\"#{cdir }\"/>"
+            text = "<d>#{dir}</d> (#{targets.join(' OR ')})"
+            if targets.length > 1
+                text = "#{monsterbold_start}#{text}#{monsterbold_end}"
+            end
+            unless room_exits.gsub!(/\b(#{dir})\b/, text)
+                go_exits << "[#{escape(cdir.upcase)} to #{targets.join(' OR ')}]\r\n"
+            end
+        end
+
+        # if room_exits.length > 0
+        #     room_exits = room_exits.join(', ')
+        # else
+        #     room_exits = "none"
+        # end
+
+        #
+        # if rm.paths.length > 0 and rm.paths[0] =~ /^Obvious exits:/i
+        #     room_exits = "Obvious exits: #{room_exits}"
+        # else
+        #     room_exits = "Obvious paths: #{room_exits}"
+        # end
+        #
+        go_exits = go_exits.join + proc_exits.join
+
+        output = []
+        if XMLData.send_fake_tags
+            room_exits = strip_tags(room_exits)
+            output << "\034GSo\r\n#{room_title}\034GSp\r\n\r\n"
+            output << "#{room_description}\r\n"
+            output << room_unique_loot
+            output << "#{room_exits}\r\n"
+            output << "\034GSj#{sprintf('%-20s', wfe_exits.join)}\r\n"
+            go_exits = strip_tags(go_exits)
+            output << go_exits
+            $_CLIENT_.puts(output.join)
+        else
+            # room_title = REXML::Text.new(room_title).to_s
+            # room_description = REXML::Text.new(room_description).to_s
+            output << "<resource picture=\"0\"/><nav/><style id=\"roomName\" />#{escape(room_title)}\r\n"
+            output << "<style id=\"\"/><style id=\"roomDesc\"/>#{escape(room_description)}\r\n"
+            output << escape(room_unique_loot)
+            output << "<style id=\"\"/>#{room_exits}\r\n"
+            output << go_exits
+            output << "<compass>#{compass.join}</compass>[tour:#{rm.id or '????'}]<prompt>#{escape(XMLData.prompt)}</prompt>\r\n"
+            $_CLIENT_.puts(output.join)
+        end
+    end
+
+    def self.hook
+        name = "tour_hook_Time.now.to_i"
+        before_dying do
+            UpstreamHook.remove(name)
+            DownstreamHook.remove(name)
+        end
+
+        DownstreamHook.add(name, proc{|xml|
+            xml.gsub(/(<prompt.*>)(.*<\/prompt>)/, "\\1[tour:#{Room.current.id or '????'}]\\2")
+        })
+
+        UpstreamHook.add(name, proc{|line|
+            next line unless line =~ /^(?:<c>)? *([^ ]+)(?: +(.*))?$/
+            cmd = $1.downcase
+            cmd = (@verb_autocomplete[cmd] || cmd)
+            args = $2
+            if 'go'.start_with?(cmd)
+                if args =~ /^\d+/
+                    if (target = visit_room(args))
+                        echo "Touring room ##{target}..."
+                        send_look
+                        next nil
+                    else
+                        echo "Room ##{args} not found!"
+                        next nil
+                    end
+                end
+            end
+            unless args
+                if 'look'.start_with?(cmd) or (cmd.length > 2 and 'examine'.start_with?(cmd))
+                    send_look
+                    next nil
+                elsif 'inspect'.start_with?(cmd) and cmd.length > 2
+                    respond Room.current.inspect
+                    next nil
+                end
+            end
+            target = find_target(Room.current, cmd, args)
+            if target
+                unless visit_room(target)
+                    echo "Could not visit room ##{target}"
+                    next nil
+                end
+                send_look
+                next nil
+            elsif @verb_autocomplete[cmd]
+                echo "You can't #{cmd} there."
+                next nil
+            elsif (dir = @directions_normalized[cmd])
+                echo "You can't go #{dir} from here."
+                next nil
+            elsif cmd.length > 2 and ('next'.start_with?(cmd) or 'previous'.start_with?(cmd))
+                id = Room.current.id
+                unless id
+                    echo "Current room is unknown."
+                    next nil
+                end
+
+                if cmd[0] == 'n'  # Next
+                    nrooms = Room.list.length
+                    while true
+                        id = id + 1
+                        if id >= nrooms
+                            id = 0
+                        end
+                        if visit_room(id)
+                            send_look
+                            break
+                        end
+                    end
+                else
+                    while true
+                        id = id - 1
+                        if id < 0
+                            id = Room.list.length - 1
+                        end
+                        if visit_room(id)
+                            send_look
+                            break
+                        end
+                    end
+                end
+                next nil
+            end
+
+
+            next line
+        })
+    end
+
+    def self.visit_room(where)
+        rm = Room[where]
+        return nil unless rm
+        Map.tour_set_room_id(rm.id)
+        return rm.id
+    end
+end
+
+
+TourModule.hook
+
+if script.vars.length > 0
+    if (target = TourModule.visit_room(script.vars[0]))
+        echo "Touring room ##{target}..."
+    else
+        echo "Room ##{args} not found!"
+        exit
+    end
+end
+TourModule.send_look
+
+sleep

@@ -1,0 +1,1668 @@
+=begin
+
+    Creatures and hunting areas atlas.  Requires atlas_data.db to also
+    be downloaded and must be ;trust'ed so it can use that data.
+
+     author: Jymamon (gs4-jymamon@hotmail.com)
+       game: Gemstone
+       tags: creature,critter,hunting
+    version: 2017.06.28.01 - Fixed adding new creatures
+
+    History:
+        2017.06.28.01 - Fixed adding new creatures
+        2017.01.13.01 - Fixed saving new area
+        2017.01.12.02 - Fixed broken area activation
+        2017.01.12.01 - Display creatures for area in a treeview
+        2017.01.11.01 - Add area add/delete/edit
+        2017.01.10.01 - Add filtering by level. Add area deletion.
+        2016.12.31.01 - Initial release.
+
+=end
+
+# ------------------------------------------------------------------------------
+# Areas, creatures, and backing DB goo.  Possibly to be split out later.
+# ------------------------------------------------------------------------------
+
+# A hunting area with a start room, boundaries, and what can be hunted.
+# The region attribute exists mostly to allow the correct bounty areas
+# to be found without having to first query mapdb for all rooms in a
+# specific region and then determine which hunting areas are within it.
+# The field will be auto-populated for the area based on the mapdb
+# location of the start room.
+class Area
+    attr_reader :id, :start, :boundaries, :creatures, :region
+
+    def initialize(id, start, boundaries, creatures)
+        @id         = id
+        @start      = start
+        @boundaries = boundaries|| Array.new
+        @creatures  = creatures || Array.new
+        @region     = Room[start].location || "<Unknown region>"
+    end
+end
+
+# A creature that can be hunted.  We track the creatures skin, but don't
+# really need to as skin bounties include the creature name. Since we'll
+# end up with nil for unskinnable creatures, it may come in handy for
+# deciding what areas to "free" hunt. (Similarly, we should track gem
+# and treasure types.)
+#
+# The hated and undead attributes are also included not for bounty use
+# but for anyone wanting to use the creature db for deciding what to hunt
+# based on society membership.
+class Creature
+    attr_reader :id, :hated, :level, :name, :noncorp, :skin, :undead
+
+    def initialize(id, level, name, skin, undead, noncorp, hated)
+        @id      = id
+        @level   = level
+        @name    = name
+        @skin    = skin
+        @hated   = hated
+        @noncorp = noncorp
+        @undead  = undead
+    end
+end
+
+# Just a based database class to simplify a shared database for creatue and area
+# data which are logically separate. This also gives us a place to shove in version
+# so we can ensure the DB version and this script's version are compatible in the
+# future.
+# These should be treated as mostly private methods, but I'm still playing with how
+# to make those work in ruby.  Once I do, they will be marked as such and break anything
+# relying on them.  If you need a dependency on anything I've commented on private,
+# let me know the use case so I can expose it properly.  All current use should come
+# through the Creatures and Areas modules or the Creature and Area classes.
+module AtlasDatabase
+    @@areatable         = "areas"
+    @@areaboundarytable = "areaboundaries"
+    @@areacreaturetable = "areacreatures"
+    @@creaturetable     = "creatures"
+    @@versiontable      = "version"
+
+    @@database          = nil
+    @@mutex             = Mutex.new
+
+    @@make_area = proc {|areaid|
+        start = AtlasDatabase.db.get_first_value("SELECT start FROM #{@@areatable} WHERE id = ?;", areaid);
+
+        Area.new(
+            areaid,
+            start,
+            AtlasDatabase.db.execute("SELECT boundary FROM #{@@areaboundarytable} WHERE area = ?;", areaid),
+            AtlasDatabase.db.execute("SELECT creature FROM #{@@areacreaturetable} WHERE area = ?;", areaid).map {|c|
+                @@make_creature.call(c[0])
+            })
+    }
+
+    @@make_creature = proc {|creatureid|
+        start = AtlasDatabase.db.get_first_row("SELECT level, name, skin, undead, noncorp, hated FROM #{@@creaturetable} WHERE id = ?", creatureid);
+
+        Creature.new(
+            creatureid,
+            start[0].to_i,
+            start[1],
+            start[2],
+            start[3].to_i==1,
+            start[4].to_i==1,
+            start[5].to_i==1)
+    }
+
+    def AtlasDatabase.version
+        return "2016.11.22.01"
+    end
+
+    # private
+    def AtlasDatabase.db
+        if $SAFE == 0
+            @@database ||= SQLite3::Database.new("#{$script_dir}/atlas_data.db3")
+        else
+            nil
+        end
+    end
+
+    def AtlasDatabase.close_db
+        @@mutex.synchronize {
+            if (! @@database.nil? )
+                AtlasDatabase.db.close()
+                @@database = nil;
+            end
+        }
+    end
+
+    # private
+    def AtlasDatabase.delete_area(areaid)
+        @@mutex.synchronize {
+            begin
+                AtlasDatabase.db.execute("DELETE FROM #{@@areacreaturetable} WHERE area = ?;", areaid)
+            rescue SQLite3::BusyException
+                sleep 0.1
+                retry
+            end
+
+            begin
+                AtlasDatabase.db.execute("DELETE FROM #{@@areaboundarytable} WHERE area = ?;", areaid)
+            rescue SQLite3::BusyException
+                sleep 0.1
+                retry
+            end
+
+            begin
+                AtlasDatabase.db.execute("DELETE FROM #{@@areatable} WHERE id = ?;", areaid)
+            rescue SQLite3::BusyException
+                sleep 0.1
+                retry
+            end
+        }
+    end
+
+    # private
+    def AtlasDatabase.delete_creature(creatureid)
+        @@mutex.synchronize {
+            begin
+                AtlasDatabase.db.execute("DELETE FROM #{@@creaturetable} WHERE id = ?;", creatureid)
+            rescue SQLite3::BusyException
+                sleep 0.1
+                retry
+            end
+        }
+    end
+
+    # private
+    def AtlasDatabase.find_area_all()
+        results = Array.new
+
+        AtlasDatabase.db.execute("SELECT id FROM #{@@areatable};").each {|row|
+            results << @@make_area.call(row[0])
+        }
+
+        return results
+    end
+
+    # private
+    def AtlasDatabase.find_area_by_creature(creatureid)
+        areas = Array.new
+        results = Array.new
+
+        AtlasDatabase.db.execute("SELECT area FROM #{@@areacreaturetable} WHERE creature = #{creatureid};").each {|area|
+            results << @@make_area.call(area[0])
+        }
+
+        return results
+    end
+
+    # private
+    def AtlasDatabase.find_area_by_id(id)
+        return @@make_area.call(id)
+    end
+
+
+    # private
+    def AtlasDatabase.find_area_by_region(region)
+        results = Array.new
+
+        AtlasDatabase.db.execute("SELECT id FROM #{@@areatable} WHERE region = \"#{region}\";").each {|row|
+            results << @@make_area.call(row[0])
+        }
+
+        return results
+    end
+
+    # private
+    def AtlasDatabase.find_creature_all()
+        results = Array.new
+
+        AtlasDatabase.db.execute("SELECT id FROM #{@@creaturetable}").each {|row|
+            results << @@make_creature.call(row[0])
+        }
+
+        return results
+    end
+
+    # private
+    def AtlasDatabase.find_creature_by_id(id)
+        return @@make_creature.call(id)
+    end
+
+    # private
+    def AtlasDatabase.find_creature_by_level(min = 1, max = nil)
+        if ( max.nil? )
+            max = min
+        end
+
+        results = Array.new
+
+        AtlasDatabase.db.execute("SELECT id FROM #{@@creaturetable} WHERE level >= #{min} and level <= #{max}").each {|row|
+            results << @@make_creature.call(row[0])
+        }
+
+        return results
+    end
+
+    # private
+    def AtlasDatabase.find_creature_by_name(name, exact = true)
+        results = Array.new
+
+        if (exact)
+            clause = "name = \"#{name}\";"
+        else
+            clause = "name LIKE \"%#{name}%\";"
+        end
+
+        AtlasDatabase.db.execute("SELECT id FROM #{@@creaturetable} WHERE #{clause}").each {|row|
+            results << @@make_creature.call(row[0])
+        }
+
+        return results
+    end
+
+    # private
+    def AtlasDatabase.find_creature_by_skin(skin)
+        results = Array.new
+
+        AtlasDatabase.db.execute("SELECT id FROM #{@@creaturetable} WHERE skin = ?;", skin).each {|row|
+            results << @@make_creature.call(row[0])
+        }
+
+        return results
+    end
+
+    def AtlasDatabase.init_db
+        @@mutex.synchronize {
+            begin
+                # Versioning tables
+                AtlasDatabase.db.execute("CREATE TABLE IF NOT EXISTS #{@@versiontable}(version TEXT NOT NULL, module_version_required TEXT NOT NULL, PRIMARY KEY(version));")
+                AtlasDatabase.db.execute("INSERT OR REPLACE INTO #{@@versiontable}(version, module_version_required) VALUES('#{AtlasDatabase.version}', '#{AtlasDatabase.version}');")
+                # Creatures table
+                AtlasDatabase.db.execute("CREATE TABLE IF NOT EXISTS #{@@creaturetable} (id INT NOT NULL, level INT NOT NULL, undead INT NOT NULL, noncorp INT NOT NULL, hated INT NOT NULL, name TEXT NOT NULL, skin TEXT, extra BLOB, PRIMARY KEY(name));")
+                # Hunting area tables
+                AtlasDatabase.db.execute("CREATE TABLE IF NOT EXISTS #{@@areatable} (id INTEGER PRIMARY KEY, region TEXT NOT NULL, start INT NOT NULL);")
+                AtlasDatabase.db.execute("CREATE TABLE IF NOT EXISTS #{@@areaboundarytable} (id INTEGER PRIMARY KEY, area INT NOT NULL, boundary INT NOT NULL, FOREIGN KEY(area) REFERENCES #{@@areatable}(id), CONSTRAINT unique_boundary UNIQUE(area, boundary));")
+                AtlasDatabase.db.execute("CREATE TABLE IF NOT EXISTS #{@@areacreaturetable} (id INTEGER PRIMARY KEY, area INT NOT NULL, creature INT NOT NULL, FOREIGN KEY(area) REFERENCES #{@@areatable}(id), FOREIGN KEY(creature) REFERENCES #{@@creaturetable}(id), CONSTRAINT unique_creature UNIQUE(area, creature));")
+
+            rescue SQLite3::BusyException
+                sleep 0.1
+                retry
+            end
+        }
+    end
+
+    # private
+    def AtlasDatabase.insert_area(area)
+        AtlasDatabase.delete_area(area.id)
+
+        @@mutex.synchronize {
+            begin
+                AtlasDatabase.db.execute("INSERT OR REPLACE INTO #{@@areatable}(id, start, region) VALUES(?,?,?);",
+                    area.id,
+                    area.start,
+                    area.region.encode('UTF-8'));
+
+                area.boundaries.each {|boundary|
+                    AtlasDatabase.db.execute("INSERT OR REPLACE INTO #{@@areaboundarytable}(area, boundary) VALUES(?,?);",
+                        area.id,
+                        boundary);
+                }
+
+                area.creatures.each {|creature|
+                    AtlasDatabase.db.execute("INSERT OR REPLACE INTO #{@@areacreaturetable}(area, creature) VALUES(?,?);",
+                        area.id,
+                        creature);
+                }
+
+            rescue SQLite3::BusyException
+                sleep 0.1
+                retry
+            end
+        }
+    end
+
+    # private
+    def AtlasDatabase.insert_creature(creature)
+        AtlasDatabase.delete_creature(creature.id)
+
+        @@mutex.synchronize {
+            begin
+                AtlasDatabase.db.execute("INSERT OR REPLACE INTO #{@@creaturetable}(id, name, skin, level, undead, noncorp, hated) VALUES(?,?,?,?,?,?,?);",
+                    creature.id,
+                    creature.name.encode('UTF-8'),
+                    creature.skin.encode('UTF-8'),
+                    creature.level,
+                    creature.undead ? 1 : 0,
+                    creature.noncorp ? 1 : 0,
+                    creature.hated ? 1 : 0);
+            rescue SQLite3::BusyException
+                sleep 0.1
+                retry
+            rescue
+                echo "ERROR IN: INSERT OR REPLACE INTO #{@@creaturetable}(id, name, skin, level, undead, noncorp, hated) VALUES(#{creature.id},#{creature.name.encode('UTF-8')},#{creature.skin.encode('UTF-8')},#{creature.level},#{creature.undead},#{creature.noncorp},#{creature.hated});"
+                echo "#{$!.backtrace.join("\n\t")}"
+            end
+        }
+    end
+end
+
+# Purely for "namespacing" access to area related methods
+module Areas
+    def Areas.all()
+        AtlasDatabase.find_area_all()
+    end
+
+    def Areas.delete(areaid)
+        AtlasDatabase.delete_area(areaid)
+    end
+
+    def Areas.find_by_creature(creatureid)
+        AtlasDatabase.find_area_by_creature(creatureid)
+    end
+
+    def Areas.find_by_id(areaid)
+        AtlasDatabase.find_area_by_id(areaid)
+    end
+
+    def Areas.find_by_region(region)
+        AtlasDatabase.find_area_by_region(region)
+    end
+
+    def Areas.ids()
+        Areas.all().map{|a| a.id}
+    end
+
+    def Areas.init_db
+        AtlasDatabase.init_db
+    end
+
+    def Areas.insert(area)
+        AtlasDatabase.insert_area(area)
+    end
+end
+
+# Purely for "namespacing" access to creature related methods
+module Creatures
+    def Creatures.version
+        return AtlasDatabase.version
+    end
+
+    def Creatures.ids()
+        Creatures.all().map{|c| c.id}
+    end
+
+    def Creatures.all()
+        AtlasDatabase.find_creature_all()
+    end
+
+    def Creatures.delete(creatureid)
+        AtlasDatabase.delete_creature(creatureid)
+    end
+
+    def Creatures.find_by_id(id)
+        AtlasDatabase.find_creature_by_id(id)
+    end
+
+    def Creatures.find_by_level(min = 1, max = nil)
+        AtlasDatabase.find_creature_by_level(min, max)
+    end
+
+    def Creatures.find_by_name(name, exact = false)
+        AtlasDatabase.find_creature_by_name(name, exact)
+    end
+
+    def Creatures.find_by_skin(skin)
+        AtlasDatabase.find_creature_by_skin(skin)
+    end
+
+    def Creatures.init_db
+        AtlasDatabase.init_db
+    end
+
+    def Creatures.insert(creature)
+        AtlasDatabase.insert_creature(creature)
+    end
+end
+
+# -------------------------------------------------------------------------------
+# Jymamon's GTK wrapper.  To be split out to another module.
+# -------------------------------------------------------------------------------
+if $jgtk_development
+    # Before exiting, undef the class so we can redefine them next run.
+    before_dying {
+        JGTK.constants.each{|c|
+            JGTK.send(:remove_const, c)
+        }
+    }
+end
+
+module JGTK
+    # Curse interpetted languages for forward declarations like this being required.
+    class Widget
+    end
+
+    class Table < Widget
+    end
+
+    ## ------------------------------------------------------------------------
+    # Used for my auto-loader snippet
+    #   if File.file?("#{$script_dir}/moduleloader.lic")
+    #       load("#{$script_dir}/moduleloader.lic")
+    #   else
+    #       echo "\n\nmoduleloader.lic is required: ';repos download moduleloader.lic'\n\n."
+    #       exit
+    #   end
+    #
+    #   ModuleLoader::load_support_script("JGTK", [required_version])
+    ## ------------------------------------------------------------------------
+    def JGTK.version
+        return "2017.01.10.01"
+    end
+
+    ## ------------------------------------------------------------------------
+    # Basic GTK window "dumbed down" for the limited cases we need to
+    # support.
+    ## ------------------------------------------------------------------------
+    class BaseWindow
+        attr_accessor :action
+        attr_reader :height, :resizable, :title, :width, :window
+        protected :window
+
+        def initialize(title, width = 400, height = 300)
+            # Windows can be resized by default with GTK
+            @resizable = true
+            @width     = width
+            @height    = height
+            @title     = title
+
+            Gtk.queue {
+                @window = Gtk::Window.new
+                @window.title = "#{self.title}"
+                @window.border_width = 3 # Arbitrarily chosen
+            }
+
+            self.resize(self.width, self.height)
+        end
+
+        def resizable=(can_resize)
+            @resizable = can_resize
+
+            Gtk.queue {
+                self.window.resizable = self.resizable
+            }
+        end
+
+        def resize(width, height)
+            @height = height
+            @width = width
+
+            Gtk.queue {
+                # http://stackoverflow.com/questions/3582558/setting-resizable-to-false-shrinks-window-to-point
+                @window.set_size_request(@width, @height)
+            }
+        end
+
+        def run
+            begin
+                Gtk.queue {
+                    # Hook up closing the window
+                    @window.signal_connect_after('delete_event') {
+                        @action = :exit
+                    }
+
+                    # Show the window
+                    @window.show
+                    # Keep it above the client window.
+                    @window.keep_above = true
+                }
+
+                wait_while { @action.nil? }
+
+            rescue
+                respond "That was bad.\n#{$!.backtrace.join("\n\t")}"
+
+            ensure
+                Gtk.queue {
+                    @window.destroy
+                }
+            end
+        end
+
+    end
+
+    ## ------------------------------------------------------------------------
+    # It's a button. It's clicky.
+    ## ------------------------------------------------------------------------
+    class Button < Widget
+        attr_reader :action
+
+        def initialize(text, action = nil)
+            @text = text
+            @action = action
+
+            Gtk.queue {
+                @widget = Gtk::Button.new(text)
+            }
+
+            if (!action.nil?)
+               onclick(action);
+            end
+        end
+
+        def onclick(action)
+            @action = action
+
+            Gtk.queue {
+                @widget.signal_connect('clicked') {
+                    begin
+                       Gtk.queue {
+                            @action.call(self, text);
+                        }
+                    rescue
+                        echo "error in clicked() callback for #{self.class} with text #{self.text}"
+                    end
+                }
+            }
+        end
+
+        def text=(newtext)
+            @text = newtext
+
+            Gtk.queue {
+                @widget.label = @text
+            }
+        end
+
+        def text
+            return @text
+        end
+    end
+
+    ## ------------------------------------------------------------------------
+    # True/False check box.
+    ## ------------------------------------------------------------------------
+    class CheckButton < Widget
+        attr_reader :text
+
+        def initialize(label=nil)
+            @text = label
+
+            Gtk.queue {
+                @widget = Gtk::CheckButton.new(label)
+                @widget.sensitive = false
+            }
+        end
+
+        def checked?
+            return @widget.active?
+        end
+
+        def checked=(bool)
+            Gtk.queue {
+                @widget.set_active(bool)
+                @widget.show
+            }
+        end
+
+        def enabled?
+            value = nil
+
+            Gtk.queue {
+                value = @widget.sensitive?
+            }
+
+            return value
+        end
+
+        def enabled=(bool)
+            Gtk.queue {
+                @widget.sensitive = bool
+            }
+        end
+
+    end
+
+    ## ------------------------------------------------------------------------
+    # GridView is a TreeView using ListStore as the backing data provider so
+    # there are no nodes to expand
+    # Currently specialized to creature listing. Need to fix that.
+    ## ------------------------------------------------------------------------
+    class GridView < Widget
+        attr_reader :model, :grid
+
+        def text
+            if @grid.selection.nil?
+                return nil
+            else
+                return @grid.selection.selected[0]
+            end
+        end
+
+        def initialize()
+            @frame = Gtk::Frame.new().set_shadow_type(Gtk::SHADOW_ETCHED_IN)
+            # TODO: allow column definitions
+            #@widget = Gtk::VBox.new(homogeneous=false, spacing=nil)
+            @model = Gtk::ListStore.new(String, String)
+
+            @grid = Gtk::TreeView.new(@model)
+            @grid.selection.mode = Gtk::SELECTION_SINGLE
+            @grid.set_headers_visible(false)
+
+            # TODO: allow column naming
+            column = Gtk::TreeViewColumn.new("1", Gtk::CellRendererText.new, :text => 0)
+            @grid.append_column(column)
+            column2 = Gtk::TreeViewColumn.new("2", Gtk::CellRendererText.new, :text => 1)
+            @grid.append_column(column2)
+
+            # Use ScrolledWindow to make the TreeView scrollable
+            # Otherwise the TreeView would expand to show all items
+            # Only allow vertical scrollbar
+            @widget = Gtk::ScrolledWindow.new(nil, nil)
+            @widget.set_policy( Gtk::POLICY_NEVER, Gtk::POLICY_AUTOMATIC )
+            @widget.add(@grid)
+            @widget.set_shadow_type(Gtk::SHADOW_IN)
+        end
+
+        # TODO: record is assumed to just be a string at the moment
+        def add_option(creature, level)
+            begin
+                Gtk.queue {
+                    iter = @model.append
+                    iter[0] = creature
+                    iter[1] = "Level: #{level==999 ? 'scaling' : level}"
+                }
+            rescue
+                echo "error in add_option() callback for #{self.class}"
+                echo "#{$!.backtrace.join("\n\t----- ")}"
+            end
+        end
+
+        def clear()
+            Gtk.queue {
+                @model.clear
+            }
+        end
+
+        # This is only working when option==0 and is weirdness
+        # otherwise.  Need to investigate, but delete is not the
+        # top concern at the moment.
+        def remove_option()
+            begin
+                Gtk.queue {
+                    remove = nil
+
+                    @model.each{|model,path,iter|
+                        remove = iter if (iter[0]==self.text)
+                    }
+
+                    @model.remove(remove)
+                }
+            rescue
+                echo "error in remove_option() for #{self.class}"
+                echo "#{$!.backtrace.join("\n-- ")}"
+            end
+        end
+    end
+
+    ## ------------------------------------------------------------------------
+    # A Drop down list.  onchange() to do stuff then it changes.
+    # Useful hints: https://www.ruby-forum.com/topic/2381946
+    ## ------------------------------------------------------------------------
+    class ListStore < Widget
+        attr_reader :selected, :action
+
+        def text
+            return @widget.active_text
+        end
+
+        def initialize(text, options = nil)
+            @selected = 0
+
+            Gtk.queue {
+                @widget = Gtk::ListStore.new(String)
+
+                options.each{|o|
+                    iter = @widget.append
+                    iter[0] = o
+                }
+            }
+        end
+
+        def active=(value)
+            Gtk.queue {
+                self.set_active(value)
+            }
+        end
+
+        def add_option(option, active = false)
+            Gtk.queue {
+                iter = @widget.append
+                iter[0] = option
+
+                if (active)
+                    @widget.active_iter = iter;
+                end
+            }
+        end
+
+        def clear()
+            Gtk.queue {
+                @widget.clear
+            }
+        end
+
+        def onchange(action)
+            @action = action
+
+            Gtk.queue {
+                @widget.signal_connect("changed") {|c|
+                    if c.active > -1
+                        @selected = @widget.active.to_i
+
+                        begin
+                            @action.call(c.active_iter[0])
+                        rescue
+                            echo "error in onchange() callback for #{self.class}"
+                            echo "#{$!.backtrace.join("\n\t")}"
+                        end
+                    end
+                }
+            }
+        end
+
+        # This is only working when option==0 and is weirdness
+        # otherwise.  Need to investigate, but delete is not the
+        # top concern at the moment.
+        def remove_option(option=-1)
+            begin
+                if ( option==-1)
+                    option = @widget.active
+                end
+
+                Gtk.queue {
+                    @widget.remove_text(@widget.active)
+                }
+
+                if (option > 0)
+                    option = option - 1
+                end
+
+                Gtk.queue {
+                    self.set_active(option.to_i);
+                }
+            rescue
+                echo "error in remove_option() for #{self.class}"
+                echo "#{$!.backtrace.join("\n\t")}"
+            end
+        end
+
+        def set_active(index)
+            @selected = index
+
+            Gtk.queue {
+                @widget.set_active(index)
+            }
+        end
+    end
+
+    ## ------------------------------------------------------------------------
+    # A Drop down list.  onchange() to do stuff then it changes.
+    # Useful hints: https://www.ruby-forum.com/topic/2381946
+    ## ------------------------------------------------------------------------
+    class ComboBox < Widget
+        attr_reader :selected, :action
+
+        def text
+            return @widget.active_text
+        end
+
+        def initialize(text, options = nil)
+            @selected = 0
+
+            Gtk.queue {
+                @model = Gtk::ListStore.new(String)
+                @widget = Gtk::ComboBox.new(@model)
+
+                renderer = Gtk::CellRendererText.new
+                @widget.pack_start(renderer, true)
+                @widget.set_attributes(renderer, :text => 0)
+
+                options.each{|o|
+                    iter = @model.append
+                    iter[0] = o
+                }
+            }
+        end
+
+        def active=(value)
+            Gtk.queue {
+                self.set_active(value)
+            }
+        end
+
+        def add_option(option, active = false)
+            Gtk.queue {
+                iter = @model.append
+                iter[0] = option
+
+                if (active)
+                    @widget.active_iter = iter;
+                end
+            }
+        end
+
+        def clear()
+            Gtk.queue {
+                @model.clear
+            }
+        end
+
+        def onchange(action)
+            @action = action
+
+            Gtk.queue {
+                @widget.signal_connect("changed") {|c|
+                    if c.active > -1
+                        @selected = @widget.active.to_i
+
+                        begin
+                            @action.call(c.active_iter[0])
+                        rescue
+                            echo "error in onchange() callback for #{self.class}"
+                            echo "#{$!.backtrace.join("\n\t")}"
+                        end
+                    end
+                }
+            }
+        end
+
+        # This is only working when option==0 and is weirdness
+        # otherwise.  Need to investigate, but delete is not the
+        # top concern at the moment.
+        def remove_option(option=-1)
+            begin
+                if ( option==-1)
+                    option = @widget.active
+                end
+
+                Gtk.queue {
+                    @widget.remove_text(@widget.active)
+                }
+
+                if (option > 0)
+                    option = option - 1
+                end
+
+                Gtk.queue {
+                    self.set_active(option.to_i);
+                }
+            rescue
+                echo "error in remove_option() for #{self.class}"
+                echo "#{$!.backtrace.join("\n\t")}"
+            end
+        end
+
+        def set_active(index)
+            @selected = index
+
+            Gtk.queue {
+                @widget.set_active(index)
+            }
+        end
+    end
+
+    ## ------------------------------------------------------------------------
+    # It's a label. It has text.
+    ## ------------------------------------------------------------------------
+    class Label < Widget
+        attr_reader :text
+
+        def initialize(text)
+            @text = text
+
+            Gtk.queue {
+                @widget = Gtk::Label.new(@text)
+                @widget.set_alignment(0, 0)
+            }
+        end
+    end
+
+    ## ------------------------------------------------------------------------
+    # A notebook page is just a Table with a title that the notebook
+    # can use when it is added to that.
+    ## ------------------------------------------------------------------------
+    class NotebookPage < Table
+        attr_reader :title, :container
+
+        # This needs done!
+        def initialize(page_title, container, rows=1, columns=1)
+            @title = page_title
+            @container = container
+            super(rows, columns)
+        end
+    end
+
+    ## ------------------------------------------------------------------------
+    # Specialized main window for a notebook (property pages) use
+    # New up a NotebookWindow. Add some NotebookPages. Call run.
+    ## ------------------------------------------------------------------------
+    class NotebookWindow < BaseWindow
+        attr_reader :container, :notebook, :pages
+        protected :container, :notebook, :pages
+
+        # Instance setup
+        def initialize(title, height, width)
+            # Call super() first since it creates the base window
+            super(title, height, width)
+
+            # Track the tabs
+            @pages = Array.new
+
+            Gtk.queue {
+                @notebook = Gtk::Notebook.new
+                @notebook.set_show_border(true)
+                @notebook.set_tab_border(3)
+                @window.add(@notebook)
+
+                @notebook.signal_connect_after('switch-page') {|me, page, number|
+                    Gtk.queue {
+                        begin
+                            @pages[number].container.activate
+                        rescue
+                            echo "switch-page error"
+                            echo "#{$!.backtrace.join("\n\t")}"
+                        end
+                    }
+                }
+            }
+
+            self.resizable = false
+        end
+
+        def run
+            super()
+        end
+
+        def add_page(page)
+            label = JGTK::Label.new(page.title)
+            @pages.push(page)
+
+            Gtk.queue {
+                @notebook.append_page(page.widget, label.widget)
+                @notebook.show_all
+            }
+        end
+    end
+
+    ## ------------------------------------------------------------------------
+    # A table without full table support.  Used for laying out notebook pages.
+    ## ------------------------------------------------------------------------
+    class Table < Widget
+        attr_reader :rows, :columns, :rows_used, :columns_used
+
+        def initialize(rows=1, columns=1)
+            @rows = rows
+            @columns = columns
+
+            @rows_used = 0
+            @columns_used = 0
+
+            Gtk.queue {
+                @widget = Gtk::Table.new(@rows, @columns, true)
+                @widget.border_width = 10
+            }
+        end
+
+        def add_widget(widget, position)
+            Gtk.queue {
+                @widget.attach_defaults(widget.widget, position.left, position.right, position.top, position.bottom)
+            }
+        end
+
+        def remove_widget(widget)
+            Gtk.queue {
+                @widget.remove(widget.widget)
+            }
+        end
+    end
+
+    ## ------------------------------------------------------------------------
+    # Not as useful as I'd hoped.
+    ## ------------------------------------------------------------------------
+    class TablePosition
+        attr_reader :bottom, :left, :top, :right
+
+        def initialize(left, right, top, bottom)
+            @bottom = bottom
+            @left = left
+            @top = top
+            @right = right
+        end
+    end
+
+    ## ------------------------------------------------------------------------
+    # Also known as a edit box.  It has text.  It can be disabled.
+    ## ------------------------------------------------------------------------
+    class TextBox < Widget
+        def initialize(text=nil)
+            Gtk.queue {
+                @widget = Gtk::Entry.new()
+
+                if (!text.nil?)
+                    @widget.text = text
+                end
+
+                @widget.editable = false
+            }
+        end
+
+        def enabled?
+            value = nil
+
+            Gtk.queue {
+                value = @widget.editable?
+            }
+
+            return value
+        end
+
+        def enabled=(bool)
+            Gtk.queue {
+                @widget.editable = bool
+            }
+        end
+
+        def text=(newtext)
+            Gtk.queue {
+                @widget.text = newtext
+            }
+        end
+
+        def text
+            return @widget.text
+        end
+    end
+
+    ## ------------------------------------------------------------------------
+    # Common base widget corresponding to GTK::Widget so we can use
+    # the common widget property for adding one widget to another.
+    ## ------------------------------------------------------------------------
+    class Widget
+        attr_reader :widget
+
+        def hide
+            @widget.hide
+        end
+
+        def show
+            @widget.show
+        end
+    end
+end
+
+# ------------------------------------------------------------------------------
+# Atlas specific GUI
+# ------------------------------------------------------------------------------
+quiet_exit
+
+include JGTK
+
+# Before exiting, undef the class so we can redefine them next run.
+before_dying {
+    Atlas.constants.each{|c|
+        Atlas.send(:remove_const, c)
+    }
+}
+
+class Atlas
+    def Atlas.version
+        return "2017.01.12.02"
+    end
+
+    # A bunch of common stuff across all of these pages.
+    class CommonPageSetup
+        attr_reader :page, :mode, :window
+
+        def activate
+            cancel_edit
+        end
+
+        def initialize(title, containing_window)
+            @window = containing_window
+            @page = NotebookPage.new(title, self)
+
+
+            self.add_dropdown(          TablePosition.new( 0, 10,  0,  1))
+            self.add_filter_button(     TablePosition.new( 8, 10,  9, 10))
+
+            self.add_delete_button(     TablePosition.new( 2,  4, 11, 12))
+            self.add_new_cancel_button( TablePosition.new( 4,  6, 11, 12))
+            self.add_edit_save_button(  TablePosition.new( 6,  8, 11, 12))
+            self.add_exit_button(       TablePosition.new(10, 12, 11, 12))
+
+            @mode = :display
+        end
+
+        def add_delete_button(postion)
+            delete_button_proc = Proc.new {
+                self.delete(@dropdown.text)
+                @dropdown.remove_option();
+            }
+
+            @page.add_widget(delete_button = Button.new("Delete", delete_button_proc), postion)
+        end
+
+        def add_dropdown(position)
+            @dropdown = ComboBox.new("", Array.new)
+
+            @dropdown.onchange(
+                Proc.new{|active|
+                    # How do I simulate a button click instead
+                    # to avoid this repetion.
+                    if ( @mode == :edit )
+                        self.set_display_mode
+                        self.cancel_edit
+
+                    elsif (@mode == :new )
+                        self.set_display_mode
+                        self.cancel_new
+
+                    end
+
+                    self.dropdown_changed(active)
+                });
+
+            self.build_dropdown
+
+            @page.add_widget(@dropdown, position)
+
+            @dropdown.set_active(0);
+        end
+
+        def add_edit_save_button(position)
+            @edit_save_button = Button.new("Edit")
+            @page.add_widget(@edit_save_button, position)
+
+            edit_save_button_proc = Proc.new {|this, text|
+                if @mode == :display
+                    self.set_edit_mode
+                    self.start_edit
+
+                elsif @mode == :edit
+                    self.set_display_mode
+                    self.save_edit
+
+                elsif @mode == :new
+                    self.set_display_mode
+                    self.save_new
+
+                else
+                    echo "You messed that up."
+
+                end
+            }
+
+            @edit_save_button.onclick(edit_save_button_proc)
+        end
+
+        def add_exit_button(position)
+            exit_button_proc = Proc.new {
+                @window.action = :exit
+            }
+
+            page.add_widget(Button.new("Exit", exit_button_proc), position)
+        end
+
+        def add_filter_button(position)
+            @filter_button = Button.new("Filter")
+            @page.add_widget(@filter_button, position)
+
+            @page.add_widget(Label.new("Min Level"),            TablePosition.new(0, 2, 9, 10))
+            @page.add_widget(@min_level_text = TextBox.new(""), TablePosition.new(2, 3, 9, 10))
+            @min_level_text.enabled = true
+
+            @page.add_widget(Label.new("Max Level"),            TablePosition.new(4, 6, 9, 10))
+            @page.add_widget(@max_level_text = TextBox.new(""), TablePosition.new(6, 7, 9, 10))
+            @max_level_text.enabled = true
+
+            @page.add_widget(@filter_button, position)
+
+            filter_button_proc = Proc.new {|this, text|
+                @dropdown.clear
+                min = @min_level_text.nil? ? -1 : @min_level_text.text.to_i
+                max = @max_level_text.nil? ? 10000 : @max_level_text.text.to_i
+                self.filter(min, max)
+                @dropdown.active = 0
+            }
+
+            @filter_button.onclick(filter_button_proc)
+        end
+
+        def add_new_cancel_button(position)
+            @new_cancel_button = Button.new("New")
+            @page.add_widget(@new_cancel_button, position)
+
+            new_cancel_button_proc = Proc.new{|this, text|
+                if @mode == :display
+                    self.set_new_mode
+                    self.start_new
+
+                elsif @mode == :edit
+                    self.set_display_mode
+                    self.cancel_edit
+
+                    # Force any edits to be undone by
+                    # setting to a different item then
+                    # moving back to the currently selected
+                    # item
+                    restore = @dropdown.selected
+
+                    if ( @dropdown.selected!=0 )
+                        @dropdown.set_active(0);
+                    else
+                        @dropdown.set_active(1);
+                    end
+
+                    @dropdown.set_active(restore);
+
+                elsif @mode == :new
+                    self.set_display_mode
+                    @dropdown.set_active(0);
+                    self.cancel_new
+
+                else
+                    echo "You messed that up."
+
+                end
+            }
+
+            @new_cancel_button.onclick(new_cancel_button_proc)
+        end
+
+        def set_display_mode
+            @edit_save_button.text = "Edit"
+            @new_cancel_button.text = "New"
+            @mode = :display
+        end
+
+        def set_edit_mode
+            @edit_save_button.text = "Save"
+            @new_cancel_button.text = "Cancel"
+            @mode = :edit
+        end
+
+        def set_new_mode
+            @edit_save_button.text = "Save"
+            @new_cancel_button.text = "Cancel"
+            @dropdown.set_active(-1)
+            @mode = :new
+        end
+    end
+
+    class AreasPage < CommonPageSetup
+        attr_reader :page, :mode, :newcreatures
+
+        def initialize(containing_window)
+            super("Areas", containing_window)
+
+            add_activate_button(TablePosition.new(0,  2, 11, 12))
+            build_display_fields
+
+            @newcreatures.hide
+            @remove_creature_button.hide
+            @add_creature_button.hide
+        end
+
+        def delete(entry)
+            entry =~ /^0*([1-9][0-9]*): (.*)$/;
+            Areas.delete($1)
+        end
+
+        def add_activate_button(position)
+            @activate_button = Button.new("Activate")
+            @page.add_widget(@activate_button, position)
+
+            activate_button_proc = Proc.new {|this, text|
+                # TODO: Change this
+                creatures = Array.new;
+
+                @creatures.grid.model.each{|_model, path, iter|
+                    creatures.push(iter[0])
+                }
+
+                UserVars.op['hunting_room_id']    = @start_text.text
+                UserVars.op['hunting_boundaries'] = @boundary_text.text
+                UserVars.op['targets']            = creatures.join(",");
+            }
+
+            @activate_button.onclick(activate_button_proc)
+        end
+
+        def add_creatures_display(position)
+            @page.add_widget(@creatures = GridView.new(), position)
+        end
+
+        def dropdown_changed(active)
+            active =~ /^0*([1-9][0-9]*): (.*)$/;
+            area = Areas.find_by_id($1);
+            @id_text.text       = "#{'%04d' % $1}"
+            @start_text.text    = "#{area.start}"
+            @boundary_text.text = "#{area.boundaries.join(", ")}"
+
+            @creatures.clear
+
+            area.creatures.each{|c|
+                @creatures.add_option(c.name, "#{c.level}");
+            }
+
+            #@creatures.set_active(0)
+
+            cancel_edit
+        end
+
+        def build_dropdown
+            Areas.all().each{|a|
+               @dropdown.add_option("#{'%04d' % a.id}: #{a.region}", false)
+            }
+        end
+
+        def build_display_fields
+            @page.add_widget(Label.new("ID"),                  TablePosition.new(0, 2, 1, 2))
+            @page.add_widget(Label.new("Start"),               TablePosition.new(0, 2, 2, 3))
+            @page.add_widget(Label.new("Boundaries"),          TablePosition.new(0, 2, 3, 4))
+            # TODO: Drop down that is 2-3 rows tall or other form of list.
+            @page.add_widget(Label.new("Targets"),             TablePosition.new(0, 2, 4, 5))
+            add_creatures_display(TablePosition.new(2, 10, 4, 7))
+            @page.add_widget(@id_text       = TextBox.new(""), TablePosition.new(2, 10, 1, 2))
+            @page.add_widget(@start_text    = TextBox.new(""), TablePosition.new(2, 10, 2, 3))
+            @page.add_widget(@boundary_text = TextBox.new(""), TablePosition.new(2, 10, 3, 4))
+
+            @newcreatures = ComboBox.new("", Array.new)
+
+            @page.add_widget(@remove_creature_button = Button.new("Del"), TablePosition.new(11, 12, 4, 5))
+
+            remove_creature_button_proc = Proc.new {|this, text|
+                @newcreatures.add_option(@creatures.text, true)
+                @creatures.remove_option
+            }
+
+            @remove_creature_button.onclick(remove_creature_button_proc)
+
+            @page.add_widget(@add_creature_button = Button.new("Add"), TablePosition.new(11, 12, 7, 8))
+
+            add_creature_button_proc = Proc.new {|this, text|
+                c = Creatures.find_by_name(@newcreatures.text, true).first
+                @creatures.add_option(c.name, "#{c.level}")
+                @newcreatures.remove_option
+            }
+
+            @add_creature_button.onclick(add_creature_button_proc)
+
+            @page.add_widget(@newcreatures,                  TablePosition.new(2, 10, 7, 8))
+
+            @newcreatures.widget.child_visible = false
+
+            cancel_edit
+        end
+
+        #----------------------------------------------------------------------------------------
+        def cancel_edit
+            @start_text.enabled    = false
+            @boundary_text.enabled = false
+            @newcreatures.clear
+            @newcreatures.hide
+            @remove_creature_button.hide
+            @add_creature_button.hide
+        end
+
+        def cancel_new
+            self.cancel_edit
+        end
+
+        def filter(min, max)
+            Areas.all().find_all{|a|a.creatures.find{|c| c.level >= min && c.level <= max}}.each{|a|
+                @dropdown.add_option("#{'%04d' % a.id}: #{a.region}", false)
+            }
+        end
+
+        def save_edit
+            creatures = Array.new
+
+            @creatures.grid.model.each{|_model, path, iter|
+                creatures.push(Creatures.find_by_name(iter[0]).first.id)
+            }
+
+            edited_area = Area.new(
+                @id_text.text.to_i,
+                @start_text.text.to_i,
+                @boundary_text.text.split(/\s*,\*/),
+                creatures);
+
+            begin
+                Areas.delete(@id_text.widget.text.to_i)
+                Areas.insert(edited_area)
+            rescue
+                echo "Failed!\n#{$!.backtrace.join("\n\t")}"
+            end
+
+            cancel_edit
+        end
+
+        def save_new
+            new_id = Areas.ids.find_all{|i| i > 3000}.push(3000).max + 1
+
+            creatures = Array.new
+
+            @creatures.grid.model.each{|_model, path, iter|
+                creatures.push(Creatures.find_by_name(iter[0]).first.id)
+            }
+
+            newarea = Area.new(
+                new_id,
+                @start_text.text.to_i,
+                @boundary_text.text.split(',').map{|s| s.to_i},
+                creatures);
+
+            begin
+                Areas.insert(newarea)
+                @dropdown.add_option("#{newarea.id}: #{newarea.region}", true)
+
+            rescue
+                echo "Failed!\n#{$!.backtrace.join("\n\t")}"
+            end
+
+            cancel_edit
+        end
+
+        def start_edit
+            begin
+                @start_text.enabled    = true
+                @boundary_text.enabled = true
+
+                @newcreatures.clear
+
+                @dropdown.text =~ /^0*([1-9][0-9]*): (.*)$/;
+                area = Areas.find_by_id($1);
+
+                Creatures.all.sort{|a, b| a.name.downcase <=> b.name.downcase}.each{|c|
+                    if ( !area.creatures.map{|t| t.id}.include?(c.id) )
+                        @newcreatures.add_option(c.name);
+                    end
+                }
+
+                @newcreatures.set_active(0)
+                @newcreatures.widget.show
+                @remove_creature_button.show
+                @add_creature_button.show
+            rescue
+                echo "Failed!\n#{$!.backtrace.join("\n\t")}"
+            end
+        end
+
+        def start_new
+            @id_text.text       = "Unassigned"
+            @start_text.text    = ""
+            @boundary_text.text = ""
+            self.start_edit
+
+            @creatures.clear
+            @newcreatures.clear
+            Creatures.all.sort{|a, b| a.name.downcase <=> b.name.downcase}.each{|c|
+                @newcreatures.add_option(c.name);
+            }
+
+            @newcreatures.set_active(0)
+        end
+        #----------------------------------------------------------------------------------------
+    end
+
+    class CreaturesPage < CommonPageSetup
+        def initialize(containing_window)
+            super("Creatures", containing_window)
+            self.build_display_fields
+        end
+
+        def build_dropdown
+            Creatures.all().sort{|a, b| a.name.downcase <=> b.name.downcase}.each{|c|
+                @dropdown.add_option("#{c.name}", false)
+            }
+        end
+
+        def build_display_fields
+            @page.add_widget(Label.new("ID"),                            TablePosition.new(0, 1, 1, 2))
+            @page.add_widget(Label.new("Name"),                          TablePosition.new(0, 1, 2, 3))
+            @page.add_widget(Label.new("Level"),                         TablePosition.new(0, 1, 3, 4))
+            @page.add_widget(Label.new("Type"),                          TablePosition.new(0, 1, 4, 5))
+            @page.add_widget(Label.new("Skin"),                          TablePosition.new(0, 1, 5, 6))
+
+            @page.add_widget(@id_text    = TextBox.new(""),              TablePosition.new(1, 10, 1, 2))
+            @page.add_widget(@name_text  = TextBox.new(""),              TablePosition.new(1, 10, 2, 3))
+            @page.add_widget(@level_text = TextBox.new(""),              TablePosition.new(1, 10, 3, 4))
+            @page.add_widget(@is_undead  = CheckButton.new("Undead?"),   TablePosition.new(1,  4, 4, 5))
+            @page.add_widget(@is_noncorp = CheckButton.new("Non-Corp?"), TablePosition.new(4,  8, 4, 5))
+            @page.add_widget(@is_hated   = CheckButton.new("Hated?"),    TablePosition.new(8, 10, 4, 5))
+            @page.add_widget(@skin_text  = TextBox.new(""),              TablePosition.new(1, 10, 5, 6))
+        end
+
+        def cancel_edit
+            @name_text.enabled  = false
+            @is_undead.enabled  = false
+            @is_noncorp.enabled = false
+            @is_hated.enabled   = false
+            @level_text.enabled = false
+            @skin_text.enabled  = false
+        end
+
+        def cancel_new
+        end
+
+        def dropdown_changed(active)
+            creature = Creatures.find_by_name(active, true).first;
+
+            @id_text.text       = "#{'%04d' % creature.id}"
+            @name_text.text     = creature.name
+            @is_undead.checked  = creature.undead
+            @is_noncorp.checked = creature.noncorp
+            @is_hated.checked   = creature.hated
+
+            @level_text.text    = "#{creature.level==999 ? 'scaling' : creature.level}"
+            @skin_text.text     = "#{creature.skin || 'none'}"
+        end
+
+        def delete(entry)
+            creature_to_delete = entry.to_i
+            Creatures.delete(creature_to_delete)
+        end
+
+        def filter(min, max)
+            Creatures.find_by_level(min, max).sort{|a, b| a.name.downcase <=> b.name.downcase}.each{|c|
+                @dropdown.add_option("#{c.name}", false)
+            }
+        end
+
+        def save_edit
+            edited_creature = Creature.new(
+                @id_text.widget.text.to_i,
+                @level_text.widget.text.to_i,
+                @name_text.text,
+                @skin_text.text,
+                @is_undead.checked?,
+                @is_noncorp.checked?,
+                @is_hated.checked?)
+            begin
+                Creatures.insert(edited_creature)
+            rescue
+                echo "Failed!\n#{$!.backtrace.join("\n\t")}"
+            end
+        end
+
+        def save_new
+            new_id = -1;
+
+            if ( @level_text.widget.text!="Scaling" )
+                new_id = Creatures.ids.find_all{|i| i < 9000}.max + 1
+            else
+                new_id = Creatures.ids.max + 1
+            end
+
+            begin
+                edited_creature = Creature.new(
+                    new_id,
+                    @level_text.widget.text.to_i,
+                    @name_text.text,
+                    @skin_text.text,
+                    @is_undead.checked?,
+                    @is_noncorp.checked?,
+                    @is_hated.checked?)
+
+                begin
+                    Creatures.insert(edited_creature)
+                    @dropdown.add_option(@name_text.text, true)
+                rescue
+                    echo "Failed!\n#{$!.backtrace.join("\n\t")}"
+                end
+            rescue
+                echo "Invalid creature!"
+            end
+        end
+
+        def start_edit
+            @name_text.enabled  = true
+            @is_undead.enabled  = true
+            @is_noncorp.enabled = true
+            @is_hated.enabled   = true
+            @level_text.enabled = true
+            @skin_text.enabled  = true
+        end
+
+        def start_new
+            @id_text.text       = "Unassigned"
+            @name_text.text     = ""
+            @is_undead.checked  = false
+            @is_noncorp.checked = false
+            @is_hated.checked   = false
+
+            @level_text.text    = ""
+            @skin_text.text     = ""
+            
+            self.start_edit
+        end
+    end
+
+    attr_reader :window
+
+    def initialize
+        @window = NotebookWindow.new("Atlas v#{Atlas.version}", 400, 300)
+
+        pages = [
+            AreasPage::new(@window).page,
+            CreaturesPage::new(@window).page
+        ];
+
+        pages.each{|p|
+            @window.add_page(p)
+        }
+    end
+
+    def run
+        @window.run
+    end
+end
+
+Atlas.new.run()

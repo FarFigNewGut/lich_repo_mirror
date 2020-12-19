@@ -1,0 +1,442 @@
+=begin
+This script will walk around looking for bandits until all group members have finished their bandit bounties.
+
+It is untested outside of Kraken Falls, but should work anywhere.
+
+It will work better if followers allow the leader to see their bounty via lichnet, e.g. ;lnet allow bounty all
+
+# Name: azbandit
+# Author: Azanoth
+# Categories: Bounties
+# Tags: bandit, bandits, bounty
+# Version: 0.1
+=end
+
+# TODO sometimes the script thinks someone gets left behind when they don't
+# TODO large groups overwhelm lnet with requests - throttle lnet requests
+# TODO during combat if bandits hide the script will move on
+# TODO script doesn't recognize arrow firing from shadows on group member
+
+module AzBandit
+  # static variables
+  @ROOM_PAUSE_TIME = 0.1
+  @PROGRESS_UPDATE_INTERVAL = 0.1
+  @DEBUG = false
+  @BANDIT_BOUNTY = /^You have been tasked to (?:help \w+ )?suppress bandit activity (?:in|on|near|between|under) (?:the )?(.*)\s(?:near|between|under|\.)/
+  @BANDIT_SET = Set["thief", "rogue", "bandit", "mugger", "outlaw", "highwayman", "marauder", "brigand", "thug", "robber"]
+  @BAD_LOCATIONS = /the town of Kharam-Dzu/
+  @NOT_ON_TASK = "not on task"
+  @DIFFERENT_LOCATION_TASK = "different location bounty"
+  @FINISHED = "finished"
+  @DENIED = "denied"
+  @MY_CHARS_HACK = ["Kasparaitis", "Azanoth", "Aranthius"]
+
+  # dynamic variables
+  @grouplist = []
+  @groupset = {}
+  @bounty_text = ""
+  @bounty_location = ""
+  @deniers = {}
+  @last_progress_update = nil
+  @step2_ways = {}
+
+  def self.main()
+    # Setup
+    fput "flag GroupMovement on"
+
+    echo "a"
+    @grouplist, @groupset = populate_group()
+    echo "Group is #{@grouplist.length ? @grouplist.join(", ") : "empty"}"
+    echo "b"
+    @bounty_text, @bounty_location = find_bounty_text()
+    echo "c"
+    exit_azbandit() if all_done?()
+    echo "Bounty location is #{@bounty_location}"
+
+    # Go to bounty area
+    rooms_list = populate_rooms_list()
+    if !rooms_list.include? Room.current.id
+      move_to_bounty_area(rooms_list[0])
+      if Room.current.id != rooms_list[0]
+        echo "Failed to get to bounty area"
+        exit
+      end
+    end
+
+    # Handle first room
+    echo "Handling first room" if @DEBUG
+    wait_for_battle() if should_wait_for_actions?()
+
+    # Main loop - handle remaining rooms
+    echo "Handling remaining rooms" if @DEBUG
+    prev_room = nil
+    prev_room_poaching = false
+    loop {
+      # Identify next room
+      # (we prefer previous room unless we were poaching or are poaching in this
+      #  room, to avoid getting stuck in e.g. y1/x2 in a x1-y1-x2 layout where
+      #  another group is in y1)
+      next_room = Room.current.id != prev_room && prev_room &&
+                  !prev_room_poaching && !is_poaching?() ?
+        prev_room :
+        Room.current.find_nearest(rooms_list).to_i
+
+      if next_room == 0 || next_room.nil?
+        rooms_list = populate_rooms_list()
+        next
+      end
+
+      # Step to next room
+      if Room.current.id != next_room
+        prev_room = Room.current.id
+        prev_room_poaching = is_poaching?()
+        step_to_next_room(next_room)
+        retrieve_stragglers(prev_room)
+      end
+      echo "rooms_list #{rooms_list}" if @DEBUG
+      rooms_list = rooms_list.reject { |id| id == Room.current.id }
+
+      # Possibly wait for battle
+      if should_wait_for_actions?()
+        wait_for_battle()
+        exit_azbandit() if all_done?()
+      end
+    }
+  end
+
+  def self.retrieve_stragglers(prev_room_id)
+    stragglers = identify_stragglers()
+    while stragglers.length > 0
+      put "look"
+      sleep 0.5 # try again in a second - this thing is fiddly
+      put "look"
+      sleep 0.5
+      echo "whisper ooc group GameObj.pcs thinks we left behind #{stragglers.join(" and ")}"
+      step2(prev_room_id)
+      waitrt?
+      stragglers.each { |char| fput "hold #{char}" }
+      echo "a"
+      stragglers = identify_stragglers()
+      echo "b"
+      return if stragglers.length == 0 # we got em
+      echo "c"
+      sleep 3
+    end
+  end
+
+  def self.identify_stragglers()
+    pc_set = {}
+    GameObj.pcs.each { |pc| pc_set[pc.noun] = true }
+    return @grouplist.select { |name| !pc_set[name] }
+  end
+
+  def self.move_to_bounty_area(first_room_id)
+    # BEGIN handle jacked up KF map
+    Script.run("go2", "28919") if is_kraken_falls_bounty() # move past jacked up map
+    if @bounty_text =~ /Muddy Village/
+      Script.run("go2", "29022")
+      move "go village"
+    elsif @bounty_text =~ /Black Weald/
+      Script.run("go2", "29028")
+      move "go trail"
+    end
+    # END
+    Script.run("go2", "#{first_room_id}") unless Room.current.id == first_room_id
+  end
+
+  def self.is_kraken_falls_bounty()
+    return !!(@bounty_text =~ /Widowmaker's Road/ or @bounty_text =~ /Muddy Village/ or @bounty_text =~ /Cliffwalk/ or @bounty_text =~ /Black Weald/)
+  end
+
+  def self.populate_rooms_list()
+    $AZBANDIT_ROOM_CACHE = {} unless $AZBANDIT_ROOM_CACHE
+
+    if !$AZBANDIT_ROOM_CACHE[@bounty_location]
+      if @bounty_text =~ /Widowmaker's Road/
+        $AZBANDIT_ROOM_CACHE[@bounty_location] = [29021, 29022, 29023, 29024, 29025, 29026, 29027, 29028, 29029, 29030, 29050, 29051, 29053, 29054, 29055]
+      elsif @bounty_text =~ /Muddy Village/
+        $AZBANDIT_ROOM_CACHE[@bounty_location] = [29047, 29049, 29059, 29060, 29070, 29071, 29066, 29065]
+      elsif @bounty_text =~ /Cliffwalk/
+        $AZBANDIT_ROOM_CACHE[@bounty_location] = [29124, 29120, 29128, 29129, 29133, 29134, 29217, 29219,29223, 29222]
+      elsif @bounty_text =~ /Black Weald/
+        return [29227, 29228, 29229, 29234, 29235, 29236, 29237, 29238, 29239, 29240, 29231, 29230]
+      else
+        echo "Loading bounty rooms..."
+        $AZBANDIT_ROOM_CACHE[@bounty_location] = Room.list.find_all { |r|
+          r.outside? &&
+          r.location =~ /#{@bounty_location}/i &&
+          r.location !~ @BAD_LOCATIONS
+        }.collect { |r| r.id }
+        echo "...done!"
+      end
+    end
+    return $AZBANDIT_ROOM_CACHE[@bounty_location]
+  end
+
+  def self.populate_group()
+    grouplist = []
+    groupset = {}
+    fput "group"
+    while line = get
+      if line =~ /(\w+) is (?:following you|the leader of your group|also a member of your group)/i && !$1.nil?
+        grouplist.push($1)
+        groupset[$1] = true
+      elsif line =~ /group status is currently|to set your group status|^.$|You are not currently in a group/m
+        return [grouplist, groupset]
+      end
+    end
+  end
+
+  def self.find_bounty_text()
+    bounty_text = [
+      bounty?,
+      *@grouplist.map { |n| LNet.get_data(n, "bounty") },
+    ].find { |b| b =~ @BANDIT_BOUNTY }
+    if !bounty_text
+      echo "Unable to find bandit bounty on you or group! Exiting"
+      exit
+    end
+    return [bounty_text, $1]
+  end
+
+  def self.get_target_bounty_count(name)
+    echo "get_target_bounty_count #{name}" if @DEBUG
+    result = name == Char.name ? bounty? : LNet.get_data(name, "bounty")
+    return @DENIED if result.nil?
+    return @FINISHED if result =~ /^You succeeded in your task/
+    if result =~ @BANDIT_BOUNTY
+      return @DIFFERENT_LOCATION_TASK if !result.downcase.match(@bounty_location.downcase)
+      bandit_count = result.scan(/\d+/).first
+      if bandit_count.nil?
+        echo "ERROR finding bandit count: #{result}"
+        return 0
+      end
+      return bandit_count.to_i
+    end
+    return @NOT_ON_TASK
+  end
+
+  def self.has_targets?()
+    return GameObj.npcs.any? { |npc|
+             (npc.type =~ /bandit/ or @BANDIT_SET.include?(npc.noun)) &&
+             !npc.name.start_with?("animated ")
+           }
+  end
+
+  def self.has_loot?()
+    echo "has_loot?" if @DEBUG
+    return GameObj.npcs.any? { |n| n.status == "dead" } ||
+             GameObj.loot.any? { |n|
+               n.type == "skin" ||
+               n.type == "gem" ||
+               n.name =~ /coins/
+             }
+  end
+
+  def self.is_poaching?()
+    if @DEBUG
+      echo "is_poaching? #{(checkpcs - @grouplist).count}"
+      echo @grouplist
+    end
+    return (checkpcs - @grouplist).count > 0
+  end
+
+  def self.should_wait_for_actions?()
+    echo "should_wait_for_actions?" if @DEBUG
+    if (has_targets?() or has_loot?()) and !is_poaching?()
+      return true
+    else
+      return false
+    end
+  end
+
+  def self.step_to_next_room(room_id)
+    return if should_wait_for_actions?()
+
+    # Pull group members to feet
+    GameObj.pcs.each { |pc|
+      if @groupset[pc.noun] and pc.status =~ /kneeling|sitting|lying down|prone/
+        put "pull #{pc.noun}"
+      end
+    }
+
+    # Step towards next room
+    start_room_id = Room.current.id
+    while Room.current.id == start_room_id
+      GameObj.pcs.each { |pc|
+        if @groupset[pc.noun] and pc.status =~ /kneeling|sitting|lying down|prone/
+          put "pull #{pc.noun}"
+        end
+      }
+      step2(room_id)
+      sleep 0.01
+      return if should_wait_for_actions?()
+    end
+
+    return if is_poaching?()
+
+    prebuffer = []
+    until (line = get?).nil?
+      prebuffer.push(line) # drain get? buffer into local buffer
+    end
+
+    # remove entries in local buffer up until most recent room entry
+    buffer = []
+    i = prebuffer.length - 1
+    while i >= 0
+      line = prebuffer[i]
+      break if line =~ /^Obvious paths: / or line =~ /^Obvious exits: /
+      buffer.push line
+      i -= 1
+    end
+    buffer = buffer.reverse
+
+    # Wait @ROOM_PAUSE_TIME to see if bandits are hiding
+    start_time = Time.now.to_f
+    loop {
+      return if should_wait_for_actions?()
+      if (start_time < Time.now.to_f - @ROOM_PAUSE_TIME)
+        echo "Timed out" if @DEBUG
+        return
+      end
+
+      line = buffer.length > 0 ? buffer.shift() : get?
+      echo "Scanning #{line}" if @DEBUG
+
+      if line.nil?
+        sleep 0.1
+      elsif line =~ /^You hear a voice shout, "Die/ or line =~ /^Suddenly, a tiny shard of jet black crystal/ or line =~ /^A faint silvery light flickers from the shadows/ or line =~ /^A plain wooden arrow flies out of the shadows/
+        start_time = Time.now.to_f
+        echo "Waiting for targets to appear" if @DEBUG
+        wait_until { has_targets?() or start_time < Time.now.to_f - 15 }
+        echo "Done waiting" if @DEBUG
+        return
+      end
+    }
+  end
+
+  def self.step2(destination_room)
+    # adapted from step2.lic
+    echo "running step2 towards #{destination_room} (current #{Room.current.id})" if @DEBUG
+    throw "current room was not found in the map database" unless Room.current.id
+    throw "destination room was not found in the map database" unless destination_room
+
+    start_room = Room.current.id
+    if start_room == destination_room
+      echo "start room and destination room are the same"
+      return
+    end
+
+    key = "#{start_room}->#{destination_room}"
+
+    unless @step2_ways[key]
+      previous, shortest_distances = Map.dijkstra(Room.current.id, destination_room)
+      unless previous[destination_room]
+        echo "error: failed to find a path between your current room (#{start_room}) and destination room (#{destination_room})"
+        exit
+      end
+      path = [destination_room]
+      path.push(previous[path[-1]]) until previous[path[-1]].nil?
+      path.reverse!
+      @step2_ways[key] = Room.current.wayto[path[path.index(start_room) + 1].to_s]
+    end
+
+    way = @step2_ways[key]
+
+    if way.class == String
+      move way, 2
+    elsif way.class == Proc
+      way.call
+    else
+      throw "error in the map database"
+    end
+  end
+
+  def self.wait_for_battle()
+    loop {
+      echo "waiting for battle" if @DEBUG
+      if has_loot?()
+        if should_loot?()
+          Script.run("sloot")
+        else
+          echo "Waiting for loot to be picked up"
+          sleep 1
+        end
+      elsif has_targets?()
+        echo "Waiting for targets to be killed/searched"
+        sleep 1
+      else
+        return
+      end
+    }
+  end
+
+  def self.should_loot?()
+    return @MY_CHARS_HACK.any? { |char| char == Char.name } && !is_poaching?
+  end
+
+  def self.whisper_cmd(char, cmd, arg = "")
+    fput "whisper ooc #{char} do:#{cmd}:#{arg}"
+    while line = get
+      return true if line =~ /^\(OOC\) #{char}'s player whispers, "DONE/
+      return false if line =~ /^\(OOC\) #{char}'s player whispers, "FAIL/
+    end
+  end
+
+  def self.exit_azbandit()
+    if @MY_CHARS_HACK.any? { |char| char == Char.name } && @grouplist.all? { |char| @MY_CHARS_HACK.include? char }
+      throw "Not done" unless bounty? =~ /^You succeeded in your task/
+      @MY_CHARS_HACK.each { |char|
+        if char != Char.name
+          result = whisper_cmd(char, "verify-done")
+          throw "Failed to verify" unless result
+        end
+      }
+      Script.start("fbandit")
+    end
+    exit
+  end
+
+  def self.all_done?()
+    echo "Checking if done" if @DEBUG
+    status_by_char = {}
+    counts = []
+    [Char.name, *@grouplist].each { |name|
+      status = get_target_bounty_count(name)
+
+      if status == @DENIED
+        echo "WARNING - #{name} denied your request for bounty information. Counting them as finished." if !@deniers[name]
+        @deniers[name] = true
+      end
+
+      status_by_char[name] = status
+      counts.push(
+        [@DENIED, @NOT_ON_TASK, @DIFFERENT_LOCATION_TASK, @FINISHED].include?(status) ?
+          0 : status
+      )
+    }
+
+    all_done = counts.all? { |count| count == 0 }
+    give_progress_update = all_done ||
+                           @last_progress_update.nil? ||
+                           @last_progress_update < Time.now.to_f - @PROGRESS_UPDATE_INTERVAL
+
+    if give_progress_update
+      msg = status_by_char.map { |char, status| "#{char} #{status}" }.join(". ")
+      fput "whisper ooc group #{msg}"
+      @last_progress_update = Time.now.to_f
+    end
+
+    if all_done
+      fput "whisper ooc group Everyone is done!"
+      if @deniers.length > 0
+        echo "...except maybe those who aren't sharing bounty info via lich: #{@deniers.keys.join(", ")}"
+      end
+      return true
+    end
+
+    return false
+  end
+end
+
+AzBandit.main()

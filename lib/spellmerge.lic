@@ -1,0 +1,1077 @@
+=begin
+  Spellmerge condenses the effects of certain mass spells falling off (and other similar effects) to reduce screen
+  scroll.  See `;spellmerge help` for more details or `;spellmerge theory` for a detailed explanation of how it works.
+
+  Rather than seeing:
+
+    <spell effect> fades from Wyrom
+    <spell effect> fades from Kenstrom
+    <spell effect> fades from Haliste
+
+  You'll see
+
+    <spell effect> fades from Wyrom, Kenstrom, and Haliste.
+
+  This works by slightly delaying the spell messaging while it collects additional names to add to the list.  As
+  such, spell effect messaging may appear slightly out-of-order from how it actually happens.  By default, this delay
+  is about one tenth of a second (and some events force it to be sent immediately to try to maintain at least some
+  consistency.)
+
+  Spell effects on you are not affected by either the delay nor the merging effect.  Spell effects on NPCs and
+  monsters are not merged.
+
+  Spellmerge also traps the output of GROUP by default, which can be used as a quick basic test of functionality.
+  You can disable this with `;spellmerge disable group`
+
+	  author: LostRanger (thisgenericname@gmail.com)
+   thanks to: Skaster and Flimbo for producing some mass spell effect messaging
+   thanks to: Dreaven for creating the perfect opportunity to stress-test the script
+	  game: GemStone
+	  tags: Magic, QOL
+	  required: Lich >= 4.6.0.
+
+  version: 0.7 (2020-05-03)
+
+  changelog:
+    version 0.7 (2020-05-03)
+      * Condense celerity fall-off messaging (for group celerity).
+
+    version 0.6 (2019-11-30)
+      * Condense APPRAISE GROUP messaging.  (Unless you're a cleric, sorry.)
+
+    version 0.5.1 (2019-07-19)
+      * Remove inadvertently-left-in debugging code.
+
+    version 0.5 (2019-07-19)
+      * Add Song of Power falloff messaging.
+      * Add responses from SIGNAL.
+      * Don't break when no-pronoun-links is running.
+
+    version 0.4.4 (2017-07-15)
+      * Fix errant character that MIGHT have broken the script for everyone.  Hurray for typing in wrong window.
+
+    version 0.4.3 (2017-07-14)
+      * Fix 1213 falloff message.  Seriously, this went over a month with no reports until I saw it myself?  C'mon guys :p
+
+    version 0.4.2 (2017-06-17)
+      * Fix group heroism.  Really.
+
+    version 0.4.1 (2017-06-17)
+      * Fix group heroism.
+
+    version 0.4 (2017-06-16)
+      * Properly catch end messaging for 1213, rather than just cast messaging.
+      * Fix an issue where spells failing to meet the minimum affected players threshold would not actually be output.
+
+    version 0.3 (2017-06-09)
+      * Add Symbol of Disruption falloff ("The churning spectral aura suddenly vanishes from around PLAYER.")
+      * Added the option to customize which spell effects are handled and how they are handled.  They can now be
+        squelched outright, ignored (in which case they are sent to the client normally), or merged (default behavior).
+        This can be customized on a per-spell basis.
+      * You can now view the entire list of effects with ;spellmerge effects
+      * Added minor tweaks to ;spellmerge stats
+      * The replacement engine now supports procedurally generated effect messaging when merging effects, instead of simple substitution.
+      * Tweaked merge effect messaging for Kai's Triumphs (1007), Troll's Blood (1125), and Hand of the Arkati (1605).
+      * Added cast messaging for various Paladin group spells.
+      * Check to see if we should be awake immediately on startup rather than waiting for game data.
+      * ;spellmerge stop now works properly instead of breaking the client's ability to communicate with the game.
+      * Dropped "Experimental" tag
+
+    version 0.2.1 (EXPERIMENTAL 2017-06-03)
+      * Remove accidental debug code spam on startup.
+
+    version 0.2 (EXPERIMENTAL 2017-06-03)
+      * Add/fix Paladin spell messaging
+      * Fix a bug where effects without replacements would not output correctly.
+
+    version 0.1 (EXPERIMENTAL 2017-06-03)
+      * Initial release.
+=end
+
+# Theory:
+# Fast-check each incoming line to see if it contains a potential reference to a player.  If not, skip all other checks.
+# Check each incoming line of XML against each pattern to see if it matches to see if it matches.
+# Return if it does not
+
+# If line matches:
+# Check against hashtable of queued matches.
+# If present, add to list.
+# If negative, schedule.
+
+# Scheduler events
+# First component is event time.
+# Second component is list of names.
+
+#
+# Check key against queue
+# If found: Append name to list
+# If not found: Determine expiration time, create new entry.
+#
+# Scheduling:
+# If queue is empty before we add to the list, schedule an event DELAY seconds in the future.
+# When we handle an event, the next event is the timestamp of the next entry in the queue.
+
+
+# Spell merge delay, in seconds.
+
+
+class SpellMerge
+    VERSION = '0.7 (2020-05-03)'
+    VERSION_INT = 700000
+
+    DEFAULT_SETTINGS = {
+        'delay' =>  0.1,   # Spell merge delay, in seconds.
+        'players' =>  3,   # Minimum number of players who must appear in a message to trigger spell merging.
+        'roomsize' => 5,   # Minimum number of players in the room before merging is enabled.
+        'actions'  => {},  # Effect-specific actions.  Missing values here use the default
+    }
+
+    PLAYER_PATTERN_STRING = '(<a exist="-\d+" noun="\w+\">[A-Z][a-z\']+</a>)'
+    HAS_PLAYER_PATTERN = Regexp.new(PLAYER_PATTERN_STRING)  #  /(<a exist="-\d+" noun="\w+">\w+<\/a>)/
+    # FLUSH_PATTERN = /<style id="roomName"|^<pushStream|^Your group status is currently |^Cast Roundtime|^Roundtime/
+    FLUSH_PATTERN = /<style id="roomName"|^<pushStream|^Cast Roundtime|^Roundtime/
+    PROMPT_FLUSH_PATTERN = /<prompt|^Your group status is currently/
+
+    class Effect
+        attr_reader :effect, :replacement, :pattern, :id, :prompt
+        attr_accessor :deadline, :names, :lines, :next, :newline, :action
+
+        def initialize(id, effect, replacement=nil, prompt: false)
+            @action = :merge
+            @id = id.to_s.intern
+            @effect = effect
+
+            if @effect.is_a?(Regexp)
+                @pattern = @effect
+                raise('Replacement must be specified when pattern is a regex') unless replacement
+            elsif @effect.is_a?(String) and effect =~ /^\/(.+)\/(.*)$/
+                @pattern = Regexp.new($1.gsub('@', PLAYER_PATTERN_STRING), $2)
+                raise('Replacement must be specified when pattern is a pseudo-regex') unless replacement
+            else
+                @pattern = Regexp.new("^#{Regexp.escape(@effect).gsub('@', PLAYER_PATTERN_STRING)}$")
+                replacement = effect unless replacement
+            end
+
+            @replacement = replacement
+            @deadline = nil # When to flush
+            @names = [] # Names
+            @lines = [] # Unaltered lines.
+
+            @next = nil # Next effect in pseudo-queue
+
+            @newline = false
+
+            @prompt = prompt
+        end
+
+        def all_names
+            case @names.length
+                when 1
+                    return @names[0]
+                when 2
+                    return @names.join(' and ')
+                else
+                    return "#{@names[0..-2].join(', ')}, and #{@names[-1]}"
+            end
+        end
+
+        def check(line)
+            # Returns the character name if line matches, nil otherwise
+            # Adds to names/lines at the same time.
+            if line =~ @pattern
+                @names << $1
+                @lines << line
+                return $1
+            end
+            nil
+        end
+
+        def length
+            @names.length
+        end
+
+        def clear(ret = nil)
+            @names = []
+            @lines = []
+            @deadline = nil
+            @newline = false
+            ret
+        end
+
+        def merged
+            # Returns all results on one line and flushes state.
+            case @names.length
+                when 0
+                    return nil
+                when 1
+                    return clear(@lines[0])
+                else
+                    return clear(replacement.call(self.all_names)) if replacement.is_a?(Proc)
+                    return clear(replacement.sub('@', self.all_names))
+            end
+        end
+
+        def each(&block)
+            # Returns individual lines and flushes state
+            lines = @lines.dup
+            self.clear
+            if block_given?
+                return lines.each(&block)
+            else
+                return lines.each
+            end
+        end
+
+    end
+
+    EFFECTS = [
+        # Effect.new(pattern, replacement)
+        # Pattern can be a:
+        #    Exact spell effect messaging.  "@" takes the place of the player name (including possible "'s")
+        #    Replacement is optional if using this form, and defaults to the same as pattern.
+        #
+        #    A pseudo-regex: A string beginning with / and containing a closing /.  This works like an actual regex,
+        #        except ^ and $ are automatically added and "@" will be replaced with a suitable regex to match a player
+        #        name
+        #
+        #    A full regex, which will be used as-is.  The first capturing group must contain the player name (including)
+        #    surrounding XML), other capture groups are ignored.
+        #
+        # Replacement can be a:
+        #    String, where "@" in the string will be replaced with the generated list of names.
+        #    Proc, which receives the (stringified) list of names as its first argument and should return the new messaging.
+        #
+        ## 1xx Minor Spirit
+        # No known spells
+
+        ## 2xx Major Spirit (group-castable with sufficient lore)
+        Effect.new(211, '@ appears less confident.', '@ appear less confident.'),  # 211
+        Effect.new(215, 'The brilliant aura fades away from @.'),   # 215
+        Effect.new(219, 'The opalescent aura fades from around @.'),  # 219
+
+        ## 3xx Cleric
+        Effect.new(307, '@ looks empowered.', '@ look empowered.'),
+        Effect.new(307, '/@ seems hesitant, looking unsure of (?:<a.*>|himself|herself)\./', '@ seem hesitant, looking unsure of themselves.'),
+        Effect.new(310, '@ basks in the glow of the sphere.', '@ bask in the glow of the sphere.'),
+        Effect.new(310, '@ seems slightly different.', '@ seem slightly different.'),
+
+        ## 4xx Minor Elemental
+        Effect.new(419, 'The brilliant luminescence fades from around @.'),
+
+        ## 5xx Major Elemental
+        Effect.new(506, '@ suddenly stops moving light-footedly.', '@ suddenly stop moving light-footedly.'),
+
+        ## 6xx Ranger
+        Effect.new(611, '@ returns to normal color.', '@ return to normal color.'),
+
+        ## 7xx Sorcerer
+        # No known spells
+
+        ## 8xx Old Empath -- no longer relevant
+
+        ## 9xx Wizard
+        Effect.new(911, '@ becomes solid again.', '@ become solid again.'),  # 911
+
+        ## 10xx Bard
+        Effect.new(1006, 'The air stops shimmering around @.'),  # 1006,
+        # Effect.new(1007, '@ spirits are no longer lifted.'),     # 1007,
+        Effect.new(1007,
+                   '@ spirits are no longer lifted.',
+                   proc {|names| "The spirits of #{names.gsub("'s", '')} are no longer lifted."}
+        ),
+        Effect.new(1018, "The mana around @ returns to its natural state."),
+
+        # 1035
+        Effect.new(1035,
+            '@ seems to slow down and become a bit less nimble.',
+            '@ seem to slow down and become a bit less nimble.',
+        ),
+
+        ## 11xx Empath
+        # Troll's Blood now has a better rewrite message, because the rewrite engine now supports it.
+        Effect.new(1125,
+                   'Dark red droplets seep out of @ skin and evaporate.',
+                   proc{|names| "Dark red droplets seep out of the skin of #{names.gsub("'s", '')} and evaporate." }
+        ),
+
+        ## 12xx Minor Mental
+        # 1213
+        Effect.new(1213,
+                   '/For a brief moment, @ muscles ripple all across his body. A heightened sense of awareness can be seen in (?:his|her) eyes./',
+                   'For a brief moment, @ muscles ripple all across their bodies. A heightened sense of awareness can be seen in their eyes.',
+        ),
+        Effect.new(1213,
+                   '/@ muscles seem to strain for an instant.  A sense of loss can be seen in .* eyes./',
+                   proc{|names| "The muscles of #{names.gsub("'s", '')} seem to strain for an instant.  A sense of loss can be seen in their eyes." }
+        ),
+
+        # 1216
+        Effect.new(1216,
+            'The barrier of force around @ dissipates.',
+            'The barriers of force around @ dissipate.'
+        ),
+
+        ## 13xx Major Mental(?)
+        # Ha.
+
+        ## 14xx Savant(?)
+        # HAHAHHAHA
+
+        ## 15xx Unnamed Mentalist Semi?
+        # Yeah, right.
+
+        ## 16xx Paladin
+        # # 1601 Mantle of Faith.  This one has weird effect durations and may not benefit much from grouping.
+        # # It's not even a mass spell...
+        # Effect.new(
+        #     'The dully illuminated mantle protecting @ begins to falter, then completely fades away.',
+        #     'The dully illuminated mantles that are protecting @ begin to falter, then completely fade away.',
+        # ),
+        Effect.new(1605,
+            '/@ movements no longer appear to be influenced by a divine power as the spiritual force fades from around (?:his|her) arms./',
+                   proc{|names| "The movements of #{names.gsub("'s", '')} no longer appear to be influenced by a divine power as the spiritual force fades from around their arms." }
+        ),
+        Effect.new(1605, "@ seems to move as if influenced by a divine power.", "@ seem to move as if influenced by a divine power."),
+
+        Effect.new(1609, '@ is surrounded by the resplendence.', '@ are surrounded by the resplendence.'),
+        Effect.new(1609, 'The warm glow fades from around @.'),  # 1609
+
+        Effect.new(1613,
+            '/@ appears less battle-ready as a soft glow dissipates from around (?:his|her) form./',
+            '@ appear less battle-ready as a soft glow dissipates from around their forms.'
+        ),  # 1613
+
+        Effect.new(1613, "@ appears to be better defended for battle.", "@ appear to be better defended for battle."),
+
+        Effect.new(1617, '@ seems less resolute.', '@ seem less resolute.'),  # 1617
+        Effect.new(1617, '@ looks determined and resolute.', '@ look determined and resolute.'),
+
+        Effect.new(1618, 'The divine force surrounding @ slowly fades away.', 'The divine forces surrounding @ slowly fade away.'),  # 1618
+        Effect.new(1618, '/@ basks in a divine force that suddenly surrounds (?:<a.*>|himself|herself)\./', '@ bask in a divine force that suddenly surrounds them.'),
+
+        # Misc
+        # Symbol of Disruption
+        Effect.new(:disruption, 'The churning spectral aura suddenly vanishes from around @.'),
+
+        # GROUP verb
+        Effect.new(:group, '@ is following you.', '@ are following you.', prompt: true),
+        Effect.new(:group, '@ is also a member of your group.', '@ are also members of your group.', prompt: true),
+        # Effect.new(:group, '@ is following you.', proc{|names| "Your group consists of #{names}." }),
+        # Effect.new(:group, '@ is also a member of your group.', proc{|names| "Your group consists of #{names}."}),
+
+        # SIGNAL
+        Effect.new(:signal, "@ acknowledged your signal.", prompt: true),
+
+        # APPRAISE GROUP
+        Effect.new(:appraise,
+           '/You take a quick appraisal of @ and find that (?:<a.*>|he|she) has no apparent injuries\./',
+           'You take a quick appraisal of @ and find that they have no apparent injuries.',
+           prompt: true
+        ),  # 1613
+
+    ]
+    # EFFECTS.each{|e| echo e.pattern.inspect }
+
+    # Settings
+
+    # Time between the first spell effect and outputting all players affected.
+    DELAY = 5
+
+    # If less than this number of people are affected by the spell, output the messaging unchanged.  (The 'gather'
+    # latency will still be present)
+    MIN_AFFECTED = 2 # Only condense messaging if at least this many people are affected by the spell effect.
+
+    # If the room has less than this number of people in it, no gathering will be performed and all spell effects will be
+    # unchanged.  (Latency will not be present)
+    MIN_IN_ROOM = 2 # Only condense messaging if there are at least this many PCs in the room.
+
+    def initialize(script)
+        @script = script
+        @queue = Queue.new # Current effect queue.
+        @mutex = Mutex.new # Synchronization mutex
+        @flush_pattern = FLUSH_PATTERN
+
+        @stripxml = ($frontend != 'stormfront')
+
+        @head = nil # First effect in pseudo-queue
+        @tail = nil # Last effect in pseudo-queue
+        @eat_newline = false  # True to eat the next line of output if it is blank.
+
+        DEFAULT_SETTINGS.each{|k, v| CharSettings[k] = v if CharSettings[k].nil? }
+        CharSettings.to_hash.delete('group')  # Deprecated.
+
+        @config_delay = CharSettings['delay']
+        @config_players = CharSettings['players']
+        @config_roomsize = CharSettings['roomsize']
+        EFFECTS.each{|e| e.action = CharSettings['actions'][e.id] if CharSettings['actions'].include?(e.id) }
+
+        @hooked = false
+        @hook_change_time = Time.now
+
+        @stats = {
+            :newlines_eaten => 0,
+            :newlines_added => 0,
+            :lines_squelched => 0,
+            :effects_list_size => EFFECTS.length,
+            :merged_effects => 0,
+            :unmerged_effects => 0,
+            :forced_flushes => 0,
+            :delayed_flushes => 0,
+            :time_started => Time.now,
+            :time_awake => 0,
+            :time_asleep => 0
+        }
+
+        # We can't change CharSettings within a hook procedure, so this is a hack to do it in the main loop instead
+        @pending_changes_hack = nil
+
+        previous_version = GameSettings[:current_version] || 0
+        unless previous_version == VERSION_INT
+            if (Time.now - $login_time) > 60  # Has been more than 60 seconds since login, so we probably aren't from autostart
+                show_changelog(previous_version)
+            else
+                Thread.new{
+                    echo "Waiting to show changelog"
+                    sleep 10
+                    show_changelog(previous_version)
+                }
+            end
+        end
+
+        run(script.vars[0])
+    end
+
+    def save_settings
+        return unless @pending_changes_hack
+        @mutex.synchronize {
+            @pending_changes_hack.each{|k,v|
+                CharSettings[k] = v
+            }
+            @pending_changes_hack = nil
+        }
+    end
+
+    def start
+        @script.want_upstream = true
+        @script.want_downstream = false
+        @script.want_downstream_xml = true
+
+        @worker = Thread.new {worker_proc}
+
+        command_pattern = /^(?:<c>)?#{Regexp.escape($lich_char + @script.name)}( .*)?$/
+        UpstreamHook.add('spellmerge_upstream_hook', proc {|line|
+            if line =~ command_pattern
+                self.run($1, true)
+                next(nil)
+            end
+
+            next(line)
+        })
+
+        before_dying {
+            @worker.kill
+            self.active = false
+            UpstreamHook.remove('spellmerge_upstream_hook')
+        }
+
+        self.active = (GameObj.pcs.length >= @config_roomsize)
+        while get
+            self.active = (GameObj.pcs.length >= @config_roomsize)
+            save_settings
+        end
+    end
+
+
+    def active
+        @hooked
+    end
+
+    def active=(value)
+        return value if @hooked == value
+        @hooked = value
+        now = Time.now
+        delta = now - @hook_change_time
+        @hook_change_time = now
+        if @hooked
+            @stats[:time_asleep] += delta
+            DownstreamHook.add('spellmerge_downstream_hook', proc {|line| process(line)})
+        else
+            DownstreamHook.remove('spellmerge_downstream_hook')
+            @stats[:time_awake] += delta
+            flush_all
+        end
+    end
+
+    def worker_proc
+        # Delayed output thread main loop
+        duration = nil
+        while true
+            if duration
+                sleep(duration) # Sleep a set amount of time.
+            else
+                sleep # Sleep forever
+            end
+            @mutex.synchronize {
+                now = Time.now
+                while @head.deadline <= now
+                    @stats[:delayed_flushes] += 1
+                    @head = flush(@head)
+                end
+
+                if @head
+                    duration = @head.deadline - now
+                else
+                    duration = nil
+                    @tail = nil # No tail if no head.
+                end
+            }
+        end
+    end
+
+    def process(line)
+        if @eat_newline
+            @eat_newline = false
+            if line == "\r\n"
+                @mutex.synchronize {
+                    if @tail
+                        @tail.newline = true
+                        @stats[:newlines_eaten] += 1
+                    end
+                }
+                return nil
+            end
+        end
+
+        if line =~ @flush_pattern
+            flush_all
+            @flush_pattern = FLUSH_PATTERN
+            return line
+        end
+
+        return line unless line =~ HAS_PLAYER_PATTERN # Fast exit before we iterate over all the patterns.
+
+        stripped = line.strip
+        @mutex.synchronize {
+            EFFECTS.each {|effect|
+                next unless effect.action
+                next unless effect.check(stripped) # Effect matches
+                @stats[:lines_squelched] += 1
+                @eat_newline = true
+                return nil if effect.deadline
+                effect.deadline = Time.now + DELAY
+                @flush_pattern = PROMPT_FLUSH_PATTERN if effect.prompt
+                if @tail
+                    @tail.next = effect
+                    @tail = @tail.next
+                else
+                    @head = @tail = effect
+                    @worker.run # Worker is probably asleep if there's no head event.
+                end
+                return nil
+            }
+        }
+        return line
+    end
+
+    def flush(effect)
+        result = effect.next
+        effect.next = nil
+
+        newline = effect.newline
+        # Flushes effect.  Returns next effect.
+        if effect.length < MIN_AFFECTED
+            effect.each{|line|
+                write(line)
+                @stats[:unmerged_effects] += 1
+            }
+        else
+            if effect.action == :squelch
+                effect.clear
+                return
+            end
+            write(effect.merged)
+            @stats[:merged_effects] += 1
+        end
+        if newline
+            write('')
+            @stats[:newlines_added] += 1
+        end
+        result
+    end
+
+    def flush_all
+        # Flushes all effects
+        @mutex.synchronize {
+            @stats[:forced_flushes] += 1
+            begin
+                while @head
+                    @head = flush(@head)
+                end
+                @head = @tail = nil
+            end
+        }
+    end
+
+    def write(line)
+        line = strip_xml(line) if @stripxml
+        puts line + "\r\n"
+    end
+
+    def echo(msg)
+        # Override Lich echo because script may be unknown.
+        respond "[#{@script.name}: #{msg}]"
+    end
+
+    def run(cmdline, reinvoke = false)
+        cmdline = '' unless cmdline
+        cmdline = cmdline.strip.downcase.split(/[\s,;]+/)
+
+        if cmdline.length == 0
+            if reinvoke
+                echo "Already running."
+            else
+                echo "Version #{VERSION} starting."
+            end
+            echo "Use #{$lich_char}#{@script.name} STOP to exit, #{$lich_char}#{@script.name} HELP for more options."
+            start unless reinvoke
+            return
+        end
+
+        commands = []
+        @mutex.synchronize {
+            cmdline.each{|arg|
+                unless arg =~ /^(.+)=(.+)/
+                    commands.push(arg)
+                    next
+                end
+                setting = $1
+                value = $2
+                if value =~ /^-?\d+$/
+                    value_i = value.to_i
+                    value_f = value.to_f
+                elsif value =~ /^-?(?:\d+(?:\.\d+)?|\.\d+)$/
+                    value_i = nil
+                    value_f = value.to_f
+                end
+
+                case setting
+                    when 'delay', 'lag'
+                        if value_f > 0
+                            @pending_changes_hack = {} unless @pending_changes_hack
+                            @pending_changes_hack['delay'] = @config_delay = value_f
+                            echo "Delay changed to #{value_f} seconds."
+                            if value_f >= 1
+                                echo "Warning: a delay greater than 1 second may cause undesirable side effects.  See #{$lich_char}#{@script.name} THEORY for details."
+                            end
+                        else
+                            echo 'Delay must be a positive number.'
+                        end
+                    when 'players', 'count'
+                        if value_i
+                            if value_i < 2
+                                echo "Setting for `players` cannot be less than 2.  See #{$lich_char}#{@script.name} THEORY for details."
+                                value_i = 2
+                            end
+                            @pending_changes_hack = {} unless @pending_changes_hack
+                            @pending_changes_hack['players'] = @config_players = value_i
+                            echo "Minimum players changed to #{value_i}."
+                        else
+                            echo 'Invalid value for players.'
+                        end
+                    when 'roomsize'
+                        if value_i
+                            if value_i < 2
+                                echo "Setting for `roomsize` cannot be less than 2.  See #{$lich_char}#{@script.name} THEORY for details."
+                                value_i = 2
+                            end
+                            @pending_changes_hack = {} unless @pending_changes_hack
+                            @pending_changes_hack['roomsize'] = @config_roomsize = value_i
+                            echo "Minimum room size changed to #{value_i}."
+                        else
+                            echo 'Invalid value for roomsize.'
+                        end
+                    else
+                        echo "Invalid setting '#{setting}'.  See #{$lich_char}#{@script.name} HELP."
+                end
+            }
+        }
+        save_settings unless reinvoke
+        return unless commands.length > 0
+
+        case commands[0]
+            when 'theory'
+                theory_command
+            when 'effect', 'effects', 'list'
+                effects_command(commands[1..-1])
+            when 'help'
+                if commands[1] == 'theory'
+                    theory_command
+                else
+                    help_command
+                end
+            when 'start'
+                if reinvoke
+                    echo "Already running."
+                else
+                    echo "Version #{VERSION} starting."
+                    start
+                end
+            when 'stop'
+                if reinvoke
+                    @active = false
+                    # UpstreamHook.remove('spellmerge_upstream_hook')
+                    # DownstreamHook.remove('spellmerge_downstream_hook')
+                    # sleep 0.1
+                    Script.kill(@script.name)
+                    return
+                else
+                    echo "Not running."
+                end
+            when 'reset'
+                run('delay=0.1 players=2 roomsize=4 enable all')
+            when 'stats', 'status', 'info'
+                stats_command(reinvoke)
+            when 'merge', 'enable'
+                # Unknown effect 'xxx'
+                # Added the following effect(s) to the merge list: xxx
+                # Effect(s) already on the merge list: xxx
+                action_command(:merge, commands, 'merge')
+            when 'ignore', 'disable'
+                action_command(nil, commands, 'ignore')
+            when 'squelch'
+                action_command(:squelch, commands, 'squelch')
+            else
+                echo "Unknown command '#{commands[0]}.  See #{$lich_char}#{@script.name} HELP."
+        end
+        save_settings unless reinvoke
+    end
+
+    def action_command(action, args, name)
+        # We could do this differently, but this allows us to maintain the input sort order when producing messaging.
+        command, *args = args
+        unless args.length
+            echo "Must specify one or more effects to #{name}, or ALL to #{name} all effects."
+            echo "See #{$lich_char}#{@script.name} HELP"
+            return
+        end
+
+        ids = {}
+        args.each_with_index{|arg, ix|
+            arg = arg.downcase.intern
+            ids[arg] = ix unless ids[arg]
+        }
+
+        Set.new(args.map{|a| a.downcase.intern})
+        if ids[:all]
+            EFFECTS.each{|e| e.action = action}
+            echo "Added all effects to the #{name} list."
+        else
+            changed = Set.new
+            unchanged = Set.new
+            EFFECTS.each{|e|
+                next unless ids.include?(e.id)
+                if e.action == action
+                    unchanged.add(e.id)
+                else
+                    e.action = action
+                    changed.add(e.id)
+                end
+            }
+
+            fn = proc{|id| ids[id]}
+            missing = (Set.new(ids.keys) - unchanged - changed).sort_by(&fn)
+            changed = changed.sort_by(&fn)
+            unchanged = unchanged.sort_by(&fn)
+
+            missing.each{|id| echo "Unknown effect '#{id}'"}
+
+            echo "The following effect#{unchanged.length == 1 ? 's are' : ' is'} already on the #{name} list: #{unchanged.join(', ')}" if unchanged.length > 0
+
+            echo "Added the following effect#{'s' unless changed.length == 1} to the #{name} list: #{changed.join(', ')}" if changed.length > 0
+
+            if missing.length > 0
+                echo "See #{$lich_char}#{@script.name} EFFECTS to see the list of effects, or #{$lich_char}#{@script.name} HELP for more help."
+            end
+
+            return unless changed.length
+        end
+
+        actions_to_save = {}
+        EFFECTS.each{|e| actions_to_save[e.id] = e.action unless e.action == :merge }
+        @mutex.synchronize {
+            @pending_changes_hack = {} unless @pending_changes_hack
+            @pending_changes_hack['actions'] = actions_to_save
+        }
+    end
+
+    def effects_command(filter)
+        effects = EFFECTS
+        debug = false
+        if filter.length > 0
+            filter = Set.new(filter.map{|id| id.downcase.intern})
+            debug = true if filter.delete?(:debug)
+            if filter.length > 0
+                effects = effects.find_all{|e| filter.include?(e.id)}
+            end
+        end
+        maxlen = 4
+
+        actions = {}
+        effects.each{|e|
+            len = e.id.to_s.length
+            maxlen = len if len > maxlen
+            actions[e.action] = [] unless actions[e.action]
+            actions[e.action] << e
+        }
+
+        def output_list(maxlen, effects, suffix)
+            ct = effects.length
+            respond("#{ct or 'No'} effect#{'s' unless ct == 1} #{suffix}#{ct ? ':' : '.'}")
+            respond
+            return unless ct
+            effects.each{|e|
+                respond "    #{e.id.to_s.ljust(maxlen, '.')}: #{e.effect.to_s}"
+            }
+            respond
+        end
+
+        output_list(maxlen, actions[:merge], 'will be merged')
+        output_list(maxlen, actions[:squelch], 'will be squelched')
+        output_list(maxlen, actions[nil], 'are currently ignored')
+
+        return unless debug
+        EFFECTS.each{|e| respond e.inspect }
+    end
+
+    def stats_command(reinvoke)
+        respond "Spellmerge version #{VERSION}"
+        actions = {}
+        EFFECTS.each{|e|
+            actions[e.action] = 0 unless actions[e.action]
+            actions[e.action] += 1
+        }
+        respond "Settings: delay=#{@config_delay} players=#{@config_players} roomsize=#{@config_roomsize}"
+        respond "Effects: #{actions[:merge] or 0} merged, #{actions[:squelch] or 0} squelched, #{actions[nil] or 0} ignored, #{EFFECTS.length} total."
+        unless reinvoke
+            respond "Not currently running, thus no detailed stats are available."
+            return
+        end
+
+        now = Time.now
+        time_awake = @stats[:time_awake]
+        time_asleep = @stats[:time_asleep]
+        if self.active
+            time_awake += (now - @hook_change_time)
+        else
+            time_asleep += (now - @hook_change_time)
+        end
+
+        def format_time(t)
+            return t.strftime('%Y-%m-%d %H:%I:%S')
+        end
+
+        def safe_pct(fmt, a, b, otherwise = '')
+            if b != 0
+                return sprintf(fmt, 100 * a/b)
+            else
+                return otherwise
+            end
+        end
+
+
+        respond sprintf(
+                    "%16s: %20s  (%i sec.)", "Running since",
+                    format_time(@stats[:time_started]), now - @stats[:time_started]
+                )
+        respond sprintf(
+                    "%16s: %20s  (%i sec.)", (if self.active; "Awake since"; else "Sleeping since"; end),
+                    format_time(@hook_change_time), now - @hook_change_time
+                )
+        respond sprintf(
+                    "%16s: %12d sec.%s", "Time awake",
+                    time_awake, safe_pct("  (%3i%%)", time_awake, time_awake+time_asleep)
+                )
+        respond sprintf(
+                    "%16s: %12d sec.%s", "Time asleep",
+                    time_asleep, safe_pct("  (%3i%%)", time_asleep, time_awake+time_asleep)
+                )
+        respond
+
+        respond sprintf(
+                    "%24s: %6d / %-6d%s", "Newlines squelched/added",
+                    @stats[:newlines_eaten], @stats[:newlines_added],
+                    safe_pct("  (%3i%% savings)", @stats[:newlines_eaten] - @stats[:newlines_added], @stats[:newlines_eaten])
+                )
+        lines_added = @stats[:merged_effects] + @stats[:unmerged_effects]
+
+        respond sprintf(
+                    "%24s: %6d / %-6d%s", "Messages squelched/added",
+                    @stats[:lines_squelched], @stats[:merged_effects] + @stats[:unmerged_effects],
+                    safe_pct("  (%3i%% savings)", @stats[:lines_squelched] - lines_added, @stats[:lines_squelched])
+                )
+
+        respond sprintf("%24s: %6d", "Merged effects", @stats[:merged_effects])
+        respond sprintf("%24s: %6d", "Unchanged effects", @stats[:unmerged_effects])
+    end
+
+    def help_command
+        script = "#{$lich_char}#{@script.name}"
+        spacer = ''.ljust(script.length, ' ')
+        respond "#{script} version #{VERSION}"
+        respond "Commands:"
+        respond "   #{script} [START]  Start spellmerge."
+        respond "   #{script} STOP     Exit spellmerge."
+        respond "   #{script} HELP     Shows this help text."
+        respond "   #{script} THEORY   Explains in detail how the script works and how the various settings affect it."
+        respond "   #{script} STATS    Report some statistics."
+        respond "   #{script} RESET    Reset all settings to their defaults."
+        respond
+        respond "Effect Handling:"
+        respond "   #{script} EFFECTS  Lists all effects and their current settings.  You can also specify one or more."
+        respond "   #{spacer}          to show just those effects."
+        respond "   #{script} <action> effect1 effect2....  or ALL"
+        respond "   #{spacer}          Changes the specified effects to use <action>"
+        respond
+        respond "   <action> can be one of:"
+        respond "       merge:   Merges effects on to one line, e.g. '<effect> fades from Wyrom, Kenstrom, and Haliste.')"
+        respond "       squelch: Discards the effect messaging entirely."
+        respond "       ignore:  Disables all special handling and allows normal game messaging."
+        respond "       enable:  Synonym for 'merge'."
+        respond "       disable: Synonym for 'ignore'."
+        respond
+        respond "   'merge' and 'squelch' actions still only occur if other criteria (room size and # affected players)"
+        respond "   are met."
+        respond
+        respond "Other Settings:"
+        respond "   You can specify more than one setting at a time by separating them with spaces."
+        respond "   See #{script} THEORY for a more in-depth explanation as to how the settings work."
+        respond
+        respond "   #{script} DELAY=x     Gather spell effect messages for up to `x` seconds before outputting them."
+        respond "   #{spacer}             Note that certain actions and events may cause effects to be output early."
+        respond
+        respond "   #{script} PLAYERS=x   Merge spell effects if they include at least `x` players, otherwise output"
+        respond "   #{spacer}             them individually."
+        respond
+        respond "   #{script} ROOMSIZE=x  Disable all functionality unless there are at least `x` players in the room."
+    end
+
+    def theory_command
+        respond "#{@script} version #{VERSION}"
+        respond "Theory:"
+        respond "  Spellmerge works by checking each line of messaging from the game and seeing if it matches one of"
+        respond "  several 'effect' patterns.  If it does, the original line is squelched and saved for later, and"
+        respond "  the effect is scheduled to be handled DELAY seconds in the future.  If the effect was already "
+        respond "  scheduled (i.e. from a line immediately prior), the player name from the new line is added to an "
+        respond "  ongoing list of players, and no further voodoo happens at this point."
+        respond
+        respond "  When the effect is scheduled to trigger, the list of names is examined.  If it is short enough"
+        respond "  (meaning that it is smaller than the PLAYERS setting), the originally squelched lines are all output"
+        respond "  as-is.  Otherwise, a new line is constructed that includes all of the names attached to the effect "
+        respond "  in the same order they appeared-in game, which condenses the effect down to a single message."
+        respond
+        respond "  Due to the delaying factor, this means you may occasionally see spell effects out-of-order.  For"
+        respond "  instance, you may see members of a group losing a spell effect AFTER the group left the room."
+        respond
+        respond "  To reduce the impact of the delay, a number of events can cause all scheduled effects to trigger"
+        respond "  immediately.  For instance, when receiving a description (e.g. via movement, or simply via LOOK),"
+        respond "  all pending effects will be sent."
+        respond
+        respond "  Additionally, the entire functionality of the script is suppressed if the number of visible players"
+        respond "  in the room is sufficiently small (The 'ROOMSIZE' setting).  This allows you to ensure that"
+        respond "  Spellmerge will not induce extra lag while hunting."
+        respond
+        respond "  It is recommended that DELAY be between 0.1 and 0.5 seconds."
+        respond "  If you're frequently seeing out-of-order messaging and it bothers you, decrease the DELAY setting."
+        respond "  If you're seeing multiple 'sets' of combined spell messaging for the same effect, increase the "
+        respond "  setting."
+        respond
+        respond "  The PLAYERS setting must be at least 2, since if only 1 player is effected by a message the original"
+        respond "  messaging will always be output.  Set this according to preference.  Note that there are some"
+        respond "  blank-line-suppressing effects, so you may see less wasted space even if this is a very high value."
+        respond
+        respond "  The ROOMSIZE setting must be at least 2, and it only counts OTHER players in the room -- not"
+        respond "  yourself.  If you're alone or there's only one other player in the room, it is pretty unlikely"
+        respond "  that there'll be any spell messaging to merge."
+        respond
+        respond "  Spell effect messages with YOU as the target will never be merged.  Spell effect messages for"
+        respond "  NPCs (i.e. familiars, animal companions, or spirit servants) are likewise not merged -- only"
+        respond "  players."
+    end
+
+    def show_changelog(prev)
+        prev ||= 0
+        GameSettings[:current_version] = VERSION_INT
+
+        changelog = {
+            500000 => [
+                "Version 0.5 changes:",
+                '',
+                "  * Add support for Song of Power falloff.",
+                '',
+                "  * Add support for responses to SIGNAL.",
+                '',
+                "  * Still merge spells that refer to himself/herself when no-pronoun-links is running.",
+            ],
+            500001 => [
+                "Version 0.5.1 changes:",
+                '',
+                "  * Remove accidental debugging code left in regarding changelog handling.",
+            ],
+            600000 => [
+                "Version 0.6 changes:",
+                '',
+                "  * Condense APPRAISE GROUP messaging.  (Unless you're a cleric, sorry.)",
+            ],
+            700000 => [
+                "Version 0.7 changes:",
+                '',
+                "  * Condense celerity fall-off messaging (for group celerity)",
+            ],
+        }
+
+        if prev != VERSION_INT
+            msg = []
+            msg << "<preset id='speech'>--------------------</preset>"
+            msg << "<preset id='speech'>Welcome to #{$lich_char}#{@script.name}</preset> <preset id='whisper'>#{VERSION}</preset>"
+            msg << ''
+            changelog.each do |version, notes|
+                if version > prev or version == VERSION_INT
+                    msg += notes
+                    msg << ''
+                end
+            end
+            msg << "For a more detailed changelog: <d>#{$lich_char}repo info #{@script.name}</d>."
+            msg << "To enable automatic updates:   <d>#{$lich_char}repo set-updatable #{@script.name}</d>."
+            msg << "For details on new features:   <d>#{$lich_char}#{@script.name} help</d>"
+            msg << "For more LostRanger scripts:   https://bit.ly/lostranger-scripts"
+            msg << ''
+            msg << "This message will not be displayed again until a new version is downloaded."
+            msg << "<preset id='speech'>--------------------</preset>"
+            send msg
+        end
+    end
+
+    def send(what)
+        unless $fake_stormfront
+            return _respond(what)
+        end
+
+        unless what.is_a?(Array)
+            what = [what]
+        end
+
+        return _respond what.map{|line|
+            if line =~ /^\s*<\/?output[^>]*>$/
+                nil
+            else
+                line = line.gsub(/<preset.*?>(.*?)<\/preset>/, "\\1")
+                line.gsub!('<pushBold/>', monsterbold_start)
+                line.gsub!('<popBold/>', monsterbold_end)
+                line.gsub!(/<\/?d.*?>/, '')
+                line
+            end
+        }.keep_if{|x| x}
+    end
+end
+
+SpellMerge.new(script)

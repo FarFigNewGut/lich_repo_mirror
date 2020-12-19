@@ -1,0 +1,152 @@
+require "Olib"
+
+module Bounty::Util
+  class BountyError < Exception; end
+  include Result::Constructors
+  wait_until do defined?(Cluster) end
+  wait_until do Cluster.up? end
+
+  Cluster.on_request(:bounty_remove) do |_, req|
+    if Room.current.tags.include?("advguild") and not %i[report_to_guard succeeded].include?(Bounty.task)
+      Bounty.remove()
+      wait_until do Bounty.none? end
+      {ok: :removed}
+    elsif Bounty.none?
+      {ok: :no_bounty}
+    elsif Room.current.tags.include?("advguild")
+      {err: Bounty.task}
+    else
+      {err: :wrong_room}
+    end
+  end
+
+  Cluster.on_request(:bounty) do |_, req|
+    Bounty.task.to_h
+  end
+  #
+  # parses all ui input
+  #
+  module CLI
+    def self.exec(contents)
+      Bounty::Util.module_eval(contents, __FILE__)
+    end
+
+    ENTRY     = "<c>/bounty"
+    CMD_SIZE  = ENTRY.size
+    HELP_CMDS = %w[help info]
+    Handler   = -> incoming {
+      return incoming unless incoming.start_with?(ENTRY)
+      CLI.consume(incoming)
+      return nil
+    }
+
+    def self.add_hook()
+      UpstreamHook.add(self.name.downcase, Handler)
+    end
+
+    def self.print_help()
+      fail BountyError, <<-HELP
+        bounty@1.0.0
+
+        this script is useful short-hand to interact with bounties
+
+        commands:
+
+            share        shares a bounty with all your clustered group members
+      HELP
+    end
+
+    def self.parse_input(raw)
+      this = raw.slice(0, CMD_SIZE)
+      cmd  = raw.slice(CMD_SIZE, raw.size)
+      return print_help() if HELP_CMDS.include?(cmd.strip) or cmd.empty?
+      {cmd: cmd, kind: this.gsub("<c>/", "").to_sym}
+    end
+
+    def self.consume(incoming)
+      Bounty::Util.unwrap_error do 
+        Bounty::Util.schedule(
+          **CLI.parse_input(incoming))
+      end
+    end
+  end
+  
+  OPERATIONS     = Queue.new
+  SHARED_TASK    = %r[nods to you and says, "Very well, #{Char.name}.] 
+  HAS_TASK       = %r[is already assigned a task]
+  SHARE_COOLDOWN = %r[was already part of a group task not too long ago]
+  INEXPERIENCED  = %r[is too inexperienced for your task]
+
+  ALL_SHARE_OUTCOMES = Regexp.union(
+    SHARED_TASK,
+    SHARE_COOLDOWN,
+    INEXPERIENCED,
+    HAS_TASK)
+
+  def self.is_same_task?(person)
+    return [:err, :not_connected] unless Cluster.alive?(person.noun)
+    resp = Cluster.request(person.noun, channel: :bounty, timeout: 5)
+    Log.out(resp)
+    return [:err, resp] if resp.is_a?(Exception)
+    resp.partner.eql?(Char.name)
+  end
+
+  def self.add(person)
+    return {ok: :already_shared} if is_same_task?(person)
+    case result = dothistimeout("ask #{Bounty.npc} for add #{person.noun}", 3, ALL_SHARE_OUTCOMES) 
+    when SHARED_TASK
+      {ok: person}
+    when SHARE_COOLDOWN
+      {err: :shared_cooldown}
+    when INEXPERIENCED
+      {err: :inexperienced}
+    when HAS_TASK
+      return {err: :unreachable} unless Cluster.alive?(person.noun)
+      remove = Cluster.request(person.noun, channel: :bounty_remove, timeout: 5)
+      return Bounty::Util.add(person) if remove.ok
+      return remove
+    else
+      fail "unknown outcome #{result} : #{ALL_SHARE_OUTCOMES}"
+    end
+  end
+
+  def self.share()
+    @starting_room = Room.current.id
+    Group.check()
+    Go2.advguild
+    Group.members.each do |member| 
+      Log.out(Bounty::Util.add(member), label: %i[share]) end
+  end
+
+  def self.unwrap_error()
+		begin
+			yield
+		rescue BountyError => e
+			_respond e.message
+		rescue Exception => e
+			_respond e.message
+			respond e.backtrace
+		end
+  end
+
+  def self.schedule(**args)
+    OPERATIONS << args
+  end
+  
+  def self.init()
+		loop do 
+			wait_while do OPERATIONS.empty? end
+			Bounty::Util.run_in_main_thread(**OPERATIONS.shift) until OPERATIONS.empty?
+		end
+  end
+  
+  def self.run_in_main_thread(cmd: "", kind:)
+		respond "Bounty::Util.schedule(item: #{item}, container: #{container}, kind: #{kind})" if @vars.include?("--debug")
+		Bounty::Util.unwrap_error do 
+      Bounty::Util.module_eval(cmd) unless cmd.empty?
+		end
+  end
+  
+  CLI.add_hook()
+  Bounty::Util.init()
+end

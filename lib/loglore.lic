@@ -1,0 +1,731 @@
+=begin
+  Logs loresinging results and ANALYZE, ASSESS, INSPECT and Abandoned Inn Crystal messaging
+  to lich\logs\<game code>-<char name>\lore-<date>-<number>.log.
+
+  Does not perform any actual loresinging or other related commands.  Should work with scripts that do.
+
+  This script must be trusted so that it can write to log files..
+
+  ;loglore version 0.3 (2017-06-02)
+  Usage:
+
+     ;loglore HELP                  Shows this help text.
+
+     ;loglore [START]               Starts logging loresong results.
+
+     ;loglore STOP                  Stops logging loresong results.  Equivalent to ;kill loglore
+
+     ;loglore ID [{ON|OFF|YES|NO}]  Whether to use INV HANDS to attempt to identify complete item names if we
+                                    can't figure it out otherwise.  Shows the current setting if no option
+                                    is provided
+
+     ;loglore ASSESS [{ON|OFF}]     Whether to log ASSESS results.
+
+     ;loglore ANALYZE [{ON|OFF}]    Whether to log ANALYZE results.
+
+     ;loglore INSPECT [{ON|OFF}]    Whether to log INSPECT results.
+
+     ;loglore CRYSTAL [{ON|OFF}]    Whether to log Abandoned Inn crystal results.
+
+     ;loglore COMMENT comment...    Write a comment to the log file.
+
+     ;loglore INFO                  Relay what we know about the most recently sung to item and the current logfile.
+
+     ;loglore OPEN                  Open the current logfile with your default text editor.  (Windows only)
+
+     ;loglore DIR                   Open the log directory in Explorer.  (Windows only)
+
+  author: LostRanger (thisgenericname@gmail.com)
+  game: GemStone
+  version: 0.3.1 (2017-06-19)
+
+  changelog:
+    0.3.1 (2017-06-19)
+      * Accept commands while running from non-Stormfront users as well.
+    0.3 (2017-06-02)
+      * Add LOGLORE OPEN to open your current logfile in your default text editor (Windows only)
+      * Add LOGLORE DIR to open your current log directory in Explorer (Windows only)
+    0.2.3 (2017-05-05)
+      * Fix issues where patterns for matching full item names may not always be matched.
+    0.2.2 (2017-05-05)
+      * Remove debug messaging when capturing ASSESS messaging
+    0.2.1 (2017-05-04)
+      * Improve LOGLORE COMMENT
+    0.2 (2017-05-04)
+      * Support logging messaging from ANALYZE, ASSESS, INSPECT, and the Abandoned Inn Crystal.
+      * Significantly overhauled logic for writing to files.  Items now write immediately if their full name is known,
+        or as soon as their name is known.
+      * Facts about an item are only written the first time they are encountered and will not be duplicated.
+      * Written files are now named lore-* rather than loresing-* since they might not actually include LORESING.
+    0.1 (2017-04-24)
+      Initial release
+
+    NOTE: If updating from a previous version, you must ';loglore stop' before the new version will be active.
+=end
+
+
+CharSettings['find_full_name'] = true if CharSettings['find_full_name'].nil?
+CharSettings['assess'] = true if CharSettings['assess'].nil?
+CharSettings['analyze'] = true if CharSettings['analyze'].nil?
+CharSettings['inspect'] = true if CharSettings['inspect'].nil?
+CharSettings['crystal'] = true if CharSettings['crystal'].nil?
+
+
+unless $SAFE == 0
+    echo "This script must be trusted to be allowed to write to log files."
+    echo "You can trust it with the following command: #{$lich_char}trust #{script.name}"
+    exit
+end
+
+unless defined?(script.want_script_output)
+    echo 'Your version of Lich is too old for this script.'
+    exit
+end
+
+
+class LogLore
+    VERSION = "0.3.1 (2017-06-19)"
+
+    # With apologies to http://stackoverflow.com/questions/1732348/regex-match-open-tags-except-xhtml-self-contained-tags
+    # for the terrible, terrible regex parsing of XML that is done here.
+    PATTERNS = {
+        # Matches beginning to sing to an item, so we can identify what's being targetted.
+        :startsing => /^As you sing, .* <a exist="(?<id>\d+)" noun="(?<noun>.+?)">(?<partial_name>.+?)<\/a> in your hand.*/,
+
+        # Matches INSPECT
+        :inspect => /^You carefully inspect your <a exist="(?<id>\d+)" noun="(?<noun>.+?)">(?<partial_name>.+?)<\/a>.*/,
+
+        # Matches ANALYZE
+        :analyze => /^You analyze your <a exist="(?<id>\d+)" noun="(?<noun>.+?)">(?<partial_name>.+?)<\/a> and sense.*/,
+
+        # Matches ASSESS
+        :assess => /^(?:<roundTime .*?\/>)?You assess the <a exist="(?<id>\d+)" noun="(?<noun>.+?)">(?<partial_name>.+?)<\/a> for structural weaknesses and strengths\./,
+
+        # Matches the Abandoned Inn crystal
+        :aicrystal => /^You touch the <a exist="\d+" noun="crystal">crystal<\/a> with one hand, your <a exist="(?<id>\d+)" noun="(?<noun>.+?)">(?<partial_name>.+?)<\/a> in the other hand\./,
+
+        # Matches the result of INV HANDS
+        :hands => /(?x)
+        (?:<dialogData.*<\/dialogData>)*
+        You\shave
+          (?:# Right hand contents
+            .+?(?:(?<right_article>an?)\s)?
+            <a\sexist="(?<right_id>\d+)"\snoun="(?<right_noun>.+?)">(?<right_name>.+?)<\/a>
+            \sin\syour\sright\shand
+            (?:\sand)?
+          )?
+          (?:# Left hand contents
+            .+?(?:(?<left_article>an?)\s)?
+            <a\sexist="(?<left_id>\d+)"\snoun="(?<left_noun>.+?)">(?<left_name>.+?)<\/a>
+            \sin\syour\sleft\shand
+          )?
+        \.\s*$
+      /,
+
+        # Matches <prompt
+        :prompt => /^<prompt/,
+
+        # Matches a fully qualified item identifier.
+        :itemref => /(?x)^
+        (?:<dialogData.*<\/dialogData>)*  # Don't want this
+        (?:
+          # Must match one of these things to be a (known) fully qualified item reference
+          (?:You\saccept.*'s<\/a>\soffer\sand\sare\snow\sholding\s)  # ACCEPT
+          |
+          (?:(?:<clearContainer.*?\/inv>)?You\s(?:(?:remove)|(?:put)|(?:drop)|(?:pick up)))\s  # GET PUT DROP
+        )
+        # Fully qualified reference
+        (?:(?<article>an?)\s)?
+        <a\sexist="(?<id>\d+)"\snoun="(?<noun>.+?)">(?<name>.+?)<\/a>
+      /,
+    }
+
+    CACHESIZE = 20 # Remember full item names of this many items.
+    MAXLOGGEDITEMS = 1000 # Cycle logs after logging this many items.
+
+    @script = nil
+
+    def initialize(script)
+        @script = script
+        script.want_script_output = false
+        script.want_downstream = false
+        script.want_downstream_xml = true
+        script.clear
+
+        @item_id = nil # Last item ID we sung to
+        @item_name = nil # Last item name we sung to
+        @have_full_name = nil # Do we have the full item name
+
+        @pending = [] # Pending file writes that are waiting for a full item name
+        @facts = Set.new # Item facts to avoid duplication
+        @facts_ordered = [] # For INFO
+        @output_started # True if we've started writing this item's details to file.
+
+
+        @loresing_started = nil # When we started loresinging or gathering item info
+        @loresing_updated = nil # When the item info was updated.
+        @read_to_prompt = false # Whether to save all data until the next prompt.
+        @cache = {} # Cache of exist IDs => full item names.
+
+        @running = false
+
+        @items_logged = 0 # For log rotation
+        @logfile = nil
+        @logfile_date = nil # So we can rotate logs if the date changed
+
+        @logdir = nil
+    end
+
+    def make_log_dir
+        return @logdir if @logdir
+        basedir = "#{$lich_dir}logs"
+        @logdir = basedir + "/#{XMLData.game}-#{XMLData.name}"
+        Dir.mkdir(basedir) unless File.exists?(basedir)
+        Dir.mkdir(@logdir) unless File.exists?(@logdir)
+        @logdir
+    end
+
+    def check_rotate_log
+        make_log_dir
+
+        today = Date.today
+
+        rotate = ((not @logfile) or (@logfile_date != today) or (@items_logged > MAXLOGGEDITEMS))
+
+        if rotate
+            @logfile_date = today
+            num = 0
+            filename = nil
+            while num == 0 or File.exists?(filename)
+                basename = "lore-#{Time.now.strftime("%Y-%m-%d")}-#{num+=1}.txt"
+                filename = "#{@logdir}/#{basename}"
+            end
+
+            if @logfile
+                @logfile.puts("\n\n[Logging continued in #{basename}]\n")
+                @logfile.close
+            end
+
+            @logfile = File.open(filename, 'a')
+            @logfile.write("[Loglore #{VERSION}]\n")
+            echo "Now logging to #{filename}"
+            @items_logged = 0
+        end
+        @items_logged += 1
+    end
+
+    def got_full_name
+        debug "got_full_name"
+        return if @have_full_name
+        @have_full_name = true
+        flush_item
+    end
+
+    def discover_item(id, name, article=nil)
+        # Used when we discover the full name of an item to cache it.
+        debug "[discover_item #{id} #{name.inspect} #{article.inspect}]"
+        return unless id
+        if article
+            name = "#{article} #{name}"
+        end
+        if @item_id == id
+            @item_name = name
+            got_full_name
+        end
+        if @cache.include?(id)
+            # Need to delete and re-create to push it to the end of the cache hash
+            @cache.delete(id)
+        end
+        @cache[id] = name
+        if @cache.size > CACHESIZE
+            k, v = @cache.first
+            @cache.delete(k)
+        end
+        debug "[discovered that ##{id} is a #{name}]"
+    end
+
+    def debug(str)
+        # echo str
+    end
+
+    def reset_item
+        debug "reset_item"
+        @item_id = nil
+        @have_full_name = false
+        @loresing_started = nil
+        @loresing_updated = nil
+        @pending = []
+        @facts = Set.new
+        @facts_ordered = []
+        @output_started = false
+        debug "-- No longer reading until prompt."
+    end
+
+    def update_current_item(id, name)
+        # Call when we get the intro messaging on loresinging, or other things that trigger recording.
+        debug "[debug: update_item #{id}: #{name.inspect}]"
+        # Updates what we're currently loresinging to.  If the id changes, flushes the old item
+        return if id == @item_id
+        flush_item if @pending and @pending.length > 0
+        reset_item
+        # elsif @logfile.nil?
+        #   check_rotate_log
+        # end
+
+        @item_id = id
+        @loresing_started = @loresing_updated = DateTime.now
+        @pending = []
+        if @cache[@item_id]
+            @item_name = @cache[@item_id]
+            @have_full_name = true
+        else
+            @item_name = name
+            @have_full_name = false
+            if CharSettings['find_full_name'] == true
+                waitrt?
+                fput "inv hands"
+            end
+        end
+    end
+
+    def add_fact(text, force = false)
+        # Adds fact to the current item.
+        # force: If true, adds even if it's in the known facts list.
+        debug "add_fact: #{text.inspect}"
+        return unless text
+        return if text == ''
+
+        @loresing_updated = DateTime.now
+        if @facts.add?(text) or force
+            @facts_ordered.push(text)
+            if @output_started
+                @logfile.write(text + "\n")
+                @logfile.flush
+            else
+                @pending.push(text)
+
+                flush_item if @have_full_name
+            end
+        end
+    end
+
+    def flush_item
+        debug "flushing, output_started=#{@output_started.inspect}"
+        return if @output_started
+        check_rotate_log
+        @output_started = true
+
+        @logfile.write("==========\n#{@item_name}: #{'(incomplete name) ' unless @have_full_name}[#{@loresing_started}]\n")
+        if @pending.length > 0
+            @logfile.write(@pending.join("\n") + "\n")
+        end
+        @pending = nil
+        @logfile.flush
+    end
+
+    def parse_server_xml(xml)
+        # Read server messages to try to capture items we're looking for
+
+        # debug xml.inspect
+        # debug PATTERNS[:hands].inspect
+
+        if xml =~ PATTERNS[:hands] # We saw the contents of our hands
+            debug "hands"
+            discover_item($~[:right_id], $~[:right_name], $~[:right_article])
+            discover_item($~[:left_id], $~[:left_name], $~[:left_article])
+            return
+        end
+
+        if xml =~ PATTERNS[:itemref] # We saw any one of a number of actions that can reveal item full names
+            debug "itemref"
+            discover_item($~[:id], $~[:name], $~[:article])
+            return
+        end
+
+        if xml =~ PATTERNS[:startsing] # We started singing to an object.
+            debug "startsing"
+
+            @read_to_prompt = true
+            debug "** Now reading until prompt (LORESING)."
+            update_current_item($~[:id], $~[:partial_name])
+            return
+        end
+
+        if CharSettings['analyze'] and xml =~ PATTERNS[:analyze] # ANALYZE command
+            @read_to_prompt = true
+            debug "** Now reading until prompt (ANALYZE)."
+            update_current_item($~[:id], $~[:partial_name])
+            # No return, because the first line of ANALYZE is itself a fact.
+        end
+
+        if CharSettings['assess'] and xml =~ PATTERNS[:assess] # ASSESS command
+            @read_to_prompt = true
+            debug "** Now reading until prompt (ASSESS)."
+            update_current_item($~[:id], $~[:partial_name])
+            return
+        end
+
+        if CharSettings['inspect'] and xml =~ PATTERNS[:inspect] # INSPECT command
+            @read_to_prompt = true
+            debug "** Now reading until prompt (INSPECT)."
+            update_current_item($~[:id], $~[:partial_name])
+            return
+        end
+
+        if CharSettings['crystal'] and xml =~ PATTERNS[:aicrystal] # INSPECT command
+            update_current_item($~[:id], $~[:partial_name])
+            text = strip_xml(xml).strip
+            add_fact(text) unless text == ''
+        end
+
+        if xml =~ PATTERNS[:prompt] # We received a prompt, which triggers the end of our results
+            debug "-- No longer reading until prompt."
+            @read_to_prompt = false
+            return
+        end
+
+        if @read_to_prompt
+            text = strip_xml(xml).strip
+            add_fact(text) unless text == "" or text.start_with?("Roundtime:")
+        end
+        #
+        # if @loresing_updated and (DateTime.now - @loresing_updated) > TIMEOUT
+        #   debug "flush"
+        #   flush_item
+        # end
+    end
+
+    def start_command
+        if @running
+            echo "Already running."
+            return
+        end
+        @running = true
+
+        eventq = Queue.new
+        worker = nil
+
+        before_dying {
+            DownstreamHook.remove("loglore_downstream_hook")
+            UpstreamHook.remove("loglore_upstream_hook")
+            worker.kill if worker
+        }
+
+        clear
+
+        trigger = /^(?:<c>)?#{Regexp::escape("#{$lich_char}#{@script.name}")}(?:\s+.*)?$/
+
+        worker = Thread.new {
+            UpstreamHook.add("loglore_upstream_hook", proc {|data|
+                command = data.downcase.strip
+                if command =~ trigger
+                    args = command.split(/\s+/)
+                    eventq.push([true, args])
+                    data = nil
+                end
+                data
+            })
+
+            DownstreamHook.add("loglore_downstream_hook", proc {|data|
+                eventq.push([false, data.dup])
+                data
+            })
+        }
+
+        loop {
+            is_client, data = eventq.pop
+            if is_client
+                break if run(data)
+            else
+                parse_server_xml(data)
+            end
+        }
+
+        UpstreamHook.remove("loglore_upstream_hook")
+        DownstreamHook.remove("loglore_downstream_hook")
+        worker.kill
+        flush_item if @pending and @pending.length > 0
+        @logfile.close if @logfile
+        echo "Loglore stopped."
+    end
+
+    def stop_command
+        unless @running
+            echo "Loglore is not currently running."
+            return
+        end
+        echo "Loglore stopping..."
+        @running = false
+    end
+
+    def parse_bool(arg)
+        case args.downcase.strip
+            when 'yes', 'on', 'true'
+                return true
+            when 'no', 'off', 'false'
+                return false
+            else
+                return nil
+        end
+    end
+
+    def handle_setting(command, key, truetext, falsetext, newsetting = nil)
+        script = "#{$lich_char}#{@script.name}"
+        if newsetting and newsetting != ''
+            case newsetting.downcase.strip
+                when 'yes', 'on', 'true'
+                    opt = true
+                when 'no', 'off', 'false'
+                    opt = false
+                else
+                    echo "Unknown setting for #{script} #{command}.  See #{script} HELP for details"
+                    return
+            end
+            CharSettings[key] = opt
+        end
+        if CharSettings[key]
+            if truetext.class == String
+                echo truetext
+            else
+                truetext.each {|line| echo line}
+            end
+            echo "You can disable this with #{script} #{command} OFF"
+        else
+            if falsetext.class == String
+                echo falsetext
+            else
+                falsetext.each {|line| echo line}
+            end
+            echo "You can disable this with #{script} #{command} OFF"
+        end
+    end
+
+    def id_command(args = nil)
+        handle_setting(
+            'ID', 'find_full_name',
+            ["Will perform INV HANDS if we cannot identify an item's full description."],
+            [
+                "Will NOT perform INV HANDS if we cannot identify an item's full description.",
+                "This may (rarely) result on incomplete item names in generated logs."
+            ],
+            args
+        )
+    end
+
+    def assess_command(args = nil)
+        handle_setting(
+            'ASSESS', 'assess',
+            ["Will log ASSESS results."],
+            ["Will NOT log ASSESS results."],
+            args
+        )
+    end
+
+    def analyze_command(args = nil)
+        handle_setting(
+            'ANALYZE', 'analyze',
+            ["Will log ANALYZE results."],
+            ["Will NOT log ANALYZE results."],
+            args
+        )
+    end
+
+    def inspect_command(args = nil)
+        handle_setting(
+            'INSPECT', 'inspect',
+            ["Will log INSPECT results."],
+            ["Will NOT log INSPECT results."],
+            args
+        )
+    end
+
+    def crystal_command(args = nil)
+        handle_setting(
+            'CRYSTAL', 'crystal',
+            ["Will log Abandoned Inn crystal messaging."],
+            ["Will NOT log Abandoned Inn crystal messaging."],
+            args
+        )
+    end
+
+    def comment_command(line)
+        line = line.strip
+        unless line and line.length > 0
+            script = "#{$lich_char}#{@script.name}"
+            echo "Usage: #{script} COMMENT This is a really neat item."
+            return
+        end
+        unless @running
+            echo "This command only works if loglore is currently running."
+            return
+        end
+        unless @item_id
+            echo "There doesn't appear to be an item to attach this comment to."
+            return
+        end
+        add_fact "# #{line}", true
+        echo "Added comment: #{line}"
+        # add_fact
+        # if @pending and @pending.length
+        #   @pending.push("# #{line}")
+        # else
+        #   unless @logfile
+        #     echo "Nothing seems to have triggered logging yet, perhaps because you haven't sang to anything yet.  Opening a logfile."
+        #     check_rotate_log
+        #   end
+        #   @logfile.puts("# #{line}\n")
+        #   @logfile.flush
+        # end
+    end
+
+    def info_command
+        if @logfile
+            respond "Logging to #{@logfile.path}"
+        end
+        if @item_id
+            respond "We most recently sang to ##{@item_id} \"#{@item_name}\"."
+            if @have_full_name
+                respond "This is the complete item name."
+            else
+                respond "*** This is an INCOMPLETE item name due to never seeing the complete title ***"
+                respond "You can fix this by typing INV HANDS or some various other commands that expose the full name, such as"
+                respond "GIVE, PUT, or ACCEPT, or by using #{$lich_char}#{@script.name} ID YES to perform INV HANDS automatically"
+                respond "when the full item name is unavailable."
+                respond
+            end
+            respond "The following information is known about this item so far:"
+            respond
+            @facts_ordered.each {|line| respond line}
+            respond
+            respond "If this is missing any information, please ask for the Loglore author on the LNET or CODE channels."
+        else
+            respond "It seems you haven't successfully loresang to anything recently."
+        end
+    end
+
+    def secret_command_for_those_who_read_source_code
+        # No, this does not actually send anything.
+        puts "You sing:"
+        puts ""
+        puts "    \"There once was a ranger, his name as lost as he"
+        puts "     Who rolled up a bard (and a menagerie)"
+        puts "     Some goodies he would bring,"
+        puts "     So that he could LORESING,"
+        puts "     And now he's written a script (or three)\""
+        puts ""
+        puts "As you sing, you sense that this verse, for better or worse, was entirely in your head.  Nobody else seems to have heard it, at least."
+    end
+
+    def echo(str)
+        respond "[#{@script.name}: #{str}]"
+    end
+
+    def help_command
+        script = "#{$lich_char}#{@script.name}"
+        spacer = ''.ljust(script.length, ' ')
+        respond "#{script} version #{VERSION}"
+        respond "Usage:"
+        respond
+        respond "   #{script} HELP                  Shows this help text."
+        respond
+        respond "   #{script} [START]               Starts logging loresong results."
+        respond
+        respond "   #{script} STOP                  Stops logging loresong results.  Equivalent to #{$lich_char}kill #{@script.name}"
+        respond
+        respond "   #{script} ID [{ON|OFF}]         Whether to use INV HANDS to attempt to identify complete item names if we"
+        respond "   #{spacer}                       can't figure it out otherwise.  Shows the current setting if no option"
+        respond "   #{spacer}                       is provided"
+        respond
+        respond "   #{script} ASSESS [{ON|OFF}]     Whether to log ASSESS results."
+        respond
+        respond "   #{script} ANALYZE [{ON|OFF}]    Whether to log ANALYZE results."
+        respond
+        respond "   #{script} INSPECT [{ON|OFF}]    Whether to log INSPECT results."
+        respond
+        respond "   #{script} CRYSTAL [{ON|OFF}]    Whether to log Abandoned Inn crystal results."
+        respond
+        respond "   #{script} COMMENT comment...    Write a comment to the log file."
+        respond
+        respond "   #{script} INFO                  Relay what we know about the most recently sung to item and the current logfile."
+        respond
+        respond "** These commands will not work on your current platform **" unless defined?(Win32)
+        respond "   #{script} OPEN                  Open the current logfile with your default text editor.  (Windows only)"
+        respond
+        respond "   #{script} DIR                   Open the log directory in Explorer.  (Windows only)"
+    end
+
+    def run(vars)
+        cmd, *args = vars[1..-1]
+        if args
+            args = args.join(" ")
+        end
+        if args == ''
+            args = nil
+        end
+
+        unless cmd
+            # echo "Defaulting to #{$lich_char}#{@script.name} START.  See #{$lich_char}#{@script.name} HELP for more options." unless @running
+            start_command
+            return
+        end
+
+        case cmd
+            when "help"
+                help_command
+            when "start"
+                start_command
+            when "stop"
+                stop_command
+                return true
+            when "id"
+                id_command(args)
+            when "assess"
+                assess_command(args)
+            when "analyze"
+                analyze_command(args)
+            when "inspect"
+                inspect_command(args)
+            when "crystal"
+                crystal_command(args)
+            when "id"
+                id_command(args)
+            when "comment"
+                comment_command(args)
+            when "info"
+                info_command
+            when "debug" # Debugging command
+                tempscript = @script
+                @script = nil
+                respond self.inspect
+                %w(find_full_name assess analyze inspect crystal).each {|k|
+                    respond "CharSettings[#{k.inspect}] == #{CharSettings[k].inspect}"
+                }
+                @script = tempscript
+            when "open"
+                if defined?(Win32)
+                    if @logfile
+                        Win32.ShellExecuteEx(:lpVerb => 'open', :lpFile => @logfile.path, :nShow => 5)
+                    else
+                        echo "No logfile is open yet.  Use #{$lich_char}#{@script.name} DIR to open the log directory."
+                    end
+                else
+                    echo "Sorry, this subcommand only works on Windows."
+                end
+            when "dir"
+                if defined?(Win32)
+                    Win32.ShellExecuteEx(:lpVerb => 'explore', :lpFile => make_log_dir, :nShow => 5)
+                else
+                    echo "Sorry, this subcommand only works on Windows."
+                end
+            when "sing"
+                secret_command_for_those_who_read_source_code # shh...
+            else
+                echo "Unknown subcommand.  See #{$lich_char}#{@script.name} HELP."
+        end
+        return false
+    end
+end
+
+LogLore.new(script).run(script.vars)
+
+hide_me

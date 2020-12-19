@@ -1,0 +1,255 @@
+=begin
+
+  So you don't make poohbear angry.
+
+  Spirit costs code from no_spirit_death by Tgo01
+  Wander proc from waggle by Tillmen
+  Checking for evil people also from waggle.
+
+  This script does not know if there are hidden or invisible people who might see you and make poohbear mad.
+
+  This is in beta. 
+  
+    author: Veni
+      game: GS
+      tags: col, society, signs
+  required: Lich >= 4.6.4
+   version: 0.3
+  
+  Changelog:  
+        -Will now prioritize invisibility over hiding if at tables.
+        -Will now unhide if it hid you once you're safely above threshold
+        -Will pause waggle if it hides you
+=end
+#------------------------------------------------------------------------------#
+# script settings
+#------------------------------------------------------------------------------#
+@script                     = script;
+@script.want_downstream     = false;
+@script.want_downstream_xml = true;
+#------------------------------------------------------------------------------#
+# quiet_command by LostRanger, modded a bit by Xanlin
+#------------------------------------------------------------------------------#
+@script_name = script.name;
+def self.anon_hook(prefix = '');now = Time.now;"#{@script_name}::#{prefix}-#{now.tv_sec}.#{now.tv_usec}-#{Random.rand(10000)}";end;
+def self.cleanup; [DownstreamHook, UpstreamHook].each{|provider| provider.list.find_all{|name| name.start_with?("#{@script_name}::")}.each{|name| provider.remove(name)};  };end;
+def self.quiet_command(command, start_pattern, quiet = true, end_pattern = /^(?:<popBold\/>)?<prompt/, include_end = true, timeout=5)result = [];name   = self.anon_hook;filter = false;begin;Timeout::timeout(timeout, Interrupt) {DownstreamHook.add(name, proc {|xml|if filter;if xml =~ end_pattern;DownstreamHook.remove(name);filter = false;else;next(nil) if quiet;xml if !quiet;end;elsif xml =~ start_pattern;filter = true;next(nil) if quiet;xml if !quiet;else;next(nil) if xml.strip.length == 0;xml;end;});fput command;until (xml = get) =~ start_pattern; end;result << xml.rstrip;until (xml = get) =~ end_pattern;result << xml.rstrip;end;if include_end;result << xml.rstrip;end;};rescue Interrupt;DownstreamHook.remove(name);nil;end;return result;end;
+#------------------------------------------------------------------------------#
+# global variables
+#------------------------------------------------------------------------------#
+$col_members     = [] if $col_members.nil?;
+$non_col_members = [] if $non_col_members.nil?;
+#------------------------------------------------------------------------------#
+# instance variables
+#------------------------------------------------------------------------------#
+@debug, @test, @echo = false;
+@debug = true if script.vars[0] =~ /@?debug/;
+@test  = true if script.vars[0] =~ /@?test/;
+@echo  = false;
+#------------------------------------------------------------------------------#
+# local variables
+#------------------------------------------------------------------------------#
+add_up_spirit_costs = nil;   # proc placeholder, Dreaven style
+total_spirit_cost   = 0;     # holds current spirit cost
+all_done_checking   = nil;   # unused
+did_something       = false; # if moved/hid etc to avoid penalties
+initial_move        = true;  # unused
+members             = nil;   # members of col
+roomcheck           = nil;   # hold id of most recent room checked
+wastabled           = nil;   # true if at a table when called
+firstrun            = true;  # 
+return_room         = nil;   # room to return to if you had to wander
+currentpeeps        = nil;   # pcs in room at last check
+members             = [];    # col members
+goody_goodies       = [];    # non col members
+max_people          = 8;     # max people before room is assumed unsafe
+time_threshold      = 1.15   # minutes as float
+time_threshold      = 20 if @test;
+#------------------------------------------------------------------------------#
+# script pausing/unpausing
+#------------------------------------------------------------------------------#
+@scripts_to_pause   = ["waggle","rest_waggle","stand","phaseorb"];
+@scripts_to_resume  = [];
+do_pause_scripts = proc {
+  @scripts_to_pause.each {|s| (@scripts_to_resume << s;Script.pause(s);) if Script.running?(s) and !Script.paused?(s);};
+};
+do_unpause_scripts = proc { 
+  @scripts_to_resume.reverse.each { s = @scripts_to_resume.pop; Script.unpause(s) if Script.running?(s) and Script.paused?(s);};
+};
+before_dying{do_unpause_scripts.call};
+#------------------------------------------------------------------------------#
+# checking col members in its own method, using quiet_command
+#------------------------------------------------------------------------------#
+def self.check_col();
+  command       = "sign of recognition";
+  start_pattern = /^You (?:touch|scratch|rub|tap|point to) your (?:right|left) (?:eyebrow|nostril|earlobe|shoulder|cheek) with your (?:right|left) (?:pinky|forefinger|thumb|index finger)/;
+  quiet         = true;
+  quiet         = false if @debug or @test;
+  end_pattern   = /^(<popBold\/>)?<prompt/;
+  include_end   = false;
+  timeout       = 5;
+  data          =  self.quiet_command(command, start_pattern, quiet, end_pattern, include_end, timeout);
+  return data.each_with_object([]){ |d,a| 
+    a << $1 if d =~ /<a.*?>([A-Z][a-z]+)<\/a> acknowledges your sign/;
+  };
+end;
+
+def self.check_room();
+  currentpeeps  = checkpcs;
+  members       = [];
+  goody_goodies = [];
+  # if the room is empty, we're done
+  if currentpeeps.nil?; 
+    echo "room is empty" 
+    return [],[],[];
+  end;
+  # find out if we need to use sign of recognition
+  if (currentpeeps - $col_members).empty?;
+    members = currentpeeps;
+    echo "All clear, everyone here is a known member." if @test;
+  elsif g = (currentpeeps & $non_col_members) and !g.empty?;
+    echo "known non-members: #{g}" if @test;
+    goody_goodies = g
+  else
+    members       = self.check_col; #checks with sign of recognition
+    $col_members = ($col_members | members);
+    goody_goodies = currentpeeps - members;
+    $non_col_members = ($non_col_members | goody_goodies);
+    echo "members      : #{members}"       if @echo == true;
+    echo "people here  : #{currentpeeps}"  if @echo == true;
+    echo "goody_goodies: #{goody_goodies}" if @echo == true;
+  end;
+  return goody_goodies, members, currentpeeps;
+end
+#------------------------------------------------------------------------------#
+# Wandering
+#------------------------------------------------------------------------------#
+wander_rooms = [];
+wander = proc {
+  room = Room.current;
+  next_room_options = room.wayto.keys;
+  next_room = next_room_options.find_all { |r| ((room.timeto[r].class == Float && room.timeto[r] <= 3) or (room.timeto[r].class == Proc && room.timeto[r].call != nil && room.timeto[r].call <= 3)) and not wander_rooms.include?(r)};
+  if next_room.empty?;
+    next_room = wander_rooms.find { |r| next_room_options.include?(r) };
+  else;
+    next_room = next_room[rand(next_room.length)];
+  end;
+  wander_rooms.delete(next_room);
+  wander_rooms.push(next_room);
+  way = room.wayto[next_room];
+  if way.class == String;
+    move(way);
+  else;
+    way.call;
+  end;
+};
+#------------------------------------------------------------------------------#
+# 
+#------------------------------------------------------------------------------#
+add_up_spirit_costs = proc{
+  total_spirit_cost  = 0;
+  total_spirit_cost += 1 if Spell[9912].active?; #Sign of Swords
+  total_spirit_cost += 1 if Spell[9913].active?; #Sign of Shields
+  total_spirit_cost += 1 if Spell[9914].active?; #Sign of Dissipation
+  total_spirit_cost += 3 if Spell[9916].active?; #Sign of Madness
+  echo "total_spirit_cost: #{total_spirit_cost}" if @test or @debug;
+};
+#------------------------------------------------------------------------------#
+# The loop
+#------------------------------------------------------------------------------#
+silence_me;
+
+loop{
+  sleep 10 if !firstrun;
+  add_up_spirit_costs.call;
+  spiritleft = spirit - total_spirit_cost;
+  unsafe = (maxspirit+1)/2;
+  unsafe = 4 if unsafe < 4;
+  unsafe = 10 if script.vars[0] =~ /debug|test/i;
+  # checks if the script hid us for spirit reasons, and unhides/returnsif so
+  if (did_something == true and total_spirit_cost == 0); 
+    if hidden?;
+      echo "I think we're safe now.";
+      fput "unhide";
+      do_unpause_scripts.call;
+    end;
+    if !return_room.nil? and Room.current.id != return_room;
+      Script.run('go2',"#{return_room}") ;
+      sleep 1;
+      return_room = nil; #reset so we can mark our return room again later
+    end;
+    fput "sit" if wastabled and XMLData.room_title =~ /\bTable\]$/i;
+    did_something = false;
+  end
+
+  if (spiritleft <= unsafe and total_spirit_cost > 0) or @debug == true;
+    #echo gonna make poohbear mad, gonna check if we're hidden  
+    if (!invisible? and !hidden? and checkpcs);
+      if (currentpeeps != checkpcs) or (roomcheck =! Room.current.id) or (firstrun == true) or !goody_goodies.empty?;
+        firstrun     = false;
+        if currentpeeps != checkpcs;
+          if checkpcs and checkpcs.size < max_people;
+            goody_goodies, members, currentpeeps = self.check_room;
+          else;
+            echo "too many people, assuming unsafe" if @test or @debug;
+          end;
+        else;
+          echo "same people, assume same result" if @test or @debug;
+        end;
+        if goody_goodies.empty? and checkpcs.size < max_people; #room is safe
+          echo "We're ok, no goody-goodies here.";
+          currentpeeps = checkpcs;
+          wait_while { currentpeeps == checkpcs; };
+        else; #room is not safe
+          echo "Danger Zone.  Signs active that would take you below safety threshold.  Checking time left.." if @test or @debug;
+          echo "9912 timeleft: #{Spell[9912].timeleft}" if Spell[9912].active? and @echo == true;
+          echo "9913 timeleft: #{Spell[9913].timeleft}" if Spell[9913].active? and @echo == true;
+          echo "9914 timeleft: #{Spell[9914].timeleft}" if Spell[9914].active? and @echo == true;
+          echo "9916 timeleft: #{Spell[9916].timeleft}" if Spell[9916].active? and @echo == true;
+          if   (Spell[9912].active? and Spell[9912].timeleft < time_threshold) \
+            or (Spell[9913].active? and Spell[9913].timeleft < time_threshold) \
+            or (Spell[9914].active? and Spell[9914].timeleft < time_threshold) \
+            or (Spell[9916].active? and Spell[9916].timeleft < time_threshold) \
+            or @debug == true;
+            if !hidden?;
+              echo "You're going to make poohbear mad.  Taking action." if @echo == true;
+              if Spell[916].known? and Spell[916].affordable? and not Room.current.tags.include?('no-magic');
+                do_pause_scripts.call;
+                Spell[916].cast;
+                did_something = true;
+                do_unpause_scripts.call;
+              elsif checkroom =~ /\bTable\]$/i;
+                do_pause_scripts.call;
+                fput "hide";
+                wastabled = true;
+                did_something = true;
+              else;
+                echo "Moving!";
+                fput "disband"; #TODO: handle regroup?
+                return_room   = Room.current.id if return_room.nil?;
+                did_something = true;
+                20.times {
+                  wander.call;
+                  break if (checkpcs.nil? or invisible?);
+                  echo "checking new room"; 
+                  roomcheck = Room.current.id;
+                  goody_goodies, members, currentpeeps = self.check_room;
+                  break if goody_goodies.empty?;
+                };
+                2.times {fput "hide" if !hidden?;};
+              end;
+            else;
+              echo "already hidden" if @echo or @test or @debug;
+            end;
+          else;
+            #members = checkpcs;
+            roomcheck = Room.current.id;
+            echo "sleeping for 10 seconds";
+            sleep 10;
+          end;
+        end;
+      end;
+    end;
+  end;
+  firstrun = false;
+};

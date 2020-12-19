@@ -1,0 +1,421 @@
+=begin
+
+    This script is an update to scriptcheck which adds Jabber
+    support. It requires ruby 2.0.0 (rubyinstaller.org) and
+    xmpp4r (gem install xmpp4r).
+
+     author: spiffyjr
+      email: theman@spiffyjr.me
+       name: SpiffyAlert
+       tags: scripting, alert
+    version: 1.0
+
+=end
+
+require 'xmpp4r'
+
+QUIT_HOUR = 4
+
+if $SAFE > 0
+	echo "error: This script needs to be trusted to work. (;trust #{script.name})"
+	exit
+end
+
+settings = CharSettings.to_hash
+settings['ignore-scripts'] = ['waggle', 'go2', 'useherbs', 'loot-be-gone', 'sloot', 'slootbeta']
+settings['ignore-tags']    = ['town', 'consignment', 'pawnshop', 'locksmith', 'gemshop', 'herbalist', 'bank', 'furrier', 'chronomage', 'advguard', 'advguild', 'advguild2', 'supernode', 'node']
+settings['long-scripts']   = ['sammo', 'sammu', 'useherbs', 'swar', 'ForgeMaster', 'forgery', 'sheal']
+settings['echo']           = false
+settings['lines']          ||= Hash.new
+settings['restore-lines']  ||= Hash.new
+settings['username']       ||= ''
+settings['password']       ||= ''
+settings['receiver']       ||= ''
+
+ALERT_COUNT = 1
+MAX_LENGTH  = 2048
+JABBER_CLIENT = nil
+
+respond_cmd = nil
+
+if $frontend == 'stormfront'
+    fam_window_begin = "<pushStream id=\"familiar\" ifClosedStyle=\"watching\"/>"
+    fam_window_end   = "<popStream/>\r\n"
+else
+    fam_window_begin = "\034GSe\r\n"
+    fam_window_end   = "\034GSf\r\n"
+end
+
+$salert_queue = []
+$salert_echo = settings['echo']
+$salert_responding = false
+
+message = proc do |msg|
+    $salert_queue.push(msg)
+end
+
+town = proc do
+    message.call('returning to town')
+
+    Script.running.each { |s|
+        if s == script or ['keepalive', 'song-manager', 'sspell'].include?(s.name)
+            next
+        end
+
+        if s.name == 'sspell'
+            $sspell_hunt.call(false)
+        end
+
+        s.kill
+    }
+
+    waitrt?
+    waitcastrt?
+
+    start_script('go2', ['town', '_disable_confirm_'])
+    wait_while { running?('go2') }
+end
+
+prune_line = proc do |line|
+	line.gsub!(/<[^>]+>/, '')
+
+	if checknpcs
+        line.gsub!(/#{GameObj.npcs.collect { |npc| npc.name }.join('|')}/, '')
+        line.gsub!(/#{GameObj.npcs.collect { |npc| npc.noun }.join('|')}/, '')
+	end
+
+	if checkpcs
+        line.gsub!(/#{GameObj.pcs.collect { |pc| pc.name }.join('|')}/, '')
+        line.gsub!(/#{GameObj.pcs.collect { |pc| pc.noun }.join('|')}/, '')
+	end
+
+    line.downcase!
+    line.gsub!(/You also see[^.]+\./, '')
+    line.gsub!(/\b(?:north|east|south|west|up|down|out|him|his|hers?)\b/i, '')
+    line.gsub!(/\b(?:he|she|it)\b/i, '')
+	line.gsub!(/[+-](0-9)+/, '$1')
+	line.gsub!(/[0-9]+/, '*')
+    line.gsub!(/[^a-zA-Z]/, '')
+    line.gsub!(GameObj.left_hand.name, '')
+    line.gsub!(GameObj.right_hand.name, '')
+
+	line
+end
+
+clear_lines = proc do |line|
+    if line == 'all'
+		message.call('clearing all settings')
+		settings['lines'] = Hash.new
+		next
+	end
+
+    if (mod_line = prune_line.call(line))
+        settings['lines'][mod_line] = false
+    else
+		message.call("line \"#{line}\" does not exist")
+	end
+end
+
+jabber = proc do |msg|
+    # Clear any XML tags
+    msg.gsub!(/<[^>]+>/, '')
+
+    msg = Jabber::Message::new(settings['receiver'], msg)
+    msg.type=:chat
+    JABBER_CLIENT.send(msg)
+end
+
+connect = proc do 
+    echo('info: connecting to remote server...')
+    JABBER_CLIENT = Jabber::Client::new(Jabber::JID::new(settings['username']))
+    JABBER_CLIENT.keepalive_interval = 30
+    JABBER_CLIENT.connect
+    JABBER_CLIENT.auth(settings['password'])
+    JABBER_CLIENT.send(Jabber::Presence.new.set_type(:available))
+    echo('info: connected')
+end
+
+wait_for_match = proc do |regex|
+    start = Time.now.to_i
+    wait_until { (Time.now.to_i - start > 3) or get? =~ regex }
+    clear()
+end
+
+if script.vars[1] =~ /^(username|password|receiver)=(.*)$/
+	settings[$1] = $2
+	echo("set #{$1} (#{$2})")
+elsif script.vars[1] =~ /list/
+    settings.to_hash.each { |key, value|
+        next if key == 'lines'
+        next if key == 'restore-lines'
+	    echo("#{key}=#{value}")
+	}
+elsif script.vars[0] =~ /clear (.*)$/
+	clear_lines.call($1)
+elsif script.vars.length > 0
+    echo('try ;salert help')
+end
+
+if script.vars.length > 0
+    exit
+end
+
+before_dying do
+    if JABBER_CLIENT
+        echo('info: disconnecting from server...')
+        JABBER_CLIENT.close
+        echo('info: success!')
+    end
+end
+
+connect.call
+
+# Receiver thread
+Thread.new do
+    while true
+        begin
+            JABBER_CLIENT.add_message_callback { |msg|
+                echo("received message: #{msg.body}")
+
+                if msg.type == :error
+                    echo('error, invalid message received')
+                elsif msg.body =~ /^,([^\s]+)(?:\s(.*))?/
+                    cmd = $1
+                    args = $2
+
+                    if cmd =~ /clear/i
+                        clear_lines.call(args)
+                    elsif cmd =~ /save/i
+                        settings['restore-lines'] = settings['lines'].clone
+                        message.call('lines saved for future use')
+                    elsif cmd =~ /restore/i
+                        settings['lines'] = settings['restore-lines'].clone
+                        message.call('saved lines restored')
+                    elsif cmd =~ /town/i
+                        town.call()
+                    elsif cmd =~ /echo/i
+                        settings['echo'] = !settings['echo']
+                        message.call("echo changed (#{settings['echo']})")
+                        $salert_echo = settings['echo']
+                    elsif cmd =~ /favor/i
+                        message.call($favor.inspect)
+                    elsif cmd =~ /chat/i
+                        message.call("sending \"chat #{args}\" to lnet")
+                        send_to_script('lnet', "chat #{args}")
+                    else
+                        message.call("unknown command: #{cmd}")
+                    end
+                elsif msg.body !~ /^;/
+                    clear()
+                    respond_cmd = msg.body
+                end
+
+                true
+            }
+        rescue
+            echo("error in receiver thread: #{$!}")
+            echo $!.backtrace
+        end
+        
+        sleep 0.25
+    end
+end
+
+# Sender thread
+Thread.new do
+    while true
+        msgs = nil
+
+        begin
+            $salert_queue.uniq!
+            if not $salert_queue.empty?
+                # reconnect if we got disconnected somehow
+                if not JABBER_CLIENT
+                    connect.call
+                end
+
+                msgs = $salert_queue.shift(10)
+            
+                jabber.call(msgs.join("\r\n"))
+
+                sleep 1.0
+            end
+        rescue
+            echo("error in sender thread: #{$!}")
+
+            JABBER_CLIENT.close
+            JABBER_CLIENT = nil
+
+            if msgs
+                $salert_queue.unshift(msgs)
+            end
+        end
+
+        sleep 0.25
+    end
+end
+
+clear()
+
+NOTIFY_LINES = {
+	'You smile as you realize that this piece is the very best that you can create.' => 'Perfect forged piece created!',
+    'A moment of close inspection is all you need to tell that you have done your best work this time.' => 'Perfect crafted piece created!',
+    'locking the hinges in place' => 'Gemmed chest found!',
+    'but your attack has no effect' => 'Bless wore out',
+    'is soon to arrive in the' => 'Possible merchant',
+    'Suddenly you feel sick and queasy, and your world seems blurry and indistinct\.' => 'You were ported in the Rift!',
+}
+
+COMMON_LINES = [
+    # Movement lines
+    '^[\s\w]+ (?:just )?(?:arrived|went|stride|strode)',
+    'Also here: [\w\s]+',
+    'You also see (?:an?|the)[^.]+',
+    'Obvious (?:paths:exits)',
+
+    # Death lines
+    '^\s*\* \w+[\w\s-]+!',
+
+    # Bounties
+	'^You forage',
+	'^You spy a .*, which looks like the heirloom that you are searching for!$',
+	'^Obvious (?:paths|exits):',
+    '^You also see',
+    '^You notice an?',
+
+    # Digging Stuff
+    '^You lift the lid',
+    '^You open the lid on your',
+    '^You begin pulling at',
+    '^In(?:side)? the',
+    '^You reach down and pull',
+    '^You reach down to see what',
+    '^As you place a',
+    'from the rocky terrain',
+    'lifts the lid on',
+    'gathers the remaining coins',
+    'tries to empty the contents',
+    '^As you (?:pluck|bust|break|pick|reach)',
+
+    # Sewers stuff
+    '^You search around',
+]
+
+script.want_downstream = false
+script.want_downstream_xml = true
+
+attack_partial = '(?:(?:make a precise )?attempt|gesture|trace|aim|fire|swing|slash|thrust|punch|weave|concentrate|channel|hurl)s? '
+
+# Main loop
+while true
+    sleep 0.10
+
+    if Time.now.hour == QUIT_HOUR
+        # Exit the game so we don't forget on accident
+        if Script.running?('ego2') or Script.running?('escort')
+            put 'exit'
+        else
+            town.call()
+        end
+
+        break
+    elsif respond_cmd
+        # If a connected client sent a command we should respond until done
+        start = Time.now.to_i
+
+        script.want_downstream = true
+        script.want_downstream_xml = false
+
+        clear
+        put(respond_cmd)
+
+        while true
+            line = get
+            if line =~ /<prompt/ or Time.now.to_i - start >= 3
+                break
+            end
+
+            message.call(line)
+            sleep 0.10
+        end
+
+        script.want_downstream = false
+        script.want_downstream_xml = true
+
+        respond_cmd = nil
+        clear()
+        next
+    elsif dead?
+        # Shiet, we dead m8
+        message.call('you died!')
+        sleep 10
+        fput 'exit'
+        break
+    end
+
+    # skip the zul mine carts
+    if Room.current.id == 19547
+        clear()
+        next
+    end
+
+    # skip the voln monks
+    if Room.current.title.include?('[Path to Enlightenment]')
+        clear()
+        next
+    end
+
+    # get current line if it exists or continue if empty
+    if (xml = get?).nil?
+        next
+    end
+
+    # parse XML lines first
+    if xml =~ /\[Private\]-(\w+):(\w+): "([^"]+)"/
+        # LNet private messages should be sent always
+        message.call("[Private]-#{$1}:#{$2}: \"#{$3}\"")
+    elsif xml =~ /(?:<style id="roomDesc|roomName" \/>|<compDef id='room desc|room objs'>)/
+        # skip room titles and descriptions
+    elsif xml =~ /<prompt time="\d+">[^<]+<\/prompt>/
+        # skip prompts
+    elsif xml =~ /You search the <pushBold\/><a exist="\d+" noun="[^"]+">[^<]+<\/a><popBold\/>\./
+        # skip searching npcs
+        wait_for_match.call(/decays/)
+    elsif xml =~ /An? <a exist="\d+" noun="[^"]+">[^<]+<\/a><popBold\/> #{attack_partial}.*at you!$/
+        # skip enemy npc attacks
+        wait_for_match.call(/<prompt/)
+    elsif xml =~ /You #{attack_partial}/
+        # skip attacks the player makes
+        wait_for_match.call(/Roundtime:? \d/i)
+    elsif xml =~ /<a exist="(\d+)" noun="[^"]+">[^<]+<\/a>/ and (GameObj[$1] and GameObj[$1].type =~ /aggressive|escort|passive|familiar|companion/)
+        # skip aggressive npcs, escorts, companions, passive npcs, etc.
+    elsif xml =~ /<pushStream id="thoughts|voln"\/>/i
+        # skip LNet chats
+    else
+        # strip the XML and do regular string parsing from this point on - skip blank lines
+        if (line = xml.gsub(/<[^>]+>/, '').strip).length === 0
+            next
+        end
+
+        if notify = NOTIFY_LINES.find { |l| line =~ /#{l[0]}/i }
+            # always notify on some lines
+            message.call(notify[1])
+        elsif line =~ /#{COMMON_LINES.join('|')}/i
+            # skip common lines
+        elsif Script.running.find { |script| settings['ignore-scripts'].include?(script.name) }
+            # skip output while some scripts are running (like go2)
+            clear()
+        elsif Room.current.tags.any? { |tag| settings['ignore-tags'].include?(tag) }
+            # skip some room tags
+            clear()
+        elsif checkrt > 20 and not settings['long-scripts'].find { |script| running?(script) }
+            message.call("excessive roundtime: #{checkrt.to_i.to_s} seconds!")
+        elsif mod_line = prune_line.call(line.dup) and not settings['lines'][mod_line]
+            CharSettings['lines'][mod_line] = true
+
+            echo "Unrecognized: #{xml}"
+            puts("#{fam_window_begin}#{line}\r\n#{fam_window_end}")
+            message.call(line)
+        end
+    end
+end

@@ -1,0 +1,640 @@
+=begin
+
+	This is probably a script.
+
+=end
+
+max_overpay = 500
+target_value = :auto
+container_name = Vars.lootsack
+
+for var in script.vars
+	if var =~ /^\-\-target(?:\-value)?=([0-9]+)$/
+		target_value = $1.to_i
+	elsif var =~ /^\-\-max\-overpay=([0-9]+)$/
+		max_overpay = $1.to_i
+	elsif var =~ /^\-\-container(?:\-name)?=(.+)$/
+		container_name = $1
+	else
+		echo "warning: ignoring unrecognized command line parameter: #{var}"
+	end
+end
+
+$cheap_deed_gem ||= Hash.new
+put_regex = /^You (?:attempt to shield .*? from view as you |discreetly |carefully |absent-mindedly )?(?:put|place|slip|tuck|add|hang|drop|untie your|find an incomplete bundle|wipe off .*? and sheathe)|^A sigh of grateful pleasure can be heard as you feed .*? to your|^As you place|^I could not find what you were referring to\.$|^Your bundle would be too large|^The .+ is too large to be bundled\.|^As you place your|^The .*? is already a bundle|^Your .*? won't fit in .*?\.$|^You can't .+ It's closed!$/
+get_regex = /^You (?:shield the opening of .*? from view as you |discreetly |carefully |deftly )?(?:remove|draw|grab|reach|slip|tuck|retrieve|already have|unsheathe|detach)|^Get what\?$|^Why don't you leave some for others\?$|^You need a free hand|^You already have that/
+
+check_deeds = proc {
+	started = false
+	action = proc { |server_string|
+		if started
+			if server_string =~ /<prompt/
+				DownstreamHook.remove("#{script.name}_check_deeds")
+				server_string
+			elsif server_string =~ /<output class=""\/>/
+				server_string
+			else
+				nil
+			end
+		elsif server_string =~ /^\s+Level:\s+[0-9]+\s+Deeds:\s+(\-?[0-9]+)\s*$/
+			started = true
+			nil
+		else
+			server_string
+		end
+	}
+	DownstreamHook.add("#{script.name}_check_deeds", action)
+	save_silent = script.silent
+	script.silent = true
+	put 'experience'
+	script.silent = save_silent
+	while line = get
+		if line =~ /^\s+Level:\s+[0-9]+\s+Deeds:\s+(\-?[0-9]+)/
+			deeds = $1.to_i
+			break
+		end
+	end
+	deeds
+}
+
+#
+# find the lootsack
+#
+unless container = (GameObj.inv.find { |obj| obj.noun == container_name } || GameObj.inv.find { |obj| obj.name == container_name } || GameObj.inv.find { |obj| obj.name =~ /\b#{Regexp.escape(container_name)}$/i } || GameObj.inv.find { |obj| obj.name =~ /\b#{container_name.split(' ').collect { |n| Regexp.escape(n) }.join(".*\\b")}/i })
+	echo "error: unable to find container \"#{container_name}\" in your inventory."
+	exit
+end
+
+#
+# appraise gems in the lootsack and adjust for trading skill
+#
+if container.contents.any? { |o| o.type =~ /gem/ and $cheap_deed_gem[o.id].nil? }
+	# trading modifiers assume Wehnimer's only
+	trading_mod = (Skills.to_bonus(Skills.trading) + Stats.inf[1])/12
+	trading_mod = 0 unless Skills.trading > trading_mod
+	if Char.race =~ /^Dark Elf$|^Forest Gnome$/
+		race_mod = -5
+	elsif Char.race == 'Half-krolvin'
+		race_mod = -25
+	else
+		race_mod = 0
+	end
+	gemshop = Room.list.find { |r| r.tags.include?('gemshop') and r.location =~ /Wehnimer's Landing/ }
+	Script.run('go2', gemshop.id.to_s)
+	empty_hand
+	for gem in container.contents.find_all { |o| o.type =~ /gem/ and $cheap_deed_gem[o.id].nil? }
+		dothis "get ##{gem.id}", get_regex
+		if r = dothistimeout("appraise ##{gem.id}", 5, /I'll give you \d+ for/)
+			$cheap_deed_gem[gem.id] = (r.slice(/\d+/).to_i*(1/(((trading_mod + race_mod)/100.0)+1))).ceil
+		else
+			$cheap_deed_gem[gem.id] = 0
+		end
+		dothis "_drag ##{gem.id} ##{container.id}", put_regex
+	end
+	fill_hand
+end
+
+#
+# estimate deed cost
+#
+if target_value == :auto
+	deeds = check_deeds.call
+	target_value = ((Char.exp / 500) + ((((deeds * (deeds + 1)) / 2) - 1) * 40) - ((deeds - 1) * 20) + 100) / 4
+	echo "estimated deed cost: #{target_value.with_commas} (in gems in Wehnimer's Landing)"
+elsif target_value.class == Fixnum
+	echo "target value: #{target_value}"
+else
+	echo "error: out of cheese"
+	eixt
+end
+
+#
+# find the value of all available gems
+#
+values = container.contents.find_all { |o| o.type =~ /gem/ and not ($cheap_deed_gem[o.id].nil? or ($cheap_deed_gem[o.id] == 0)) }.collect { |o| $cheap_deed_gem[o.id] }
+echo "gem count: #{values.length}"
+
+if values.empty?
+	echo 'no gems'
+	exit
+end
+
+done_lookin = false
+
+#
+# find the cheapest gem > target_value and ignore anything more expensive than that
+#
+if best_single_gem = values.find { |v| v >= target_value }
+	values.delete_if { |v| v > best_single_gem }
+#	echo "values.length: #{values.length}"
+end
+echo "gem values: #{values.join(', ')}"
+if best_single_gem
+	echo "best single gem: #{best_single_gem}"
+else
+	echo "best single gem: none"
+end
+done_lookin = true if best_single_gem == target_value
+
+#
+# find the cheapest two-gem combo > target_value
+#
+best_two_gem_value = nil
+best_two_gems = []
+unless done_lookin
+	if values.length > 1
+		for i in 0...values.length
+			for j in (i+1)...values.length
+		#		echo "i: #{i}, values[i]: #{values[i].inspect}, j: #{j}, values[j]: #{values[j].inspect}"
+				sum = values[i] + values[j]
+				if (sum >= target_value) and (best_two_gem_value.nil? or (sum < best_two_gem_value))
+					best_two_gem_value = sum
+					best_two_gems = [ values[i], values[j] ]
+				end
+			end
+		end
+	end
+	if best_two_gem_value
+		echo "best two gem combo: #{best_two_gems[0]} + #{best_two_gems[1]} = #{best_two_gem_value}"
+	else
+		echo "best two gem combo: none"
+	end
+	done_lookin = true if best_two_gem_value == target_value
+end
+
+#
+# find the cheapest three-gem combo > target_value
+#
+best_three_gem_value = nil
+best_three_gems = []
+unless done_lookin
+	if values.length > 2
+		for i in 0...values.length
+			for j in (i+1)...values.length
+				for k in (j+1)...values.length
+		#			echo "i: #{i}, values[i]: #{values[i].inspect}, j: #{j}, values[j]: #{values[j].inspect}, k: #{k}, values[k]: #{values[k].inspect}"
+					sum = values[i] + values[j] + values[k]
+					if (sum >= target_value) and (best_three_gem_value.nil? or (sum < best_three_gem_value))
+						best_three_gem_value = sum
+						best_three_gems = [ values[i], values[j], values[k] ]
+					end
+				end
+			end
+		end
+	end
+	if best_three_gem_value
+		echo "best three gem combo: #{best_three_gems[0]} + #{best_three_gems[1]} + #{best_three_gems[2]} = #{best_three_gem_value}"
+	else
+		echo "best three gem combo: none"
+	end
+	done_lookin = true if best_three_gem_value == target_value
+end
+
+#
+# find the cheapest four-gem combo > target_value
+#
+best_four_gem_value = nil
+best_four_gems = []
+unless done_lookin
+	if values.length > 3
+		for i in 0...values.length
+			for j in (i+1)...values.length
+				for k in (j+1)...values.length
+					for l in (k+1)...values.length
+		#				echo "i: #{i}, values[i]: #{values[i].inspect}, j: #{j}, values[j]: #{values[j].inspect}, k: #{k}, values[k]: #{values[k].inspect}, l: #{l}, values[l]: #{values[l].inspect}"
+						sum = values[i] + values[j] + values[k] + values[l]
+						if (sum >= target_value) and (best_four_gem_value.nil? or (sum < best_four_gem_value))
+							best_four_gem_value = sum
+							best_four_gems = [ values[i], values[j], values[k], values[l] ]
+						end
+					end
+				end
+			end
+		end
+	end
+	if best_four_gem_value
+		echo "best four gem combo: #{best_four_gems[0]} + #{best_four_gems[1]} + #{best_four_gems[2]} + #{best_four_gems[3]} = #{best_four_gem_value}"
+	else
+		echo "best four gem combo: none"
+	end
+	done_lookin = true if best_four_gem_value == target_value
+end
+
+values = values.sort.reverse
+
+#
+# find a cheap five-gem combo > target_value
+#
+best_five_gem_value = nil
+best_five_gems = []
+unless done_lookin
+	if values.length > 4
+		for i in 1...values.length
+			for j in (i+1)...values.length
+				for k in (j+1)...values.length
+					for l in (k+1)...values.length
+						sum = values[0] + values[i] + values[j] + values[k] + values[l]
+						if (sum >= target_value) and (best_five_gem_value.nil? or (sum < best_five_gem_value))
+							best_five_gem_value = sum
+							best_five_gems = [ values[0], values[i], values[j], values[k], values[l] ]
+						end
+					end
+				end
+			end
+		end
+	end
+	if best_five_gem_value
+		echo "five gem combo: #{best_five_gems[0]} + #{best_five_gems[1]} + #{best_five_gems[2]} + #{best_five_gems[3]} + #{best_five_gems[4]} = #{best_five_gem_value}"
+	else
+		echo "five gem combo: none"
+	end
+	done_lookin = true if best_five_gem_value == target_value
+end
+
+#
+# find a cheap six-gem combo > target_value
+#
+best_six_gem_value = nil
+best_six_gems = []
+unless done_lookin
+	if values.length > 5
+		for i in 2...values.length
+			for j in (i+1)...values.length
+				for k in (j+1)...values.length
+					for l in (k+1)...values.length
+						sum = values[0] + values[1] + values[i] + values[j] + values[k] + values[l]
+						if (sum >= target_value) and (best_six_gem_value.nil? or (sum < best_six_gem_value))
+							best_six_gem_value = sum
+							best_six_gems = [ values[0], values[1], values[i], values[j], values[k], values[l] ]
+						end
+					end
+				end
+			end
+		end
+	end
+	if best_six_gem_value
+		echo "six gem combo: #{best_six_gems[0]} + #{best_six_gems[1]} + #{best_six_gems[2]} + #{best_six_gems[3]} + #{best_six_gems[4]} + #{best_six_gems[5]} = #{best_six_gem_value}"
+	else
+		echo "six gem combo: none"
+	end
+	done_lookin = true if best_six_gem_value == target_value
+end
+
+#
+# find a cheap seven-gem combo > target_value
+#
+best_seven_gem_value = nil
+best_seven_gems = []
+unless done_lookin
+	if values.length > 6
+		for i in 3...values.length
+			for j in (i+1)...values.length
+				for k in (j+1)...values.length
+					for l in (k+1)...values.length
+						sum = values[0] + values[1] + values[2] + values[i] + values[j] + values[k] + values[l]
+						if (sum >= target_value) and (best_seven_gem_value.nil? or (sum < best_seven_gem_value))
+							best_seven_gem_value = sum
+							best_seven_gems = [ values[0], values[1], values[2], values[i], values[j], values[k], values[l] ]
+						end
+					end
+				end
+			end
+		end
+	end
+	if best_seven_gem_value
+		echo "seven gem combo: #{best_seven_gems[0]} + #{best_seven_gems[1]} + #{best_seven_gems[2]} + #{best_seven_gems[3]} + #{best_seven_gems[4]} + #{best_seven_gems[5]} + #{best_seven_gems[6]} = #{best_seven_gem_value}"
+	else
+		echo "seven gem combo: none"
+	end
+	done_lookin = true if best_seven_gem_value == target_value
+end
+
+#
+# find a cheap eight-gem combo > target_value
+#
+best_eight_gem_value = nil
+best_eight_gems = []
+unless done_lookin
+	if values.length > 7
+		for i in 4...values.length
+			for j in (i+1)...values.length
+				for k in (j+1)...values.length
+					for l in (k+1)...values.length
+						sum = values[0] + values[1] + values[2] + values[3] + values[i] + values[j] + values[k] + values[l]
+						if (sum >= target_value) and (best_eight_gem_value.nil? or (sum < best_eight_gem_value))
+							best_eight_gem_value = sum
+							best_eight_gems = [ values[0], values[1], values[2], values[3], values[i], values[j], values[k], values[l] ]
+						end
+					end
+				end
+			end
+		end
+	end
+	if best_eight_gem_value
+		echo "eight gem combo: #{best_eight_gems[0]} + #{best_eight_gems[1]} + #{best_eight_gems[2]} + #{best_eight_gems[3]} + #{best_eight_gems[4]} + #{best_eight_gems[5]} + #{best_eight_gems[6]} + #{best_eight_gems[7]} = #{best_eight_gem_value}"
+	else
+		echo "eight gem combo: none"
+	end
+	done_lookin = true if best_eight_gem_value == target_value
+end
+
+#
+# find a cheap nine-gem combo > target_value
+#
+best_nine_gem_value = nil
+best_nine_gems = []
+unless done_lookin
+	if values.length > 8
+		for i in 5...values.length
+			for j in (i+1)...values.length
+				for k in (j+1)...values.length
+					for l in (k+1)...values.length
+						sum = values[0] + values[1] + values[2] + values[3] + values[4] + values[i] + values[j] + values[k] + values[l]
+						if (sum >= target_value) and (best_nine_gem_value.nil? or (sum < best_nine_gem_value))
+							best_nine_gem_value = sum
+							best_nine_gems = [ values[0], values[1], values[2], values[3], values[4], values[i], values[j], values[k], values[l] ]
+						end
+					end
+				end
+			end
+		end
+	end
+	if best_nine_gem_value
+		echo "nine gem combo: #{best_nine_gems[0]} + #{best_nine_gems[1]} + #{best_nine_gems[2]} + #{best_nine_gems[3]} + #{best_nine_gems[4]} + #{best_nine_gems[5]} + #{best_nine_gems[6]} + #{best_nine_gems[7]} + #{best_nine_gems[8]} = #{best_nine_gem_value}"
+	else
+		echo "nine gem combo: none"
+	end
+	done_lookin = true if best_nine_gem_value == target_value
+end
+
+#
+# find a cheap ten-gem combo > target_value
+#
+best_ten_gem_value = nil
+best_ten_gems = []
+unless done_lookin
+	if values.length > 9
+		for i in 6...values.length
+			for j in (i+1)...values.length
+				for k in (j+1)...values.length
+					for l in (k+1)...values.length
+						sum = values[0] + values[1] + values[2] + values[3] + values[4] + values[5] + values[i] + values[j] + values[k] + values[l]
+						if (sum >= target_value) and (best_ten_gem_value.nil? or (sum < best_ten_gem_value))
+							best_ten_gem_value = sum
+							best_ten_gems = [ values[0], values[1], values[2], values[3], values[4], values[5], values[i], values[j], values[k], values[l] ]
+						end
+					end
+				end
+			end
+		end
+	end
+	if best_ten_gem_value
+		echo "ten gem combo: #{best_ten_gems[0]} + #{best_ten_gems[1]} + #{best_ten_gems[2]} + #{best_ten_gems[3]} + #{best_ten_gems[4]} + #{best_ten_gems[5]} + #{best_ten_gems[6]} + #{best_ten_gems[7]} + #{best_ten_gems[8]} + #{best_ten_gems[9]} = #{best_ten_gem_value}"
+	else
+		echo "ten gem combo: none"
+	end
+	done_lookin = true if best_ten_gem_value == target_value
+end
+
+#
+# find a cheap eleven-gem combo > target_value
+#
+best_eleven_gem_value = nil
+best_eleven_gems = []
+unless done_lookin
+	if values.length > 10
+		for i in 7...values.length
+			for j in (i+1)...values.length
+				for k in (j+1)...values.length
+					for l in (k+1)...values.length
+						sum = values[0] + values[1] + values[2] + values[3] + values[4] + values[5] + values[6] + values[i] + values[j] + values[k] + values[l]
+						if (sum >= target_value) and (best_eleven_gem_value.nil? or (sum < best_eleven_gem_value))
+							best_eleven_gem_value = sum
+							best_eleven_gems = [ values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[i], values[j], values[k], values[l] ]
+						end
+					end
+				end
+			end
+		end
+	end
+	if best_eleven_gem_value
+		echo "eleven gem combo: #{best_eleven_gems[0]} + #{best_eleven_gems[1]} + #{best_eleven_gems[2]} + #{best_eleven_gems[3]} + #{best_eleven_gems[4]} + #{best_eleven_gems[5]} + #{best_eleven_gems[6]} + #{best_eleven_gems[7]} + #{best_eleven_gems[8]} + #{best_eleven_gems[9]} + #{best_eleven_gems[10]} = #{best_eleven_gem_value}"
+	else
+		echo "eleven gem combo: none"
+	end
+	done_lookin = true if best_eleven_gem_value == target_value
+end
+
+#
+# find a cheap twelve-gem combo > target_value
+#
+best_twelve_gem_value = nil
+best_twelve_gems = []
+unless done_lookin
+	if values.length > 11
+		for i in 8...values.length
+			for j in (i+1)...values.length
+				for k in (j+1)...values.length
+					for l in (k+1)...values.length
+						sum = values[0] + values[1] + values[2] + values[3] + values[4] + values[5] + values[6] + values[7] + values[i] + values[j] + values[k] + values[l]
+						if (sum >= target_value) and (best_twelve_gem_value.nil? or (sum < best_twelve_gem_value))
+							best_twelve_gem_value = sum
+							best_twelve_gems = [ values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[i], values[j], values[k], values[l] ]
+						end
+					end
+				end
+			end
+		end
+	end
+	if best_twelve_gem_value
+		echo "twelve gem combo: #{best_twelve_gems[0]} + #{best_twelve_gems[1]} + #{best_twelve_gems[2]} + #{best_twelve_gems[3]} + #{best_twelve_gems[4]} + #{best_twelve_gems[5]} + #{best_twelve_gems[6]} + #{best_twelve_gems[7]} + #{best_twelve_gems[8]} + #{best_twelve_gems[9]} + #{best_twelve_gems[10]} + #{best_twelve_gems[11]} = #{best_twelve_gem_value}"
+	else
+		echo "twelve gem combo: none"
+	end
+	done_lookin = true if best_twelve_gem_value == target_value
+end
+
+#
+# find a cheap thirteen-gem combo > target_value
+#
+best_thirteen_gem_value = nil
+best_thirteen_gems = []
+unless done_lookin
+	if values.length > 12
+		for i in 9...values.length
+			for j in (i+1)...values.length
+				for k in (j+1)...values.length
+					for l in (k+1)...values.length
+						sum = values[0] + values[1] + values[2] + values[3] + values[4] + values[5] + values[6] + values[7] + values[8] + values[i] + values[j] + values[k] + values[l]
+						if (sum >= target_value) and (best_thirteen_gem_value.nil? or (sum < best_thirteen_gem_value))
+							best_thirteen_gem_value = sum
+							best_thirteen_gems = [ values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[i], values[j], values[k], values[l] ]
+						end
+					end
+				end
+			end
+		end
+	end
+	if best_thirteen_gem_value
+		echo "thirteen gem combo: #{best_thirteen_gems[0]} + #{best_thirteen_gems[1]} + #{best_thirteen_gems[2]} + #{best_thirteen_gems[3]} + #{best_thirteen_gems[4]} + #{best_thirteen_gems[5]} + #{best_thirteen_gems[6]} + #{best_thirteen_gems[7]} + #{best_thirteen_gems[8]} + #{best_thirteen_gems[9]} + #{best_thirteen_gems[10]} + #{best_thirteen_gems[11]} + #{best_thirteen_gems[12]} = #{best_thirteen_gem_value}"
+	else
+		echo "thirteen gem combo: none"
+	end
+	done_lookin = true if best_thirteen_gem_value == target_value
+end
+
+#
+# find a cheap fourteen-gem combo > target_value
+#
+best_fourteen_gem_value = nil
+best_fourteen_gems = []
+unless done_lookin
+	if values.length > 13
+		for i in 10...values.length
+			for j in (i+1)...values.length
+				for k in (j+1)...values.length
+					for l in (k+1)...values.length
+						sum = values[0] + values[1] + values[2] + values[3] + values[4] + values[5] + values[6] + values[7] + values[8] + values[9] + values[i] + values[j] + values[k] + values[l]
+						if (sum >= target_value) and (best_fourteen_gem_value.nil? or (sum < best_fourteen_gem_value))
+							best_fourteen_gem_value = sum
+							best_fourteen_gems = [ values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9], values[i], values[j], values[k], values[l] ]
+						end
+					end
+				end
+			end
+		end
+	end
+	if best_fourteen_gem_value
+		echo "fourteen gem combo: #{best_fourteen_gems[0]} + #{best_fourteen_gems[1]} + #{best_fourteen_gems[2]} + #{best_fourteen_gems[3]} + #{best_fourteen_gems[4]} + #{best_fourteen_gems[5]} + #{best_fourteen_gems[6]} + #{best_fourteen_gems[7]} + #{best_fourteen_gems[8]} + #{best_fourteen_gems[9]} + #{best_fourteen_gems[10]} + #{best_fourteen_gems[11]} + #{best_fourteen_gems[12]} + #{best_fourteen_gems[13]} = #{best_fourteen_gem_value}"
+	else
+		echo "fourteen gem combo: none"
+	end
+	done_lookin = true if best_fourteen_gem_value == target_value
+end
+
+#
+# find a cheap fifteen-gem combo > target_value
+#
+best_fifteen_gem_value = nil
+best_fifteen_gems = []
+unless done_lookin
+	if values.length > 14
+		for i in 11...values.length
+			for j in (i+1)...values.length
+				for k in (j+1)...values.length
+					for l in (k+1)...values.length
+						sum = values[0] + values[1] + values[2] + values[3] + values[4] + values[5] + values[6] + values[7] + values[8] + values[9] + values[10] + values[i] + values[j] + values[k] + values[l]
+						if (sum >= target_value) and (best_fifteen_gem_value.nil? or (sum < best_fifteen_gem_value))
+							best_fifteen_gem_value = sum
+							best_fifteen_gems = [ values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9], values[10], values[i], values[j], values[k], values[l] ]
+						end
+					end
+				end
+			end
+		end
+	end
+	if best_fifteen_gem_value
+		echo "fifteen gem combo: #{best_fifteen_gems[0]} + #{best_fifteen_gems[1]} + #{best_fifteen_gems[2]} + #{best_fifteen_gems[3]} + #{best_fifteen_gems[4]} + #{best_fifteen_gems[5]} + #{best_fifteen_gems[6]} + #{best_fifteen_gems[7]} + #{best_fifteen_gems[8]} + #{best_fifteen_gems[9]} + #{best_fifteen_gems[10]} + #{best_fifteen_gems[11]} + #{best_fifteen_gems[12]} + #{best_fifteen_gems[13]} + #{best_fifteen_gems[14]} = #{best_fifteen_gem_value}"
+	else
+		echo "fifteen gem combo: none"
+	end
+	done_lookin = true if best_fifteen_gem_value == target_value
+end
+
+best_value = nil
+best_gems = nil
+if best_single_gem
+	best_value = best_single_gem
+	best_gems = [ best_single_gem ]
+end
+if best_two_gem_value and (best_value.nil? or (best_two_gem_value < best_value))
+	best_value = best_two_gem_value
+	best_gems = best_two_gems
+end
+if best_three_gem_value and (best_value.nil? or (best_three_gem_value < best_value))
+	best_value = best_three_gem_value
+	best_gems = best_three_gems
+end
+if best_four_gem_value and (best_value.nil? or (best_four_gem_value < best_value))
+	best_value = best_four_gem_value
+	best_gems = best_four_gems
+end
+if best_five_gem_value and (best_value.nil? or (best_five_gem_value < best_value))
+	best_value = best_five_gem_value
+	best_gems = best_five_gems
+end
+if best_six_gem_value and (best_value.nil? or (best_six_gem_value < best_value))
+	best_value = best_six_gem_value
+	best_gems = best_six_gems
+end
+if best_seven_gem_value and (best_value.nil? or (best_seven_gem_value < best_value))
+	best_value = best_seven_gem_value
+	best_gems = best_seven_gems
+end
+if best_eight_gem_value and (best_value.nil? or (best_eight_gem_value < best_value))
+	best_value = best_eight_gem_value
+	best_gems = best_eight_gems
+end
+if best_nine_gem_value and (best_value.nil? or (best_nine_gem_value < best_value))
+	best_value = best_nine_gem_value
+	best_gems = best_nine_gems
+end
+if best_ten_gem_value and (best_value.nil? or (best_ten_gem_value < best_value))
+	best_value = best_ten_gem_value
+	best_gems = best_ten_gems
+end
+if best_eleven_gem_value and (best_value.nil? or (best_eleven_gem_value < best_value))
+	best_value = best_eleven_gem_value
+	best_gems = best_eleven_gems
+end
+if best_twelve_gem_value and (best_value.nil? or (best_twelve_gem_value < best_value))
+	best_value = best_twelve_gem_value
+	best_gems = best_twelve_gems
+end
+if best_thirteen_gem_value and (best_value.nil? or (best_thirteen_gem_value < best_value))
+	best_value = best_thirteen_gem_value
+	best_gems = best_thirteen_gems
+end
+if best_fourteen_gem_value and (best_value.nil? or (best_fourteen_gem_value < best_value))
+	best_value = best_fourteen_gem_value
+	best_gems = best_fourteen_gems
+end
+if best_fifteen_gem_value and (best_value.nil? or (best_fifteen_gem_value < best_value))
+	best_value = best_fifteen_gem_value
+	best_gems = best_fifteen_gems
+end
+
+echo best_gems.inspect
+#exit
+
+if best_gems
+	if best_value > (target_value + max_overpay)
+		echo "cheapest gems exceed max overpay"
+		exit
+	else
+		echo "overpay: #{best_value - target_value}"
+	end
+	sleep 3
+	Script.run('go2', '4044')
+	move 'go tapestry'
+	dothistimeout 'ring chime with mallet', 20, /^You strike/
+	dothistimeout 'ring chime with mallet', 20, /^You strike/
+	dothistimeout 'kneel', 20, /^You kneel/
+	best_gems.each { |value|
+		if id = $cheap_deed_gem.find { |k,v| (v == value) and container.contents.any? { |i| i.id == k } }[0]
+			r = dothistimeout "_drag ##{id} drop", 5, /^You drop/
+			if r =~ /^You drop/
+				$cheap_deed_gem.delete(id)
+			end
+		end
+	}
+	r = dothistimeout 'ring chime with mallet', 20, /thy deed has been recorded|The Goddess was neither convinced nor pleased/
+	move 'out'
+	if r =~ /thy deed has been recorded/
+		Script.log "#{Time.now.strftime("%Y-%m-%d %I:%M%P")}: lvl=#{Char.level}, deeds=#{deeds}, value=#{best_value}: success"
+	elsif r =~ /The Goddess was neither convinced nor pleased/
+		Script.log "#{Time.now.strftime("%Y-%m-%d %I:%M%P")}: lvl=#{Char.level}, deeds=#{deeds}, value=#{best_value}: failed"
+	else
+		Script.log "#{Time.now.strftime("%Y-%m-%d %I:%M%P")}: timed out after final chime"
+	end
+end

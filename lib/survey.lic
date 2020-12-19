@@ -1,0 +1,272 @@
+=begin
+  Quick and dirty script to look at everything in the room, ideal for examining merchant events.
+
+  Now with more features (see ;survey help)
+
+  Disclaimer: This is STILL not what I'd consider release quality.
+
+  author: LostRanger (thisgenericname@gmail.com)
+  game: any
+  tags: utility
+  required: Lich >= 4.6.0.
+  version: 0.4 (2019-10-21)
+
+  changelog:
+    version 0.4 (2019-10-21)
+      * Actually initialize our queue of things we're planning to scan.  Fixes collections of items not being surveyed.
+    version 0.3 (2019-08-24)
+      * Now ignores disks.
+    version 0.2.2 (2019-06-01)
+      * Now runs the inspect script instead of normal inspect if that script is installed.
+    version 0.2.1 (2090-06-01)
+      * Fix accidental debugging message left in 0.2
+    version 0.2 (2019-06-01)
+      * Now suppresses duplicate messages from the same item.
+      * Now has options to automatically survey each room and (SF only) survey/analyze/inspect items on click.
+    version 0.1 (2017-07-14)
+      * Initial release
+=end
+
+
+module Survey
+    class StopSurvey < Exception
+        attr_reader :next_survey
+
+        def initialize(next_survey=nil)
+            @next_survey = next_survey
+        end
+    end
+
+    SQUELCH =
+        /^(?:There is nothing (?:on|in|under|behind) there\.|You see nothing unusual\.|There is nothing there to read\.|It looks empty\.)\s*$/
+
+    def Survey.hook
+        eat_prompt = false
+        DownstreamHook.add("survey.lic", proc {|xml|
+            next(xml) unless @silent
+            if xml =~ /<prompt/ and eat_prompt
+                eat_prompt = false
+                next(nil)
+            end
+            eat_prompt = true
+            if xml =~ SQUELCH
+                next(nil)
+            end
+            next(nil) unless @seen_messages.add?(xml)
+            if xml =~ /^You see <a.*?<\/a>\.\s+Looking at the <a.*?<\/a>, you see (.*)\.\s*$/
+                items = $1.split(/(?:\s*,\s*)|(?:\s+and\s+(?=[^,]*<a))/)
+                items.each{|item|
+                    next unless item =~ /^(?:(.+)\s+)?<a exist="(-?\d+)" noun="([^"]*)">([^<]*)<\/a>(?:\s+(.+))?/
+                    @queue << GameObj.new($2, $3, $4, $1, $5)
+                }
+                next(nil)
+            end
+            eat_prompt = false
+            xml
+        })
+    end
+
+    def Survey.survey_item(item)
+        return if item.full_name =~ /^[A-Z][a-z]+ disk$/  # Skip player disks
+        return if @seen.add?(item.id)
+        @silent = true
+        @seen_messages.clear
+        puts "[<a exist=\"#{item.id}\" noun=\"#{item.noun}\">#{item.full_name}</a>]"
+        put "read ##{item.id}"
+        put "look ##{item.id}"
+        %w(in on under behind).each{|loc| put "look #{loc} ##{item.id}"}
+        sleep 1
+        @seen_messages.clear
+        @silent = false
+    end
+
+    def Survey.survey_item_recursive(item)
+        @queue.clear
+        survey_item(item)
+        survey_item(@queue.shift) while @queue.length > 0
+    end
+
+    def Survey.survey_room
+        GameObj.room_desc.each {|x| survey_item_recursive(x) }
+        GameObj.loot.each {|x| survey_item_recursive(x) unless x.name =~ /[A-Z][a-z]+ disk$/}
+    end
+
+    def Survey.survey_id(id)
+        item = GameObj[id.to_s]
+        if item
+            return survey_item(item)
+        end
+        @silent = true
+        @seen_messages.clear
+        puts "[<a exist=\"#{id}\" noun=\"##{id}\">Item ##{id}</a>]"
+        put "read ##{id}"
+        put "look ##{id}"
+        %w(in on under behind).each{|loc| put "look #{loc} ##{id}"}
+        sleep 1
+        @seen_messages.clear
+        @silent = false
+    end
+
+    def Survey.survey_id_recursive(id)
+        @queue.clear
+        survey_id(id)
+        survey_item(@queue.shift) while @queue.length > 0
+    end
+
+    def Survey.help
+        name = $lich_char + @script.name
+        msg = []
+        msg << "Usage: #{name} [OPTIONS]"
+        msg << "       where OPTIONS is zero or more of: keep, menu, inspect, analyze"
+        msg << ''
+        msg << 'keep    - Stay running and re-survey every time a new room is entered.'
+        msg << 'menu    - When clicking on an item in StormFront (only), survey it'
+        msg << 'inspect - When clicking on an item in StormFront (only), INSPECT it'
+        msg << 'analyze - When clicking on an item in StormFront (only), ANALYZE it'
+        msg << ''
+        msg << "#{name} by itself will 'survey' all top-level items (and occasionally nested items) in the room:"
+        msg << "It will look at, on, in, and under each item, and read it -- while squelching any irrelevant messages"
+        msg << "(e.g. 'There is nothing on there.')"
+        msg << ''
+        msg << "If 'keep' is specified, this process will repeat every time you move to a different room.  (This "
+        msg << "includes rooms previously visited.)"
+        msg << ''
+        msg << "The other options apply when you click on an item in StormFront.  Note that the INSPECT option may"
+        msg << "frequently produce third-party messaging -- i.e. other players will see what you are doing."
+        msg << ''
+        msg << 'Moving rooms or (if using any of the menu options) clicking on a link aborts any current surveying.'
+        respond msg
+
+        @read_help = true
+    end
+
+    def Survey.cleanup
+        DownstreamHook.remove("survey.lic")
+        UpstreamHook.remove("survey.lic")
+        @child_threads.each{|thr| thr.kill} if @child_threads
+    end
+
+    def Survey.run(script)
+        @script = script
+        @opts = {}
+        @main_thread = Thread.current
+        @child_threads = []
+        @seen_messages = Set.new
+        @queue = []
+        silence_me if $SAFE == 0
+
+        args = script.vars[0].downcase.strip.split(/\s+/)
+
+        need_menu_tracking = false
+        args.each do |arg|
+            case arg
+            when 'help'
+                help
+                exit
+            when 'keep'
+                @opts[:keep] = true
+            when 'menu'
+                @opts[:menu] = true
+                need_menu_tracking = true
+            when 'inspect'
+                @opts[:inspect] = true
+                need_menu_tracking = true
+            when 'analyze'
+                @opts[:analyze] = true
+                need_menu_tracking = true
+            else
+                echo "Unknown option '#{arg}'.  For help, see #{$lich_char}#{@script.name} HELP"
+                exit
+            end
+        end
+
+        now = Time.now
+        unless @read_help
+            if @last_help_nag.nil?  # Hasn't seen help yet
+                @last_help_nag = now
+                echo "Type #{$lich_char}#{@script.name} HELP for more options and to suppress this message for the rest of this session."
+            elsif @last_help_nag + 300 < now  # Hasn't seen help or been nagged in last 5 minutes.
+                @last_help_nag = now
+                echo "For more options, see #{$lich_char}#{@script.name} HELP."
+            end
+        end
+
+        before_dying { cleanup }
+        hook
+
+        Thread.handle_interrupt(StopSurvey => :never) do
+            @child_threads << Thread.new{
+                room_count = XMLData.room_count
+                while true
+                    wait_until { room_count != XMLData.room_count }
+                    room_count = XMLData.room_count
+                    @main_thread.raise(StopSurvey)
+                end
+            }
+
+            if need_menu_tracking
+                @script.want_upstream = true
+                @child_threads << Thread.new {
+                    while true
+                        nil until upstream_get =~ /^(?:<c>)?_menu\s+#(-?\d+)\b/
+                        @main_thread.raise(StopSurvey.new($1))
+                    end
+                }
+            end
+
+            first_pass = true
+
+            next_survey = nil
+            while true
+                @seen.clear
+                @queue.clear
+                current_room_count = XMLData.room_count
+                surveying = false
+                begin
+                    Thread.handle_interrupt(StopSurvey => :immediate) {
+                        surveying = true
+                        if next_survey
+                            survey_id_recursive(next_survey) if @opts[:menu]
+                            if @opts[:inspect]
+                                if Script.exists?("inspect")
+                                    Script.run("inspect", "##{next_survey}")
+                                else
+                                    fput "inspect ##{next_survey}"
+                                end
+                            end
+                            fput "analyze ##{next_survey}" if @opts[:analyze]
+                        elsif first_pass or @opts[:keep]
+                            survey_room
+                            first_pass = false
+                        end
+                        surveying = false
+                        @silent = false
+                        exit unless need_menu_tracking or @opts[:keep]
+                        sleep
+                    }
+                rescue StopSurvey => ex
+                    @silent = false
+                    next_survey = ex.next_survey
+                    if surveying
+                        if next_survey
+                            echo "[Survey aborted -- item clicked]"
+                        else
+                            echo "[Survey aborted -- changed rooms]"
+                        end
+                        surveying = false
+                    end
+                ensure
+                    @silent = false
+                    exit unless need_menu_tracking or @opts[:keep]
+                end
+                # begin
+                #     nil
+                # rescue StopSurvey
+                #     nil
+                # end
+            end
+        end
+    end
+end
+
+Survey.run(script)

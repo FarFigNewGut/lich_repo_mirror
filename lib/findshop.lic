@@ -1,0 +1,336 @@
+=begin
+    Searches for a particular player's shop and shows you the SHOP BROWSE page for it.
+
+    Usage:
+       ;findshop <partial name of shop>
+
+    findshop has a memory of previous shop queries that will last either one login or 12 hours, whichever is shorter.
+    You can forcibly reset its memory with:
+       ;findshop reset
+
+    See also ;go2shop, which will take you to the shop in question.
+
+	  author: LostRanger (thisgenericname@gmail.com)
+	  game: GS
+	  tags: utility
+	  required: Lich >= 4.6.0.
+
+  version: 0.3 (2019-09-29)
+
+  changelog:
+    version 0.3 (2019-09-29)
+      * First release.  (Version 0.3 since it syncs to ;go2shop version 0.3)
+=end
+
+# [UPDATED] ;go2shop 0.2 released with minor quality-of-life improvements.  ;go2shop allows you to go to a player shop by partial player or shop name, even if it is not mapped.
+
+module FindShopScript
+    VERSION = '0.3 (2019-09-29)'
+    API_VERSION = 1000
+
+    PATTERNS = {
+        :town_list => /^You must specify in which town.*Valid options include: (.*)$/,
+        :town_list_end => /^<prompt/,
+        :town_pattern => /<d cmd=['"]shop directory (.+?)['"]>(.*?)<\/d>/,
+        :dir_start => /^<output class="mono"\/>/,
+        # :dir_end => /^You can use the SHOP BROWSE/,
+        :dir_end => /^<prompt/,
+        :shop_pattern => /<d cmd=['"]shop browse (.+?) (\d+)['"]>(.*?)<\/d>/,
+        :shop_browse => /^(?:(.*) is located (?:.*?)(\[.*?]) at (a |an |the )<a exist="(-?\d+)"(?:.*?)>(.*?)<\/a>)|(Unknown town specified)|(That is not a valid shop number)/,
+        :shop_browse_end => /^<prompt/,
+    }
+
+    MAXAGE = 86400 / 2  # In-memory pseudodatabase lifetime of 12 hours
+
+    @db ||= {}
+    unless defined?(@last_refreshed)
+        @last_refreshed = nil
+    end
+
+    def self.anon_hook(prefix = '')
+        now = Time.now
+        "FindShop::#{prefix}-#{now.tv_sec}.#{now.tv_usec}-#{Random.rand(10000)}"
+    end
+    #
+    # def self.cleanup
+    #     [DownstreamHook, UpstreamHook].each{|provider|
+    #         provider.list.find_all{|name| name.start_with?('FindShop::')}.each{|name| provider.remove(name)}
+    #     }
+    # end
+    def self.quiet_command(command, start_pattern, end_pattern = /<prompt/, include_end = true, timeout=5)
+        result = []
+        name = self.anon_hook
+        filter = false
+
+        begin
+            Timeout::timeout(timeout, Interrupt) {
+                DownstreamHook.add(name, proc {|xml|
+                    if filter
+                        if xml =~ end_pattern
+                            DownstreamHook.remove(name)
+                            filter = false
+                            # result << xml.rstrip if include_end
+                            # thread.raise(Interrupt)
+                            # next(include_end ? nil : xml)
+                        else
+                            # result << xml.rstrip
+                            next(nil)
+                        end
+                    elsif xml =~ start_pattern
+                        filter = true
+                        # result << xml.rstrip
+                        next(nil)
+                    else
+                        xml
+                    end
+                })
+                fput command
+
+                until (xml = get) =~ start_pattern; end
+                result << xml.rstrip
+                until (xml = get) =~ end_pattern
+                    result << xml.rstrip
+                end
+                if include_end
+                    result << xml.rstrip
+                end
+            }
+        rescue Interrupt
+            nil
+        end
+        return result
+    end
+
+
+    def self.reset_database
+        echo "Shop database is out-dated, forcing refresh..."
+        db = {}
+        waitrt?
+        lines = self.quiet_command("shop directory", PATTERNS[:town_list], PATTERNS[:town_list_end])
+        lines.each{|line|
+            line.scan(PATTERNS[:town_pattern]).each{|id, name|
+                db[id] = {
+                    :name => name,
+                    :shops => {},
+                }
+            }
+        }
+
+        db.each{|town, _|
+            waitrt?
+            lines = self.quiet_command("shop directory #{town}", PATTERNS[:dir_start], PATTERNS[:dir_end])
+            lines.each{|line|
+                line.scan(PATTERNS[:shop_pattern]).each{|town, id, name|
+                    id = id.to_i
+                    db[town][:shops][id.to_i] = {
+                        :name => name,
+                        :id => id,
+                        :town => town,
+                    }
+                }
+            }
+        }
+
+        @db = db
+        @last_refreshed = Time.now
+        echo "Shop database updated, next refresh at #{@last_refreshed + MAXAGE}"
+        return @db
+    end
+
+    def self.get_database
+        if (not @last_refreshed) or @last_refreshed + MAXAGE < Time.now
+            return self.reset_database
+        end
+        return @db
+    end
+
+    def self.update_shop(shop)
+        waitrt?
+        lines = self.quiet_command("shop browse #{shop[:town]} #{shop[:id]}", PATTERNS[:shop_browse], PATTERNS[:shop_browse_end])
+        lines.each{|line|
+            if line =~ PATTERNS[:shop_browse]
+                if $6
+                    echo "Failed to update shop (#{$6}): #{shop.inspect}"
+                    exit
+                end
+                # if $1 != shop[:name]
+                #     echo "Warning: Shop name mismatch (#{$1}} != #{shop[:name]})"
+                #     shop[:name] = $1
+                # end
+                shop[:exist] = $4
+                shop[:exist_name] = $5
+                shop[:exist_article] = $3
+                shop[:room_title] = $2
+                shop[:room_id] = nil
+                shop[:shop_room_id] = nil
+
+                return shop
+            end
+        }
+
+        echo "Failed to update shop (no data found): #{shop.inspect}"
+    end
+
+    def self.get_shop(shop)
+        if shop[:exist] then
+            return shop
+        end
+        return self.update_shop(shop)
+    end
+
+    def self.clear_database
+        @db = nil
+        @last_refreshed = nil
+        echo "Shop directory cache cleared."
+        exit
+    end
+
+    def self.find_shop(search_string)
+        db = self.get_database
+        exact_matches = []
+        matches = []
+
+        db.each{|town, data|
+            data[:shops].each{|id, shop|
+                name = shop[:name].downcase
+                if name == search_string
+                    exact_matches.push(shop)
+                elsif exact_matches.empty? and name.include?(search_string)
+                    matches.push(shop)
+                end
+            }
+        }
+
+        unless exact_matches.empty?
+            matches = exact_matches
+        end
+
+        if matches.empty?
+            echo "No shops found matching '#{search_string}'."
+            return
+        end
+
+        return matches[0] if matches.length == 1
+
+        if matches.length > 10
+            echo "Too many matching shops, skipping in-depth data collection."
+        else
+            matches.each{|shop|
+                self.get_shop(shop)
+            }
+        end
+
+        name_padding = 0
+        matches.each{|shop|
+            n = shop[:name].length
+            name_padding = n if name_padding < n
+        }
+
+        if exact_matches.empty?
+            respond "Multiple matching shops found"
+        else
+            respond "Multiple exact matches found"
+        end
+
+        if @stormfront
+            output = ['<output class="mono"/>']
+        end
+
+        ix = 0
+
+        matches.each{|shop|
+            ix += 1
+            ix_str = "#{ix.to_s.rjust(6)}: "
+            shopname = shop[:name].ljust(name_padding)
+            if shop[:room_title]
+                info = "(#{db[shop[:town]][:name]} shop ##{shop[:id]}, #{shop[:exist_article]}#{shop[:exist_name]} at #{shop[:room_title]})"
+            else
+                info = "(#{db[shop[:town]][:name]} shop ##{shop[:id]})"
+            end
+
+            if @stormfront
+                infoxml = REXML::Text.new(info)
+
+                dlink = REXML::Element.new("d")
+                dlink.add_attribute("cmd", "#{$lich_char}send #{ix}")
+                dlink.add_text(shopname)
+
+                output.push("#{ix_str}#{dlink} #{infoxml}")
+            else
+                respond "#{ix_str}#{shopname} #{info}"
+            end
+        }
+
+        if @stormfront
+            dlink = REXML::Element.new("d")
+            dlink.add_attribute("cmd", "#{$lich_char}send 0")
+            dlink.add_text("CANCEL")
+            output.push("     0: #{dlink}")
+            output.push('<output class=""/>')
+            puts output.join("\n")
+            respond "Select a shop from the list using #{$lich_char}send <#> or by clicking on the desired shop."
+        else
+            respond "     0: CANCEL"
+            respond "Select a shop from the list using #{$lich_char}send <#>."
+        end
+        toggle_unique
+
+        while true
+            line = nil
+            line = get until line.strip =~ /^[0-9]+$/i
+            n = line.to_i
+            if n == 0
+                echo "Cancelled."
+                toggle_unique
+                return
+            end
+            if n > matches.length
+                echo "Value out of range.  (Expected a value between 0 and #{matches.length}"
+            else
+                toggle_unique
+                return matches[n-1]
+            end
+        end
+
+        return nil
+    end
+
+    def self.run(script)
+        @stormfront = ($frontend == 'stormfront')
+        @script = script
+        @script.want_downstream = false
+        @script.want_downstream_xml = true
+
+        args = script.vars[0].strip.downcase
+        if args.empty?
+            msg = []
+            msg << "#{@script.name} version #{VERSION}"
+            msg << "Usage: #{$lich_char}#{@script.name} <search string> - Find the shop matching this name."
+            msg << "Usage: #{$lich_char}#{@script.name} reset           - Clear the cache of shop directory information."
+            msg << ""
+            msg << "Use #{$lich_char}go2shop to travel to a shop rather than simply viewing its inventory."
+            unless Script.exists?("go2shop")
+                msg << "You can download it with: "
+                msg << "    #{$lich_char}repo download go2shop.lic"
+            end
+            respond msg
+            exit
+        end
+        exit if args == '--api'  # Used by other scripts to load this script without doing anything else.
+
+        if args == 'reset'
+            clear_database
+            exit
+        end
+
+        shop = find_shop(args)
+        exit unless shop
+        waitrt?
+        put "shop browse #{shop[:town]} #{shop[:id]}"
+    end
+end
+
+$api_findshop = FindShopScript
+FindShopScript.run(script)
+
+# ;echo Room.list.find_all{|x| x.title.include?("[East Row, Ebonwood Way]")}.inspect
