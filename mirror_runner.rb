@@ -4,7 +4,7 @@ WORKSPACE = ENV['GITHUB_WORKSPACE']
 LICH_DIR = WORKSPACE + '/Lich'
 BACKUPLIB = ENV['GITHUB_WORKSPACE'] + '/lib'
 
-SEED_SCRIPTS = ['repo_mirror', 'keepalive']
+SEED_SCRIPTS = ['repo_mirror', 'mirror_keeper']
 
 
 SEED_SCRIPTS.each { |script|
@@ -57,5 +57,5 @@ char_strings.each { |cs|
 	cs = cs.split(',')
 	puts "char: #{cs[0]}"
 	make_entry_for_char.call(cs[0], cs[1], cs[2])
-	system("ruby #{LICH_DIR}/lich.rb --login #{cs[0]} --gemstone --without-frontend --detachable-client=8787 --start-scripts=keepalive,repo_mirror")
+	system("ruby #{LICH_DIR}/lich.rb --login #{cs[0]} --gemstone --without-frontend --detachable-client=8787 --start-scripts=mirror_keeper,repo_mirror")
 }
