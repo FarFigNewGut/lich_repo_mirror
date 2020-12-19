@@ -8,7 +8,7 @@ SEED_SCRIPTS = ['repo_mirror', 'keepalive']
 
 
 SEED_SCRIPTS.each { |script|
-	FileUtils.cp(WORKSPACE + '/#{script}.lic', LICH_DIR + '/scripts/#{script}.lic')
+	FileUtils.cp(WORKSPACE + "/#{script}.lic", LICH_DIR + "/scripts/#{script}.lic")
 }
 
 if File.exists?("#{LICH_DIR}/data/entry.dat")
