@@ -14,3 +14,22 @@ On a commit action the repo is packaged using the [jinxp](https://github.com/ela
 ;jinx repo add ffnglichrepoarchive https://ffnglichrepoarchive.netlify.app
 ```
 (you can use something shorter instead of "ffnglichrepoarchive" for the repo name if you'd like)
+
+Once it is setup as a source for ;jinx you can install any scripts from the repo with:
+
+```ruby
+# install script for the first time
+;jinx script install --repo=ffnglichrepoarchive <script name>
+
+# update previously installed script
+;jinx script update --repo=ffnglichrepoarchive <script name>
+```
+
+For example if you wanted to download or update bigshot.lic:
+```ruby
+# first install
+;jinx script install --repo=ffnglichrepoarchive bigshot
+
+# update if you had previously downloaded bigshot
+;jinx script update --repo=ffnglichrepoarchive bigshot
+```
