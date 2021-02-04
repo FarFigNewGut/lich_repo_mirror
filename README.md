@@ -1,4 +1,4 @@
-![Run repo mirror](https://github.com/FarFigNewGut/lich_repo_mirror/workflows/Run%20repo%20mirror/badge.svg) [![Netlify Status](https://api.netlify.com/api/v1/badges/98693ac5-9e69-4477-ae92-664a09922f8c/deploy-status)](https://app.netlify.com/sites/ffnglichrepoarchive/deploys)
+[![Run repo mirror](https://github.com/FarFigNewGut/lich_repo_mirror/workflows/Run%20repo%20mirror/badge.svg)](https://github.com/FarFigNewGut/lich_repo_mirror/actions) [![Netlify Status](https://api.netlify.com/api/v1/badges/98693ac5-9e69-4477-ae92-664a09922f8c/deploy-status)](https://app.netlify.com/sites/ffnglichrepoarchive/deploys)
 
 # Lich Repo Mirror
 
