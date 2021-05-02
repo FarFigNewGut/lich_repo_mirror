@@ -1,0 +1,413 @@
+=begin
+
+    Modified & stripped down version of Atlas for use with Nesbounty.
+
+    Creatures and hunting areas atlas.  Requires atlas_data.db.
+    Original author Jymamon (gs4-jymamon@hotmail.com)
+
+     author: Nesmeor
+       name: NesAtlas
+       tags: creature,critter,hunting
+    version: 0.0.1
+=end
+
+# ------------------------------------------------------------------------------
+# Areas, creatures, and backing DB goo.  Possibly to be split out later.
+# ------------------------------------------------------------------------------
+
+# A hunting area with a start room, boundaries, and what can be hunted.
+# The region attribute exists mostly to allow the correct bounty areas
+# to be found without having to first query mapdb for all rooms in a
+# specific region and then determine which hunting areas are within it.
+# The field will be auto-populated for the area based on the mapdb
+# location of the start room.
+class Area
+    attr_reader :id, :start, :boundaries, :creatures, :region
+
+    def initialize(id, start, boundaries, creatures)
+        @id         = id
+        @start      = start
+        @boundaries = boundaries|| Array.new
+        @creatures  = creatures || Array.new
+        @region     = Room[start].location || "<Unknown region>"
+    end
+end
+
+# A creature that can be hunted.  We track the creatures skin, but don't
+# really need to as skin bounties include the creature name. Since we'll
+# end up with nil for unskinnable creatures, it may come in handy for
+# deciding what areas to "free" hunt. (Similarly, we should track gem
+# and treasure types.)
+#
+# The hated and undead attributes are also included not for bounty use
+# but for anyone wanting to use the creature db for deciding what to hunt
+# based on society membership.
+class Creature
+    attr_reader :id, :hated, :level, :name, :noncorp, :skin, :undead
+
+    def initialize(id, level, name, skin, undead, noncorp, hated)
+        @id      = id
+        @level   = level
+        @name    = name
+        @skin    = skin
+        @hated   = hated
+        @noncorp = noncorp
+        @undead  = undead
+    end
+end
+
+# Just a based database class to simplify a shared database for creatue and area
+# data which are logically separate. This also gives us a place to shove in version
+# so we can ensure the DB version and this script's version are compatible in the
+# future.
+# These should be treated as mostly private methods, but I'm still playing with how
+# to make those work in ruby.  Once I do, they will be marked as such and break anything
+# relying on them.  If you need a dependency on anything I've commented on private,
+# let me know the use case so I can expose it properly.  All current use should come
+# through the Creatures and Areas modules or the Creature and Area classes.
+module AtlasDatabase
+    @@areatable         = "areas"
+    @@areaboundarytable = "areaboundaries"
+    @@areacreaturetable = "areacreatures"
+    @@creaturetable     = "creatures"
+    @@versiontable      = "version"
+
+    @@database          = nil
+    @@mutex             = Mutex.new
+
+    @@make_area = proc {|areaid|
+        start = AtlasDatabase.db.get_first_value("SELECT start FROM #{@@areatable} WHERE id = ?;", areaid);
+
+        Area.new(
+            areaid,
+            start,
+            AtlasDatabase.db.execute("SELECT boundary FROM #{@@areaboundarytable} WHERE area = ?;", areaid),
+            AtlasDatabase.db.execute("SELECT creature FROM #{@@areacreaturetable} WHERE area = ?;", areaid).map {|c|
+                @@make_creature.call(c[0])
+            })
+    }
+
+    @@make_creature = proc {|creatureid|
+        start = AtlasDatabase.db.get_first_row("SELECT level, name, skin, undead, noncorp, hated FROM #{@@creaturetable} WHERE id = ?", creatureid);
+
+        Creature.new(
+            creatureid,
+            start[0].to_i,
+            start[1],
+            start[2],
+            start[3].to_i==1,
+            start[4].to_i==1,
+            start[5].to_i==1)
+    }
+
+    def AtlasDatabase.version
+        return "2016.11.22.01"
+    end
+
+    # private
+    def AtlasDatabase.db
+        if $SAFE == 0
+            @@database ||= SQLite3::Database.new("#{$script_dir}/atlas_data.db3")
+        else
+            nil
+        end
+    end
+
+    def AtlasDatabase.close_db
+        @@mutex.synchronize {
+            if (! @@database.nil? )
+                AtlasDatabase.db.close()
+                @@database = nil;
+            end
+        }
+    end
+
+    # private
+    def AtlasDatabase.delete_area(areaid)
+        @@mutex.synchronize {
+            begin
+                AtlasDatabase.db.execute("DELETE FROM #{@@areacreaturetable} WHERE area = ?;", areaid)
+            rescue SQLite3::BusyException
+                sleep 0.1
+                retry
+            end
+
+            begin
+                AtlasDatabase.db.execute("DELETE FROM #{@@areaboundarytable} WHERE area = ?;", areaid)
+            rescue SQLite3::BusyException
+                sleep 0.1
+                retry
+            end
+
+            begin
+                AtlasDatabase.db.execute("DELETE FROM #{@@areatable} WHERE id = ?;", areaid)
+            rescue SQLite3::BusyException
+                sleep 0.1
+                retry
+            end
+        }
+    end
+
+    # private
+    def AtlasDatabase.delete_creature(creatureid)
+        @@mutex.synchronize {
+            begin
+                AtlasDatabase.db.execute("DELETE FROM #{@@creaturetable} WHERE id = ?;", creatureid)
+            rescue SQLite3::BusyException
+                sleep 0.1
+                retry
+            end
+        }
+    end
+
+    # private
+    def AtlasDatabase.find_area_all()
+        results = Array.new
+
+        AtlasDatabase.db.execute("SELECT id FROM #{@@areatable};").each {|row|
+            results << @@make_area.call(row[0])
+        }
+
+        return results
+    end
+
+    # private
+    def AtlasDatabase.find_area_by_creature(creatureid)
+        areas = Array.new
+        results = Array.new
+
+        AtlasDatabase.db.execute("SELECT area FROM #{@@areacreaturetable} WHERE creature = #{creatureid};").each {|area|
+            results << @@make_area.call(area[0])
+        }
+
+        return results
+    end
+
+    # private
+    def AtlasDatabase.find_area_by_id(id)
+        return @@make_area.call(id)
+    end
+
+
+    # private
+    def AtlasDatabase.find_area_by_region(region)
+        results = Array.new
+
+        AtlasDatabase.db.execute("SELECT id FROM #{@@areatable} WHERE region LIKE \"%#{region}%\";").each {|row|
+            results << @@make_area.call(row[0])
+        }
+
+        return results
+    end
+
+    # private
+    def AtlasDatabase.find_creature_all()
+        results = Array.new
+
+        AtlasDatabase.db.execute("SELECT id FROM #{@@creaturetable}").each {|row|
+            results << @@make_creature.call(row[0])
+        }
+
+        return results
+    end
+
+    # private
+    def AtlasDatabase.find_creature_by_id(id)
+        return @@make_creature.call(id)
+    end
+
+    # private
+    def AtlasDatabase.find_creature_by_level(min = 1, max = nil)
+        if ( max.nil? )
+            max = min
+        end
+
+        results = Array.new
+
+        AtlasDatabase.db.execute("SELECT id FROM #{@@creaturetable} WHERE level >= #{min} and level <= #{max}").each {|row|
+            results << @@make_creature.call(row[0])
+        }
+
+        return results
+    end
+
+    # private
+    def AtlasDatabase.find_creature_by_name(name, exact = true)
+        results = Array.new
+
+        if (exact)
+            clause = "name = \"#{name}\";"
+        else
+            clause = "name LIKE \"%#{name}%\";"
+        end
+
+        AtlasDatabase.db.execute("SELECT id FROM #{@@creaturetable} WHERE #{clause}").each {|row|
+            results << @@make_creature.call(row[0])
+        }
+
+        return results
+    end
+
+    # private
+    def AtlasDatabase.find_creature_by_skin(skin)
+        results = Array.new
+
+        AtlasDatabase.db.execute("SELECT id FROM #{@@creaturetable} WHERE skin = ?;", skin).each {|row|
+            results << @@make_creature.call(row[0])
+        }
+
+        return results
+    end
+
+    def AtlasDatabase.init_db
+        @@mutex.synchronize {
+            begin
+                # Versioning tables
+                AtlasDatabase.db.execute("CREATE TABLE IF NOT EXISTS #{@@versiontable}(version TEXT NOT NULL, module_version_required TEXT NOT NULL, PRIMARY KEY(version));")
+                AtlasDatabase.db.execute("INSERT OR REPLACE INTO #{@@versiontable}(version, module_version_required) VALUES('#{AtlasDatabase.version}', '#{AtlasDatabase.version}');")
+                # Creatures table
+                AtlasDatabase.db.execute("CREATE TABLE IF NOT EXISTS #{@@creaturetable} (id INT NOT NULL, level INT NOT NULL, undead INT NOT NULL, noncorp INT NOT NULL, hated INT NOT NULL, name TEXT NOT NULL, skin TEXT, extra BLOB, PRIMARY KEY(name));")
+                # Hunting area tables
+                AtlasDatabase.db.execute("CREATE TABLE IF NOT EXISTS #{@@areatable} (id INTEGER PRIMARY KEY, region TEXT NOT NULL, start INT NOT NULL);")
+                AtlasDatabase.db.execute("CREATE TABLE IF NOT EXISTS #{@@areaboundarytable} (id INTEGER PRIMARY KEY, area INT NOT NULL, boundary INT NOT NULL, FOREIGN KEY(area) REFERENCES #{@@areatable}(id), CONSTRAINT unique_boundary UNIQUE(area, boundary));")
+                AtlasDatabase.db.execute("CREATE TABLE IF NOT EXISTS #{@@areacreaturetable} (id INTEGER PRIMARY KEY, area INT NOT NULL, creature INT NOT NULL, FOREIGN KEY(area) REFERENCES #{@@areatable}(id), FOREIGN KEY(creature) REFERENCES #{@@creaturetable}(id), CONSTRAINT unique_creature UNIQUE(area, creature));")
+
+            rescue SQLite3::BusyException
+                sleep 0.1
+                retry
+            end
+        }
+    end
+
+    # private
+    def AtlasDatabase.insert_area(area)
+        AtlasDatabase.delete_area(area.id)
+
+        @@mutex.synchronize {
+            begin
+                AtlasDatabase.db.execute("INSERT OR REPLACE INTO #{@@areatable}(id, start, region) VALUES(?,?,?);",
+                    area.id,
+                    area.start,
+                    area.region.encode('UTF-8'));
+
+                area.boundaries.each {|boundary|
+                    AtlasDatabase.db.execute("INSERT OR REPLACE INTO #{@@areaboundarytable}(area, boundary) VALUES(?,?);",
+                        area.id,
+                        boundary);
+                }
+
+                area.creatures.each {|creature|
+                    AtlasDatabase.db.execute("INSERT OR REPLACE INTO #{@@areacreaturetable}(area, creature) VALUES(?,?);",
+                        area.id,
+                        creature);
+                }
+
+            rescue SQLite3::BusyException
+                sleep 0.1
+                retry
+            end
+        }
+    end
+
+    # private
+    def AtlasDatabase.insert_creature(creature)
+        AtlasDatabase.delete_creature(creature.id)
+
+        @@mutex.synchronize {
+            begin
+                AtlasDatabase.db.execute("INSERT OR REPLACE INTO #{@@creaturetable}(id, name, skin, level, undead, noncorp, hated) VALUES(?,?,?,?,?,?,?);",
+                    creature.id,
+                    creature.name.encode('UTF-8'),
+                    creature.skin.encode('UTF-8'),
+                    creature.level,
+                    creature.undead ? 1 : 0,
+                    creature.noncorp ? 1 : 0,
+                    creature.hated ? 1 : 0);
+            rescue SQLite3::BusyException
+                sleep 0.1
+                retry
+            rescue
+                echo "ERROR IN: INSERT OR REPLACE INTO #{@@creaturetable}(id, name, skin, level, undead, noncorp, hated) VALUES(#{creature.id},#{creature.name.encode('UTF-8')},#{creature.skin.encode('UTF-8')},#{creature.level},#{creature.undead},#{creature.noncorp},#{creature.hated});"
+                echo "#{$!.backtrace.join("\n\t")}"
+            end
+        }
+    end
+end
+
+# Purely for "namespacing" access to area related methods
+module Areas
+    def Areas.all()
+        AtlasDatabase.find_area_all()
+    end
+
+    def Areas.delete(areaid)
+        AtlasDatabase.delete_area(areaid)
+    end
+
+    def Areas.find_by_creature(creatureid)
+        AtlasDatabase.find_area_by_creature(creatureid)
+    end
+
+    def Areas.find_by_id(areaid)
+        AtlasDatabase.find_area_by_id(areaid)
+    end
+
+    def Areas.find_by_region(region)
+        AtlasDatabase.find_area_by_region(region)
+    end
+
+    def Areas.ids()
+        Areas.all().map{|a| a.id}
+    end
+
+    def Areas.init_db
+        AtlasDatabase.init_db
+    end
+
+    def Areas.insert(area)
+        AtlasDatabase.insert_area(area)
+    end
+end
+
+# Purely for "namespacing" access to creature related methods
+module Creatures
+    def Creatures.version
+        return AtlasDatabase.version
+    end
+
+    def Creatures.ids()
+        Creatures.all().map{|c| c.id}
+    end
+
+    def Creatures.all()
+        AtlasDatabase.find_creature_all()
+    end
+
+    def Creatures.delete(creatureid)
+        AtlasDatabase.delete_creature(creatureid)
+    end
+
+    def Creatures.find_by_id(id)
+        AtlasDatabase.find_creature_by_id(id)
+    end
+
+    def Creatures.find_by_level(min = 1, max = nil)
+        AtlasDatabase.find_creature_by_level(min, max)
+    end
+
+    def Creatures.find_by_name(name, exact = false)
+        AtlasDatabase.find_creature_by_name(name, exact)
+    end
+
+    def Creatures.find_by_skin(skin)
+        AtlasDatabase.find_creature_by_skin(skin)
+    end
+
+    def Creatures.init_db
+        AtlasDatabase.init_db
+    end
+
+    def Creatures.insert(creature)
+        AtlasDatabase.insert_creature(creature)
+    end
+end
