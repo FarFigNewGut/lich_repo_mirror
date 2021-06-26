@@ -3,7 +3,7 @@
 # another option would be to just ignore them since they are on the EO repo
 # but in the spirit of being a mirror...
 echo "Adding temp remote and checking out EOL scripts dir..."
-git remote add eo git@github.com:elanthia-online/scripts.git
+git remote add eo https://github.com/elanthia-online/scripts.git
 git fetch eo
 git checkout eo/master -- scripts/
 mv -v scripts/* lib/
