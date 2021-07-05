@@ -1,0 +1,542 @@
+=begin
+
+	NesStats by Nesmeor
+
+  Will display stats for exp and lifetime bounty points. Shows stats from previous days at launch.
+  Can be set to brief (default) or verbose.
+
+  If you have issues find me on GSIV Discord.
+
+  Thanks to Ondreian, Tysong, Doug, and Athias for the coding help
+  (and all of the rest of the beautiful people in #scripting!)
+
+  Thanks to Volkinar, Eliseen, Porom, and Uchiwa for initial testing and feedback!
+
+	 author: Nesmeor
+	   name: NesStats
+	   tags: exp,stats
+	version: 0.0.3
+  updated: 7/4/2021
+
+  Changelog
+  0.0.3 - fixed last_stat issues
+  0.0.2 - fixed race conditions for stat scraping, display issues
+  0.0.1 - initial release
+
+=end
+
+begin
+  raise "utils is missing" unless Script.exists? "utils.lic"
+  load 'scripts/utils.lic'
+rescue => error
+  echo error.message
+  echo "Downloading utils from the repo!"
+  do_client(";repository download utils.lic")
+  wait_while {running?('repository')}
+  retry if Script.exists? "utils.lic"
+  echo "Some how a core script is missing.  Don't know what happened."
+  exit
+end
+
+$stats_script_name = script.name
+CharSettings['debug'] = false if CharSettings['debug'].nil?
+CharSettings['stat_data'] = {} if CharSettings['stat_data'].nil?
+CharSettings['latest_stat'] = {'xp' => nil, 'bounty' => nil} if CharSettings['latest_stat'].nil?
+CharSettings['sampling_interval'] = 30 # WARNING: changing this will clear all sample data!
+CharSettings['previous_sampling_interval'] = 30 if CharSettings['previous_sampling_interval'].nil?
+CharSettings['display_interval'] = 60 if CharSettings['display_interval'].nil?
+CharSettings['display'] = {'loop' => true, 'xp' => true, 'bounty' => true, 'best' => true, 'daily' => true, 'brief' => true} if CharSettings['display'].nil?
+CharSettings['today_start'] = {} if CharSettings['today_start'].nil?
+CharSettings['yesterday_avg'] = {} if CharSettings['yesterday_avg'].nil?
+CharSettings['yesterday_total'] = {}  if CharSettings['yesterday_total'].nil?
+CharSettings['best_day'] = {}  if CharSettings['best_day'].nil?
+CharSettings['best_hr'] = {}  if CharSettings['best_hr'].nil?
+CharSettings['last_date_updated'] = Date.today if CharSettings['last_date_updated'].nil?
+CharSettings['first_run'] = true if CharSettings['first_run'].nil?
+CharSettings['daily_avg'] = {} if CharSettings['daily_avg'].nil?
+CharSettings['daily_totals'] = {} if CharSettings['daily_totals'].nil?
+# TODO: Require full utils file
+class NesStats
+  ONE_HOUR= 3600
+  TEN_SECONDS = 10
+  STATS = ['xp', 'bounty']
+  @@sampling_interval = CharSettings['sampling_interval']
+  @@display = CharSettings['display']
+  @@best_hr = CharSettings['best_hr']
+  @@best_day = CharSettings['best_day']
+  @@today_start = CharSettings['today_start']
+  @@yesterday_avg = CharSettings['yesterday_avg']
+  @@yesterday_total = CharSettings['yesterday_total']
+  @@current_exp = CharSettings['latest_stat']['xp']
+  @@current_bounty_points = CharSettings['latest_stat']['bounty']
+
+  def initialize
+    if CharSettings['previous_sampling_interval'] != CharSettings['sampling_interval'] 
+      Utils.msg("Sampling interval has changed! You have 30 seconds to kill this script before all stat data is wiped", "warn")
+      pause 30
+      CharSettings['stat_data'] = {}
+      Utils.msg("Stats wiped!", "warn")
+      CharSettings['previous_sampling_interval'] = CharSettings['sampling_interval'] 
+    end
+
+    if CharSettings['first_run']
+      first_run
+    elsif CharSettings['last_date_updated'] < Date.today
+      # TODO handle this regularly / in real time
+      daily_refresh
+      self.class.display_dailies
+    end
+    @last_stat_value = {}
+  end
+
+  def daily_refresh
+    Utils.msg("Updating daily stats","info")
+    yesterday = Time.parse((Date.today - 1).to_s)
+    today = Time.parse(Date.today.to_s)
+    
+    STATS.each do | stat |
+      CharSettings['stat_data'][stat].each do | key, value |
+        if key < yesterday
+          CharSettings['stat_data'][stat].delete(key)
+        end
+      end
+
+      sum, count = self.class.get_sum_and_count(stat, today, "before")
+      
+      if count == 0
+        Utils.msg("count equals zero","debug")
+        CharSettings['yesterday_avg'][stat] = 0
+        CharSettings['yesterday_total'][stat] = 0
+      else
+        Utils.msg("count greater than zero","debug")
+        estimated_avg = self.class.estimated_hourly(sum,count)
+
+        CharSettings['yesterday_avg'][stat] = estimated_avg
+        CharSettings['daily_avg'][stat][yesterday] = estimated_avg
+
+        if estimated_avg > CharSettings['best_hr'][stat]['value']
+          CharSettings['best_hr'][stat]['date'] = Date.today
+          CharSettings['best_hr'][stat]['value'] = estimated_avg
+          Utils.msg("New best #{stat} record set yesterday! #{estimated_avg}/hr!", "info")
+        end
+        
+        CharSettings['yesterday_total'][stat] = sum
+        CharSettings['daily_totals'][stat][yesterday] = sum
+        
+        if sum > CharSettings['best_day'][stat]['value']
+          CharSettings['best_day'][stat]['date'] = Date.today
+          CharSettings['best_day'][stat]['value'] = sum
+          Utils.msg("New daily #{stat} record set yesterday: #{sum}!", "info")          
+        end
+      end
+      
+      if stat == 'xp'
+        CharSettings['today_start'][stat] = self.class.get_exp
+      elsif stat == 'bounty'
+        CharSettings['today_start'][stat] = self.class.get_bounty_points
+      end
+      Utils.msg("CharSettings['today_start'][#{stat}]: #{CharSettings['today_start'][stat]}","debug")
+    end
+    CharSettings['last_date_updated'] = Date.today
+  end
+
+  def first_run
+    today = Time.parse(Date.today.to_s)
+
+    STATS.each do | stat |
+      if stat == 'xp'
+        CharSettings['today_start'][stat] = get_exp
+        Utils.msg("#{stat} today_start: #{get_exp}","debug")
+      elsif stat == 'bounty'
+        CharSettings['today_start'][stat] = get_bounty_points
+        Utils.msg("#{stat} today_start: #{get_bounty_points}","debug")
+      end
+      # TODO: Remove if nothing fails in next test: CharSettings['stat_data'][stat] = {}
+      CharSettings['yesterday_avg'][stat] = 0
+      CharSettings['yesterday_total'][stat] = 0
+      CharSettings['best_hr'][stat] = {}
+      CharSettings['best_hr'][stat]['date'] = Date.today
+      CharSettings['best_hr'][stat]['value'] = 0
+      CharSettings['best_day'][stat] = {}
+      CharSettings['best_day'][stat]['date'] = Date.today
+      CharSettings['best_day'][stat]['value'] = 0
+      CharSettings['daily_avg'][stat] = {}
+      CharSettings['daily_totals'][stat] = {}
+    end
+    CharSettings['last_date_updated'] = Date.today
+    CharSettings['first_run'] = false
+  end
+  
+  def add_moving_data_points
+    current_stat = nil
+    STATS.each do | stat |
+      if stat == 'xp'
+        current_stat = self.class.get_exp
+      elsif stat == 'bounty'
+        current_stat = self.class.get_bounty_points
+      end
+      add_moving_data_point(stat,current_stat)
+    end
+  end
+
+  def add_moving_data_point(type,current_stat)
+    Utils.msg("type: #{type} current_state: #{current_stat}","debug")
+    if @last_stat_value[type].nil?
+      @last_stat_value[type] = current_stat
+    end
+    Utils.msg("@last_stat_value[type]: #{@last_stat_value[type]}","debug")
+    stat_gained = current_stat - @last_stat_value[type]
+    Utils.msg("stat_gained: #{stat_gained}","debug")
+    self.class.add_data_point(type,stat_gained)
+    @last_stat_value[type] = current_stat
+  end
+
+  def self.display_stats
+    today = Time.parse(Date.today.to_s)
+    one_hour_ago = Time.now - ONE_HOUR
+    Utils.msg("CharSettings['today_start']: #{CharSettings['today_start']} @@today_start: #{@@today_start}","debug")
+    STATS.each do | stat |
+      if @@display[stat]
+        if stat == 'xp'
+          Utils.msg("#{stat} current_exp: #{@@current_exp} today_start: #{@@today_start[stat]}","debug") 
+          current_exp = @@current_exp
+          today_total = current_exp - @@today_start[stat]
+        elsif stat == 'bounty'
+          Utils.msg("#{stat} current_bounty_points: #{@@current_bounty_points} today_start: #{@@today_start[stat]}","debug")
+          current_bounty_points = @@current_bounty_points
+          today_total = current_bounty_points - @@today_start[stat]
+        end
+        Utils.msg("#{stat} today_total: #{today_total}","debug")
+        if today_total.nil?
+          today_total = 0
+        end
+        name = get_proper_name(stat)        
+        today_avg = avg_per_hour(stat,today)
+        hour_avg = avg_per_hour(stat,one_hour_ago)
+        if @@display['brief']
+          Utils.msg("#{name.to_s.rjust(15)} Last hour's avg/hr: #{hour_avg.to_s.rjust(6)}   Today's avg/hr: #{today_avg.to_s.rjust(6)}   Today's total: #{today_total.to_s.rjust(6)}","info")
+        else
+          output = "\n"
+          output.concat "     -------------------------------  #{name} Statistics  -------------------------------\n"
+          output.concat "Last hour's avg/hr: ".rjust(24) + hour_avg.to_s.rjust(6) + "Today's avg/hr: ".rjust(24) + today_avg.to_s.rjust(6) + "Yesterday's avg/hr: ".rjust(24) + @@yesterday_avg[stat].to_s.rjust(6) + "\n"
+          output.concat "Today's total: ".rjust(24) + today_total.to_s.rjust(6) + "Yesterday's total: ".rjust(24) + @@yesterday_total[stat].to_s.rjust(6) + "\n"
+          if @@display['best']
+            output.concat  "Best avg/hr: ".rjust(24) + @@best_hr[stat]['value'].to_s.rjust(6) + "Best total/day: ".rjust(24) + @@best_day[stat]['value'].to_s.rjust(6) + "\n"
+          end
+          respond output
+        end
+      end
+    end
+    respond "\n"
+  end
+
+  def self.display_sum_today(stat_name)
+    today_sum = get_sum_today
+    Utils.msg("Sum of #{stat_name} today: #{today_sum}","info")
+  end
+
+  def self.get_sum_today(stat_name)
+    today = Time.parse(Date.today.to_s)
+    today_sum, count = get_sum_and_count(stat_name,today,"after")
+    return today_sum
+  end
+
+  def self.display_sum_last_hour(stat_name)
+    hour_sum = get_sum_last_hour(stat_name)    
+    Utils.msg("Sum of #{stat_name} during the previous hour: #{hour_sum}","info")
+  end
+
+  def self.get_sum_last_hour(stat_name)
+    this_hour = Time.parse(Time.now.strftime("%F %H:00:00 %z"))
+    last_hour = Time.parse((Time.now - ONE_HOUR).strftime("%F %H:00:00 %z"))
+    hour_sum, count = get_sum_and_count(stat_name,last_hour,"between",this_hour)
+    return hour_sum
+  end
+
+  def self.get_sum_and_count(stat_name,period,operation,later_period=nil)
+    sum = 0
+    count = 0
+
+    if operation == "after"
+      CharSettings['stat_data'][stat_name].each do | key, value |
+        if key > period
+          sum += value
+          count += 1
+        end
+      end
+    elsif operation == "before"
+      CharSettings['stat_data'][stat_name].each do | key, value |
+        if key < period
+          sum += value
+          count += 1
+        end
+      end
+    elsif operation == "between"
+      CharSettings['stat_data'][stat_name].each do | key, value |
+        if key > period and key < later_period
+          sum += value
+          count += 1
+        end
+      end
+    else
+      Utils.msg("Operation not recognized: #{operation}","error")
+    end
+
+    sum_and_count = [sum, count]
+    return sum_and_count
+  end
+
+  def self.estimated_hourly(sum, count)
+    if count == 0
+      Utils.msg("Stats estimated_hourly count == 0","debug")
+      return 0
+    else
+      average = sum / count
+      intervals_in_hr = ONE_HOUR / @@sampling_interval
+      estimated_hourly = average * intervals_in_hr
+      Utils.msg("Stats estimated_hourly: #{estimated_hourly}","debug")
+      return estimated_hourly
+    end
+  end
+  
+  def self.avg_per_hour(type,period)
+    Utils.msg("type: #{type} period: #{period}","debug")
+    sum, count = get_sum_and_count(type,period,"after")
+    Utils.msg("sum: #{sum} count: #{count}","debug")
+    return estimated_hourly(sum,count)
+  end
+
+  def self.get_bounty_points
+    loop do
+      result = get_bounty_point_output
+      unless result.nil?
+        CharSettings['latest_stat']['bounty'] = result
+        Utils.msg("latest_stat: #{CharSettings['latest_stat']}", "debug")
+        Utils.msg("result: #{result}","debug")
+        return result
+      end
+      pause 1
+    end
+  end
+
+  def self.get_bounty_point_output
+    timeout = Time.now + TEN_SECONDS
+    lifetime_bounty = nil
+    time_to_next_bounty = nil
+    done = false
+    started = false
+    action = proc { |server_string|
+      if server_string =~ /accumulated a total of ((\d+|\d{1,3}(,\d{3})*)(.\d+)?) lifetime bounty points/ 
+        lifetime_bounty = $1.gsub(',','').to_i
+        done = true
+        nil
+      elsif server_string =~ /You are not currently assigned a task\.  You will be eligible for new task assignment in about (\d+) minutes\./
+        time_to_next_bounty = $1
+        nil
+      elsif server_string =~ /You are not currently assigned a task\.  You will be eligible for new task assignment in about a minute\./
+        time_to_next_bounty = 1
+        nil
+      elsif server_string =~ /You are not currently assigned a task\.  You are eligible for new task assignment\./
+        time_to_next_bounty=0
+        nil
+      elsif server_string =~ /You have succeeded|information is as follows|unspent bounty|expedited task|tasked|currently exempt from|prompt time|taskmaster told you|output class|^$|^\s+$|^\n$/
+        started = true
+        nil
+      elsif server_string =~ /[A-Za-z\d]+/
+        server_string
+      else
+        nil
+      end
+    }
+    
+    # TODO: Benchmark this
+    Utils.msg("get bounty point hook starting", "debug")
+    DownstreamHook.add('get_bounty_points', action)
+    before_dying { DownstreamHook.remove('get_bounty_points') }
+    $_SERVER_.puts 'bounty'
+    wait_until { (started and done) }#or Time.now > timeout }
+    DownstreamHook.remove('get_bounty_points')
+    Utils.msg("get bounty point hook removed", "debug")
+    undo_before_dying
+    if lifetime_bounty.nil?
+      return nil
+      Utils.msg("No bounty points detected!", "error")
+    else
+      return lifetime_bounty.to_i
+    end
+  end
+
+  def self.get_exp_output
+    timeout = Time.now + TEN_SECONDS
+    data = {}
+    done = false
+    started = false
+    action = proc { |server_string|
+      if server_string =~ /^\s+Level: ([0-9]+)\s+Fame: [0-9,]+\s*$/
+        level = $1
+        data['level'] = string_to_number(level)
+        nil
+      elsif server_string =~ /Your recent adventures echo powerfully in your mind\.|You feel the eyes of Lumnis upon you\.|find that you are able to reflect/
+        data['lumnis'] = true
+        nil
+      elsif server_string =~ /^\s+Long-Term Exp: [0-9,]+\s+Deeds: ([0-9,]+)\s*$/
+        deeds = $1
+        data['deeds'] = string_to_number(deeds)
+        nil
+      elsif server_string =~ /^\s+Total Exp: ([0-9,]+)\s+Death's Sting: \w+\s*$/
+        started = true
+        total_exp = $1
+        data['total_exp'] = string_to_number(total_exp)
+        nil
+      elsif server_string =~ /^<prompt time="\d+">/
+        done = true
+        nil
+       elsif server_string =~ /Exp until lvl: ([0-9,]+)/
+        exp_to_next = $1
+        data['exp_to_next'] = string_to_number(exp_to_next)
+        nil
+      else
+        nil
+      end
+    }
+    # TODO: Benchmark this
+    Utils.msg("get exp hook starting", "debug")
+    DownstreamHook.add('get_exp_output', action)
+    before_dying { DownstreamHook.remove('get_bounty_points') }
+    $_SERVER_.puts 'experience'
+    wait_until { (started and done) }#or Time.now > timeout }
+    DownstreamHook.remove('get_exp_output')
+    Utils.msg("get exp hook removed", "debug")
+    undo_before_dying
+  
+    if data['lumnis'] == nil
+      data['lumnis'] = false
+    end
+  
+    return data
+  end
+
+  def self.get_exp
+    loop do
+      data = get_exp_output
+      Utils.msg("total_exp: #{data['total_exp']}","debug")
+      unless data['total_exp'].nil?
+        CharSettings['latest_stat']['xp']= data['total_exp']
+        Utils.msg("latest_stat: #{CharSettings['latest_stat']}", "debug")
+        return data['total_exp']
+      end
+      pause 1
+    end
+  end
+  
+  def self.string_to_number(string)
+    number = string.gsub(/[\s,]/ ,"").to_i
+    return number
+  end
+
+  def self.display_dailies
+    respond "\n"
+    display_daily_totals
+    display_daily_averages
+  end
+
+  def self.display_daily_totals
+    STATS.each do | stat |
+      name = get_proper_name(stat)
+      Utils.msg("-- #{name} Daily Totals --", "info")
+      CharSettings['daily_totals'][stat].each do | key, value |
+        Utils.msg("Date: #{key} Total: #{value}", "info")
+      end
+      respond "\n"
+    end      
+  end
+
+  def self.display_daily_averages
+    STATS.each do | stat |
+      name = get_proper_name(stat)
+      Utils.msg("-- #{name} Daily Averages --", "info")
+      CharSettings['daily_avg'][stat].each do | key, value |
+        Utils.msg("  Date: #{key} Avg: #{value}", "info")
+      end
+      respond "\n"
+    end      
+  end
+
+  def self.add_data_point(stat_name,data)
+    if CharSettings['stat_data'][stat_name].nil?
+      CharSettings['stat_data'][stat_name] = {}
+    end
+    CharSettings['stat_data'][stat_name][Time.now] = data
+  end
+
+  def self.get_proper_name(stat)
+    if stat == 'xp'
+      return 'Experience'
+    elsif stat == 'bounty'
+      return 'Bounty Points'
+    end
+  end
+end
+
+module StatsRunner
+  def self.main
+    if CharSettings['display']['loop']
+      Thread.new do
+        Utils.msg("#{$stats_script_name} sampling thread starting!", "debug")
+        display_interval = CharSettings['display_interval']
+        while (running?($stats_script_name))
+          NesStats.display_stats
+          pause display_interval  
+        end
+        Utils.msg("#{$stats_script_name} sampling thread exiting!", "debug")
+      end
+    end
+
+    loop do
+      stats = NesStats.new
+      sampling_interval = CharSettings['sampling_interval']
+      stats.add_moving_data_points
+      pause sampling_interval
+    end
+  end
+end
+
+module Utils
+  def self.toggle_display_setting(setting)
+    if CharSettings['display'][setting]
+      CharSettings['display'][setting] = false
+      Utils.msg("#{setting} disabled","info")
+    else
+      CharSettings['display'][setting] = true
+      Utils.msg("#{setting} enabled","info")
+    end
+  end
+end
+
+if script.vars[1].nil?
+  StatsRunner.main
+else
+  vars = script.vars[0]
+  if vars =~ /(debug|brief|exp|bounty|best|interval|show|help|daily|loop)\s*(\d+)?/
+    command = $1
+    seconds = $2
+    if command == ""
+      Utils.msg("Command not recognized!", "error")
+    elsif command == "interval"
+      Utils.change_setting(CharSettings['display_interval'],seconds)
+      Utils.msg("Display interval changed to #{seconds}", "info")
+    elsif command == "help"
+      Utils.show_help
+    elsif command == "show"
+      Utils.show_current_settings
+    elsif command == "debug"
+      Utils.toggle_setting("debug")
+    elsif command == "daily"
+      NesStats.display_dailies
+    else
+      Utils.toggle_display_setting(command)
+    end
+  else
+    Utils.msg("Command not recognized. ;#{script.name} help for assistance", "error")
+  end
+end
