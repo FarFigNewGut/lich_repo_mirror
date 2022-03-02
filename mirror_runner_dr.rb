@@ -4,7 +4,7 @@ WORKSPACE = ENV['GITHUB_WORKSPACE']
 LICH_DIR = WORKSPACE + '/Lich'
 BACKUPLIB = ENV['GITHUB_WORKSPACE'] + '/lib'
 
-SEED_SCRIPTS = ['repo_mirror', 'mirror_keeper']
+SEED_SCRIPTS = ['repo_mirror', 'mirror_keeper', 'dr_repo_mirror']
 
 
 SEED_SCRIPTS.each { |script|
