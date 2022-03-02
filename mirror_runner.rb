@@ -58,4 +58,5 @@ char_strings.each { |cs|
 	puts "char: #{cs[0]}"
 	make_entry_for_char.call(cs[0], cs[1], cs[2])
 	system("ruby #{LICH_DIR}/lich.rb --login #{cs[0]} --gemstone --without-frontend --detachable-client=8787 --start-scripts=mirror_keeper,repo_mirror")
+	system("ruby #{LICH_DIR}/lich.rb --login #{cs[0]} --gemstone --without-frontend --detachable-client=8787 --start-scripts=mirror_keeper,dr_repo_mirror")
 }
