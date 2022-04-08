@@ -2,6 +2,8 @@ require 'fileutils'
 
 WORKSPACE = ENV['GITHUB_WORKSPACE']
 LICH_DIR = WORKSPACE + '/Lich'
+DATA_DIR = LICH_DIR + '/data'
+GAME = "GSIV"
 BACKUPLIB = ENV['GITHUB_WORKSPACE'] + '/lib'
 
 SEED_SCRIPTS = ['repo_mirror', 'mirror_keeper', 'dr_repo_mirror']
@@ -59,3 +61,9 @@ char_strings.each { |cs|
 	make_entry_for_char.call(cs[0], cs[1], cs[2])
 	system("ruby #{LICH_DIR}/lich.rb --login #{cs[0]} --gemstone --without-frontend --detachable-client=8787 --start-scripts=mirror_keeper,repo_mirror")
 }
+
+file_list = Dir.entries("#{DATA_DIR}/#{GAME}").find_all { |filename|
+  filename =~ /^map\-[0-9]+\.json$/i }.collect { |filename|
+  "#{DATA_DIR}/#{GAME}/#{filename}" }.sort.reverse
+map_file = file_list.shift
+FileUtils.cp(map_file, WORKSPACE + "gs_map/gs_map.json")
