@@ -66,4 +66,4 @@ file_list = Dir.entries("#{DATA_DIR}/#{GAME}").find_all { |filename|
   filename =~ /^map\-[0-9]+\.json$/i }.collect { |filename|
   "#{DATA_DIR}/#{GAME}/#{filename}" }.sort.reverse
 map_file = file_list.shift
-FileUtils.cp(map_file, WORKSPACE + "gs_map/gs_map.json")
+FileUtils.cp(map_file, WORKSPACE + "/gs_map/gs_map.json")
