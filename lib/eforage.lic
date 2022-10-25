@@ -1,0 +1,215 @@
+=begin
+  *** THIS IS AN ALPHA RELEASE LOTS OF SHIT DOESN'T WORK STILL ***
+
+  ;eforage --quantity=<int> --herb="<herb>" [--area=""]
+  ;eforage --bounty
+  ;eforage --load
+  
+  1. will cast Sanctuary, Foraging, Haste, Presence if known
+  2. if your skill in S&Hing is over 50, it will automagically hide you as well
+  3. Avoids voids in the Rift
+  4. automagically uncursed Rift herbs if 315 is known
+
+  author: Ondreian
+  tags: foraging, herbs
+  version: 0.0.1-rc.0
+    
+=end
+
+
+module Eforage
+  # cache these things so they don't need to be looked up everytime
+  Sanctuary              = Spell[213]
+  Uncurse                = Spell[315]
+  Haste                  = Spell[506]
+  Forage                 = Spell[603]
+  Presence               = Spell[402]
+  Sigil_Of_Resolve       = Spell['Sigil Of Resolve']
+  # state of casting sanctuary
+  @should_cast_sanct = false
+  
+  module Outcomes
+    module Forage
+      WrongTime = /As you carefully forage around you can find no hint of what you are looking for right now, though you are fairly certain this is where it can be found/
+      BadData   = /no trace of what you are looking for/
+      Ok        = /You forage briefly and manage to find/
+      RightHand = /In order to forage, you must be able to use at least one of your hands/
+      Tapped    = /you notice that someone has been foraging here recently and you are unable to find anything useful/
+      Err       = Regexp.union(
+          %r`You forage around but find nothing of interest`,
+          %r`You stumble about in a fruitless attempt at foraging`,
+          %r`You begin to forage around when your hand comes into contact with something that stabs you in the finger`)
+      All       = Regexp.union(
+        WrongTime,
+        BadData,
+        Ok,
+        Tapped,
+        Err,
+      )
+    end
+  end
+
+  def self.injured?
+    raise Exception, "You're too injured to do this safely" if Wounds.head > 1 || Wounds.rightArm > 1 || Wounds.rightHand > 1 || Wounds.nerves > 1 
+  end
+
+  def self.sanct()
+    return unless @should_cast_sanct
+    raise Exception, "You should be able to cast sanctuary but can't" if sanctuary.known? && !sanctuary.affordable?
+    if sanctuary.known?
+      respond "casting sanctuary..."
+      @should_cast_sanct = false
+      sanctuary.cast
+    end
+  end
+
+  def self.hide()
+    dothistimeout "hide", 4, /You attempt to blend with the surroundings/ if Skills.stalkingandhiding > 50 && !hidden?
+  end
+
+  def self.unhide()
+    fput "unhide" if hidden?
+  end
+
+  def self.cast(spell)
+    spell.cast if spell.known? && spell.affordable? && !spell.active?
+  end
+
+  def self.msg(m)
+    _respond "<b>%s</b>" % m
+  end
+
+  def self.near_void?
+    return :void unless GameObj[/void/].nil?
+    checkpaths.each { |dir| 
+      result = dothistimeout "peer #{dir}", 3, /You peer (.*?) and see/
+      return :err unless result
+      while line=get
+        break        if line=~ /Obvious paths|Obvious exits/
+        return :void if line=~ /\svoid/
+      end
+    }
+    return nil
+  end
+
+  def self.insert_sanctuary_watcher()
+    self.msg "watching for sanctuaries to fall for refreshing"
+    DownstreamHook.add('sailormoon-sanctuary-watcher', -> srv_ln {
+      @should_cast_sanct = true if srv_ln =~ /The sense of peace and security passes away from the area/
+      srv_ln
+    })
+    before_dying { DownstreamHook.remove('sailormoon-sanctuary-watcher') }
+  end
+
+  def self.stash
+    self.msg "stashing #{GameObj.right_hand.full_name}"
+    
+    if GameObj.right_hand.full_name =~ /flesh/
+      wait_until { Spell[315].affordable? } unless Spell[315].affordable? 
+      multifput "prep 315", "cast ##{GameObj.right_hand.id}"
+    end
+    # todo: no Olib
+    Containers.lootsack.add(Char.right)
+  end
+
+  def self.forage(herb)
+    herb = self.forageable_herb(herb)
+    case result = dothistimeout("forage %s" % herb, 10, Outcomes::Forage::All)
+    when Outcomes::Forage::BadData then return :bad_data
+    when Outcomes::Forage::WrongTime then return :wrong_time
+    when Outcomes::Forage::Tapped then return :tapped
+    when Outcomes::Forage::Err then return :retry
+    when Outcomes::Forage::Ok  then return :stash
+    else fail "unknown outcome"; end
+  end
+
+  def self.argv_herb
+    argv = Script.current.vars[0].downcase
+    return Bounty.herb if argv.eql?("bounty") || argv.nil?
+    return argv.split("\s")[0..-2].join("\s")
+  end
+
+  def self.forageable_herb(herb)
+    return "mawflower" if herb =~ /twisted black mawflower/
+    return herb
+  end
+
+  def self.argv_quantity
+    argv = Script.current.vars[0].downcase
+    return Bounty.number if argv.eql?("bounty") || argv.nil?
+    q = argv.split("\s").last
+    fail "last argv must be an integer" unless q =~ /\d+/
+    return q.to_i
+  end
+
+  def self.get_next_room(rooms)
+    nearest = Room.current.find_nearest(rooms)
+    rooms.delete(nearest)
+    return nearest
+  end
+
+  def self.pp_room(id)
+    dest = Room[id]
+    self.msg "\n#{dest.title[-1]} ... [#{dest.location}: Room ##{dest.id}] \n#{dest.description[-1]}\n#{dest.paths[-1]}\n"
+  end
+
+  def self.go2(id)
+    fput "unhide" if hidden?
+    Script.run("go2", "%s" % id) unless Room.current.id.eql?(id)
+    raise Exception, "could not travel to room %s" % id unless Room.current.id.eql?(id)
+  end
+
+  def self.found(herb)
+    # todo: no Olib
+    Containers.lootsack.select {|item| item.name.end_with?(herb)}.size
+  end
+
+  def self.wrong_rift_env?(herb)
+    herb.end_with?("slime") && Room.current.outside?
+  end
+
+  def self.main()
+    # todo: no Olib
+    return self.task(herb: Bounty.herb, quantity: Bounty.number, area: Bounty.area) if Opts.bounty
+    self.task(herb: Opts.herb, quantity: Opts.quantity.to_i, area: Opts.area)
+  end
+
+  def self.task(herb:, quantity:, area: nil)
+    rooms  = Room.current.find_all_nearest_by_tag(herb)
+    rooms.select! {|id| Room[id].location.eql?(area)} unless area.nil?
+    origin = Room.current.id
+
+    self.msg "task: {rooms=%s, herb=%s, quantity=%s, area=%s}" % [rooms.size, herb, quantity, area]
+    
+    fail "Could not find rooms for the herb: #{herb}" if rooms.empty? || rooms.nil?
+    fail "You do not know Uncurse (315) but are attempting to forage a cursed herb\nThis will not proceed for safety reasons" if herb =~ /flesh/ && !Spell[315].known?
+    
+    loop {
+      self.msg "{task.remaining=%s}" % [quantity - self.found(herb)]
+      break if rooms.empty? || self.found(herb) >= quantity
+      self.msg "{rooms.remaining=%s}" % [rooms.size]
+      id = self.get_next_room(rooms)
+      self.go2(id)
+      next if Room.current.location =~ /rift/i && (self.wrong_rift_env?(herb) || self.near_void?)
+      self.hide
+      loop {
+        outcome = self.forage(herb)
+        self.msg "{forage.outcome=%s}" % [outcome]
+        raise Exception, "this herb cannot be found right now" if outcome.eql?(:wrong_time)
+        break unless %i(retry stash).include?(outcome)
+        waitrt?
+        self.stash unless Char.right.nil?
+        break if self.found(herb) >= quantity
+        sleep 0.1
+      }
+      
+      sleep 0.1
+    }
+
+    self.go2 origin
+    
+  end
+
+  exit if Script.current.vars.include?("--load")
+  self.main()
+end
