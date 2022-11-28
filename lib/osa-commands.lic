@@ -1,0 +1,838 @@
+=begin
+    Reduces OSA tedium by adding a helpers for multistep actions.
+
+    ;osa-commands
+
+    author: Jymamon (gs4-jymamon@hotmail.com)
+       game: Gemstone
+       tags: osa
+    version: 2022.11.24.01
+
+    history:
+        2022.11.24.01 - Update ;sail for room ids, tags, locations. Not afk friendly, but
+                        will get you there most of the time.
+        2022.11.21.01 - Better ;repair when able to assess all rooms.
+        2022.11.20.01 - New command: ;anchor - raises the sails and drops the anchor
+        2022.11.16.02 - New command: ;patch - repairs just the current room
+        2022.11.16.01 - New command: ;fire - fires a single cannon, loading it if needed
+        2022.11.15.02 - New command: ;volley - fires all the loaded cannons
+        2022.11.15.01 - Initial version. New commands: ;launch, ;load, ;repair, ;sail
+=end
+=begin
+    To do:
+    - boarding action - sails towards a ship, keeps damage below 75%(?), fires
+        cannons if not repairing, deploys the gangplank and boards when the
+        enemy ship is near enough
+    - add ';stop' to stop running the current command. Currently, commands
+        cannot be interrupted other than by killing the whole script.
+    - add exit command instead of relying on ';k osa'?
+=end
+
+toggle_upstream
+$osa_cmd_queue = Queue.new
+commands = Array.new
+
+# ------------------------------------------------------------------------------------------------------------
+# General routines
+# ------------------------------------------------------------------------------------------------------------
+
+# Registers a new command for use while OSA is running.
+#   parameters:
+#   - the string to register as the command
+#   - the action to call when the string is entered
+#   Note: If the action is a lambda, it must take a single parameter
+#         which is everything from the command line after the initial
+#         command word.
+add_command = lambda {|command, command_proc, help_text|
+    hookname = "#{script.name}_#{command}_cmd"
+    respond "Adding command #{$clean_lich_char}#{command}"
+
+    hook_proc = proc {|client_string|
+        if client_string =~ /^(?:<c>)?#{$clean_lich_char}(?:#{command})\s+(.*)/i
+            params = $1.to_s
+            $osa_cmd_queue << [command, command_proc, params]
+            nil
+        else
+            client_string
+        end
+    }
+
+    before_dying {
+        UpstreamHook.remove(hookname)
+    }
+
+    UpstreamHook.add(hookname, hook_proc)
+
+    commands << [command, help_text]
+}
+
+# Gets information for the current ship or nil if not on a ship.
+#   parameters:
+#   - none
+get_ship = lambda {
+    # So far, I only have a sloop to mess with, so I'm guessing the correct
+    # rooms on the others. Some are obvious, others seem seem right
+    # based on the narost maps but the actual descriptions leave me wondering.
+    ship = {
+        'Sloop' => {
+            :type => 'sloop',
+            :cannons => 29038,
+            :capstan => 29041,
+            :crowsnest => 29040,
+            :gangplank => 29038,
+            :map => 29042,
+            :node => 29042,
+            :sails => [29038],
+            :supplies => 29039,
+            :wheel => 29041
+        },
+    }
+    ships_needed = {
+        'Brigantine' => {
+            :type => 'brigantine',
+            :cannons => 30144,
+            :capstan => 30141,
+            :crowsnest => 30143,
+            :gangplank => 30142,
+            :map => 30140,
+            :node => 30140,
+            :sails => [30142],
+            :supplies => 30145,
+            :wheel => 30141
+        },
+        'Carrack' => {
+            :type => 'carrack',
+            :cannons => 30144,
+            :capstan => 30141,
+            :crowsnest => 30143,
+            :gangplank => 30142,
+            :map => 30140,
+            :node => 30140,
+            :sails => [30142],
+            :supplies => 30145,
+            :wheel => 30141
+        },
+        'Galleon' => {
+            :type => 'galleon',
+            :cannons => 30144,
+            :capstan => 30141,
+            :crowsnest => 30143,
+            :gangplank => 30142,
+            :map => 30140,
+            :node => 30140,
+            :sails => [30142],
+            :supplies => 30145,
+            :wheel => 30141
+        },
+        'Frigate' => {
+            :type => 'frigate',
+            :cannons => 30144,
+            :capstan => 30141,
+            :crowsnest => 30143,
+            :gangplank => 30142,
+            :map => 30140,
+            :node => 30140,
+            :sails => [30142],
+            :supplies => 30145,
+            :wheel => 30141
+        }
+    }
+
+    ship.keys.each{|type|
+        ship[type][:rooms] = ship[type]
+            .select{|k, v| k!=:type}
+            .values
+            .flatten
+            .uniq
+    }
+
+    Room.current.title[0] =~ /^\[(#{ship.keys.join('|')}),/
+
+    if $1 != "" && !$1.nil?
+        ship[$1]
+    else
+        nil
+    end
+}
+
+# Runs ;go2 to move to a specified room
+#   parameters:
+#   - the room to move to
+#   - any additional parameters to pass to ;go2
+go = lambda {|room, parameters=nil|
+    script_parameters = ["_disable_confirm_"]
+
+    if (!parameters.nil?)
+        if parameters.class==String
+            script_parameters.push(parameters)
+        elsif parameters.class==Array
+            script_parameters.concat(parameters)
+        else
+            Message.bold "Ignoring parameters I don't know how to handle: #{parameters}!"
+        end
+    end
+
+    if ( Room.current.id != room )
+        script_parameters.push(room)
+        start_script "go2", script_parameters
+        wait_while{running? "go2"}
+    end
+}
+
+# Runs ;go2 to move to a specified room, performs an action,
+# then returns to the initial room.
+#   parameters:
+#   - the room to move to
+#   - the action to perform there
+go_do_this = Proc.new {|room, action, parameters|
+    returnto = Room.current.id
+    go.call(room);
+    action.call(parameters);
+    go.call(returnto);
+}
+
+# Displays a message to the client. The message will be in bold if the client
+# supports that.
+#   parameters:
+#   - The message to display
+message_bold = lambda{|text|
+    stringArray  = Array.new
+    stringArray  = (text.gsub(/[\n]+/, "o=\_=zz")).split(/o=\_=zz/)
+    begin_text   = "<pushBold\/>"
+    end_text     = "<popBold\/>"
+
+    if $fake_stormfront
+        begin_text = "\034GSL\r\n "
+        end_text   = "\034GSM\r\n "
+    end
+
+    stringArray.each { |line|
+        puts "#{begin_text}#{line.gsub('\n','')}#{end_text}"
+    }
+}
+
+# Force a message to be monospaced in Stormfront. Just outputs the message
+# in Wizard since that's a monospaced interface already. Also stolen from
+# a script by Casis.
+message_mono = lambda{|text, bold=false|
+    stringArray  = Array.new
+    stringArray  = (text.gsub(/[\n]+/, "cr#lf")).split(/cr#lf/)
+    begin_text   = "<output class=\"mono\"\/>"
+    end_text     = "<output class=\"\"\/>"
+
+    if $fake_stormfront
+        begin_text = ""
+        end_text   = ""
+    end
+
+    if bold
+        begin_text = "#{begin_text}<pushBold\/>"
+        end_text = "<popBold\/>#{end_text}"
+    end
+
+    text = "#{begin_text}"
+    stringArray.each { |line|
+        text += "#{line}\n"
+    }
+    text += "#{end_text}"
+
+    puts "#{text}"
+}
+
+# Orders a list of target rooms by nearest to furthest
+#   parameters:
+#   - The rooms to be ordered
+order_by_nearest = lambda{|targets|
+    start_room   = Room.current
+    previous, shortest_distances = Map.dijkstra(Room.current.id.to_i)
+    return targets.reject{|t| shortest_distances[t].nil?}.sort{|a,b| shortest_distances[a]<=>shortest_distances[b]};
+}
+
+# ------------------------------------------------------------------------------------------------------------
+# Common, ship related, actions
+# ------------------------------------------------------------------------------------------------------------
+
+# Raises or lowers the anchor
+#   parameters:
+#   - ship - the current ship
+#   - true/false - raising (true) or lowering (false) the anchor
+anchor = lambda { |ship, raise|
+    returnto = Room.current.id
+    go.call(ship[:capstan])
+
+    if raise
+        loop do
+            result = dothistimeout "push capstan", 5, /You manage to push|You can now DEPART|you shove|The anchor is already up!/
+            pause 0.1
+            waitrt?
+            break if result =~ /DEPART|already up/
+        end
+    else
+        fput "kick capstan"
+        pause 0.1
+        waitrt?
+    end
+
+    go.call(returnto)
+}
+
+# Gets the current wheel direction
+#   parameters:
+#   - none
+current_direction = lambda {|ship|
+    returnto = Room.current.id
+    go.call(ship[:wheel])
+
+    direction = nil
+
+    result = dothistimeout "look wheel", 2, /The wooden wheel is currently turned (.*)$/
+
+    if ( result =~ /to the (.*)\.$/ )
+        direction = $1
+    elsif ( result =~ /nowhere in particular/ )
+        direction = "nowhere"
+    elsif ( result =~ /toward a (.*)\.$/ )
+        direction = $1
+    end
+
+    go.call(returnto)
+
+    message_bold.call("The wheel is turned #{direction}") if $osadebug
+
+    return direction
+}
+
+# Applies planks to a room until it is fixed.
+#   parameters:
+#   - none
+fix_room = lambda {|ship|
+    loop do
+        result = dothistimeout "get plank", 2, /Get what\?|plank|You already have that/
+
+        if ( result =~ /Get what\?/ )
+            count = ship[:supplies] == Room.current.id ? 0 : 3
+            go_do_this.call(
+                ship[:supplies],
+                lambda { |params|
+                    1.upto(count) {
+                        fput "get wood";
+                        waitrt;
+                        fput "stow plank"
+                    }
+
+                    fput "get wood";
+                    waitrt;
+                },
+                nil)
+        end
+
+        result = dothistimeout "fix", 2, /repair some|repair all/
+        waitrt
+
+        break if result =~ /repair all/
+    end
+}
+
+# Raises or lowers the sails and optionall tries to fill them with magical wind
+#   parameters:
+#   - ship - the current ship
+#   - true/false - raising (true) or lowering (false) the sails
+#   - true/false - true if 612/912 should be cast at the sails (if known)
+sails = lambda { |ship, raise, wind|
+    returnto = Room.current.id
+    ship[:sails].each {|sail_room|
+        go.call(sail_room)
+
+        result = dothistimeout "look sail", 1, /currently raised|half mast|fully lowered/
+
+        if raise
+            if (result =~ /fully lowered/)
+                fput "raise sail"
+                waitrt
+                fput "raise sail"
+                waitrt
+            elsif (result =~ /half mast/)
+                fput "raise sail"
+                waitrt
+            end
+        else
+            if (result =~ /currently raised/)
+                fput "lower sail"
+                waitrt
+                fput "lower sail"
+                waitrt
+            elsif (result =~ /half mast/)
+                fput "lower sail"
+                waitrt
+            end
+
+            if wind
+                if Spell[912].known? && result !~ /filled with magical wind/
+                    Spell[912].cast("sail")
+                    waitcastrt
+                elsif Spell[612].known? && result !~ /filled with magical wind/
+                    Spell[612].cast("sail")
+                    waitcastrt
+                end
+            end
+        end
+    }
+
+    go.call(returnto)
+}
+
+# Returns extra planks to the supply room.
+#   parameters:
+#   - none
+return_planks = lambda {|ship, goback|
+    returnto = Room.current.id
+    go.call(ship[:supplies])
+
+    loop do
+        result = dothistimeout "get plank", 2, /Get what\?|plank|You already have that/
+
+        if ( result !~ /Get what\?/ )
+            fput "put plank in wood"
+        else
+            break
+        end
+    end
+
+    go.call(returnto) if goback
+}
+
+# ------------------------------------------------------------------------------------------------------------
+# Command implementations
+# ------------------------------------------------------------------------------------------------------------
+
+# Anchoers the boat.
+#   parameters:
+#   - ignored
+anchor_cmd = lambda {|params|
+    returnto = Room.current.id
+    ship = get_ship.call()
+
+    anchor.call(ship, false)
+    sails.call(ship, true, false)
+
+    go.call(returnto)
+    message_bold.call("We ain't going nowhere now, Cap'n!")
+}
+
+# Fires a single cannon, loading it if necessary.
+#   parameters:
+#   - ignored
+fire_cmd = lambda {|params|
+    returnto = Room.current.id
+    ship = get_ship.call()
+    go.call(ship[:cannons])
+
+    result = dothistimeout "look cannon", 1, /Loaded/
+
+    if result !~ /Loaded/
+        go.call(ship[:supplies])
+        fput "get ball"
+        waitrt
+        go.call(ship[:cannons])
+        fput "load cannon"
+        waitrt
+    end
+
+    fput "fire cannon"
+    pause 0.1
+    waitrt?
+
+    go.call(returnto)
+
+    message_bold.call("Light 'em up, Cap'n!")
+}
+
+# Launches the ship from the port
+#   parameters:
+#   - ignored
+launch_cmd = lambda {|params|
+    if (ship = get_ship.call) != nil
+        case ship[:type]
+        when 'sloop'
+            go.call(ship[:gangplank])
+        else
+            message_bold.call("I have no idea what kind of ship this is, Cap'n.")
+            return
+        end
+    elsif  GameObj.loot.any?{|c| c.noun=="gangplank"}
+        fput "go gangplank"
+        ship = get_ship.call
+    elsif  GameObj.loot.any?{|c| c.noun=="sloop"}
+        fput "go sloop"
+        ship = get_ship.call
+    else
+        message_bold.call("I don't know where you are, Cap'n!")
+        return
+    end
+
+    go.call(ship[:gangplank])
+    fput "pull gang"
+
+    anchor.call(ship, true)
+
+    fput "depart"
+    fput "depart"
+    go.call(ship[:map])
+
+    if (defined?(OsaMap))
+        fput "look map"
+    end
+
+    message_bold.call("We're afloat, Cap'n!")
+}
+
+# Loads all the unloaded cannons on the ship.
+#   parameters:
+#   - ignored
+load_cmd = lambda {|params|
+    returnto = Room.current.id
+    ship = get_ship.call()
+
+    go.call(ship[:cannons])
+
+    loop do
+        result = dothistimeout "look cannon", 1, /Unloaded/
+        break if result !~ /Unloaded/
+        go.call(ship[:supplies])
+        fput "get ball"
+        waitrt
+        go.call(ship[:cannons])
+        fput "load cannon"
+        waitrt
+    end
+
+    go.call(returnto)
+
+    message_bold.call("Cannons ready, Cap'n!")
+}
+
+# Repairs just the current room
+#   parameters:
+#   - ignored
+patch_cmd = lambda {|params|
+    ship = get_ship.call()
+    result = ""
+
+    if !ship.nil?
+        result = dothistimeout "assess", 5, /^[^:]*It appears to be .* damaged|\/\d+/
+        waitrt
+
+        if (result =~ /It appears to be/)
+            fix_room.call(ship)
+        else
+            message_bold.call("Lookin' fine 'ere, Cap'n!")
+            return
+        end
+
+        return_planks.call(ship, true)
+    end
+
+    message_bold.call("That should hold 'er, Cap'n!")
+}
+
+# Checks each room on the ship for damage and repairs it. If run during
+# a boarding action, it doesn't go back and check for new damage after
+# completing a room.
+#   parameters:
+#   - ignored
+repair_cmd = lambda {|params|
+    returnto = Room.current.id
+
+    ship = get_ship.call()
+    result = ""
+
+    if !ship.nil?
+        ship_rooms = order_by_nearest.call(ship[:rooms])
+
+        ship_rooms.each{|room|
+            loop do
+                go.call(room)
+
+                result = dothistimeout "assess", 5, /It appears to be .* damaged|\/\d+/
+                waitrt
+
+                if (result =~ /It appears to be/)
+
+                    if (result =~ /^[^:]*It appears to be .* damaged/)
+                        fix_room.call(ship)
+                    elsif (result =~ /^\s*([^:]*):\s*It appears to be .* damaged/)
+                        damaged = $1
+
+                        message_bold.call("That #{damaged} needs attention, Cap'n!")
+
+                        # This needs updated/fixed for other ships.
+                        if (damaged == "Main Deck")
+                            go.call(ship[:cannons])
+                        elsif (damaged == "Helm")
+                            go.call(ship[:capstan])
+                        elsif (damaged == "Cargo Hold")
+                            go.call(ship[:supplies])
+                        elsif (damaged == "Captain's Quarters")
+                            go.call(ship[:map])
+                        elsif (damaged == "Crow's Nest")
+                            go.call(ship[:crowsnest])
+                        else
+                            message_bold.call("Where is da #{damaged}, Cap'n?")
+                            break
+                        end
+
+                        fix_room.call(ship)
+                    else
+                        message_bold.call("Now, I've been drinkin' too much, Cap'n!")
+                        break
+                    end
+                else
+                    break
+                end
+            end
+
+            # 100% health, no need to continue to other rooms
+            break if result =~ /(\d{3,})\/\1/
+        }
+
+        return_planks.call(ship, false)
+
+        go.call(returnto)
+
+        message_bold.call("All fixed up, Cap'n!")
+    else
+        message_bold.call("You're not on a ship I know, Cap'n.")
+    end
+}
+
+# String to determine if a given 'sail' command should just turn the wheel or
+# search the map for matching rooms.
+wheel_directions_builtin = ["north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest", "left", "right", "port", "island", "ship", "ne", "se", "sw", "nw"]
+
+# Sails the ship in the direction or towards a target
+#   parameters:
+#   - the direction or target to sail towards
+sail_cmd = lambda {|direction|
+    returnto = Room.current.id
+    ship = get_ship.call()
+
+    if wheel_directions_builtin.find{|builtin| builtin =~ /^#{direction}/i}
+        # Built-in direction for the wheel. Just turn it and check the sails.
+        go.call(ship[:wheel])
+
+        result = dothistimeout "turn wheel #{direction}", 2, /do your best to steer|you'd have better luck|already turned/
+
+        if result =~ /better luck|already turned/
+            message_bold.call("You been nippin' da rum too much, Cap'n!")
+            go.call(returnto)
+            return
+        end
+
+        waitrt
+
+        if ( direction != "port" )
+            sails.call(ship, false, direction != "ship")
+        end
+
+        go.call(returnto)
+
+        if direction == "ship"
+            message_bold.call("Pursuing 'em, Cap'n!")
+        elsif direction == "port"
+            message_bold.call("Docking her, Cap'n!")
+        else
+            message_bold.call("Under way, Cap'n!")
+        end
+
+    elsif (Object.const_defined?(:OsaMap))
+        navigate = nil
+        # V1 - assume the ship is launched but otherwise unmoving. Otherwise, a move while
+        # we're setting up can much with things. Really, we probably want to get the route
+        # list more frequently
+        
+        # HANDLE? : A large swell crashes into the side of the sloop!  The sound of the anchor can be heard rattling down the side of the sloop.
+        # HANDLE! : The sloop lurches forward as it strains against the deployed anchor.
+        if ( !OsaMap.current.is_mapped? )
+            go.call(ship[:map])
+            fput "look map"
+            # It takes a moment for the map data to update
+            pause 0.2
+        end
+
+        if OsaMap.current.id == 0
+            go.call(returnto)
+            message_bold.call("We are nae a sea, Cap'n!")
+            return
+        elsif !OsaMap.current.is_mapped?
+            go.call(returnto)
+            message_bold.call("Better we find ourselves first, Cap'n!")
+            return
+        end
+
+        if (direction =~ /^\d+$/)
+            navigate = Ocean.current.path_to(direction.to_i)
+        else
+            targets = OsaMap.list.find_all { |destination|
+                destination.tags.any? {|tag|
+                    tag =~ /#{direction}/i
+                } || destination.location =~ /#{direction}/i
+            }.map{|target| target.id}
+
+            if targets.length == 0
+                go.call(returnto)
+                message_bold.call("No knowin' where #{direction} is, Cap'n!")
+                return
+            end
+            
+            navigate = Ocean.current.path_to(targets)
+        end
+
+        if navigate.nil?
+            go.call(returnto)
+            message_bold.call("No knowin' where #{direction} is, Cap'n!")
+            return
+        end
+
+        message_bold.call("Headin' to #{navigate[-1]} in the #{OsaMap[navigate[-1]].location}, Cap'n!")
+
+        go.call(ship[:wheel])
+
+        sails.call(ship, false, true)
+        last_sail_check = Time.now
+        sailing = current_direction.call(ship)
+        last_ocean = OsaMap.current.location
+        
+        navigate.each{ |nextroom|
+            turn = Ocean.current.wayto.invert[nextroom]
+
+            if ( turn != sailing )
+                go.call(ship[:wheel])
+                fput "turn wheel #{turn}"
+                waitrt?
+                sailing = turn
+            end
+
+            if (Spell[612].known? || Spell[912].known?) && ((Time.now - last_sail_check) > 60)
+                last_sail_check = Time.now
+                sails.call(ship, false, true)
+            end
+
+            message_bold.call("Heading from #{Ocean.current.id} to #{nextroom} to the #{turn}") if $osadebug
+            wait_while { Ocean.current.id != nextroom }
+            
+            if ( Ocean.current.location != last_ocean )
+                message_bold.call("We've entered #{Ocean.current.location}, Cap'n!")
+                last_ocean = Ocean.current.location
+            end
+        }
+
+        if Ocean.current.tags.any?{|tag| tag =~ /port/i}
+            message_bold.call("Figurin' ya wan' 'er at da docks, Cap'n!")
+            fput "turn wheel port"
+            waitrt
+            waitfor("designated pier")
+        end
+
+        go.call(returnto)
+        message_bold.call("We're there, Cap'n!")
+
+    else
+        go.call(returnto)
+        message_bold.call("Got no idea where ya wanna go, Cap'n!")
+    end
+}
+
+# Fires all the loaded cannons
+#   parameters:
+#   - ignored
+volley_cmd = lambda {|params|
+    returnto = Room.current.id
+    ship = get_ship.call()
+    fired_one = false
+
+    go.call(ship[:cannons])
+    loop do
+        result = dothistimeout "fire cannon", 2, /You fire|You'll need to load|You cannot fire/
+
+        if result !~ /You fire/
+            break
+        else
+            fired_one = true
+        end
+
+        waitrt?
+    end
+
+    go.call(returnto)
+
+    if fired_one
+        message_bold.call("That'll send a message, Cap'n!")
+    else
+        message_bold.call("They don't load themselves, Cap'n!")
+    end
+}
+
+# ------------------------------------------------------------------------------------------------------------
+# Register the commmands.
+# ------------------------------------------------------------------------------------------------------------
+add_command.call("anchor", anchor_cmd, "Raises the sails and drops the anchor.")
+add_command.call("fire", fire_cmd, "Fires one cannon, loading it if necessary.")
+add_command.call("launch", launch_cmd, "Lowers the sails, raises the anchor, and pulls in the gang plank. If docked, will depart the dock.")
+add_command.call("load", load_cmd, "Loads all the cannons.")
+add_command.call("patch", patch_cmd, "Repairs the room you are currently in.")
+add_command.call("repair", repair_cmd, "Repairs the entire ship.")
+add_command.call("sail", sail_cmd, "Sets course in a direction, towards a target, to a room, to a sea, or to a town's port room. Not AFK friendly.")
+add_command.call("volley", volley_cmd, "Fires all the cannons.")
+
+# Add help - this overrides lich's default ;help for better or worse.
+help_cmd = proc {|client_string|
+    text = ""
+    commands.each{|command|
+        next if command[0] == "osa help"
+        command_link = "<d cmd='#{$clean_lich_char}#{'%-20s' % command[0]}'>#{$clean_lich_char}#{command[0]}</d>"
+        command_help = "- #{command[1]}"
+        text += "#{'%-45s' % command_link} #{'%-20s' % command_help}\n"
+    }
+
+    message_mono.call(text, true)
+}
+
+add_command.call("osa help", help_cmd, "Displays this help text.")
+
+if !Script.running?("osa-map-plugin") || !defined?(OsaMap)
+    error_message = "osa-map-plugin must be trusted and running for advanced sailing features.\n"
+
+    if !Script.running?("osa-map-plugin")
+        if !Script.start("osa-map-plugin")
+            error_message = "osa-map-plugin must be trusted and running for advanced sailing features.\n"
+            error_message += ";repos download osa-map-plugin\n"
+        elsif Script.running?("osa-map-plugin")
+            pause 0.5
+            error_message = "osa-map-plugin must be trusted and running for advanced sailing features.\n"
+            error_message += ";repos download osa-map-plugin\n"
+        end
+    end
+
+    if !defined?(OsaMap)
+        error_message += ";trust osa-map-plugin\n"
+        error_message += ";osa-map-plugin\n"
+        error_message += "Then restart ;osa-commands again to enable them.\n";
+        message_bold.call(error_message);
+
+        Script.kill("osa-map-plugin") if Script.running?("osa-map-plugin")
+    end
+end
+
+# ------------------------------------------------------------------------------------------------------------
+# Process commands so long as we're running.
+# ------------------------------------------------------------------------------------------------------------
+loop do
+    (command, action, parameters) = $osa_cmd_queue.pop
+    break if action.nil? # /Should/ never happen.
+
+    if ( command == "osa help" || Room.current.title[0] !~ /Enemy Ship/ )
+        action.call(parameters)
+    else
+        message_bold.call("Ignoring command #{command} because you've boarded an enemy ship.");
+    end
+end
