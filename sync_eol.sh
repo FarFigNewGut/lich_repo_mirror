@@ -15,3 +15,4 @@ for repo in https://repo.elanthia.online https://extras.repo.elanthia.online ;do
 		echo $repoFile >> lib/.gitignore
 	done
 done
+
