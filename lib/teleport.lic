@@ -1,0 +1,235 @@
+=begin
+  n-setting teleport logic
+
+  autogenerates a set of ruby files to patch the mapdb for jump points associated with an n-setting teleporter
+  these files exist at `data/teleporter/`
+
+  examples:
+    urglaes band -> data/teleporter/urglaes-band.rb
+  
+  The relevant patch is loaded based on if the teleporter is found in your GameObj.inv or not
+
+  -- Adding Custom Patches --
+
+  It's good practice for your n-settings to be aligned where possible across all of your characters
+  then it makes it much easier to maintain and use custom user extensions.
+
+  To add a custom user extension create a `data/teleporter/user.rb` file and add your extensions there
+  using the Ruby API
+
+  ;vars set teleporter=<full description>
+
+   author: Ondreian
+  version: v1.0.0
+  changelog:
+    v1.0.0 - first stable release
+=end
+
+require "fileutils"
+
+module Teleport
+  module Outcomes
+    Err = Regexp.union(
+      %r[is trying to reach out for something that is much too far away.],
+      %r[Something about your surroundings seems to be overpowering the abilities],
+      %r[and you get a strong inclination to take a look around.])
+    Ok = %r[In the next heartbeat, you feel yourself launch into the air]
+  end
+
+  class Entry
+    attr_reader :position, :room
+    def initialize(position, room)
+      @position = position
+      @room     = room
+    end
+
+    def to_s
+      "%s | %s - %s" % [@position.to_s.rjust(2), @room.id.to_s.rjust(6), @room.title.first]
+    end
+
+    def inspect
+      self.to_s
+    end
+  end
+
+  module Parser
+    Pattern = /(?<position>\d+)\s(?<title>.*)$/
+
+    def self.parse(menu)
+      menu.scan(Pattern).map {|position, title|
+        Teleport::Entry.new(
+          position.to_i, 
+          Map.list.find {|r| r.title.include? "[%s]" % title}
+        )
+      }
+    end
+
+    def self.apply(obj)
+      begin
+        Script.current.want_downstream_xml = true
+        menu = []
+        outcome = dothistimeout("tap #%s" % obj.id, 1, Pattern) or fail "could not parse teleporter menu"
+        menu << outcome
+        while line=get
+          return self.parse(menu.select.with_index{|_,i| (i+1) % 2 == 0}.join("\n")) if line =~ /<prompt/
+          menu << line
+        end
+      ensure
+        Script.current.want_downstream_xml = false
+      end
+    end
+  end
+
+  module Cache
+    def self.file
+      File.join(DATA_DIR, "teleporter", Teleport.description.gsub("\s", "-") + ".rb")
+    end
+
+    def self.save(contents)
+      FileUtils.mkdir_p File.join(DATA_DIR, "teleporter")
+      File.write self.file, contents
+      return file
+    end
+
+    def self.load!
+      Kernel::load self.file
+    end
+
+    def self.remove!
+      File.delete(self.file) if self.exist?
+    end
+
+    def self.user_extensions
+      File.join(DATA_DIR, "teleporter", "user.rb")
+    end
+
+    def self.exist?
+      File.exist? self.file
+    end
+  end
+
+  def self.description
+    Vars["teleporter"]
+  end
+
+  def self.teleporter()
+    GameObj.inv.find {|worn| worn.name.eql?(self.description)}
+  end
+
+  def self.exists?
+    not self.teleporter.nil?
+  end
+
+  def self.link(from:, to:, position:)
+    from = Map[from.to_i]
+    to   = Map[to.to_i]
+    return if from.id == to.id
+    fail %[could not find from(#{from})] if from.nil?
+    fail %[could not find to(#{to})]     if to.nil?
+    to_id    = to.id.to_s
+    respond("%s | %s >> %s" % [position.to_s.rjust(2), from.title.first.rjust(40), to.title.first]) if Script.current.vars.include?("--debug")
+    from.timeto[to_id] = StringProc.new "Teleport.timeto"
+    from.wayto[to_id]  = StringProc.new "Teleport.teleport(%s)" % position
+  end
+
+  def self.timeto()
+    wait_while {GameObj.inv.nil? or GameObj.inv.empty?}
+    return nil unless Teleport.exists?
+    return nil if Script.running?("escort")
+    return 10  if Script.running?("eloot")
+    return nil if $bigshot_status.eql?(:hunting) and not Room.current.tags.include?("pp:oberwood")
+    return 3
+  end
+
+  def self.teleport(position)
+    fput "twist #%s to %s" % [self.teleporter.id, position]
+    case dothistimeout "rub #%s" % self.teleporter.id, 3, Regexp.union(Outcomes::Ok, Outcomes::Err)
+    when Ok
+      :ok
+    when Err
+      fail "cannot teleport from this location"
+    end
+  end
+
+  def self.build_teleport_zones(entries)
+    west = []
+    east = []
+    others = []
+    entries.each {|entry|
+      case Room[entry.room.find_nearest_by_tag("town")].location.downcase
+      when /solhaven|landing|icemule/
+        west << entry
+      when /ta'/
+        east <<  entry
+      else
+        others << entry
+      end
+    }
+
+    return OpenStruct.new(
+      west: west.combination(2),
+      east: east.combination(2),
+      others: others.combination(2),
+    )
+  end
+
+  def self.load_user_extensions!
+    return unless File.exist? Cache.user_extensions
+    _respond "<b>loading custom user extensions from %s</b>" % Cache.user_extensions
+    load Cache.user_extensions
+  end
+
+  def self.build_patch_script(zones)
+    %i(west east).map {|zone|
+        zones.send(zone).map {|left, right|
+          <<~Ruby
+          Teleport.link(
+            from: #{left.room.id}, # #{left.room.title.first}
+            to: #{right.room.id}, # #{right.room.title.first}
+            position: #{right.position},
+          )
+          
+          Teleport.link(
+            from: #{right.room.id}, # #{right.room.title.first}
+            to: #{left.room.id}, # #{left.room.title.first}
+            position: #{left.position},
+          )
+          Ruby
+        }
+      }.flatten.join("\n") + <<~LoadCustom
+        Teleport.load_user_extensions!
+      LoadCustom
+  end
+
+  def self.load_mapdb_patch(flush: false)
+    if not Cache.exist? or Script.current.vars.include?("--flush") or flush
+      Cache.remove!
+      menu = Parser.apply(Teleport.teleporter)
+      zones = Teleport.build_teleport_zones(menu)
+      script = Teleport.build_patch_script(zones)
+      Cache.save(script)
+      _respond "<b>built patch script at %s</b>" % Cache.file
+    end
+    # load from fresh built cache
+    Cache.load!
+    _respond "<b>loaded patch script from %s</b>" % Cache.file
+    exit
+  end
+
+  def self.main()
+    exit if self.description.nil?
+    wait_while("waiting on inventory to load") {GameObj.inv.empty?}
+    self.exists? or fail "#{self.description} not found in inventory"
+    return Teleport.teleport(Script.current.vars.first) if (1..12).include?(Script.current.vars.first.to_i)
+    Teleport.load_mapdb_patch
+  end
+
+  module Test
+    if Script.current.vars.include?("--test")
+      Teleport.load_mapdb_patch(flush: true)
+      exit
+    end
+  end
+
+  self.main()
+end
