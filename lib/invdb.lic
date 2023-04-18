@@ -24,7 +24,7 @@
             tags: inventory, utility, database
   requires_trust: true
         required: Lich >= 4.6.4
-         version: 0.3.7.6
+         version: 0.3.7.7
   sqlite_version: 3.8.3+  (lich installs version 3.8.11.1 on windows which meets the requirement)
   +---------------------------------------------------------------+
   ;inv help      > help text
@@ -43,7 +43,7 @@
 module Inv_db;
   start_time = Time.now;
   # skip test server
-  # (respond "#{Script.current.name}: skipping test server"; exit;) if XMLData.game == 'GST' and (Script.current.vars[0] !~ /^[qcs]/ or Script.current.vars.size == 0);
+  (respond "#{Script.current.name}: skipping test server"; exit;) if XMLData.game == 'GST' and (Script.current.vars[0] !~ /^[qcs]/ or Script.current.vars.size == 0);
   #------------------------------------------------------------------------------#
   # requires trust on Ruby < 2.5
   #------------------------------------------------------------------------------#
@@ -233,9 +233,10 @@ module Inv_db;
   #------------------------------------------------------------------------------#
   # basic db methods
   #------------------------------------------------------------------------------#
-  def self.open;
+  def self.open(db_name = nil);
+    db_name = 'inv.db3' if db_name.nil?
     require 'sqlite3';
-    db = SQLite3::Database.open "#{$lich_dir}data/inv.db3";
+    db = SQLite3::Database.open "#{$lich_dir}data/#{db_name}";
     db.execute('PRAGMA temp_store = MEMORY');
     db.create_function('regexp', 2) do |func, pattern, expression|
       regexp = Regexp.new(pattern.to_s, Regexp::IGNORECASE)
@@ -245,7 +246,7 @@ module Inv_db;
         func.result = 0
       end
     end
-    before_dying{ db.close if db}
+    before_dying { db.close if db and !db.closed? }
     return db;
   end;
 
@@ -276,33 +277,34 @@ module Inv_db;
     rescue SQLite3::Exception => e
       # Inv_db.gs_print "Exception occured. Please contact Xanlin#4407 on discord with error details."
       Inv_db.gs_print "Exception: #{e}"
-      Inv_db.gs_print "sql: #{sql}" if e.to_s =~ /syntax error/
+      Inv_db.gs_print "sql: #{sql}" if e.to_s =~ /syntax error|no such column/
       Inv_db.gs_print "qargs:#{qargs.inspect}" if e.to_s =~ /syntax error/
     ensure
       db.close if close_db;
     end
+    exit if e
     return rows, changes
   end;
 
   def self.execute(sql, hash_args = {}, db = nil)
     close_db = false; changes = 0;
     (close_db = true; db = Inv_db.open) if db.nil?
+    respond sql if @debug_sql
+    respond "hash_args:#{hash_args.inspect}" if @debug_sql
     begin
-      respond sql if @debug_sql
-      respond "hash_args:#{hash_args.inspect}" if @debug_sql
       rows = db.execute(sql, hash_args)
       changes = db.changes
     rescue SQLite3::BusyException
       sleep 0.1
       retry
     rescue SQLite3::Exception => e
-      Inv_db.gs_print "Exception occured. Please contact #{self.format_monsterbold("Xanlin#4407")} on discord with error details."
-      Inv_db.gs_print "Exception: #{e}"
-      Inv_db.gs_print sql if e.to_s =~ /syntax error|no such bind/
-      Inv_db.gs_print "hash_args:#{hash_args.inspect}" if e.to_s =~ /syntax error|no such bind|constraint/
+      Inv_db.gs_print("Exception occured.  Please contact #{self.format_monsterbold("Xanlin#4407")} on discord with error details.")
+      respond "Exception: #{e}"
+      respond sql if e.to_s =~ /syntax error|no such|constraint/
+      respond "hash_args:#{hash_args.inspect}" if e.to_s =~ /syntax error|no such bind|UNIQUE|NOT NULL/
       if e.to_s =~ /no such bind/
         missing_bindings = []
-        hash_args.keys.each { |k| missing_bindings << k if sql !~ /:#{k.to_s}/ }
+        hash_args.keys.each { |k| missing_bindings << k if sql !~ /:#{k}/ }
         respond "missing_bindings: #{missing_bindings.inspect}"
       end
       db.close
@@ -324,16 +326,86 @@ module Inv_db;
       sleep 0.1
       retry
     rescue SQLite3::Exception => e
-      Inv_db.gs_print "Exception occured. Please contact #{self.format_monsterbold("Xanlin#4407")} on discord with error details."
-      Inv_db.gs_print "Exception: #{e}"
-      Inv_db.gs_print sql if e.to_s =~ /syntax error|no such bind/
-      Inv_db.gs_print "hash_args:#{hash_args.inspect}" if e.to_s =~ /syntax error|no such bind/
+      Inv_db.gs_print "Exception occured.  Please contact #{self.format_monsterbold("Xanlin#4407")} on discord with error details."
+      respond "Exception: #{e}"
+      respond sql if e.to_s =~ /syntax error|no such|constraint/
+      respond "hash_args:#{hash_args.inspect}" if e.to_s =~ /syntax error|no such bind|UNIQUE/
+      if e.to_s =~ /no such bind/
+        missing_bindings = []
+        hash_args.keys.each { |k| missing_bindings << k if sql !~ /:#{k}/ }
+        respond "missing_bindings: #{missing_bindings.inspect}"
+      end
       db.close
       exit
     ensure
       db.close if close_db
     end
     return rows
+  end
+
+  def self.fix_enc(db)
+    close_db = false; changes = 0;
+    (close_db = true; db = Inv_db.open) if db.nil?
+    tbl_list = db.execute("select distinct tbl_name from sqlite_master where tbl_name not like 'sqlite%'").flatten;
+    col_list = []; update = []; unique_update = [];
+    tbl_list.each { |t| db.execute("pragma table_info('#{t}')").each { |r| col_list += [[t, r[1], r[2]]] } }
+    unique_list = []
+    tbl_list.each { |tbl_name|
+      db.execute("PRAGMA index_list('#{tbl_name}')").each { |_seq, ix_name, unique, _origin, _partial|
+        next if unique == 0
+        db.execute("PRAGMA index_info('#{ix_name}')").each { |_seq, _cid, name|
+          unique_list << [tbl_name, name]
+        }
+      }
+    }
+    col_list.each { |t, c, y|
+      if y == 'text'
+        rows = db.execute("select distinct #{c} from #{t}").flatten
+        rows.each { |r|
+          next if r.encoding.to_s == 'UTF-8'
+          if unique_list.find { |tbl, col| tbl == t and col == c }.nil?
+            update << [t, c, r]
+          else
+            unique_update << [t, c, r]
+          end
+        }
+      end
+    }
+    Inv_db.gs_print("update.size:#{update.size}")
+    self.array_print(update)
+    Inv_db.gs_print("unique_update.size:#{unique_update.size}")
+    self.array_print(unique_update)
+    changes = Hash.new(0); unique_changes = Hash.new(0);
+
+    update.each { |t, c, v|
+      k = "#{t}_#{c}"
+      sql = "update #{t} set #{c} = :utf8 where #{c} = :value"
+      qargs = { :value => v, :utf8 => v.encode('UTF-8') }
+      _r, g = self.execute(sql, qargs, db)
+      changes[k] += g
+    }
+    Inv_db.gs_print("changes:")
+    self.hash_print(changes)
+
+    unique_update.each { |t, c, v|
+      k = "#{t}_#{c}"
+      sql = "select #{c} from #{t} where #{c} = :utf8 limit 1"
+      r, _g = self.execute(sql, { :utf8 => v.encode('UTF-8') }, db)
+      if r.size > 0
+        echo "deleting from #{t} where #{c} = #{v.inspect} -- in conflict with utf conversion"
+        sql = "delete from #{t} where #{c} = :value"
+        _r, g = self.execute(sql, { :value => v }, db)
+        unique_changes[k] += g
+      elsif r.size == 0
+        sql = "update #{t} set #{c} = :utf8 where #{c} = :value"
+        _r, g = self.execute(sql, { :value => v, :utf8 => v.encode('UTF-8') }, db)
+        unique_changes[k] += g
+      end
+    }
+    Inv_db.gs_print("unique_changes:")
+    self.hash_print(unique_changes)
+
+    db.close if close_db and !db.closed?
   end
   #------------------------------------------------------------------------------#
   # instance variables - newbie debugging
@@ -634,16 +706,16 @@ module Inv_db;
         :id          => id,
         :location_id => location_id.to_i,
         :level       => level.to_i,
-        :path        => path.gsub(/locker */, ''),
-        :type        => type ? type : empty_string,
-        :name        => name,
-        :noun        => noun,
+        :path        => path.gsub(/locker */, '').encode('UTF-8'),
+        :type        => !type.nil? ? type.encode('UTF-8') : empty_string,
+        :name        => name.encode('UTF-8'),
+        :noun        => noun.encode('UTF-8'),
         :amount      => amount.to_i,
         :stack       => empty_string,
-        :status      => status,
-        :marked      => marked,
-        :registered  => registered,
-        :hidden      => hidden,
+        :status      => status.encode('UTF-8'),
+        :marked      => marked.encode('UTF-8'),
+        :registered  => registered.encode('UTF-8'),
+        :hidden      => hidden.encode('UTF-8'),
         :worn        => empty_string,
         :update_noun => id ? 1 : 0
       });
@@ -652,12 +724,12 @@ module Inv_db;
           :id          => id,
           :location_id => location_id.to_i,
           :level       => level + 1,
-          :path        => "#{path} > #{stack}".gsub(/locker *> */, ''),
-          :type        => stack_type ? stack_type : empty_string,
-          :name        => stack_name,
-          :noun        => stack_noun,
+          :path        => "#{path} > #{stack}".gsub(/locker *> */, '').encode('UTF-8'),
+          :type        => stack_type ? stack_type.encode('UTF-8') : empty_string,
+          :name        => stack_name.encode('UTF-8'),
+          :noun        => stack_noun.encode('UTF-8'),
           :amount      => stack_amount.to_i,
-          :stack       => stack,
+          :stack       => stack.encode('UTF-8'),
           :status      => empty_string,
           :marked      => empty_string,
           :registered  => empty_string,
@@ -681,72 +753,24 @@ module Inv_db;
       end;
     };
   end;
+
   #------------------------------------------------------------------------------#
   # column and printing helpers
   #------------------------------------------------------------------------------#
-  @columns = Hash.new;
-  @columns["name"]         = { :justify => "-", :width => 12, :pad => 1 };
-  @columns["game"]         = { :justify => "-", :width =>  4, :pad => 0 }; # GSPlat
-  @columns["prof"]         = { :justify => "-", :width =>  8, :pad => 1 }; # Sorcerer
-  @columns["pro"]          = { :justify => "-", :width =>  3, :pad => 1 }; # Sorcerer
-  @columns["race"]         = { :justify => "-", :width =>  4, :pad => 1 }; # Bu
-  @columns["rc"]           = { :justify => "-", :width =>  2, :pad => 1 }; # Bu
-  @columns["level"]        = { :justify => "", :width =>  5, :pad => 1 };
-  @columns["lvl"]          = { :justify => "", :width =>  3, :pad => 1 };
-  @columns["lv"]           = { :justify => "", :width =>  2, :pad => 0 };
-  @columns["exp"]          = { :justify => "", :width => 13, :pad => 1 };
-  @columns["area"]         = { :justify => "-", :width => 20, :pad => 1 }; # Northern Caravansary
-  @columns["location"]     = { :justify => "-", :width => 10, :pad => 1 }; # Northern Caravansary
-  @columns["loc"]          = { :justify => "-", :width => 6, :pad => 0 }; # locker|teras|hands
-  @columns["account"] = { :justify => "-", :width => 12, :pad => 1 }; #
-  @columns["acc"]          = { :justify => "-", :width => 3, :pad => 1 }; #
-  @columns["act"]          = { :justify => "-", :width => 3, :pad => 1 }; #
-  @columns["subscription"] = { :justify => "-", :width => 12, :pad => 1 }; #
-  @columns["sub"]          = { :justify => "-", :width => 3, :pad => 1 }; #
-  @columns["locker"]       = { :justify => "-", :width => 18, :pad => 1 }; # Wehnimer's Landing
-  @columns["lockr"]        = { :justify => "-", :width => 5, :pad => 1 }; # Wehnimer's Landing
-  @columns["timestamp"]    = { :justify => "-", :width => 16, :pad => 1 }; # 2018-05-06 11:43
-  # @columns["last_update"]  = { :justify => "-", :width => 16, :pad => 0}; #2018-05-06 11:43
-  @columns["bank"]         = { :justify => "-", :width => 28, :pad => 1 }; # Bank of Kharag 'doth Dzulthu
-  @columns["source"]       = { :justify => "-", :width => 16, :pad => 1 }; # Bank of Kharag 'doth Dzulthu
-  @columns["currency"]     = { :justify => "-", :width => 28, :pad => 1 }; # Bank of Kharag 'doth Dzulthu
-  @columns["silver"]       = { :justify => "", :width => 13, :pad => 1 }; # 3,109,765,321
-  @columns["balance"]      = { :justify => "", :width => 13, :pad => 1 }; # 3,109,765,321
-  @columns["amount"]       = { :justify => "", :width => 13, :pad => 1 }; # 3,109,765,321
-  @columns["count"]        = { :justify => "", :width =>  5, :pad => 1 }; # 3,109,765,321
-  @columns["boxes"]        = { :justify => "", :width =>  5, :pad => 1 }; # 3,109,765,321
-  @columns["qty"]          = { :justify => "", :width =>  4, :pad => 0 }; # 65,321
-  @columns["loose"]        = { :justify => "", :width =>  6, :pad => 1 }; # 65,321
-  @columns["jarred"]       = { :justify => "", :width =>  6, :pad => 1 }; # 65,321
-  @columns["noun"]         = { :justify => "-", :width => 16, :pad => 1 }; # item name goes to end
-  @columns["item"]         = { :justify => "-", :width => 32, :pad => 1 }; # item name goes to end
-  @columns["abbr"]         = { :justify => "-", :width =>  6, :pad => 1 }; # item name goes to end
-  @columns["path"]         = { :justify => "-", :width => 16, :pad => 1 }; # not sure yet
-  @columns["type"]         = { :justify => "-", :width => 10, :pad => 0 }; # clothing armor gem weapon
-  @columns["stack"]        = { :justify => "-", :width =>  7, :pad => 1 }; # bundle
-  @columns["stk"]          = { :justify => "-", :width =>  3, :pad => 0 }; # bundle
-  @columns["status"]       = { :justify => "-", :width =>  7, :pad => 1 }; # full|empty|partial
-  @columns["epf"]          = { :justify => "-", :width =>  3, :pad => 0 }; # full|empty|partial
-  @columns["marked"]       = { :justify => "-", :width =>  6, :pad => 1 }; # Y
-  @columns["mark"]         = { :justify => "-", :width =>  4, :pad => 1 }; # Y
-  @columns["m"]            = { :justify => "-", :width =>  1, :pad => 0 }; # Y
-  @columns["registered"]   = { :justify => "-", :width =>  6, :pad => 1 }; # Y
-  @columns["reg"]          = { :justify => "-", :width =>  3, :pad => 1 }; # Y
-  @columns["r"]            = { :justify => "-", :width =>  1, :pad => 0 }; # Y
-  @columns["h"]            = { :justify => "-", :width =>  1, :pad => 0 }; # Y
-  @columns["worn"]         = { :justify => "-", :width =>  1, :pad => 1 }; # shoulders
-  @columns["table"]        = { :justify => "-", :width =>  8, :pad => 1 }; #
-  @columns["inserted"]     = { :justify => "", :width =>  8, :pad => 1 }; #
-  @columns["updated"]      = { :justify => "", :width =>  8, :pad => 1 }; #
-  @columns["deleted"]      = { :justify => "", :width =>  8, :pad => 1 }; #
-  @columns["character_id"] = { :justify => "", :width =>  1, :pad => 1 }; #
-  @columns["location_id"]  = { :justify => "", :width =>  1, :pad => 1 }; #
-  @columns["update_noun"]  = { :justify => "", :width =>  12, :pad => 1 }; #
-  @columns["gs_id"]        = { :justify => "", :width =>  12, :pad => 1 }; #
-  @columns["characters"]   = { :justify => "", :width =>  12, :pad => 1 }; #
-  @columns["character"]    = { :justify => "", :width =>  12, :pad => 1 }; #
-  @columns["inv"]          = { :justify => "", :width => 3, :pad => 1 }; #
+  def self.hash_print(h, indent = '  ')
+    h.each { |k, v|
+      if v.class == Hash
+        respond "#{indent}#{k}:"
+        self.hash_print(v, indent + indent)
+      else
+        respond "#{indent}#{k}: #{v.inspect}"
+      end
+    }
+  end
 
+  def self.array_print(a, indent = '  ')
+    a.each_with_index { |v, ix| respond "#{indent}#{ix}: #{v.inspect}" }
+  end
 
   @abbrs = Hash.new;
   # q item;
@@ -768,7 +792,7 @@ module Inv_db;
   @abbrs["lockr"]  = "town locker is in, multi if multiple (will show starting town for f2p)";
   @abbrs["inv"]    = "item count for carried items";
 
-  def self.output_table(rows, target, iparams = nil, highlight = nil, regex_highlight = false, date_format = "%m/%d/%y", autofit = true)
+  def self.output_table(rows, target, iparams = nil, highlight = nil, regex_highlight = false, date_format = "%m/%d/%y")
     to_print    = [];
     date_format = @settings_hash['date_format'] if !@settings_hash.nil?;
     sum_qty = 0
@@ -933,7 +957,7 @@ module Inv_db;
       inner join character c on s.character_id = c.id};
     where  += "\n      and b.name <> 'Total'" if !qargs.key?(:search_filter);
     groupby = "\n    group by b.name";
-    #groupby += extras[:groupby] if extras.key?(:groupby)
+    # groupby += extras[:groupby] if extras.key?(:groupby)
     orderby = "\n    order by #{query_extras[:orderby]}" if query_extras.key?(:orderby);
     limit   = "\n    limit #{query_extras[:limit]}" if query_extras.key?(:limit);
     sql = "#{select} #{from} #{where} #{groupby} #{having}";
@@ -1095,7 +1119,7 @@ module Inv_db;
     orderby = "\n    order by #{query_extras[:orderby]}" if query_extras.key?(:orderby);
     limit   = "\n    limit #{query_extras[:limit]}" if query_extras.key?(:limit);
     sql = "#{select} #{from} #{where} #{groupby} #{having} #{orderby} #{limit}";
-    #_respond sql if @debug_sql;
+    # _respond sql if @debug_sql;
     return sql.encode('UTF-8'), qargs;
   end;
 
@@ -1106,9 +1130,7 @@ module Inv_db;
 
     having = orderby = limit = "";
     where, qargs, extras = self.where_builder(params, 'item')
-    query_extras = { :orderby => "i.type, amount" }
-    query_extras.merge!(extras) if !extras.empty?
-
+    groupby = extras[:groupby]
     select = %{
     select
         i.type as type
@@ -1130,8 +1152,9 @@ module Inv_db;
     default_groupby += ", i.noun" if groupby =~ /noun/;
     groupby = default_groupby;
 
-    orderby = "\n    order by #{query_extras[:orderby]}" if query_extras.key?(:orderby);
-    limit   = "\n    limit #{query_extras[:limit]}" if query_extras.key?(:limit);
+    orderby = "\n    order by i.type, amount"
+    orderby = "\n    order by #{extras[:orderby]}" if extras.key?(:orderby);
+    limit   = "\n    limit #{extras[:limit]}" if extras.key?(:limit);
     sql = "#{select} #{from} #{where} #{groupby} #{having}";
     sql += "\nunion all\n #{select.gsub(/[lic].(?:name|noun|abbr)/, "'total'")} #{from} #{where}\ngroup by i.type";
     sql += " #{orderby} #{limit}";
@@ -1377,13 +1400,12 @@ module Inv_db;
       i  = item       g = game        r = registered
       in = inv        t = type        s = stack
       l  = locker     n = noun        status = status
-      b  = bank       p = path        w = worn
+      b  = bank       p = path
     +---------------------------------------------------------------+
     settings (on/off is converted into true/false)
       ;inv --settings lists your current settings
       ;inv --jar=on/off will turn on/off looking in jars
       ;inv --stack=on/off will turn on/off reading stacks of notes (light and deep notes)
-      ;inv --autofit=on/off will turn on/off table columns adjusting to fit content (on) or being ragged (off)
     };
   help_examples = %{
     examples:
@@ -1427,6 +1449,9 @@ module Inv_db;
           <d cmd=\"#{$clean_lich_char}alias add --global quit=;eq Script.run('#{Script.current.name}','refresh char');fput 'quit';\r\">;alias add --global quit=#{$clean_lich_char}eq Script.run('#{Script.current.name}','refresh char');fput 'quit'</d>
   ";
   help_changelog = %{  changelog:
+      0.3.7.7 (2023-04-18)
+        - encoding fixes
+        - removed autofit option, all will autofit now
       0.3.7.6 (2023-04-15)
         - fix for unclosable statement sometimes
       0.3.7.5 (2023-04-15)
@@ -1784,7 +1809,6 @@ module Inv_db;
   match_fail_lines = []
   match_fail_count = 0
   db = nil
-  stmt = nil
   #------------------------------------------------------------------------------#
   # variables
   #------------------------------------------------------------------------------#
@@ -1831,7 +1855,6 @@ module Inv_db;
   # Silencers/Squelchers
   #------------------------------------------------------------------------------#
   (@no_squelch = true;) if Script.current.vars[0] =~ /@no_?squelch/
-  (@autofit = true;) if Script.current.vars[0] =~ /@autofit/
   @quiet = true; @quiet = false if @no_squelch;
 
   inv_open_close_squelch_pattern = /It appears to be locked|There doesn't seem to be any way to do that|^Try holding it first|You need to be holding|You are holding.*|You are wearing.*|You (open|close|push|pull|flip).*|^You absentmindedly fiddle with your|already open|open already|^You pick at the knot holding|^You tie your|^You carefully unwind|^You flip the cover|^Hooking a finger into|^Lightly brushing your fingers|^Brushing your fingers against|^Pinching the toggle|^As you reach for the flap|^You rub your hand across|^You focus for a moment/i
@@ -1895,11 +1918,11 @@ module Inv_db;
   #------------------------------------------------------------------------------#
   # sqlite version check
   #------------------------------------------------------------------------------#
-  #sqlite_version = Inv_db.sqlite_version
-  #if Gem::Version.new(sqlite_version) < Gem::Version.new('3.8.3')
+  # sqlite_version = Inv_db.sqlite_version
+  # if Gem::Version.new(sqlite_version) < Gem::Version.new('3.8.3')
   #  Inv_db.gs_print "#{Script.current.name} requires sqlite_version: 3.8.3+ ... exiting"
   #  exit
-  #end
+  # end
 
   db = Inv_db.open
   #------------------------------------------------------------------------------#
@@ -1917,10 +1940,9 @@ module Inv_db;
       (db.execute("drop table if exists item_detail");) if target =~ /item|detail|all/
       (db.execute("drop table if exists item");) if target =~ /item|all/i
 
-      (db.execute("drop table if exists room_inventory") ;) if target =~ /room|all/
+      (db.execute("drop table if exists room_inventory");) if target =~ /room|all/
       (db.execute("drop table if exists room_container");) if target =~ /room|all/
       (db.execute("drop table if exists room");) if target =~ /room|all/
-      
 
       # (db.execute("drop table if exists profile") ;) if target =~ /all|profile/
       # (db.execute("drop table if exists simucoin") ;) if target =~ /all|simucoin/
@@ -2442,7 +2464,7 @@ module Inv_db;
     if @account_name.nil? or @subscription.nil?
       @account_name, @subscription = self.account_verb
     end
-    return @account_name, @subscription
+    return @account_name.encode('UTF-8'), @subscription.encode('UTF-8')
   end
 
   def self.account_lookup(db = nil, name = nil, game = nil)
@@ -2450,7 +2472,7 @@ module Inv_db;
     (close_db = true; db = Inv_db.open) if db.nil?
     name = XMLData.name if name.nil?
     game = XMLData.game if game.nil?
-    qargs = { :name => name, :game => game }
+    qargs = { :name => name.encode('UTF-8'), :game => game.encode('UTF-8') }
     sql = %{ select account, subscription from character where name = :name and game = :game limit 1 }
     account_name, subscription = self.execute2(sql, qargs, db)[1]
     db.close if close_db
@@ -2468,7 +2490,7 @@ module Inv_db;
       account_name = a.last if a.first =~ /Account Name/
       subscription = a.last.downcase if a.first =~ /Account Type|Subscription/
     }
-    return account_name, subscription
+    return account_name.encode('UTF-8'), subscription.encode('UTF-8')
   end;
 
   #------------------------------------------------------------------------------#
@@ -2513,16 +2535,16 @@ module Inv_db;
     cparams = {
       :name         => name.encode('UTF-8'),
       :game         => game.encode('UTF-8'),
-      :account      => @account_name,
+      :account      => @account_name.encode('UTF-8'),
       :prof         => (defined?(Stats.prof) ? Stats.prof.encode('UTF-8') : ""),
       :race         => (defined?(Stats.race) ? Stats.race.encode('UTF-8') : ""),
       :level        => XMLData.level.to_i,
       :exp          => (defined?(Stats.exp) ? Stats.exp.to_i : ""),
       :area         => current_area.encode('UTF-8'),
-      :subscription => @subscription,
-      :locker       => @locker_location,
+      :subscription => @subscription.encode('UTF-8'),
+      :locker       => @locker_location.encode('UTF-8'),
       :citizenship  => citizenship.encode('UTF-8'),
-      :society      => society,
+      :society      => society.encode('UTF-8'),
       :society_rank => society_rank,
       :timestamp    => self.db_timestamp_integer
     }
@@ -2647,13 +2669,7 @@ module Inv_db;
     respond "+---------------- proc_start: #{@current_proc}" if @debug
     respond params.to_s if @debug
     sql, qargs = Inv_db.query_char_sql(params, style)
-    Inv_db.gs_print sql if @debug_sql
-    begin
-      rows = db.execute2(sql, qargs)
-    rescue SQLite3::BusyException
-      sleep 0.1
-      retry
-    end
+    rows = self.execute2(sql, qargs, db)
     Inv_db.output_table(rows, target, qargs)
   }
   #------------------------------------------------------------------------------#
@@ -2752,9 +2768,8 @@ module Inv_db;
   end
 
   def self.lumnis_query(db = nil, params = {})
-    groupby = having = orderby = limit = "";
-    where, qargs, _extras = self.where_builder(params, 'lumnis')
-    orderby = "order by c.account, c.name"
+    groupby = having = limit = "";
+    where, qargs, extras = self.where_builder(params, 'lumnis')
     select = %{
         select
             c.account
@@ -2773,6 +2788,9 @@ module Inv_db;
         from lumnis u
           inner join character c on u.character_id = c.id
       };
+    orderby = "\n    order by c.account, c.name"
+    orderby = "\n    order by #{extras[:orderby]}" if extras.key?(:orderby);
+    limit   = "\n    limit #{extras[:limit]}" if extras.key?(:limit);
     sql = "#{select} #{from} #{where} #{groupby} #{having} #{orderby} #{limit}";
     _respond sql if @debug_sql;
     rows = self.execute2(sql, qargs, db)
@@ -2821,12 +2839,12 @@ module Inv_db;
     qargs[:timestamp] = self.db_timestamp_integer
     qargs[:bonus] = Resource.load_bonuses["#{XMLData.game}:#{Char.name}"][:bonus] if defined?(Resource::load_bonuses)
     lumnis_status, updated = self.lumnis_status_lookup(db, qargs[:character_id])
-    if qargs[:energy] != ''  
-      if !updated.nil? and Time.at(updated.to_i)+60 > Time.now 
+    if qargs[:energy] != ''
+      if !updated.nil? and Time.at(updated.to_i) + 60 > Time.now
         qargs[:weekly] = 0 if lumnis_status == 'restart'
       else
         self.lumnis_refresh(db, qargs[:character_id])
-        lumnis_status, updated = self.lumnis_status_lookup(db, qargs[:character_id])
+        lumnis_status, _updated = self.lumnis_status_lookup(db, qargs[:character_id])
         qargs[:weekly] = 0 if lumnis_status == 'restart'
       end
     end
@@ -2865,9 +2883,8 @@ module Inv_db;
   end
 
   def self.resource_query(db = nil, params = {})
-    groupby = having = orderby = limit = "";
-    where, qargs, _extras = self.where_builder(params, 'resource')
-    orderby = "order by c.account, c.name"
+    groupby = having = limit = "";
+    where, qargs, extras = self.where_builder(params, 'resource')
     select = %{
     select
         c.account
@@ -2885,6 +2902,9 @@ module Inv_db;
     from = %{
     from resource e
       inner join character c on e.character_id = c.id};
+    orderby = "\n    order by c.account, c.name"
+    orderby = "\n    order by #{extras[:orderby]}" if extras.key?(:orderby);
+    limit   = "\n    limit #{extras[:limit]}" if extras.key?(:limit);
     sql = "#{select} #{from} #{where} #{groupby} #{having} #{orderby} #{limit}";
     rows = self.execute2(sql, qargs, db)
     self.output_table(rows, 'resource', qargs)
@@ -2932,90 +2952,78 @@ module Inv_db;
     @calling_proc = @current_proc
     @current_proc = "save_bank"
     respond "+---------------- proc_start: #{@current_proc}" if @debug
-    begin
-      stmt = db.prepare("insert into temp_silver (character_id, bank, amount, timestamp) values(#{@character_id}, ?, ?, #{self.db_timestamp_integer})")
-      bank_accounts.each { |k, v|
-        stmt.execute(k.encode('UTF-8'), v)
-      }
-      #  ----delete
-      sql = %{
-      delete
-      from silver
-      where silver.character_id = :character_id
-        and not exists (
-          select 1
-          from temp_silver t
-            inner join bank b on t.bank = b.name
-          where t.character_id = silver.character_id
-            and b.id           = silver.bank_id
-          )
-      }
-      qargs = { :character_id => @character_id }
-      _rows, changes = self.execute(sql, qargs, db)
-      @db_changes[:bank][:deleted] += changes
-      #  ----update: sqlites doesn't support joins in updates
-      sql = %{
-      with cte (character_id, bank_id, amount, timestamp) as (
-        select t.character_id, b.id, t.amount, t.timestamp
-        from temp_silver t
-          inner join bank b on t.bank=b.name
-      )
-      update silver set
-          amount    = (
-            select amount
-            from cte
-            where silver.character_id = cte.character_id
-              and silver.bank_id = cte.bank_id
-              and silver.amount <> cte.amount
-          )
-        , timestamp = (
-            select timestamp
-            from cte
-            where silver.character_id = cte.character_id
-              and silver.bank_id = cte.bank_id
-              and silver.amount <> cte.amount
-          )
-      where exists (
+    timestamp = self.db_timestamp_integer
+    sql = "insert into temp_silver (character_id, bank, amount, timestamp) values(#{@character_id}, :bank, :amount, #{timestamp})"
+    bank_accounts.each { |k, v|
+      self.execute(sql, { :bank => k.encode('UTF-8'), :amount => v }, db)
+    }
+    #  ----delete
+    sql = %{
+    delete
+    from silver
+    where silver.character_id = :character_id
+      and not exists (
         select 1
-        from cte
-        where silver.character_id = cte.character_id
-          and silver.bank_id = cte.bank_id
-          and silver.amount <> cte.amount
-        )
-      }
-      _rows, changes = self.execute(sql, qargs = {}, db)
-      @db_changes[:bank][:updated] += changes
-      sql = %{
-      with cte (character_id, bank_id, amount, timestamp) as (
-        select t.character_id, b.id, t.amount, t.timestamp
         from temp_silver t
-          inner join bank b on t.bank=b.name
+          inner join bank b on t.bank = b.name
+        where t.character_id = silver.character_id
+          and b.id           = silver.bank_id
+        )
+    }
+    qargs = { :character_id => @character_id }
+    _rows, changes = self.execute(sql, qargs, db)
+    @db_changes[:bank][:deleted] += changes
+    #  ----update: sqlites doesn't support joins in updates
+    sql = %{
+    with cte (character_id, bank_id, amount, timestamp) as (
+      select t.character_id, b.id, t.amount, t.timestamp
+      from temp_silver t
+        inner join bank b on t.bank=b.name
+    )
+    update silver set
+        amount    = (
+          select amount
+          from cte
+          where silver.character_id = cte.character_id
+            and silver.bank_id = cte.bank_id
+            and silver.amount <> cte.amount
+        )
+      , timestamp = (
+          select timestamp
+          from cte
+          where silver.character_id = cte.character_id
+            and silver.bank_id = cte.bank_id
+            and silver.amount <> cte.amount
+        )
+    where exists (
+      select 1
+      from cte
+      where silver.character_id = cte.character_id
+        and silver.bank_id = cte.bank_id
+        and silver.amount <> cte.amount
       )
-      insert into silver (character_id, bank_id, amount, timestamp)
-        select character_id, bank_id, amount, timestamp
-        from cte
-        where not exists (
-          select 1
-          from silver i
-          where i.character_id = cte.character_id
-            and i.bank_id      = cte.bank_id
-          )
-        order by character_id, bank_id
-      }
-      _rows, changes = self.execute(sql, qargs = {}, db)
-      @db_changes[:bank][:inserted] += changes
-    rescue SQLite3::BusyException
-      sleep 0.1
-      retry
-    rescue SQLite3::Exception => e
-      Inv_db.gs_print "Exception occured. Please contact Xanlin#4407 on discord with error details."
-      Inv_db.gs_print "Exception: #{e}"
-      Inv_db.gs_print "character_id: #{@character_id.inspect}"
-      Inv_db.gs_print "bank_accounts: #{bank_accounts.inspect}"
-      Inv_db.gs_print sql if e.to_s =~ /syntax error/
-    ensure
-      stmt.close if stmt
-    end
+    }
+    _rows, changes = self.execute(sql, {}, db)
+    @db_changes[:bank][:updated] += changes
+    sql = %{
+    with cte (character_id, bank_id, amount, timestamp) as (
+      select t.character_id, b.id, t.amount, t.timestamp
+      from temp_silver t
+        inner join bank b on t.bank=b.name
+    )
+    insert into silver (character_id, bank_id, amount, timestamp)
+      select character_id, bank_id, amount, timestamp
+      from cte
+      where not exists (
+        select 1
+        from silver i
+        where i.character_id = cte.character_id
+          and i.bank_id      = cte.bank_id
+        )
+      order by character_id, bank_id
+    }
+    _rows, changes = self.execute(sql, {}, db)
+    @db_changes[:bank][:inserted] += changes
   }
 
   query_bank = proc { |params|
@@ -3090,31 +3098,31 @@ module Inv_db;
     @current_proc = "refresh_tickets"
     respond "+---------------- proc_start: #{@current_proc}" if @debug
 
-    @ticket_patterns = Hash.new
-    @ticket_patterns[:balance_start] = /You take a moment to recall the alternative currencies you've collected.../
-    @ticket_patterns[:balance_split] = /^ +(?<source>.*?) - (?<amount>[,\d]+) (?<currency>.*?)\./
-    @ticket_patterns[:balance_none] = /You haven't collected any alternative currencies./
-    @ticket_balance = []
+    ticket_patterns = Hash.new
+    ticket_patterns[:balance_start] = /You take a moment to recall the alternative currencies you've collected.../
+    ticket_patterns[:balance_split] = /^ +(?<source>.*?) - (?<amount>[,\d]+) (?<currency>.*?)\./
+    ticket_patterns[:balance_none] = /You haven't collected any alternative currencies./
+    ticket_balance = []
     command        = "ticket balance"
-    start_pattern  = @ticket_patterns[:balance_start]
+    start_pattern  = ticket_patterns[:balance_start]
     ticket_data    = self.client_command(command, start_pattern)
     # because it goes mono before saying anything:
     _respond "<output class=\"\"/>" if $frontend =~ /storm|wrayth/i
-    if @ticket_patterns[:balance_none].match(ticket_data.join("\n"))
+    if ticket_patterns[:balance_none].match(ticket_data.join("\n"))
       delete_tickets.call
     else
       ticket_data.each { |l|
-        m = @ticket_patterns[:balance_split].match(l)
+        m = ticket_patterns[:balance_split].match(l)
         if m
           ticket = {
-            :source   => m[:source],
+            :source   => m[:source].encode('UTF-8'),
             :amount   => m[:amount],
-            :currency => m[:currency]
+            :currency => m[:currency].encode('UTF-8')
           }
-          @ticket_balance.push(ticket)
+          ticket_balance.push(ticket)
         end
       }
-      @ticket_balance.each { |t| echo "#{t[:source]}, #{t[:amount]}, #{t[:currency]}" } if @debug
+      ticket_balance.each { |t| echo "#{t[:source]}, #{t[:amount]}, #{t[:currency]}" } if @debug
     end
 
     # ##save tickets
@@ -3123,100 +3131,87 @@ module Inv_db;
     @calling_proc = @current_proc
     @current_proc = "save_tickets"
     respond "+---------------- proc_start: #{@current_proc}" if @debug
-    begin
-      stmt = db.prepare("insert into temp_tickets (character_id, source, amount, currency, timestamp) values(#{@character_id}, ?, ?, ?, #{self.db_timestamp_integer})")
-      @ticket_balance.each { |t|
-        stmt.execute(t[:source].encode('UTF-8'), t[:amount].gsub(',', '').to_i, t[:currency].encode('UTF-8'))
-      }
-      #  ----delete
-      sql = %{
-      delete
-      from tickets
-      where tickets.character_id = :character_id
-        and not exists (
-          select 1
-          from temp_tickets t
-          where t.character_id = tickets.character_id
-            and t.source = tickets.source
-            and t.currency = tickets.currency
-          )
-      }
-      qargs = { :character_id => @character_id }
-      _rows, changes = self.execute(sql, qargs = {}, db)
-      @db_changes[:tickets][:deleted] += changes
-      #  ----update: sqlites doesn't support joins in updates
-      sql = %{
-      with cte (character_id, source, amount, currency, timestamp) as (
-        select t.character_id, t.source, t.amount, t.currency, t.timestamp
+    character_id = @character_id
+    timestamp = self.db_timestamp_integer
+    sql = "
+    insert into temp_tickets (character_id, source, amount, currency, timestamp)
+    values(#{character_id}, :source, :amount, :currency, #{timestamp})"
+    ticket_balance.each { |ticket| self.execute(sql, ticket, db) }
+
+    # delete tickets
+    sql = %{
+    delete
+    from tickets
+    where tickets.character_id = :character_id
+      and not exists (
+        select 1
         from temp_tickets t
-      )
-        update tickets set
-            amount    = (
-              select amount
-              from cte
-              where tickets.character_id = cte.character_id
-                and tickets.source = cte.source
-                and tickets.amount <> cte.amount
-                and tickets.currency = cte.currency
-            )
-          , timestamp = (
-              select timestamp
-              from cte
-              where tickets.character_id = cte.character_id
-                and tickets.source = cte.source
-                and tickets.amount <> cte.amount
-            )
-        where exists (
-          select 1
+        where t.character_id = tickets.character_id
+          and t.source = tickets.source
+          and t.currency = tickets.currency
+        )
+    }
+    qargs = { :character_id => @character_id }
+    _rows, changes = self.execute(sql, qargs, db)
+    @db_changes[:tickets][:deleted] += changes
+
+    # update tickets ----update: sqlites doesn't support joins in updates
+    sql = %{
+    with cte (character_id, source, amount, currency) as (
+      select t.character_id, t.source, t.amount, t.currency
+      from temp_tickets t
+      where t.character_id = :character_id
+    )
+    update tickets set
+        amount = (
+          select amount
           from cte
           where tickets.character_id = cte.character_id
             and tickets.source = cte.source
             and tickets.amount <> cte.amount
             and tickets.currency = cte.currency
-          )
-      }
-      _rows, changes = self.execute(sql, qargs, db)
-      @db_changes[:tickets][:updated] += changes
-
-      sql = %{
-      with cte (character_id, source, amount, currency, timestamp) as (
-        select t.character_id, t.source, t.amount, t.currency, t.timestamp
-        from temp_tickets t
+        )
+      , timestamp = #{timestamp}
+    where tickets.character_id = :character_id
+      and exists (
+      select 1
+      from cte
+      where tickets.character_id = cte.character_id
+        and tickets.source = cte.source
+        and tickets.amount <> cte.amount
+        and tickets.currency = cte.currency
       )
-      insert into tickets (character_id, source, amount, currency, timestamp)
-        select character_id, source, amount, currency, timestamp
-        from cte
-        where not exists (
-          select 1
-          from tickets i
-          where i.character_id = cte.character_id
-            and i.source       = cte.source
-            and i.currency     = cte.currency
-          )
-        order by character_id, source
-      }
-      _rows, changes = self.execute(sql, nil, db)
-      @db_changes[:tickets][:inserted] += changes
-    rescue SQLite3::BusyException
-      sleep 0.1
-      retry
-    rescue SQLite3::Exception => e
-      Inv_db.gs_print "Exception occured. Please contact Xanlin#4407 on discord with error details."
-      Inv_db.gs_print "Exception: #{e}"
-      Inv_db.gs_print "character_id: #{@character_id.inspect}"
-      Inv_db.gs_print "tickets_accounts: #{@ticket_balance.inspect}"
-    ensure
-      stmt.close if stmt
-    end
-    # }
+    }
+    _rows, changes = self.execute(sql, qargs, db)
+    @db_changes[:tickets][:updated] += changes
+
+    # insert tickets
+    sql = %{
+    with cte (character_id, source, amount, currency) as (
+      select t.character_id, t.source, t.amount, t.currency
+      from temp_tickets t
+      where t.character_id = :character_id
+    )
+    insert into tickets (character_id, source, amount, currency, timestamp)
+      select character_id, source, amount, currency, #{timestamp}
+      from cte
+      where not exists (
+        select 1
+        from tickets i
+        where i.character_id = cte.character_id
+          and i.source       = cte.source
+          and i.currency     = cte.currency
+        )
+      order by character_id, source
+    }
+    _rows, changes = self.execute(sql, qargs, db)
+    @db_changes[:tickets][:inserted] += changes
   }
   #------------------------------------------------------------------------------#
   # item
   #    todo: scrape & capture parent/path of nested items
   #    todo: locker manifest might not have all lockers (simucoin)
   #------------------------------------------------------------------------------#
-
-
 
   insert_temp_item_inv = proc { |location_id| # |location_id,contents|
     @calling_proc = @current_proc
@@ -3244,7 +3239,7 @@ module Inv_db;
       , #{timestamp}, :update_noun, :id )"
 
     temp_item_time = Benchmark.realtime do;
-      @inv_items.each { |item| self.execute(sql,item,db) }
+      @inv_items.each { |item| self.execute(sql, item, db) }
     end
     if @debug
       inserted = db.get_first_value("select count(*) from temp_item where location_id = #{location_id}")
@@ -3253,7 +3248,7 @@ module Inv_db;
     Inv_db.gs_print "+----insert_temp_item_inv time elapsed #{(temp_item_time * 1000).round(2)} milliseconds" if @benchmark;
   }
 
-  insert_temp_item_locker = proc {|items| 
+  insert_temp_item_locker = proc { |items|
     @calling_proc = @current_proc
     @current_proc = "insert_temp_item_locker"
     respond "+---------------- proc_start: #{@current_proc}" if @debug
@@ -3279,7 +3274,7 @@ module Inv_db;
     insert_temp_item_locker_time = Benchmark.realtime do;
       items.each { |locker_item|
         locker_item.delete_if { |key, _value| !key.to_s.match(/^(?:location_id|level|path|type|name|link_name|containing|noun|amount|stack|status|update_noun|worn)/) }
-        self.execute(sql,locker_item,db)
+        self.execute(sql, locker_item, db)
       }
     end;
     Inv_db.gs_print "+----insert_temp_item_locker_time time elapsed #{(insert_temp_item_locker_time * 1000).round(2)} milliseconds" if @benchmark;
@@ -3293,7 +3288,7 @@ module Inv_db;
     if location_id.to_i == 40
       @account_name, @subscription = self.account_verb if @account_name.nil?
       character_id = self.insert_fake_character(db, @account_name)
-    else 
+    else
       character_id = @character_id
     end
     sql = "insert into temp_item (
@@ -3317,7 +3312,7 @@ module Inv_db;
     insert_temp_item_premium_locker_time = Benchmark.realtime do;
       @locker_items.each { |locker_item|
         locker_item.delete_if { |key, _value| !key.to_s.match(/^(?:location_id|level|path|type|name|link_name|containing|noun|amount|stack|status|marked|registered|update_noun||worn)/) }
-        self.execute(sql,locker_item,db)
+        self.execute(sql, locker_item, db)
       }
     end;
     Inv_db.gs_print "+----insert_temp_item_premium_locker_time time elapsed #{(insert_temp_item_premium_locker_time * 1000).round(2)} milliseconds" if @benchmark;
@@ -3490,11 +3485,10 @@ module Inv_db;
         )
     }
     temp_time = Benchmark.realtime do;
-      _rows, changes = self.execute(temp_item_cte + sql, merge_params.merge({:timestamp => self.db_timestamp_integer}), db)
+      _rows, changes = self.execute(temp_item_cte + sql, merge_params.merge({ :timestamp => self.db_timestamp_integer }), db)
       @db_changes[:item][:updated] += changes
     end
     Inv_db.gs_print "+----merge-update(#{location_id}) with #{changes.inspect} changes, time elapsed #{(temp_time * 1000).round(2)} milliseconds" if @benchmark;
-
 
     #  ----insert items
     respond "+----#{@current_proc}: insert" if @debug
@@ -3544,7 +3538,7 @@ module Inv_db;
     where character_id = :character_id
       and location_id = :location_id}
     temp_time = Benchmark.realtime do;
-      _rows, _changes = self.execute(sql, merge_params.delete_if{|k,_v| k == :game}, db)
+      _rows, _changes = self.execute(sql, merge_params.delete_if { |k, _v| k == :game }, db)
     end
     Inv_db.gs_print "+----merge-cleanup(#{location_id}) with #{changes.inspect} changes, time elapsed #{(temp_time * 1000).round(2)} milliseconds" if @benchmark;
   } # end merge
@@ -3954,7 +3948,7 @@ module Inv_db;
       # @subscription   = "premium" if @subscription.nil?
     end
     if m[:town]
-      @locker_location = m[:town]
+      @locker_location = m[:town] == "Kharag 'doth Dzulthu" ? "Zul Logoth".encode('UTF-8') : m[:town]
       # @subscription   = "standard" if @subscription.nil?
     end
     @locker_location = @locker_location || "transit"
@@ -4169,7 +4163,7 @@ module Inv_db;
         leading_space = m[:depth] =~ /<d/ ? m[:depth].gsub!(/<[^>]+>/, "").gsub!(" ", "-") : m[:depth].gsub!(" ", "-")
         prename       = m[:pre] =~ /^(an ?|a ?)(.*)?/ ? $2 : m[:pre]
         id            = m[:exist]
-        name          = m[:name].gsub(/<[^>]*>/,'').strip
+        name          = m[:name].gsub(/<[^>]*>/, '').strip
         # noun          = !m[:noun].nil? ? m[:noun] : name.strip.scan(/^(?:.*?) ([^\s]+)$|^([^ ]+)$/).flatten.join('')
         noun          = Inv_db.noun_test(name)
         postname      = m[:post]
@@ -4419,7 +4413,7 @@ module Inv_db;
   #------------------------------------------------------------------------------#
   # dynamic where sql
   #------------------------------------------------------------------------------#
-  def self.extras_processor(h)
+  def self.extras_processor(h, _query_type = nil)
     e = {}
     key = h[:name].to_sym
     if h[:name] == 'orderby'
@@ -4469,10 +4463,10 @@ module Inv_db;
     # resource
     "energy" => "e", "weekly" => "e", "suffused" => "e", "bonus" => "e", "favor" => "e",
   }
-  @special_filters = { 
+  @special_filters = {
     "account" => nil, "amount" => nil, "chararacter" => nil, "name" => nil,
-    "character" => nil, "search" => nil, "location" => nil, "location_type" => nil, "total" => nil, "status" => nil 
-    }
+    "character" => nil, "search" => nil, "location" => nil, "location_type" => nil, "total" => nil, "status" => nil
+  }
 
   @amount_map = { "bank" => "s", "item" => "i", "tickets" => "t" }
   @search_map = { "account" => "account", "bank" => "name", "tickets" => "source", "character" => "name", "item" => "name" }
@@ -4586,7 +4580,6 @@ module Inv_db;
   (@debug_input = true;) if Script.current.vars[0] =~ /@input|@debug_input/
   (@debug_print = true;) if Script.current.vars[0] =~ /@print|@debug_print/
   (@no_squelch  = true;) if Script.current.vars[0] =~ /@no_?squelch/
-  (@autofit     = true;) if Script.current.vars[0] =~ /@autofit/
   (@slower      = true;) if Script.current.vars[0] =~ /@slower/
 
   silence_me if !@debug && !@no_squelch
@@ -4616,7 +4609,6 @@ module Inv_db;
   partials[:actions]["update"] = "update"
   partials[:actions]["add"]    = "add"
   partials[:actions]["remove"] = "remove"
-
 
   partials[:targets] = self.generate_partials(targets, 1)
   partials[:targets]["scrip"] = "tickets"
@@ -4921,7 +4913,6 @@ module Inv_db;
 
   begin
     retries ||= 0
-    stmt.close if !stmt.closed?
     if has_changes > 0
       last_vacuum = @settings_hash["last_vacuum"]
       respond "last_vacuum:#{last_vacuum.inspect}" if @debug
