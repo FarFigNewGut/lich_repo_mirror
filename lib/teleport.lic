@@ -29,17 +29,25 @@
   ;teleport --flush       rebuild the patch scripts in data/teleporter/ for this item
 
    author: Ondreian
-  version: v1.1.0
+  version: v1.2.0
   changelog:
-    v1.0.0 - first stable release
-    v1.1.0 - detect non-unique anchor points for better debugging
+    v1.0.0 
+      - first stable release
+    v1.1.0
+      - detect non-unique anchor points for better debugging
+    v1.2.0 
+      - add Teleport.uni(*ids)
+          makes it much easier to define one-way jump points in user extensions
+      - add Teleport::Callbacks.define_method :timeto do |from, to|; <whatever>; end
+          which allows the user to over ride timeto calculation (turn off for their scripts for instance)
 =end
 
 require "fileutils"
 
 module Teleport
+
   def self.debug?
-    Script.current.vars.include?("--debug")
+    Script.current.vars.include?("--debug") or Script.current.name.start_with?("exec")
   end
 
   module Outcomes
@@ -51,20 +59,33 @@ module Teleport
   end
 
   class Entry
-    attr_reader :position, :room
+    attr_reader :position, :room, :zone
     def initialize(position, room)
       @position = position
       @room     = room
-      @zone     = Room[room.find_nearest_by_tag("town")].location.downcase
-      respond self if Teleport.debug?
+      @zone     = Teleport.zone_for_room(@room)
     end
 
     def to_s
-      "%s | zone=%s | %s - %s" % [@position.to_s.rjust(2), @zone, @room.id.to_s.rjust(6), @room.title.first]
+      "%s | zone=%s | %s - %s" % [@position.to_s.rjust(2), self.zone, @room.id.to_s.rjust(6), @room.title.first]
     end
 
     def inspect
       self.to_s
+    end
+  end
+
+  class Callbacks
+    def timeto(from, to)
+      return 3
+    end
+  end
+  
+  Anchors = []
+  class Anchor < Entry
+    def initialize(position, room_id)
+      super(position, Room[room_id])
+      Anchors << self
     end
   end
 
@@ -141,6 +162,31 @@ module Teleport
     end
   end
 
+  def self.zone_for_room(room)
+    case room.location.downcase
+    when /ta'faendryl/
+      return :otf
+    else
+      # default to closest town's zone
+      self.zone_from_location Room[room.find_nearest_by_tag("town")].location.downcase
+    end
+  end
+
+  def self.zone_from_location(location)
+    case location.downcase
+    when /solhaven|landing|icemule/
+      :west
+    when /ta'(i|v)/
+      :east
+    when /kraken's fall/
+      :kraken_fall
+    when /hinterwilds/
+      :hinterwilds
+    else
+      :other
+    end
+  end
+
   def self.description
     Vars["teleporter"]
   end
@@ -160,18 +206,15 @@ module Teleport
     fail %[could not find from(#{from})] if from.nil?
     fail %[could not find to(#{to})]     if to.nil?
     to_id    = to.id.to_s
-    respond("%s | %s >> %s" % [position.to_s.rjust(2), from.title.first.rjust(40), to.title.first]) if Script.current.vars.include?("--debug")
-    from.timeto[to_id] = StringProc.new "Teleport.timeto"
+    respond("link> %s | %s >> %s" % [position.to_s.rjust(2), from.title.first.rjust(40), to.title.first]) if Teleport.debug?
+    from.timeto[to_id] = StringProc.new "Teleport.timeto(from: #{from.id}, to: #{to.id})"
     from.wayto[to_id]  = StringProc.new "Teleport.teleport(%s)" % position
   end
 
-  def self.timeto()
+  def self.timeto(from:, to:)
     wait_while {GameObj.inv.nil? or GameObj.inv.empty?}
     return nil unless Teleport.exists?
-    return nil if Script.running?("escort")
-    return 10  if Script.running?("eloot")
-    return nil if $bigshot_status.eql?(:hunting)
-    return 3
+    return Callbacks.new.timeto(from, to)
   end
 
   def self.teleport(position)
@@ -189,14 +232,17 @@ module Teleport
     east = []
     others = []
     kraken_fall = []
+    hinterwilds = []
     entries.each {|entry|
-      case Room[entry.room.find_nearest_by_tag("town")].location.downcase
-      when /solhaven|landing|icemule/
+      case entry.zone
+      when :west
         west << entry
-      when /ta'/
+      when :east
         east <<  entry
-      when /kraken's fall/
+      when :kraken_fall
         kraken_fall << entry
+      when :hinterwilds
+        hinterwilds << entry
       else
         others << entry
       end
@@ -206,6 +252,7 @@ module Teleport
       west: west.combination(2),
       east: east.combination(2),
       kraken_fall: kraken_fall.combination(2),
+      hinterwilds: hinterwilds.combination(2),
       others: others.combination(2),
     )
   end
@@ -223,8 +270,12 @@ module Teleport
     load Cache.user_extensions
   end
 
-  def self.build_patch_script(zones)
-    %i(west east kraken_fall).map {|zone|
+  def self.build_patch_script(menu, zones)
+    menu.map {|entry|
+      <<~Ruby
+        Teleport::Anchor.new(#{entry.position}, #{entry.room.id}) # #{entry.room.title.first}
+      Ruby
+    }.join("") + %i(west east kraken_fall).map {|zone|
         zones.send(zone).map {|left, right|
           <<~Ruby
           Teleport.link(
@@ -240,7 +291,7 @@ module Teleport
           )
           Ruby
         }
-      }.flatten.join("\n") + <<~LoadCustom
+      }.flatten.join("") + <<~LoadCustom
         Teleport.load_user_extensions!
       LoadCustom
   end
@@ -251,7 +302,7 @@ module Teleport
       Cache.remove!
       menu = Parser.apply(Teleport.teleporter)
       zones = Teleport.build_teleport_zones(menu)
-      script = Teleport.build_patch_script(zones)
+      script = Teleport.build_patch_script(menu, zones)
       Cache.save(script)
       _respond "<b>built patch script at %s</b>" % Cache.file
     end
@@ -259,6 +310,23 @@ module Teleport
     Cache.load!
     _respond "<b>loaded patch script from %s</b>" % Cache.file
     exit
+  end
+
+  def self.uni(*ids)
+    ids.each {|id|
+      next unless Room[id]
+      from = Entry.new(nil, Room[id])
+      Teleport::Anchors.each { |anchor|
+        if anchor.zone.eql?(from.zone)
+          Teleport.link(
+            from: from.room.id,
+            to: anchor.room.id,
+            position: anchor.position
+          )
+        end
+      }
+    }
+    :ok
   end
 
   def self.main()
