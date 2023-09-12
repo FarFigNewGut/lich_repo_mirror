@@ -244,6 +244,7 @@ download_mapdb = proc { |xmldata|
         }
         if response['compression'] == 'gzip'
           ungzipname = "#{temp_dir}/#{rand(100000000)}"
+          ungzipname = File.join(temp_dir, "temp_map.repo")
           File.open(ungzipname, 'wb') { |f|
             Zlib::GzipReader.open(tempfilename) { |f_gz|
               while data = f_gz.read(1_000_000)
@@ -253,6 +254,7 @@ download_mapdb = proc { |xmldata|
             }
           }
           begin
+            require_relative("mapdiff_report.rb")
             File.rename(ungzipname, tempfilename)
           rescue
             if $!.to_s =~ /Invalid cross-device link/
@@ -286,6 +288,7 @@ download_mapdb = proc { |xmldata|
         end
         updated_timestamp = Time.at(response['timestamp'].to_i)
         File.open(map_updated_at_file, 'w') { |file|
+          file.write("Last updater: #{response['uploaded by']}\n")
           file.write(updated_timestamp)
         }
       end
@@ -636,7 +639,8 @@ else
             begin
                 res = download_mapdb.call
                 break if res
-            rescue
+            rescue => e
+                puts e.inspect
                 i += 1
                 echo "Error downloading map, retrying. #{i} / 3"
             end
