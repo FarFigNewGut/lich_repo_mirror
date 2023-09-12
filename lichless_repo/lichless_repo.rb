@@ -591,8 +591,7 @@ unless (fi = headers.index('file')) and (gi = headers.index('game'))
     exit
 end
 if list.empty?
-    echoput.call("no new files to mirror")
-    exit
+    echoput.call("no new script files to mirror")
 else
     scripts_mirrored = 0
     errors = 0
