@@ -122,7 +122,7 @@
     end
 end
 
-  map_dir = "/mnt/volume_nyc3_01/lich_repo_mirror/gs_map"
+  map_dir = File.join(ENV['GITHUB_WORKSPACE'], 'gs_map')
   tempfilename = File.join(Dir.tmpdir(), "temp_map.repo")
 
   report_fn = File.join(map_dir, "report.txt")
