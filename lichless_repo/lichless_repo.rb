@@ -1,6 +1,7 @@
 require 'digest/md5'
 require 'json'
 require 'openssl'
+require 'stringio'
 require 'tmpdir'
 require 'zlib'
 
