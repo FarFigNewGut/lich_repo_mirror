@@ -584,6 +584,7 @@ download_file = proc { |file,game,version|
   end
 }
 
+errors = 0
 list = filter_list.call(get_list.call)
 headers = list.shift
 unless (fi = headers.index('file')) and (gi = headers.index('game'))
@@ -594,7 +595,6 @@ if list.empty?
     echoput.call("no new script files to mirror")
 else
     scripts_mirrored = 0
-    errors = 0
     sleeper = 0
     error_score = 0
     error_backoff = 0.5
