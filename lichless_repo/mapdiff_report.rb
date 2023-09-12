@@ -55,6 +55,10 @@
         end
     end
 
+    def find
+        @map.find
+    end
+    
     def compact
         @map.compact
     end
