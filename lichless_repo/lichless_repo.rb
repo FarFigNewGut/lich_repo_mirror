@@ -633,19 +633,19 @@ else
         end
     }
     echoput.call("Mirror complete: downloaded #{scripts_mirrored} updates with #{errors} failures")
-    unless $MIRROR_DR
-        i = 0
-        3.times {
-            begin
-                res = download_mapdb.call
-                break if res
-            rescue => e
-                puts e.inspect
-                i += 1
-                echo "Error downloading map, retrying. #{i} / 3"
-            end
-        }
-    end
+end
+unless $MIRROR_DR
+    i = 0
+    3.times {
+        begin
+            res = download_mapdb.call
+            break if res
+        rescue => e
+            puts e.inspect
+            i += 1
+            echo "Error downloading map, retrying. #{i} / 3"
+        end
+    }
 end
 if errors > 0
     Thread.main.raise("had #{errors} errors")
