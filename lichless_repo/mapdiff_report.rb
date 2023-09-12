@@ -48,7 +48,7 @@
     end
 
     def [](val)
-        if val =~ /^u(\d+)/
+        if val.to_s =~ /^u(\d+)/
           @map.find { |k,v| v['uid'].any?($1.to_i) }
         else
            @map[val]
