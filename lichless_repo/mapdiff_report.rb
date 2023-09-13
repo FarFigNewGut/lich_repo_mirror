@@ -98,7 +98,7 @@ unless new_exist && old_exist
   puts "Cannot compare, unable to detect both new and existing map files"
   puts "#{old_fn} : #{old_exist}"
   puts "#{new_fn} : #{new_exist}"
-  exit
+  fail("Old and new files do not both exist")
 end
   
 mapnum  = 0

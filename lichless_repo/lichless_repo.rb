@@ -105,7 +105,6 @@ if $MIRROR_DR
   $script_dir = "#{SCRIPT_DIR}/"
   map_data_dir = "#{work_dir}/dr_map"
   map_file = File.join(map_data_dir, 'dr_map.json')
-  XMLData = MockXMLData.new('DR')
 else
   SCRIPT_DIR = "#{ENV['GITHUB_WORKSPACE']}/lib"
   $script_dir = "#{SCRIPT_DIR}/"
@@ -220,9 +219,6 @@ download_mapdb = proc { |xmldata|
          else
            XMLData.game.downcase
          end
-  puts "Game code debug:"
-  puts XMLData.inspect
-  puts game
   request = { 'action' => 'download-mapdb', 'game' => game, 'supported compressions' => 'gzip',
               'client' => client_version }
   request['current-md5sum'] = if File.exist?(map_file)
@@ -274,6 +270,10 @@ download_mapdb = proc { |xmldata|
         end
         begin
           require_relative('mapdiff_report')
+        rescue => e
+          puts e.inspect
+        end
+        begin
           File.rename(ungzipname, tempfilename)
         rescue StandardError
           if $ERROR_INFO.to_s =~ /Invalid cross-device link/
