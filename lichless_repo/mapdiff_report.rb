@@ -160,6 +160,9 @@ checklist.each do |i|
     diff << '-' * 50
     diff << "#{i} #{new.title[0]} -- new room"
     diff << new.inspect.to_s
+    if (new.wayto.to_s + new.timeto.to_s) =~ /;e/
+      diff << stringproc_callout
+    end
     @new_rooms += 1
   elsif new.nil?
     diff << '-' * 50
