@@ -195,7 +195,7 @@ download_mapdb = proc { |xmldata|
   else
     XMLData = MockXMLData.new('GS') unless defined?(XMLData)
   end
-
+ 
   failed = true
   downloaded = false
 
@@ -215,6 +215,9 @@ download_mapdb = proc { |xmldata|
          else
            XMLData.game.downcase
          end
+  puts "Game code debug:"
+  puts XMLData.inspect
+  puts game
   request = { 'action' => 'download-mapdb', 'game' => game, 'supported compressions' => 'gzip',
               'client' => client_version }
   request['current-md5sum'] = if File.exist?(map_file)
