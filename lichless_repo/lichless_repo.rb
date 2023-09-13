@@ -48,15 +48,6 @@ class MockXMLData
   end
 end
 
-xmldata = false
-game_code = ENV['GAMECODE']
-if xmldata
-  XMLData = xmldata
-elsif game_code
-  XMLData = MockXMLData.new(game_code)
-else
-  XMLData = MockXMLData.new('GS')
-end
 
 def echo(msg)
   puts(msg)
@@ -96,11 +87,25 @@ cmd_force = true
 game_code = ENV['GAMECODE']
 
 $MIRROR_DR = ENV.fetch('MIRROR_DR', nil)
+
+xmldata = false
+game_code = ENV['GAMECODE']
+if xmldata
+  XMLData = xmldata
+elsif game_code
+  XMLData = MockXMLData.new(game_code)
+elsif $MIRROR_DR
+  XMLData = MockXMLData.new('DR')
+else
+  XMLData = MockXMLData.new('GS')
+end
+
 if $MIRROR_DR
   SCRIPT_DIR = "#{ENV['GITHUB_WORKSPACE']}/dragonrealms/lib"
   $script_dir = "#{SCRIPT_DIR}/"
   map_data_dir = "#{work_dir}/dr_map"
   map_file = File.join(map_data_dir, 'dr_map.json')
+  XMLData = MockXMLData.new('DR')
 else
   SCRIPT_DIR = "#{ENV['GITHUB_WORKSPACE']}/lib"
   $script_dir = "#{SCRIPT_DIR}/"
