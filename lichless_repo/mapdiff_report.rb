@@ -35,9 +35,16 @@ require 'English'
 require 'json'
 
 class Hash
+  # super hacky to make work with map object constructs in script
   def method_missing(method_name, *_args)
     fetch(method_name.to_s, nil)
   end
+
+  # hack of the hack for DR that doesn't have UIDs
+  def uid
+    fetch('uid', [])
+  end
+
 end
 
 class MapHash
