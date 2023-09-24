@@ -33,16 +33,17 @@
 #------------------------------------------------------------------------------#
 require 'English'
 require 'json'
+require 'tmpdir'
 
 class Hash
   # super hacky to make work with map object constructs in script
   def method_missing(method_name, *_args)
-    fetch(method_name.to_s, nil)
-  end
-
-  # hack of the hack for DR that doesn't have UIDs
-  def uid
-    fetch('uid', [])
+    if ['tags', 'wayto', 'timeto', 'uid'].any?(method_name.to_s)
+      default_val = []
+    else
+      default_val = nil
+    end
+    fetch(method_name.to_s, default_val)
   end
 
 end
