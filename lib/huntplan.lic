@@ -22,7 +22,8 @@ module HuntPlan
 # module data members
 
 class Data
-	attr_accessor :settings_path, :settings, :account_type, :author_mode, :creature_index, :spawn_index, :room_index, :excluded_paths, :has_dangerous_creature_spawned
+	attr_accessor :settings_path, :settings, :account_type, :author_mode, :creature_index, :spawn_index, :room_index,
+		:excluded_paths, :is_bounty, :bounty_location, :has_dangerous_creature_spawned
 
 	# author_mode enables functionality not suitable for the public;
 	# it may includes crude features in progress as well as personal preferences of the author.
@@ -30,6 +31,7 @@ class Data
 		@settings_path = "#{DATA_DIR}/#{XMLData.game}/#{Char.name}/huntplan.yaml"
 		@author_mode = UserVars.hunt_plan_author
 		@excluded_paths = Array.new
+		@is_bounty = false
 		@has_dangerous_creature_spawned = false
 		@room_index = Hash.new
 	end
@@ -2412,9 +2414,9 @@ class RoomData
     	@max_creature_level = nil
 	end
 
-	def merge_creature_level(level)
-		if !level.nil? && (@max_creature_level.nil? || level > @max_creature_level)
-	 		@max_creature_level = level
+	def merge_creature_level(creature_level)
+		if !creature_level.nil? && (@max_creature_level.nil? || creature_level > @max_creature_level)
+	 		@max_creature_level = creature_level
 		end
 	end
 end
@@ -2424,7 +2426,7 @@ end
 
 class SpawnRoom
 	attr_accessor :rid, :max_creature_level, :hunting_rids, :reachable_rids
-	def initialize(rid,max_creature_level)
+	def initialize(rid, max_creature_level)
 		@rid = rid
 		@max_creature_level = max_creature_level
 		@hunting_rids = Set.new
@@ -2435,9 +2437,9 @@ class SpawnRoom
 		@reachable_rids.add(rid)
 	end
 
-	def merge_creature_level(level)
-		if !level.nil? && (@max_creature_level.nil? || level > @max_creature_level)
-	 		@max_creature_level = level
+	def merge_creature_level(creature_level)
+		if !creature_level.nil? && (@max_creature_level.nil? || creature_level > @max_creature_level)
+	 		@max_creature_level = creature_level
 	 	end
 	end
 end
@@ -2455,9 +2457,9 @@ class RoomBlock
 		@max_creature_level = nil
 	end
 
-	def merge_creature_level(level)
-	 	if !level.nil? && (@max_creature_level.nil? || level > @max_creature_level)
-	 		@max_creature_level = level
+	def merge_creature_level(creature_level)
+	 	if !creature_level.nil? && (@max_creature_level.nil? || creature_level > @max_creature_level)
+	 		@max_creature_level = creature_level
 	 	end
 	end
 
@@ -2479,6 +2481,65 @@ class RoomBlock
 			merge_creature_level(HuntPlan.data.room_index[rid].max_creature_level)
 		end
 	end
+end
+
+########################################################################################################################
+# build_spawn_rooms
+
+def self.build_spawn_rooms(target_spawn_ids)
+	spawn_room_groups = Array.new
+
+	target_spawn_ids.each do |spawn_id|
+		valid_area = false
+		group_spawn_ids = Set.new
+		group_max_creature_level = nil
+		spawn_rids = data.spawn_index[spawn_id]
+
+		spawn_rids.each do |spawn_rid|
+			# if a bounty is being done, filter out any areas that have no rooms within the assigned bounty area.
+			if !data.is_bounty || data.bounty_location.nil? || Room[spawn_rid].location.delete_prefix('the ') == data.bounty_location
+				valid_area = true
+			end
+
+			# collect all of the spawn ids and find the max creature level in each spawn area,
+			# these will be used to restrict the rooms that's that the logic below will wander into.
+			room_data = data.room_index[spawn_rid]
+			room_data.spawn_ids.each{ |spawn_id| group_spawn_ids.add(spawn_id) }
+			if !room_data.max_creature_level.nil? && (group_max_creature_level.nil? || room_data.max_creature_level > group_max_creature_level)
+				group_max_creature_level = room_data.max_creature_level
+			end
+		end
+
+		next unless valid_area
+
+		spawn_room_group = Array.new
+		spawn_rids.each do |spawn_rid|
+			spawn_room = SpawnRoom.new(spawn_rid, data.room_index[spawn_rid].max_creature_level)
+
+			# build the set of rooms that we want to consider reachable from a spawn room within a limited radius.
+			# as long as 2 spawn rooms can reach each other according to this set, they'll be a part of the same hunting area.
+			HuntPlan.build_reachable_rids(spawn_room, 8)
+
+			# simulate creature wander to catch any creatures that wandered off of their spawn nodes. this takes a
+			# cautious approach and won't wander into any rooms that spawn a creature that's not already a part of the
+			# current hunting area. this isn't strictly necessary, it might be best just to stay on the spawn nodes as
+			# much as possible to increase the chance that the player will be in a spawn room when the game's spawn
+			# timer triggers, so for now keeping this disabled.
+			#HuntPlan.build_wander_rids(spawn_room, 3, nil, group_spawn_ids)
+
+			# this less restrictive wander will be performed when the dangerous creature has spawned for a bounty.
+			# we don't want to restrict the wander by creature level or spawn area because it's imperative to find the target.
+			# fixme: ideally ebounty would rerun HuntPlan and restart bigshot anytime the bounty task changes so that
+			# this goes into effect, and because HuntPlan will then limit the targets to just the spawned creature.
+			HuntPlan.build_wander_rids(spawn_room, 4, nil, nil) if data.has_dangerous_creature_spawned
+
+			spawn_room_group.push(spawn_room)
+		end
+
+		spawn_room_groups.push(spawn_room_group) if !spawn_room_group.empty?
+	end
+
+	return spawn_room_groups
 end
 
 ########################################################################################################################
@@ -2603,50 +2664,56 @@ end
 ########################################################################################################################
 # resolve_room_blocks
 
-def self.resolve_room_blocks(spawn_room_group)
-	spawn_room_blocks = Array.new
-	current_block = nil
-	loop do
-		if spawn_room_group.empty?
-			break
-		end
+def self.resolve_room_blocks(spawn_room_groups)
+	room_blocks = Array.new
 
-		if current_block.nil?
-			current_block = RoomBlock.new
-			current_block.insert_spawn_room(spawn_room_group.shift())
-		end
-  
-		expanded_current_block = false
-		spawn_room_group.each_with_index do |spawn_room,spawn_room_index|
-			if !current_block.reachable_rids.include?(spawn_room.rid)
-				next
+	spawn_room_groups.each do |spawn_room_group|
+		spawn_room_blocks = Array.new
+		current_block = nil
+		loop do
+			if spawn_room_group.empty?
+				break
 			end
 
-			if spawn_room.reachable_rids.none? { |rid| current_block.spawn_rids.include?(rid) }
-				next
+			if current_block.nil?
+				current_block = RoomBlock.new
+				current_block.insert_spawn_room(spawn_room_group.shift())
 			end
+	
+			expanded_current_block = false
+			spawn_room_group.each_with_index do |spawn_room,spawn_room_index|
+				if !current_block.reachable_rids.include?(spawn_room.rid)
+					next
+				end
 
-			expanded_current_block = true
-			current_block.insert_spawn_room(spawn_room)
-			spawn_room_group.delete_at(spawn_room_index)
-			break
+				if spawn_room.reachable_rids.none? { |rid| current_block.spawn_rids.include?(rid) }
+					next
+				end
+
+				expanded_current_block = true
+				current_block.insert_spawn_room(spawn_room)
+				spawn_room_group.delete_at(spawn_room_index)
+				break
+			end
+	
+			if !expanded_current_block || spawn_room_group.empty?
+				spawn_room_blocks.push(current_block)
+				current_block = nil
+			end
 		end
-  
-		if !expanded_current_block || spawn_room_group.empty?
-			spawn_room_blocks.push(current_block)
-			current_block = nil
+
+		# throw away small room blocks that couldn't be connected to the rest in the group.
+		# if they're all small, then as a last resort return the largest one.
+		filtered_blocks = spawn_room_blocks.select { |block| block.spawn_rooms.length >= 5 }
+		if !filtered_blocks.nil? && !filtered_blocks.empty?
+			filtered_blocks.each { |block| room_blocks.push(block) }
+		else
+			spawn_room_blocks.sort! { |l,r| l.spawn_rooms.length <=> r.spawn_rooms.length; }
+			room_blocks.push(spawn_room_blocks.last)
 		end
 	end
 
-	# throw away small room blocks that couldn't be connected to the rest in the group.
-	# if they're all small, then as a last resort return the largest one.
-	filtered_blocks = spawn_room_blocks.select { |block| block.spawn_rooms.length >= 5 }
-	if !filtered_blocks.nil? && !filtered_blocks.empty?
-		return filtered_blocks
-	end
-
-	spawn_room_blocks.sort! { |l,r| l.spawn_rooms.length <=> r.spawn_rooms.length }
-	return [spawn_room_blocks.last]
+	return room_blocks
 end
 
 ########################################################################################################################
@@ -2690,59 +2757,64 @@ def self.merge_room_blocks(spawn_room_blocks)
 end
 
 ########################################################################################################################
-# connect_room_block
+# connect_room_blocks
 
-def self.connect_room_block(room_block)
-	current_block = RoomBlock.new
-	current_block.insert_spawn_room(room_block.spawn_rooms.shift())
-	valid_rids = room_block.reachable_rids
-	weightless_rids = Set.new
-	room_block.hunting_rids.each { |rid| weightless_rids.add(rid) }
+def self.connect_room_blocks(room_blocks)
+	new_room_blocks = Array.new
+	room_blocks.each do |room_block|
+		current_block = RoomBlock.new
+		current_block.insert_spawn_room(room_block.spawn_rooms.shift())
+		valid_rids = room_block.reachable_rids
+		weightless_rids = Set.new
+		room_block.hunting_rids.each { |rid| weightless_rids.add(rid) }
 
-	loop do
-		if room_block.spawn_rooms.empty?
-			break
-		end
-
-		found_overlapping_block = false
-		shortest_path_distance = nil
-		shortest_path_start_rid = nil
-		merge_index = nil
-
-		room_block.spawn_rooms.each_with_index do |spawn_room, index|
-			if current_block.hunting_rids.any? { |rid| spawn_room.hunting_rids.include?(rid) } && spawn_room.hunting_rids.any? { |rid| current_block.hunting_rids.include?(rid) }
-				found_overlapping_block = true
-				shortest_path_distance = nil
-				shortest_path_start_rid = nil
-				merge_index = index
+		loop do
+			if room_block.spawn_rooms.empty?
 				break
 			end
 
-			start_rid = current_block.hunting_rids.first
-			path_distance = HuntPlan.find_nearest_path(start_rid, spawn_room.hunting_rids, valid_rids, weightless_rids)
-			if !path_distance.nil? && (shortest_path_distance.nil? || path_distance.distance < shortest_path_distance.distance || path_distance.distance == shortest_path_distance.distance && path_distance.path.length < shortest_path_distance.path.length)
-				shortest_path_start_rid = start_rid
-				shortest_path_distance = path_distance
-				merge_index = index
+			found_overlapping_block = false
+			shortest_path_distance = nil
+			shortest_path_start_rid = nil
+			merge_index = nil
+
+			room_block.spawn_rooms.each_with_index do |spawn_room, index|
+				if current_block.hunting_rids.any? { |rid| spawn_room.hunting_rids.include?(rid) } && spawn_room.hunting_rids.any? { |rid| current_block.hunting_rids.include?(rid) }
+					found_overlapping_block = true
+					shortest_path_distance = nil
+					shortest_path_start_rid = nil
+					merge_index = index
+					break
+				end
+
+				start_rid = current_block.hunting_rids.first
+				path_distance = HuntPlan.find_nearest_path(start_rid, spawn_room.hunting_rids, valid_rids, weightless_rids)
+				if !path_distance.nil? && (shortest_path_distance.nil? || path_distance.distance < shortest_path_distance.distance || path_distance.distance == shortest_path_distance.distance && path_distance.path.length < shortest_path_distance.path.length)
+					shortest_path_start_rid = start_rid
+					shortest_path_distance = path_distance
+					merge_index = index
+				end
 			end
+
+			current_block.insert_spawn_room(room_block.spawn_rooms[merge_index])
+
+			# the path from block A to block B may have had a 1-way edge somewhere along the path,
+			# so make sure that block B can get back to block A via the shortest path in the other direction.
+			if !found_overlapping_block
+				current_block.insert_path(shortest_path_distance.path)
+				shortest_path_distance.path.each { |rid| weightless_rids.add(rid) }
+				return_path = HuntPlan.path_to(shortest_path_distance.path.last, shortest_path_start_rid, valid_rids, weightless_rids)
+				current_block.insert_path(return_path)
+				return_path.each { |rid| weightless_rids.add(rid) }
+			end
+
+			room_block.spawn_rooms.delete_at(merge_index)
 		end
 
-		current_block.insert_spawn_room(room_block.spawn_rooms[merge_index])
-
-		# the path from block A to block B may have had a 1-way edge somewhere along the path,
-		# so make sure that block B can get back to block A via the shortest path in the other direction.
-		if !found_overlapping_block
-			current_block.insert_path(shortest_path_distance.path)
-			shortest_path_distance.path.each { |rid| weightless_rids.add(rid) }
-			return_path = HuntPlan.path_to(shortest_path_distance.path.last, shortest_path_start_rid, valid_rids, weightless_rids)
-			current_block.insert_path(return_path)
-			return_path.each { |rid| weightless_rids.add(rid) }
-		end
-
-		room_block.spawn_rooms.delete_at(merge_index)
+		new_room_blocks.push(current_block)
 	end
 
-	return current_block
+	return new_room_blocks
 end
 
 
@@ -2780,8 +2852,8 @@ def self.sort_results(resolved_blocks)
 		# if the max creature level in the areas is not much higher than the character's level,
 		# or if the max creature level difference between the areas is small, then consider them equal.
 		level_threshold = 2
-		l_level = l.max_creature_level
-		r_level = r.max_creature_level
+		l_level = l.max_creature_level.nil? ? 999 : l.max_creature_level
+		r_level = r.max_creature_level.nil? ? 999 : r.max_creature_level
 		if l_level <= Char.level + level_threshold && r_level <= Char.level + level_threshold || (l_level - r_level).abs() <= level_threshold
 			l_level = 0
 			r_level = 0
@@ -2803,7 +2875,7 @@ end
 ########################################################################################################################
 # build_hunting_plan - the main algorithm that puts all the pieces together.
 
-def self.build_hunting_plan(spawn_rids_grouped)
+def self.build_hunting_plan(target_spawn_ids)
 	start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
 	#  capture timing information in author mode.
@@ -2814,48 +2886,11 @@ def self.build_hunting_plan(spawn_rids_grouped)
 		return elapsed
 	}
 
-	# 1. convert the array of grouped room ids into an array of spawn room objects and wander around each spawn room.
+	# 1. gather information about the rooms in each spawn area, construct a SpawnRoom object for each spawn room,
+	#    and then simulate wandering outward from each spawn room to find valid paths between spawn rooms
+	#    as well as hunting rooms that creatures may have wandered into.
 
-	spawn_room_groups = Array.new
-	spawn_rids_grouped.each do |spawn_rids|
-		# collect all of the spawn ids and find the max creature level in each spawn area,
-		# these will be used to restrict the rooms that's that the logic below will wander into.
-		group_spawn_ids = Set.new
-		group_max_creature_level = nil
-		spawn_rids.each do |spawn_rid|
-			room_data = data.room_index[spawn_rid]
-			room_data.spawn_ids.each{ |spawn_id| group_spawn_ids.add(spawn_id) }
-			if !room_data.max_creature_level.nil? && (group_max_creature_level.nil? || room_data.max_creature_level > group_max_creature_level)
-				group_max_creature_level = room_data.max_creature_level
-			end
-		end
-
-		spawn_room_group = Array.new
-		spawn_rids.each do |spawn_rid|
-			spawn_room = SpawnRoom.new(spawn_rid, data.room_index[spawn_rid].max_creature_level)
-
-			# build the set of rooms that we want to consider reachable from a spawn room within a limited radius.
-			# as long as 2 spawn rooms can reach each other according to this set, they'll be a part of the same hunting area.
-			HuntPlan.build_reachable_rids(spawn_room, 8)
-
-			# simulate creature wander to catch any creatures that wandered off of their spawn nodes. this takes a
-			# cautious approach and won't wander into any rooms that spawn a creature that's not already a part of the
-			# current hunting area. this isn't strictly necessary, it might be best just to stay on the spawn nodes as
-			# much as possible to increase the chance that the player will be in a spawn room when the game's spawn
-			# timer triggers, so for now keeping this disabled.
-			#HuntPlan.build_wander_rids(spawn_room, 3, nil, group_spawn_ids)
-
-			# this less restrictive wander will be performed when the dangerous creature has spawned for a bounty.
-			# we don't want to restrict the wander by creature level or spawn area because it's imperative to find the target.
-			# fixme: ideally ebounty would rerun HuntPlan and restart bigshot anytime the bounty task changes so that
-			# this goes into effect, and because HuntPlan will then limit the targets to just the spawned creature.
-			HuntPlan.build_wander_rids(spawn_room, 4, nil, nil) if data.has_dangerous_creature_spawned
-
-			spawn_room_group.push(spawn_room)
-		end
-
-		spawn_room_groups.push(spawn_room_group)
-	end
+	spawn_room_groups = build_spawn_rooms(target_spawn_ids)
 
 	step1_elapsed = capture_time.call
 
@@ -2864,10 +2899,7 @@ def self.build_hunting_plan(spawn_rids_grouped)
 	#    a 1-way path (the ExcludedRooms can cause that to happen). the 'coyote' spawn rooms outside of WL gates has
 	#    a stray spawn room that's 20+ rooms away from the main group. this will handle situations like that.
 
-	room_blocks = Array.new
-	spawn_room_groups.each do |spawn_room_group|
-		HuntPlan.resolve_room_blocks(spawn_room_group).each { |block| room_blocks.push(block) }
-	end
+	room_blocks = HuntPlan.resolve_room_blocks(spawn_room_groups)
 
 	step2_elapsed = capture_time.call
 
@@ -2881,11 +2913,7 @@ def self.build_hunting_plan(spawn_rids_grouped)
 	#    within an area are connected. a room block may contain 2 disconnected creature areas or areas that
 	#    are only connected by 1-way paths, so this will hook everything up and round out the hunting area.
 
-	new_room_blocks = Array.new
-	room_blocks.each do |block|
-		new_room_blocks.push(HuntPlan.connect_room_block(block));
-	end
-	room_blocks = new_room_blocks
+	room_blocks = HuntPlan.connect_room_blocks(room_blocks);
 
 	step4_elapsed = capture_time.call
 
@@ -2905,8 +2933,6 @@ end
 # process command line vars and populate the index containers
 
 HuntPlan.load_profile()
-
-is_bounty = false
 
 if Script.current.vars.empty? || Script.current.vars[1] == 'help'
 	respond
@@ -2941,10 +2967,10 @@ if Script.current.vars[1] == 'setup'
 end
 
 if Script.current.vars[1] == 'bounty'
-	is_bounty = true
+	data.is_bounty = true
 	status = Parser.parse
 	target_creature = status[:requirements][:creature]
-	bounty_location = status[:requirements][:area]
+	data.bounty_location = status[:requirements][:area]
 	data.has_dangerous_creature_spawned = status[:type] == :dangerous_spawned
 	is_dangerous_creature_bounty = data.has_dangerous_creature_spawned || status[:type] == :dangerous
 else
@@ -2957,8 +2983,14 @@ if target_creature.nil?
 end
 
 target_creature.downcase!
+target_spawn_ids = data.creature_index[target_creature].spawn_ids
 
-# create a reverse index that maps spawn rooms to creature names and spawn ids
+if target_spawn_ids.empty?
+	_respond Lich::Messaging.monsterbold("no spawn areas found for: #{target_creature}")
+	exit
+end
+
+# build a reverse index that maps spawn rooms to creature names and spawn ids
 data.creature_index.each do |creature_name,creature|
 	creature.spawn_ids.each do |spawn_id|
 		data.spawn_index[spawn_id].each do |room_id|
@@ -2969,37 +3001,6 @@ data.creature_index.each do |creature_name,creature|
 			creature_room.merge_creature_level(creature.level)
     	end
   	end
-end
-
-target_spawn_ids = data.creature_index[target_creature].spawn_ids
-
-if target_spawn_ids.empty?
-	_respond Lich::Messaging.monsterbold("no spawn areas found for: #{target_creature}")
-	exit
-end
-
-
-# create a a nested array of spawn rooms for each target area the creature spawns in
-# if a bounty is being done, filter out any rooms that are within the location specified by the bounty.
-target_spawn_rid_groups = Array.new
-
-target_spawn_ids.each do |spawn_id|
-	room_ids = Array.new
-	data.spawn_index[spawn_id].each do |rid|
-		if !is_bounty || bounty_location.nil? || Room[rid].location.delete_prefix('the ') == bounty_location
-			room_ids.push(rid)
-		end
-
-		data.room_index[rid].creature_names.each do |creature_name|
-			if data.creature_index[creature_name].level.nil?
-				_respond Lich::Messaging.monsterbold("missing creature level: #{creature_name}")
-			end
-		end
-	end
-
-	if !room_ids.empty?
-		target_spawn_rid_groups.push(room_ids)
-	end
 end
 
 ########################################################################################################################
@@ -3022,15 +3023,18 @@ end
 
 
 HuntPlan.ExcludePath(7160, 8432)                    # upper trollfang, avoid falling off tree
-HuntPlan.ExcludePath(8569, 8568)                    # cavernhold and secluded valley, dangerous/annoying areas best avoided
+HuntPlan.ExcludePath(8569, 8568)                    # cavernhold and secluded valley, dangerous/annoying areas best avoided entirely
 HuntPlan.ExcludePath(3566, 3565) if Char.level < 30 # level ~15 bounty area, too easy to fall into spike pit and die
 HuntPlan.ExcludePath(4312, 4313)                    # maze on old mine road causes bigshot wander logic to wig out
+HuntPlan.ExcludePath(6633, 6634)                    # map DB is currently screwed up, 3 different rooms are mapped to 6634 and that messes up bigshot
+HuntPlan.ExcludePath(6636, 6634)                    # map DB is currently screwed up, 3 different rooms are mapped to 6634 and that messes up bigshot
+
 
 before_dying { data.excluded_paths.each{ |excluded| Map[excluded.source].wayto[excluded.destination] = excluded.command  } }
 
 data.excluded_paths.each{ |excluded| Map[excluded.source].wayto.delete(excluded.destination) }
 
-hunting_block = HuntPlan.build_hunting_plan(target_spawn_rid_groups)
+hunting_block = HuntPlan.build_hunting_plan(target_spawn_ids)
 hunting_rids = hunting_block.hunting_rids.to_a
 
 data.excluded_paths.each{ |excluded| Map[excluded.source].wayto[excluded.destination] = excluded.command  }
@@ -3044,6 +3048,7 @@ end
 ########################################################################################################################
 # build the list of targets, list of creatures to flee from, etc.
 
+# kill_targets is an array so that the primary kill target is kept first in the list
 flee_targets = Array.new
 kill_targets = Array.new
 safe_targets = Array.new
@@ -3052,8 +3057,9 @@ target_creature_data = data.creature_index[target_creature]
 valid_kill_targets = Set.new
 hunting_block.spawn_rids.each { |rid| data.room_index[rid].creature_names.each{ |name| valid_kill_targets.add(name) } }
 
+# some creatures have alternate names but they are the same creatures and count towards the same bounties.
 # 'arachne priest' may spawn as 'arachne priestess' and 'gnoll priest' may spawn as 'gnoll priestess'
-# the variants are the same creature and both count towards the bounties.
+# fixme: 'shan bard' and 'shan sorcerer' might have alternate names of 'bardess' and 'sorceress'. would need to add them to creature_index too.
 alternative_creature_name = nil
 if target_creature.end_with?('priest')
 	alternative_creature_name = target_creature + 'ess'
@@ -3084,13 +3090,18 @@ end
 
 # iterate reachable rooms rather than hunting rooms so that creatures
 # in the vicinity that could wander into the current area are considered as well.
+processed_targets = Set.new
 hunting_block.reachable_rids.each do |rid|
 	data.room_index[rid].creature_names.each do |creature_name|
+		next if processed_targets.include?(creature_name)
+		processed_targets.add(creature_name)
+
 		is_target = creature_name == target_creature || !alternative_creature_name.nil? && creature_name == alternative_creature_name
 		creature_data = data.creature_index[creature_name]
 
-		# if a creature or creature level isn't known, flee from it.
+		# if a creature's level isn't known, assume the worst and consider it a flee target.
 		if creature_data.nil? || creature_data.level.nil?
+			_respond Lich::Messaging.monsterbold("missing creature level: #{creature_name}")
 			flee_targets.push(creature_name) if !is_target
 			next
 		end
@@ -3100,11 +3111,11 @@ hunting_block.reachable_rids.each do |rid|
 			# in which case we'll kill other creatures so the one we're looking for will spawn.
 			# only kill creatures that spawn in the target area; don't kill creatures in additional areas we wandered into,
 			# or creatures that wandered into the target area from an outside area.
-			if !is_target && (!is_bounty || hunting_rids.length < 15) && !data.has_dangerous_creature_spawned && valid_kill_targets.include?(creature_name)
+			if !is_target && (!data.is_bounty || hunting_rids.length < 15) && !data.has_dangerous_creature_spawned && valid_kill_targets.include?(creature_name)
 				kill_targets.push(creature_name)
 			end
 
-			# if a creature is 5 levels less than us, then ignore it, don't count it towards the bigshot flee count.
+			# if a creature is 5 levels less than the character, then ignore it completely and don't count it towards the bigshot flee count.
 			if creature_data.level + 5 <= Char.level
 				safe_targets.push(creature_name)
 			end
@@ -3113,11 +3124,6 @@ hunting_block.reachable_rids.each do |rid|
 		end
 	end
 end
-
-# array instead of Set so that the primary target is kept first in the list
-flee_targets.uniq!
-kill_targets.uniq!
-safe_targets.uniq!
 
 ########################################################################################################################
 # find the boundaries of the hunting area, and the starting room
@@ -3207,7 +3213,7 @@ flee_targets_s = flee_targets.join(',')
 
 print_results = -> {
 	respond "  Bounty Town: #{bounty_town}" if !bounty_town.nil?
-	respond "  Bounty Location: #{bounty_location}" if !bounty_location.nil?
+	respond "  Bounty Location: #{data.bounty_location}" if !data.bounty_location.nil?
 	respond "  Primary Target: #{target_creature}"
 	respond "  Kill Targets: #{kill_targets.join(',')}"
 	respond "  Safe Targets: #{safe_targets_s}" if !safe_targets_s.empty?
@@ -3224,9 +3230,9 @@ if !Script.exists?('bigshot')
 	exit
 end
 
-bigshot_profile = data.settings[is_bounty ? :bounty_profile : :default_profile]
+bigshot_profile = data.settings[data.is_bounty ? :bounty_profile : :default_profile]
 
-if is_bounty
+if data.is_bounty
 	ebounty_filename = "#{DATA_DIR}/#{XMLData.game}/#{Char.name}/ebounty.yaml"
 	ebounty_slot = data.settings[:ebounty_slot]
 	names_key = "names_#{ebounty_slot}".to_sym
@@ -3303,6 +3309,10 @@ if data.author_mode
 				routine.push("incant 501(once prone m#{Char.maxmana * 1 / 4})")
 			end
 
+			if Spell[917].known?
+				routine.push("incant 917(once m#{Char.maxmana * 1 / 2})")
+			end
+
 			# fixme: use this if attuned to an element and attacking with that same element
 			#if Spell[502].known?
 			#	routine.prepend("incant 502(once m#{Char.maxmana * 1 / 4})")
@@ -3342,7 +3352,7 @@ if data.author_mode
 			end
 
 			routine.push("hide")
-			routine.push("fire")
+			routine.push("fire(x3)") # if a creature keeps spotting you, fire a few times before trying to hide again
 		end
 
 		routine = routine.join(',')
@@ -3371,7 +3381,7 @@ if data.author_mode
 		attack_routines.push('')
 	end
 
-	if hunting_style == 'ranger_crossbow_sniper'
+	if hunting_style == 'ranger_archer_sniper'
 		bigshot_settings['sneaky_sneaky'] = true
 		bigshot_settings["archery_aim"] = "head,right leg,left leg,chest"
 	end
@@ -3385,6 +3395,7 @@ end
 # if the dangerous creature has spawned, the kill targets are already limited to 'grizzled' and 'ancient' creatures,
 # otherwise prepend this regex that with match boss/glam creatures are matched.
 # bigshot will still flee from boss/glam creatures if that setting is enabled.
+# fixme: bigshot needs to be changed to use regex substitition for safe/flee targets so this can do that correctly.
 kill_targets = kill_targets.map{ |s| s.start_with?('ancient', 'grizzled') ? s : "(?:.*)" + s }
 
 bigshot_settings['resting_room_id'] = resting_rid
