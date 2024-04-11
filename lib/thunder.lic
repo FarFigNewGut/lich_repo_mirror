@@ -17,6 +17,15 @@
 	Version 1: Initial release!
 	Version 2: Sending a command from ;thunder that starts with either 'script' or ';' will start a lich script.
 	Version 2: Example: script go2 400 and ;go2 400 would both work.
+	Version 3: Script now tracks more status conditions and will now track multiple status conditions. You can now see if a character is bleeding AND stunned. Or even bleeding, stunned, and sleeping!
+	Version 3: Script can now track the field experience of all characters.
+	Version 3: Script can now track the encumbrance of all characters.
+	Version 3: You can now send commands to clients via ;send, because clicking buttons is too much work.
+		To send a command to everyone do: ;send t all <command> || example: ;send t all wave
+		To send a command to a specific character do: ;send t <name> <command> || example ;send t dreaven wave
+		Works for scripts too! ;send t Dreaven ;go2 bank
+		You can also partially match a character's name. Example: ;send t dre wave
+	
 
 	########################################################
 	Ways to contact me:
@@ -28,9 +37,11 @@
 	########################################################
 	
 	Author: Dreaven
-	Version: 2
+	Version: 3
 
 =end
+
+silence_me
 
 require 'socket'
 
@@ -55,6 +66,7 @@ class ThunderMain
 		"Last Command Sent" => "The last command you sent to a client.",
 		"Update Room" => "How many seconds clients (and yourself) will wait until updating their current room number again.#{update_info}",
 		"Update Info" => "How many seconds clients (and yourself) will wait until updating their info (health, mana, bounty info, etc) again.#{update_info}",
+		"Update Exp" => "How many seconds clients (and yourself) will wait until updating their experience again. Script will also update experience whenever the character's mind state changes, and then wait this many seconds before updating again.#{update_info}",
 		"Log Entries" => "The number of entries you want to save for each log.",
 		"Window Width" => "The width in pixels you want the window to be.#{size_info}",
 		"Window Height" => "The height in pixels you want the window to be.#{size_info}",
@@ -69,6 +81,8 @@ class ThunderMain
 		"Mana" => "Check this box if you want to see everyone's Mana in the status tab.#{stat_info}",
 		"Stamina" => "Check this box if you want to see everyone's Stamina in the status tab.#{stat_info}",
 		"Spirit" => "Check this box if you want to see everyone's Spirit in the status tab.#{stat_info}",
+		"Field Exp" => "Check this box if you want to see everyone's current field experience in the status tab.#{stat_info}",
+		"Encumbrance" => "Check this box if you want to see everyone's current encumbrance in the status tab.#{stat_info}",
 		"Status" => "Check this box if you want to see everyone's Status (stunned, prone, bleeding, etc) in the status tab.#{stat_info}",
 		"Bounty" => "Check this box if you want to see everyone's Bounty info in the status tab.#{stat_info}",
 		"Room #" => "Check this box if you want to see the everyone's current Lich room number in the status tab.#{stat_info}",
@@ -76,9 +90,32 @@ class ThunderMain
 		"Characters/Row" => "How many characters to show per row in the 'Stats' tab.",
 	}
 	
+	@silence = proc{
+		started = false
+		hook_proc = proc { |s|
+			if started
+				if s =~ /<prompt/
+					DownstreamHook.remove("thunder_silence")
+					nil
+				elsif s =~ /<output/
+					s
+				else
+					nil
+				end
+			elsif s =~ /Level:/
+				started = true
+				nil
+			else
+				s
+			end
+		}
+		DownstreamHook.add("thunder_silence", hook_proc)
+	}
+	
 	@defaults = {
 		"Update Room" => 1.0,
 		"Update Info" => 0.5,
+		"Update Exp" => 60,
 		"Log Entries" => 100,
 		"Window Width" => 400,
 		"Window Height" => 400,
@@ -91,6 +128,8 @@ class ThunderMain
 		"Mana" => "Yes",
 		"Stamina" => "Yes",
 		"Spirit" => "Yes",
+		"Field Exp" => "Yes",
+		"Encumbrance" => "Yes",
 		"Status" => "Yes",
 		"Bounty" => "Yes",
 		"Room #" => "Yes",
@@ -126,16 +165,17 @@ class ThunderMain
 		end
 	}
 	
-	bar_names = [ "Health", "Mana", "Stamina", "Spirit" ]
+	bar_names = [ "Health", "Mana", "Stamina", "Spirit", "Field Exp", "Encumbrance" ]
 	@needed_bars = []
 	bar_names.each{ |bar_name| @needed_bars.push(bar_name) if @needed_values[bar_name] == "Yes" }
+	@regex_bars = @needed_bars.map{ |label| label.gsub(",","") }.join("|")
 	
 	labels = [ "Status", "Bounty", "Room #" ]
 	@status_labels = []
 	labels.each{ |label_name| @status_labels.push(label_name) if @needed_values[label_name] == "Yes" }
 	@regex_labels = @status_labels.map{ |label| label.gsub(",","") }.join("|")
 	
-	stat_list = [ "Health", "Mana", "Stamina", "Spirit", "Status", "Bounty", "Room #", "Debug Mode", "Update Room", "Update Info" ]
+	stat_list = [ "Health", "Mana", "Stamina", "Spirit", "Field Exp", "Encumbrance", "Status", "Bounty", "Room #", "Debug Mode", "Update Room", "Update Info", "Update Exp" ]
 	@required_info = "Requests: "
 	stat_list.each{ |name| @required_info += "#{name}: #{@needed_values[name]}, " }
 	@required_info.chop!.chop!
@@ -259,14 +299,7 @@ class ThunderMain
 		@command_button.signal_connect("clicked"){
 			person = @all_menus["Client Menu"].active_text
 			command = @command_entry.text
-			if person.length > 0 && command.length > 0
-				if person == "Everyone"
-					@clients.each{ |_,client| client.puts "Action: #{command}" }
-				else
-					@clients[person].puts "Action: #{command}"
-				end
-				@all_labels["Last Command Sent"].text = "Last Command Sent: '#{command}' sent to #{person}."
-			end
+			command_to_send(person, command)
 		}
 		
 		@main_window.signal_connect("destroy") do
@@ -287,6 +320,18 @@ class ThunderMain
 		start_log_timer
 		Thread.new{ create_server }
 	end
+	
+	def self.command_to_send(person, command)
+		if person.length > 0 && command.length > 0
+			if person == "Everyone" || person == "All"
+				@clients.each{ |_,client| client.puts "Action: #{command}" }
+			else
+				person = @clients.keys.find { |name| name.start_with?(person) } if !@clients.include?(person)
+				@clients[person].puts "Action: #{command}"
+			end
+			@all_labels["Last Command Sent"].text = "Last Command Sent: '#{command}' sent to #{person}."
+		end
+	end
 
 	def self.create_settings_page
 		@spin_buttons = {}
@@ -294,11 +339,14 @@ class ThunderMain
 		adjustments = {}
 		
 		row = -1
-		buttons = [ "Update Room", "Update Info", "Log Entries", "Window Width", "Window Height", "Characters/Row", "Port Number" ]
+		buttons = [ "Update Room", "Update Info", "Update Exp", "Log Entries", "Window Width", "Window Height", "Characters/Row", "Port Number" ]
 		buttons.each{ |button_name|
 			if button_name =~ /Update Room|Update Info/
 				adjustments[button_name] = Gtk::Adjustment.new(@needed_values[button_name], 0.5, 10, 0.1, 0.1, 0)
 				@spin_buttons[button_name] = Gtk::SpinButton.new(adjustments[button_name], 0.1, 1)
+			elsif button_name == "Update Exp"
+				adjustments[button_name] = Gtk::Adjustment.new(@needed_values[button_name], 5, 300, 1, 10, 0)
+				@spin_buttons[button_name] = Gtk::SpinButton.new(adjustments[button_name])
 			else
 				if button_name == "Log Entries"
 					adjustments[button_name] = Gtk::Adjustment.new(@needed_values[button_name], 0, 1000, 1, 10, 0)
@@ -320,7 +368,7 @@ class ThunderMain
 		
 		column = -1
 		row = 0
-		checkboxes = [ "Show Tooltips", "Health", "Mana", "Stamina", "Spirit", "Status", "Bounty", "Room #", "Debug Mode" ]
+		checkboxes = [ "Show Tooltips", "Health", "Mana", "Stamina", "Spirit", "Field Exp", "Encumbrance", "Status", "Bounty", "Room #", "Debug Mode" ]
 		checkboxes.each{ |box_name|
 			@check_boxes[box_name] = Gtk::CheckButton.new(box_name)
 			checkbox = @check_boxes[box_name]
@@ -398,6 +446,7 @@ class ThunderMain
 				update_stat_values("Mana", mana, maxmana)
 				update_stat_values("Stamina", stamina, maxstamina)
 				update_stat_values("Spirit", spirit, maxspirit)
+				update_stat_values("Encumbrance", percentencumbrance, 100)
 				update_status if (@needed_values["Status"] == "Yes")
 				update_bounty if (@needed_values["Bounty"] == "Yes")
 				sleep @needed_values["Update Info"]
@@ -409,6 +458,22 @@ class ThunderMain
 				loop{
 					update_room
 					sleep @needed_values["Update Room"]
+				}
+			end
+		}
+		
+		@threads["Watch 3"] = Thread.new{
+			if @needed_values["Field Exp"] == "Yes"
+				loop{
+					@last_mind_state = checkmind.dup
+					update_exp
+					seconds_remaining = @needed_values["Update Exp"].dup
+					@needed_values["Update Exp"].times{
+						sleep 1
+						seconds_remaining -= 1
+						break if seconds_remaining < 1
+						break if @last_mind_state != checkmind
+					}
 				}
 			end
 		}
@@ -451,9 +516,9 @@ class ThunderMain
 					@all_labels["Latest Message"].text = "Latest message: #{data}"
 					if data.nil? || data =~ /Disconnecting\: /
 						break
-					elsif data =~ /([a-zA-Z]+)\: (-?\d+)\/(\d+)/
+					elsif data =~ /(#{@regex_bars}): (-?\d+)\/(\d+)/
 						update_progress_bar(name, $1, $2, $3)
-					elsif data =~ /(#{@regex_labels})\: (.*)/
+					elsif data =~ /(#{@regex_labels}): (.*)/
 						update_label(name, $1, $2)
 					elsif data =~ /I am responding./
 						@all_unresponsive.delete(name)
@@ -500,6 +565,14 @@ class ThunderMain
 			elsif bar_name == "Spirit"
 				bar_color = "rgba(128, 128, 128, 1.0)"
 				border_color = "rgba(128, 128, 128, 1.0)"
+				trough_color = "rgba(0, 0, 0, 1.0)"
+			elsif bar_name == "Field Exp"
+				bar_color = "rgba(255, 140, 0, 1.0)"
+				border_color = "rgba(255, 140, 0, 1.0)"
+				trough_color = "rgba(0, 0, 0, 1.0)"
+			elsif bar_name == "Encumbrance"
+				bar_color = "rgba(92, 64, 51, 1.0)"
+				border_color = "rgba(92, 64, 51, 1.0)"
 				trough_color = "rgba(0, 0, 0, 1.0)"
 			end
 			@info_labels[name][bar_name].override_color(:normal, Gdk::RGBA.new(255, 255, 255, 1.0))
@@ -563,7 +636,7 @@ class ThunderMain
 			
 			@info_labels[name].each{ |label_name, label|
 				label.set_line_wrap(true)
-				label.set_line_wrap_mode(:word)
+				label.set_max_width_chars(10)
 			}
 		}
 		
@@ -586,9 +659,13 @@ class ThunderMain
 	end
 	 
 	def self.update_progress_bar(name, stat, min, max)
+		min = min.to_i
+		max = max.to_i
 		new_min = [0, min.to_i].max
 		if max == 0
 			@progress_bars[name][stat].fraction = 0
+		elsif new_min > max
+			@progress_bars[name][stat].fraction = 1
 		else
 			@progress_bars[name][stat].fraction = ((new_min.to_f) / max.to_f)
 		end
@@ -604,15 +681,23 @@ class ThunderMain
 	
 	def self.update_status
 		all_wounds = Wounds.head, Wounds.neck, Wounds.abs, Wounds.lhand, Wounds.rhand, Wounds.larm, Wounds.rarm, Wounds.chest, Wounds.back, Wounds.rleg, Wounds.lleg, Wounds.nerves, Wounds.leye, Wounds.reye, Scars.head, Scars.neck, Scars.abs, Scars.lhand, Scars.rhand, Scars.larm, Scars.rarm, Scars.chest, Scars.back, Scars.rleg, Scars.lleg, Scars.nerves, Scars.leye, Scars.reye
-		info = "GREAT!"
-		info = "Injured" if all_wounds.any?{ |i| i > 0 }
-		info = "Prone" if checkprone
-		info = "Poisoned" if checkpoison
-		info = "Diseased" if checkdisease
-		info = "Bleeding" if checkbleeding
-		info = "Stunned" if checkstunned
-		info = "Webbed" if checkwebbed
-		info = "DEAD" if dead?
+		info = []
+		info.push("Injured") if all_wounds.any?{ |i| i > 0 }
+		info.push("Prone") if checkprone
+		info.push("Poisoned") if checkpoison
+		info.push("Diseased") if checkdisease
+		info.push("Bleeding") if checkbleeding
+		info.push("Stunned") if checkstunned
+		info.push("Webbed") if checkwebbed
+		info.push("Bound") if checkbound
+		info.push("Calmed") if checkcalmed
+		info.push("Cut Throat") if checkcutthroat
+		info.push("Silenced") if checksilenced
+		info.push("Sleeping") if checksleeping
+		info = "GREAT!" if info.empty?
+		info = "DEAD" if checkdead
+
+		info = info.join(", ") if info.is_a?(Array)
 		
 		stat_name = "Status"
 		if info != @current_stats[stat_name]
@@ -691,6 +776,15 @@ class ThunderMain
 		end
 	end
 	
+	def self.update_exp
+		$current_field_exp = nil
+		$max_field_exp = nil
+		$update_field_exp = true
+		@silence.call
+		wait_until{ $max_field_exp }
+		update_stat_values("Field Exp", $current_field_exp, $max_field_exp)
+	end
+	
 	def self.add_log(log, data)
 		max_entries = @needed_values["Log Entries"]
 		if max_entries > 0
@@ -717,7 +811,7 @@ class ThunderMain
 		else
 			match_menu_item(@all_menus["Client Menu"], @current_person)
 		end
-		@all_labels["Everyone Connected"].text = "Everyone connected (#{new_hash.count}): #{new_hash.keys.join(', ')}"
+		@all_labels["Everyone Connected"].text = "Everyone connected (#{new_hash.count}): #{new_hash.keys.join(", ")}"
 	end
 	
 	def self.match_menu_item(menu, item_needed)
@@ -749,6 +843,7 @@ class ThunderMain
 	
 	before_dying{
 		@main_window.close if @main_window
+		DownstreamHook.remove("thunder_silence")
 		echo "Shutting down server..."
 		@clients.each{ |name,client| 
 			unless client.closed?
@@ -765,4 +860,21 @@ Gtk.queue {
 	Gtk.main
 }
 
-sleep
+Thread.new{
+	loop{
+		wait_until { $update_field_exp }
+		$update_field_exp = nil
+		put "exp"
+	}
+}
+
+while line = get
+	if line =~ /^t ([a-zA-Z]+) (.*)/i
+		person = $1.capitalize
+		command = $2
+		ThunderMain.command_to_send(person, command)
+	elsif line =~ /Field Exp: ([\d,]+)\/([\d,]+)/ && $max_field_exp.nil?
+		$current_field_exp = $1.delete(",").to_i
+		$max_field_exp = $2.delete(",").to_i
+	end
+end
