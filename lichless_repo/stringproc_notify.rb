@@ -7,6 +7,10 @@ webhooks = ENV['DISCORD_WEBHOOKS']
 gs_change = ENV['MAPCHANGE_GS']
 dr_change = ENV['MAPCHANGE_DR']
 
+puts webhooks.nil?
+puts gs_change
+puts dr_change
+
 if webhooks && (gs_change == 1 || dr_change == 1 || gs_change.nil?)
   webhooks.split(',').each { |wh|
     wh.strip!
