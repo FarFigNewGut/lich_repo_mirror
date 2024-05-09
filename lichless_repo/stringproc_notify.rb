@@ -7,7 +7,7 @@ webhooks = ENV['DISCORD_WEBHOOKS']
 gs_change = ENV['MAPCHANGE_GS']
 dr_change = ENV['MAPCHANGE_DR']
 
-debug_out = {"webhooks" => webhooks, "gs_change" => gs_change, "dr_change" => dr_change}
+debug_out = {"webhooks" => webhooks.nil?, "gs_change" => gs_change, "dr_change" => dr_change}
 puts debug_out
 
 if webhooks && (gs_change == 1 || dr_change == 1)
