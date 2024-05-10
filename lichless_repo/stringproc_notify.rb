@@ -10,7 +10,7 @@ dr_change = ENV['MAPCHANGE_DR']
 debug_out = {"webhooks" => webhooks.nil?, "gs_change" => gs_change, "dr_change" => dr_change}
 puts debug_out
 
-if webhooks && (gs_change == 1 || dr_change == 1)
+if webhooks && (gs_change == 0 || dr_change == 0)
   webhooks.split(',').each { |wh|
     wh.strip!
     uri = URI(wh)
@@ -36,10 +36,10 @@ if webhooks && (gs_change == 1 || dr_change == 1)
         "embeds": []
     }
 
-    if gs_change == 1
+    if gs_change == 0
         request_body[:embeds].append(gs_embed)
     end
-    if dr_change == 1
+    if dr_change == 0
         request_body[:embeds].append(dr_embed)
     end
 
