@@ -29,20 +29,24 @@ if webhooks && (gs_change == "0" || dr_change == "0")
         "color": 16187392
     }
 
+    content = ["A StringProc change was detected in a MapDB!"]
+    # flags 4 = suppress embeds
     request_body = {
-        "content": "A StringProc change was detected in the MapDB!",
         "attachments": [],
         "avatar_url": "https://i.imgur.com/6SdBMkT.png",
-        "embeds": []
+        "embeds": [],
+        "flags": 4
     }
 
     if gs_change == "0"
         request_body[:embeds].append(gs_embed)
+        content.append("GS map stringproc detected: #{gs_embed[:url]}")
     end
     if dr_change == "0"
         request_body[:embeds].append(dr_embed)
+        content.append("DR map stringproc detected: #{dr_embed[:url]}")
     end
-
+    request_body['content'] = content.join("\n")
     req.body = request_body.to_json
 
     req_options = {
