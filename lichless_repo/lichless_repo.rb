@@ -120,10 +120,10 @@ echoput = proc { |msg|
 connect = proc {
   begin
     if ca_cert.not_before > Time.now
-      respond "Cert is not valid yet"
+      echoput.call("Cert is not valid yet")
       verify_mode = OpenSSL::SSL::VERIFY_NONE
     elsif ca_cert.not_after < Time.now
-      respond "Cert is expired"
+      echoput.call("Cert is expired")
       verify_mode = OpenSSL::SSL::VERIFY_NONE
     else
       verify_mode = OpenSSL::SSL::VERIFY_PEER
