@@ -263,11 +263,17 @@ checklist.each do |i|
         diff << "  added wayto:\n    #{(new_map[i].wayto.keys - old_map[i].wayto.keys).each_with_object([]) do |k, a|
                                          a << "#{k}: #{new_map[k.to_i].title[0]} => #{new_map[i].wayto[k].inspect}"
                                        end.join("\n    ")}"
+        if diff[-1] =~ /;e/
+          diff << stringproc_callout
+        end
       end
       if (old_map[i].wayto.keys - new_map[i].wayto.keys).size.positive?
         diff << "  removed wayto:\n    #{(old_map[i].wayto.keys - new_map[i].wayto.keys).each_with_object([]) do |k, a|
                                            a << "#{k}: #{old_map[k.to_i].title[0]} => #{old_map[i].wayto[k].inspect}"
                                          end.join("\n    ")}"
+        if diff[-1] =~ /;e/
+          diff << stringproc_callout
+        end
       end
       (old.wayto.keys & new.wayto.keys).each do |k|
         if old.wayto[k].inspect != new.wayto[k].inspect
