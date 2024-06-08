@@ -222,6 +222,14 @@ checklist.each do |i|
       end
     end
     # echo i if old.paths.class != Array or new.paths.class != Array
+    if !new.paths.is_a?(Array)
+      dif << "TYPE ERROR: NEW PATH IS A #{new.paths.class}"
+      new.paths = [new.paths].compact
+    end
+    if !old.paths.is_a?(Array)
+        dif << "TYPE ERROR: OLD PATH IS A #{old.paths.class}"
+        old.paths = [old.paths].compact
+    end
     if old.paths.to_s != new.paths.to_s
       if ((old.paths.size == new.paths.size) && (old.paths.size == 1)) || (old.paths.nil? && !new.paths.nil?) || (!old.paths.nil? && new.paths.nil?)
         if old_map[i].paths[0] != new_map[i].paths[0]
