@@ -11,6 +11,9 @@ echo "Removing any scripts actively maintained by EO to avoid download conflicts
 rm lib/.gitignore
 for repo in https://repo.elanthia.online https://extras.repo.elanthia.online ;do
 	get_repo_manifest_files "${repo}" | while read repoFile;do
+		if [ "$repoFile" == "gameobj-data.xml" ];then
+			continue
+		fi
 		git rm lib/${repoFile}
 		echo $repoFile >> lib/.gitignore
 	done
