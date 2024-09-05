@@ -59,7 +59,7 @@ Settings = {}
 temp_dir = Dir.tmpdir
 work_dir = ENV['GITHUB_WORKSPACE']
 
-script_skip_list = ['repository.lic', 'effect-list.xml', 'gameobj-data.xml']
+script_skip_list = ['repository.lic', 'effect-list.xml']
 
 cadence = ENV.fetch('CADENCE', '<6h')
 if cadence =~ /^(>|<)\s*([0-9.]+)(m|h|d|w|y)?$/i
