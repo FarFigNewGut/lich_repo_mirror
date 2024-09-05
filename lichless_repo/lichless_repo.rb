@@ -561,7 +561,7 @@ download_file = proc { |file, game, version|
       newfilename = if (file =~ /\.xml$/i) && (LICH_VERSION.split('.').collect do |num|
                                                  num.rjust(5, '0')
                                                end.join('.') >= '00004.00006.00000')
-                      "#{$data_dir}#{file}"
+                      "#{$script_dir}#{file}"
                     else
                       "#{$script_dir}#{file}"
                     end
