@@ -37,7 +37,7 @@ hide_me
 		- Added flares per attack calculation back into output.
 	1.2.0 (2024-09-10)
 		- Added logic to update the high score only if the new damage value does not exceed the mean plus double the standard deviation (threshold = avg_damage + 2 * std_deviation).
-		- Refined the main loop pattern matching logic to handle some edge cases.  Should better capture patterns occuring rapidly together and better handle dispel flares that strip multiples spells and cause a flux.
+		- Major re-work of mainloop to utilize timeout.
 =end
 
 # Main loop to monitor game lines for flares
@@ -212,6 +212,7 @@ def display_flare_data(flare_type, total_flare_damage, high_score, avg_damage, a
     appearance_rate,
     flares_per_attack  # Use %.1f in format to display one decimal place
   )
+#  echo(message)
   echo_to_familiar_window(message)
 end
 
@@ -296,7 +297,6 @@ end
 # Call display_statistics to show the data
 display_statistics(damage_data, high_scores, total_attacks)
 
-# Main loop to monitor game lines for flares
 compiled_nodmg_patterns = NODMGFLARE_PATTERNS.map { |flare_type, pattern| [flare_type, Regexp.new(pattern)] }.to_h
 compiled_dmg_patterns = DMGFLARE_PATTERNS.map { |flare_type, pattern| [flare_type, Regexp.new(pattern)] }.to_h
 compiled_attack_patterns = ATTACK_PATTERNS.map { |flare_type, pattern| [flare_type, Regexp.new(pattern)] }.to_h
@@ -304,11 +304,16 @@ compiled_attack_patterns = ATTACK_PATTERNS.map { |flare_type, pattern| [flare_ty
 save_interval = 10  # Save every 10 events
 event_counter = 0
 
+# Function to ensure combined data is updated correctly
+def update_combined_data(combined_data, damage_data, high_scores, total_attacks)
+  combined_data['damage_data'] = damage_data
+  combined_data['high_scores'] = high_scores
+  combined_data['total_attacks'] = total_attacks
+end
+
 begin
   while true
     line = get
-
-    max_lines_to_check = 5 # Allow checking up to 5 lines to account for non-consecutive damage lines
 
     # Handle attack patterns
     compiled_attack_patterns.each do |attack_type, pattern|
@@ -319,11 +324,17 @@ begin
       end
     end
 
-    # Combined handling for non-damaging and damaging flare patterns
-    patterns = compiled_nodmg_patterns.merge(compiled_dmg_patterns)
+    # Combine all three pattern hashes into one
+    patterns = compiled_nodmg_patterns.merge(compiled_dmg_patterns).merge(compiled_attack_patterns)
 
     patterns.each do |flare_type, pattern|
       if line =~ pattern
+        # Skip attack patterns
+        next if compiled_attack_patterns.key?(flare_type)
+
+        # Initialize damage data if not already present
+        damage_data[flare_type] ||= []
+
         # Track the specific flare occurrence
         flare_hits = damage_data[flare_type].size
 
@@ -332,103 +343,137 @@ begin
 
         # Determine if the current pattern is damaging or non-damaging
         is_damaging_pattern = compiled_dmg_patterns.key?(flare_type)
+        is_nodmg_pattern = compiled_nodmg_patterns.key?(flare_type)
 
-        # Initialize variables for handling lines after the pattern match
-        damage_lines = []
-        new_pattern_detected = false
-        new_pattern_line = nil
-        line_offset = 0
-        ignore_damage = false
-
-        # Check subsequent lines for damage or new patterns
-        max_lines_to_check.times do
-          damage_line = get
-          line_offset += 1
-
-          # Check if the line matches the specific line to start ignoring damage
-          ignore_damage ||= damage_line.include?("Ripples of wavering energy coalesce around")
-
-          # Check if the line matches any new flare or attack pattern
-          is_new_pattern = compiled_nodmg_patterns.any? { |_, pat| damage_line =~ pat } ||
-                           compiled_dmg_patterns.any? { |_, pat| damage_line =~ pat } ||
-                           compiled_attack_patterns.any? { |_, pat| damage_line =~ pat }
-
-          if is_new_pattern
-            new_pattern_detected = true
-            new_pattern_line = damage_line # Capture the new pattern line
-            if line_offset >= 1
-              break # Stop processing if a new pattern is detected after at least 1 line
-            else
-              next # Continue processing until reaching at least the 1st line
-            end
-          elsif damage_line.nil? || damage_line.strip.empty?
-            next # Skip empty lines and continue checking
-          elsif damage_line =~ /\.\.\. (\d+) points? of damage!/ && !ignore_damage
-            damage_lines << damage_line.match(/\.\.\. (\d+) points? of damage!/)[1].to_i
-          elsif damage_line =~ /You feel (\d+) mana surge into you|You gain (\d+) mana/i && !ignore_damage
-            damage_lines << damage_line.match(/You feel (\d+) mana surge into you|You gain (\d+) mana/i)[1].to_i
-            break
-          elsif damage_line =~ /is unaffected|with little effect|no effect|thorny barrier surrounding .* blocks/i
-            # Detected a line indicating no damage occurred
-            break
-          end
-          break if damage_lines.size >= 2
-        end
-
-        # Log and display statistics for damaging patterns
-        if is_damaging_pattern
-          if damage_lines.any?
-            total_flare_damage = damage_lines.sum
-            damage_data[flare_type] << total_flare_damage
-            avg_damage = calculate_average(damage_data[flare_type])
-            std_deviation = calculate_standard_deviation(damage_data[flare_type])
-            threshold = avg_damage + 2 * std_deviation
-            high_scores[flare_type] = [total_flare_damage, high_scores[flare_type]].compact.max if total_flare_damage <= threshold
-
-            # Display the damage data
-            total_flare_hits = damage_data.values.flatten.size
-            appearance_rate = calculate_appearance_rate(damage_data[flare_type].size, total_flare_hits)
-            display_flare_data(flare_type, total_flare_damage, high_scores[flare_type], avg_damage, appearance_rate, flares_per_attack)
-          else
-            # If no damage lines found, still log as non-damaging for damaging patterns
-            damage_data[flare_type] << nil
-            display_flare_data(flare_type, 0, 0, 0, calculate_appearance_rate(damage_data[flare_type].size, damage_data.values.flatten.size), flares_per_attack)
-          end
-        else
-          # For non-damaging patterns, log occurrence without damage
+        # Handle non-damaging patterns immediately
+        if is_nodmg_pattern
           damage_data[flare_type] << nil
           total_flare_hits = damage_data.values.flatten.size
           appearance_rate = calculate_appearance_rate(damage_data[flare_type].size, total_flare_hits)
           display_flare_data(flare_type, 0, 0, 0, appearance_rate, flares_per_attack)
+          break # Stop processing further to handle new patterns immediately
+        end
+
+        # Initialize damage_lines to capture damage information
+        damage_lines = []
+
+        # Handle two-line damage patterns first
+        if is_damaging_pattern && (flare_type.to_s.include?('DoT') || flare_type.to_s.include?('GEF') || flare_type.to_s.include?('Firewheel') || flare_type.to_s.include?('Greater_Rhimar'))
+          # Capture up to 2 lines of damage
+          begin
+            Timeout.timeout(0.03) do
+              damage_count = 0
+              5.times do  # Check up to 5 lines for a damage match
+                damage_line = get
+
+                # First priority: Check for new patterns to break immediately
+                is_new_pattern = patterns.any? { |_, pat| damage_line =~ pat }
+                if is_new_pattern
+                  line = damage_line # Set the line to the new pattern line detected
+                  break # Restart pattern matching with the new line
+                end
+
+                # Capture damage lines if no new pattern is detected
+                if damage_line =~ /(\d+) points? of damage!/
+                  damage_lines << damage_line.match(/(\d+) points? of damage!/)[1].to_i
+                  damage_count += 1
+                elsif damage_line =~ /AS\: .* vs DS\: .* with AvD|Roundtime|CS\: .* vs TD\: .* \+ CvA|is unaffected|with little effect|no effect|thorny barrier surrounding .* blocks|blinks and looks around in confusion for a moment|manages to dodge the licking flames|unharmed by the|scoffs at the/i
+                  break # Handle specific no-damage or unrelated lines
+                end
+              end
+            end
+          rescue Timeout::Error
+            # Timeout reached, stop capturing lines
+          end
+
+        # Handle one-line damage patterns second
+        elsif is_damaging_pattern
+          # Capture up to 1 line of damage, searching up to 3 lines for potential damage
+          begin
+            Timeout.timeout(0.015) do
+              damage_count = 0
+              3.times do  # Check up to 3 lines for a damage match
+                damage_line = get
+
+                # First priority: Check for new patterns to break immediately
+                is_new_pattern = patterns.any? { |_, pat| damage_line =~ pat }
+                if is_new_pattern
+                  line = damage_line # Set the line to the new pattern line detected
+                  break # Restart pattern matching with the new line
+                end
+
+                # Capture a single damage line
+                if damage_line =~ /(\d+) points? of damage!/
+                  damage_lines << damage_line.match(/(\d+) points? of damage!/)[1].to_i
+                  damage_count += 1
+                  break if damage_count >= 1 # Only capture up to 1 line for one-line patterns
+                elsif damage_line =~ /AS\: .* vs DS\: .* with AvD|Roundtime|CS\: .* vs TD\: .* \+ CvA|is unaffected|with little effect|no effect|thorny barrier surrounding .* blocks|blinks and looks around in confusion for a moment|manages to dodge the licking flames|unharmed by the|scoffs at the/i
+                  break # Handle specific no-damage or unrelated lines
+                elsif damage_line =~ /You feel (\d+) mana surge into you|You gain (\d+) mana/i
+                  damage_lines << damage_line.match(/You feel (\d+) mana surge into you|You gain (\d+) mana/i)[1].to_i
+                  break
+                end
+              end
+            end
+          rescue Timeout::Error
+            # Timeout reached, stop capturing lines
+          end
+        end
+
+        # Log and display statistics for damaging patterns
+        if damage_lines.any?
+          total_flare_damage = damage_lines.sum
+          damage_data[flare_type] << total_flare_damage
+
+          if damage_data[flare_type].any? { |v| v.is_a?(Numeric) }
+            avg_damage = calculate_average(damage_data[flare_type])
+            std_deviation = calculate_standard_deviation(damage_data[flare_type])
+            threshold = avg_damage + 2 * std_deviation
+            high_scores[flare_type] = [total_flare_damage, high_scores[flare_type]].compact.max if total_flare_damage <= threshold
+          else
+            avg_damage = 0
+            std_deviation = 0
+          end
+
+          # Display the damage data
+          total_flare_hits = damage_data.values.flatten.size
+          appearance_rate = calculate_appearance_rate(damage_data[flare_type].size, total_flare_hits)
+          display_flare_data(flare_type, total_flare_damage, high_scores[flare_type], avg_damage, appearance_rate, flares_per_attack)
+        else
+          damage_data[flare_type] << nil
+          display_flare_data(flare_type, 0, 0, 0, calculate_appearance_rate(damage_data[flare_type].size, damage_data.values.flatten.size), flares_per_attack)
         end
 
         event_counter += 1
 
-        # If a new pattern was detected and at the right offset, process it after finalizing the current one
-        if new_pattern_detected && new_pattern_line && line_offset >= 1
-          line = new_pattern_line # Set the line to the new pattern line detected
-          redo # Redo the pattern checks with the new pattern line
-        elsif new_pattern_detected && line_offset < 1
-          # Adjust to continue reading until we hit at least the first line
-          max_lines_to_check += (1 - line_offset) # Adjust to allow reading a few more lines
+        # Save data at intervals
+        if event_counter >= save_interval
+          update_combined_data(combined_data, damage_data, high_scores, total_attacks)
+          save_combined_data(combined_data, combined_data_file_path)
+          event_counter = 0
         end
 
-        break # Stop checking further patterns once processing is complete
+        break # Stop checking further patterns
       end
     end
 
-    # Save data at intervals
-    if event_counter >= save_interval
-      save_combined_data(combined_data, combined_data_file_path)
-      event_counter = 0
-    end
-
-    sleep 0.025
   end
 rescue Interrupt
-  # Save data on script exit
+  # Update combined data before saving on script exit
+  update_combined_data(combined_data, damage_data, high_scores, total_attacks)
   save_combined_data(combined_data, combined_data_file_path)
   echo_to_familiar_window("Flare damage data, high scores, and attack counts saved. Exiting script.")
 end
+
+
+
+
+
+
+
+
+
+
+
 
 
