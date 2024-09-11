@@ -20,7 +20,7 @@ NODMGFLARE_PATTERNS = {
   TotemAnimalistic: /flows from it and over your exposed skin, imbuing a sudden rush of power from/,
   TotemBestial: /the semitransparent figure moving to try to shield you from the attack/,
   TotemShifting: /the motes encasing your arm in incandescence as a rush of power sinks into you to strengthen your attack/,
-#  TotemFeral: /Feral_Totem/,
+  TotemFeral: /your vision briefly obscured with a bloody haze as a rush of strength surges into your limbs/,
   Tome_Spellwarden: /As you stare at the words, you feel the weight of tactical knowledge build in you, allowing you to better protect yourself/,
   Terror_Flare: /Your .* releases a distorted black shadow at/,
   Sprite_DefensiveFlares: /The .* sprite on your shoulder projects a .* barrier in front of you/,
