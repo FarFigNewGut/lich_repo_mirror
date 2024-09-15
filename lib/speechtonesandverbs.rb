@@ -1,3 +1,11 @@
+=begin
+  This file is required in order for speechfinder.lic to function.
+
+  1.0.0 (2024-09-15)
+    - Initial release of speechtonesandverbs.rb global constants.
+    - A list of all speech tones and speech verbs found at https://gswiki.play.net/Tones_by_Tone with definitions.
+=end
+
 # Define the global constant with all verbs and categories
 TONES_DB = {
   "Sound": {
@@ -310,7 +318,7 @@ TONES_DB = {
     "remorseful" => "speaking in a manner that shows deep regret, guilt, or sorrow for wrongdoing.",
     "resentful" => "speaking in a manner that shows bitterness, anger, or displeasure due to perceived injustice.",
     "rueful" => "speaking in a manner that shows regret, sorrow, or pity, often with a touch of irony.",
-    "sad" => "speaking in a manner that shows unhappiness, sorrow, or disappointment.",
+    "sad" => "speaking in a manner that shows sadness, unhappiness, sorrow, or disappointment.",
     "sardonic" => "speaking in a mocking, cynical, or scornfully humorous manner; often with contempt.",
     "shaky" => "speaking in a manner that shows nervousness, fear, or lack of confidence; unsteady.",
     "skittish" => "speaking in a jittery, nervous, or easily frightened manner; lacking calm or composure.",
