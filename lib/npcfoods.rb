@@ -1,7 +1,5 @@
 =begin
 	This file is required in order for foodshopper.lic to function.
-	
-	This database is not fully populated late and will be updated overtime.
 
 	https://discord.com/channels/226045346399256576/1285045233238806539
 	
@@ -6659,5 +6657,1658 @@ FOODS_DB = {
       backroom_access: 'Paid Event - FREE'
     }
   ],
+"Targon's Tavern, Tap Room" => [
+    {
+      uid: 2101951,
+      order_number: 1,
+      name: 'a glass of rose wine',
+      description: 'A light and floral glass of rose wine with a subtle sweetness.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101951,
+      order_number: 2,
+      name: 'a glass of red wine',
+      description: 'A rich and bold glass of red wine with fruity undertones.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101951,
+      order_number: 3,
+      name: 'a stein of bock beer',
+      description: 'A dark and malty stein of bock beer with a smooth finish.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101951,
+      order_number: 4,
+      name: "a stein of Haakon's Choice",
+      description: 'A specialty stein of Haakon’s Choice, known for its bold flavor and strong hops.',
+      location: "River's Rest",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101951,
+      order_number: 5,
+      name: "a glass of Targon's Best",
+      description: 'A glass of Targon’s Best, a local favorite known for its unique blend of spices and fruits.',
+      location: "River's Rest",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101951,
+      order_number: 6,
+      name: 'a shot of fine bourbon',
+      description: 'A shot of smooth and well-aged bourbon with a rich, woody flavor.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101951,
+      order_number: 7,
+      name: 'a cup of honeyed herb tea',
+      description: 'A warm cup of herb tea sweetened with honey for a soothing drink.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101951,
+      order_number: 8,
+      name: 'some clear spring water',
+      description: 'A refreshing cup of clear spring water, cool and revitalizing.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101951,
+      order_number: 9,
+      name: 'a warm buttered muffin',
+      description: 'A freshly baked muffin slathered in butter, warm and comforting.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101951,
+      order_number: 10,
+      name: 'a small bottle of milk',
+      description: 'A small bottle of fresh, creamy milk perfect for a quick refreshment.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101951,
+      order_number: 11,
+      name: 'a cup of steaming hot coffee',
+      description: 'A strong and hot cup of coffee, perfect for a morning boost.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101951,
+      order_number: 12,
+      name: 'a crisp red apple',
+      description: 'A fresh and crisp red apple, juicy and sweet.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    }
+  ],
+"Dabbings Mews, Tassel Grogs" => [
+    {
+      uid: 704217,
+      order_number: 1,
+      name: 'Dark grog',
+      description: 'A hearty, strong dark grog with a robust and bitter taste.',
+      location: "Icemule Trace",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 704217,
+      order_number: 2,
+      name: 'Ruby port',
+      description: 'A rich ruby port with a deep, fruity flavor and smooth finish.',
+      location: "Icemule Trace",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 704217,
+      order_number: 3,
+      name: 'Mulled cider',
+      description: 'A warm mulled cider infused with spices, perfect for cold nights.',
+      location: "Icemule Trace",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 704217,
+      order_number: 4,
+      name: 'Burakis sandwich',
+      description: 'A thick sandwich filled with seasoned Burakis meat, served on rustic bread.',
+      location: "Icemule Trace",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N',
+      bites_remaining: 4
+    },
+    {
+      uid: 704217,
+      order_number: 5,
+      name: "Taun'tor haunch sandwich",
+      description: 'A hearty sandwich made from roasted Taun’tor haunch with a smoky flavor.',
+      location: "Icemule Trace",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N',
+      bites_remaining: 4
+    },
+    {
+      uid: 704217,
+      order_number: 6,
+      name: 'Caramel turtle pie',
+      description: 'A sweet caramel turtle pie with a rich, gooey filling and a crunchy crust.',
+      location: "Icemule Trace",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N',
+      bites_remaining: 3
+    }
+  ],
+"The Thirsty Penguin, Bar" => [
+    {
+      uid: 4043211,
+      order_number: 1,
+      name: 'A glass of water',
+      description: 'A simple, refreshing glass of cool water.',
+      location: "Icemule Trace",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4043211,
+      order_number: 2,
+      name: 'A cup of herbal honey tea',
+      description: 'A warm cup of soothing herbal tea sweetened with honey.',
+      location: "Icemule Trace",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4043211,
+      order_number: 3,
+      name: 'A cup of hard cider',
+      description: 'A cup of crisp, fermented apple cider with a strong kick.',
+      location: "Icemule Trace",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4043211,
+      order_number: 4,
+      name: 'A glass of Penguin pilsner',
+      description: 'A light and refreshing Penguin pilsner with a slightly bitter finish.',
+      location: "Icemule Trace",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4043211,
+      order_number: 5,
+      name: 'A mug of slooberry rum',
+      description: 'A strong, fruity rum infused with the flavor of slooberries.',
+      location: "Icemule Trace",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4043211,
+      order_number: 6,
+      name: 'A glass of white wine',
+      description: 'A glass of crisp, dry white wine with subtle fruity notes.',
+      location: "Icemule Trace",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4043211,
+      order_number: 7,
+      name: 'A mug of dark ale',
+      description: 'A mug of rich, full-bodied dark ale with malty undertones.',
+      location: "Icemule Trace",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4043211,
+      order_number: 8,
+      name: "A flagon of Talbot's Special",
+      description: "A flagon of Talbot's Special, a robust brew with a hearty, bold flavor.",
+      location: "Icemule Trace",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    }
+  ],
+"Tregg's Tavern" => [
+    {
+      uid: 13002200,
+      order_number: 1,
+      name: 'Rye Brandy',
+      description: 'A glass of strong, smooth rye brandy with a hint of spice.',
+      location: "Khazar's Hold",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13002200,
+      order_number: 2,
+      name: 'Sour Whiskey',
+      description: 'A tangy sour whiskey with a bold, sharp flavor.',
+      location: "Khazar's Hold",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13002200,
+      order_number: 3,
+      name: 'Weedroot Tea',
+      description: 'A cup of earthy, soothing weedroot tea with mild bitterness.',
+      location: "Khazar's Hold",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13002200,
+      order_number: 4,
+      name: 'Rock Side Rum',
+      description: 'A robust rum with a rocky, mineral flavor and a smooth finish.',
+      location: "Khazar's Hold",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13002200,
+      order_number: 5,
+      name: 'Sand-devil Rum',
+      description: 'A fiery rum with a strong kick, named after the infamous desert creatures.',
+      location: "Khazar's Hold",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13002200,
+      order_number: 6,
+      name: 'Windblown Stout',
+      description: 'A stout with a rich, dark flavor and a hint of windblown desert sand.',
+      location: "Khazar's Hold",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13002200,
+      order_number: 7,
+      name: 'Grey Mountain Ale',
+      description: 'A hearty ale with a rugged, earthy taste, brewed in the Grey Mountains.',
+      location: "Khazar's Hold",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13002200,
+      order_number: 8,
+      name: "Khazar's Choice Stout",
+      description: 'A rich and complex stout, the preferred brew of Khazar’s Hold.',
+      location: "Khazar's Hold",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13002200,
+      order_number: 9,
+      name: "Tregg's Special Ale",
+      description: 'A special ale with a distinct flavor, unique to Tregg’s Tavern.',
+      location: "Khazar's Hold",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    }
+  ],
+"Trident's Voyage" => [
+    {
+      uid: 2101918,
+      order_number: 1,
+      name: 'a spherical oak-framed glass',
+      description: 'A spherical glass framed with smooth oak, perfect for sipping beverages.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101918,
+      order_number: 2,
+      name: 'a square wood-framed glass',
+      description: 'A square glass with a sturdy wooden frame, ideal for serving cold drinks.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101918,
+      order_number: 3,
+      name: 'a glass and blonde oak plate',
+      description: 'A plate crafted from glass and blonde oak, suitable for elegant meals.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101918,
+      order_number: 4,
+      name: 'an amber and driftwood plate',
+      description: 'A plate made from amber and driftwood, offering a rustic and charming appeal.',
+      location: "River's Rest",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101918,
+      order_number: 5,
+      name: 'a nacre and blonde oak fork',
+      description: 'A fork crafted from nacre and blonde oak, combining elegance and practicality.',
+      location: "River's Rest",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101918,
+      order_number: 6,
+      name: 'a three-tined driftwood fork',
+      description: 'A simple yet functional fork with three tines, made from driftwood.',
+      location: "River's Rest",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101918,
+      order_number: 7,
+      name: 'a carved driftwood spoon',
+      description: 'A spoon carefully carved from driftwood, perfect for casual meals.',
+      location: "River's Rest",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101918,
+      order_number: 8,
+      name: 'a nacre-inset blonde oak spoon',
+      description: 'A spoon adorned with nacre insets, crafted from fine blonde oak.',
+      location: "River's Rest",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101918,
+      order_number: 9,
+      name: 'a set of pale driftwood chopsticks',
+      description: 'A pair of chopsticks made from pale driftwood, simple yet functional.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101918,
+      order_number: 10,
+      name: 'a set of blonde oak chopsticks',
+      description: 'A set of chopsticks crafted from blonde oak, perfect for fine dining.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    }
+  ],
+"Trident's Voyage, Cafe" => [
+    {
+      uid: 2101919,
+      order_number: 1,
+      name: 'a shell-shaped parchment box',
+      description: 'A parchment box shaped like a shell, ideal for carrying small snacks.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101919,
+      order_number: 2,
+      name: 'some marinated olives',
+      description: 'A serving of marinated olives, soaked in herbs and oil for a savory snack.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101919,
+      order_number: 3,
+      name: 'some pickled papaya and turnip',
+      description: 'A tart combination of pickled papaya and turnip with a crunchy texture.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101919,
+      order_number: 4,
+      name: 'some crispy plantain chips',
+      description: 'Crispy plantain chips fried to perfection with a hint of salt.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101919,
+      order_number: 5,
+      name: 'some spiced brown rice',
+      description: 'A bowl of spiced brown rice, seasoned with aromatic spices for a flavorful side.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101919,
+      order_number: 6,
+      name: 'a piece of pepper-flecked pork',
+      description: 'A piece of tender pork flecked with cracked pepper for a spicy kick.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101919,
+      order_number: 7,
+      name: 'some spiced whitefish',
+      description: 'A serving of whitefish, spiced and cooked to a tender perfection.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101919,
+      order_number: 8,
+      name: 'a square of coconut custard',
+      description: 'A rich and creamy square of coconut custard with a hint of sweetness.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101919,
+      order_number: 9,
+      name: 'some honey-roasted figs',
+      description: 'Sweet and sticky honey-roasted figs, bursting with flavor.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101919,
+      order_number: 10,
+      name: 'a cup of winterberry tea',
+      description: 'A warm cup of winterberry tea with a fruity and tart aroma.',
+      location: "River's Rest",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    }
+  ],
+"Troll's Head, Barroom" => [
+    {
+      uid: 701373,
+      order_number: 1,
+      name: 'Vinegar crisps',
+      description: 'Crispy potato slices soaked in vinegar for a sharp, tangy flavor.',
+      location: "Orc's Nest Road Neighborhood",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 701373,
+      order_number: 2,
+      name: 'Pickled egg',
+      description: 'A briny, flavorful pickled egg with a firm texture.',
+      location: "Orc's Nest Road Neighborhood",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 701373,
+      order_number: 3,
+      name: "Troll's Head stout",
+      description: 'A dark, rich stout with a strong malty flavor and hints of roasted coffee.',
+      location: "Orc's Nest Road Neighborhood",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 701373,
+      order_number: 4,
+      name: "Troll's Head bitter",
+      description: 'A bitter ale with earthy undertones and a slightly dry finish.',
+      location: "Orc's Nest Road Neighborhood",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 701373,
+      order_number: 5,
+      name: 'Strong cider',
+      description: 'A strong, crisp cider with a sweet-tart balance and a refreshing bite.',
+      location: "Orc's Nest Road Neighborhood",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 701373,
+      order_number: 6,
+      name: 'Lager shandy',
+      description: 'A refreshing mix of lager and lemonade with a light, sweet flavor.',
+      location: "Orc's Nest Road Neighborhood",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    }
+  ],
+"Two Tarts Trading Company" => [
+    {
+      uid: 4043071,
+      order_number: 8,
+      name: 'a bottle of dark blackberry wine',
+      description: 'A deep, rich wine with a bold blackberry flavor and a sweet finish.',
+      location: "Icemule Trace",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4043071,
+      order_number: 9,
+      name: 'a bottle of iceblossom wine',
+      description: 'A delicate, floral wine with crisp notes of iceblossom petals and a hint of sweetness.',
+      location: "Icemule Trace",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    }
+  ],
+"Warewic, Warewic, and Mastil" => [
+    {
+      uid: 13010115,
+      order_number: 1,
+      name: 'a strip of tender roa\'ter steak',
+      description: 'A succulent strip of roa\'ter steak, grilled to perfection with a rich, savory flavor.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010115,
+      order_number: 2,
+      name: 'a barbecued rolton rib',
+      description: 'A smoky barbecued rolton rib, tender and marinated in a sweet, tangy sauce.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010115,
+      order_number: 3,
+      name: 'a sweet steamed scorpion claw',
+      description: 'A delicate scorpion claw, steamed and glazed with a sweet sauce.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010115,
+      order_number: 4,
+      name: 'some spicy wild gak jerky',
+      description: 'Thin strips of wild gak jerky, dried and spiced for a fiery kick.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010115,
+      order_number: 5,
+      name: 'a roasted cockatrice drumstick',
+      description: 'A hearty roasted cockatrice drumstick, seasoned and slow-cooked to enhance its robust flavor.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010115,
+      order_number: 6,
+      name: 'a crunchy fried lizard tail',
+      description: 'A crunchy fried lizard tail, crisped to perfection and lightly salted.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010115,
+      order_number: 7,
+      name: 'a beer-battered steamed snail',
+      description: 'A tender steamed snail encased in a crispy beer batter, with a savory finish.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010115,
+      order_number: 8,
+      name: 'a thick rolton steak sandwich',
+      description: 'A thick rolton steak sandwich served between freshly baked bread with a hint of garlic butter.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010115,
+      order_number: 9,
+      name: 'a steak and mushroom kabob',
+      description: 'Grilled steak and mushroom kabob, skewered and drizzled with a tangy glaze.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    }
+  ],
+"Baker's Shop, Front Room" => [
+    {
+      uid: 4111,
+      order_number: 1,
+      name: 'a loaf of bread',
+      description: 'A freshly baked loaf of bread with a golden crust and soft interior.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4111,
+      order_number: 2,
+      name: 'a wedding cake',
+      description: 'A tiered wedding cake adorned with delicate frosting decorations.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4111,
+      order_number: 3,
+      name: 'a birthday cake',
+      description: 'A celebratory birthday cake topped with colorful icing and sprinkles.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4111,
+      order_number: 4,
+      name: 'a slice of birthday cake',
+      description: 'A slice of birthday cake, moist and layered with sweet frosting.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4111,
+      order_number: 5,
+      name: 'a chocolate chip cookie',
+      description: 'A warm chocolate chip cookie, chewy with melted chocolate chunks.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4111,
+      order_number: 6,
+      name: 'a cinnamon sugar cookie',
+      description: 'A crisp cinnamon sugar cookie with a light dusting of sweetness.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4111,
+      order_number: 7,
+      name: 'a donut',
+      description: 'A fluffy donut coated with a sweet glaze.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4111,
+      order_number: 8,
+      name: 'a mug of strong Elanthian coffee',
+      description: 'A steaming mug of bold Elanthian coffee, rich and aromatic.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4111,
+      order_number: 9,
+      name: 'a cup of herbal tea',
+      description: 'A soothing cup of herbal tea with delicate floral notes.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4111,
+      order_number: 10,
+      name: 'a steaming mug of hot chocolate',
+      description: 'A rich mug of hot chocolate, topped with a frothy swirl of cream.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4111,
+      order_number: 11,
+      name: 'a cinnamon raisin crumb muffin',
+      description: 'A soft muffin filled with plump raisins and topped with a crumbly cinnamon streusel.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4111,
+      order_number: 12,
+      name: 'a mushroom and savory pasty',
+      description: 'A hearty pasty filled with mushrooms and a savory mixture.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4111,
+      order_number: 13,
+      name: 'a sugar-dusted cinnamon twist',
+      description: 'A flaky cinnamon twist dusted with sugar.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4111,
+      order_number: 14,
+      name: 'a blackberry scone',
+      description: 'A tender scone filled with sweet blackberries.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4111,
+      order_number: 15,
+      name: 'a rum-spattered spiced nut cake',
+      description: 'A moist spiced nut cake splashed with rum for added flavor.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4111,
+      order_number: 16,
+      name: 'a cocoa-dusted raspberry twist',
+      description: 'A raspberry twist lightly dusted with cocoa powder.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4111,
+      order_number: 17,
+      name: 'a plum and brandy crumble',
+      description: 'A warm crumble of plums infused with a hint of brandy.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4111,
+      order_number: 18,
+      name: 'a glazed pumpkin cookie',
+      description: 'A soft pumpkin cookie drizzled with sweet glaze.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4111,
+      order_number: 19,
+      name: 'a jam-filled blackberry cookie',
+      description: 'A buttery cookie filled with sweet blackberry jam.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4111,
+      order_number: 20,
+      name: 'a buttery cornbread square',
+      description: 'A moist square of cornbread, lightly sweetened and buttery.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4111,
+      order_number: 21,
+      name: 'a strawberry ice',
+      description: 'A refreshing strawberry ice, perfect for a hot day.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Y'
+    },
+    {
+      uid: 4111,
+      order_number: 22,
+      name: 'a loaf of gnollish lichen bread',
+      description: 'A dense loaf of bread made from gnollish lichen.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'Y'
+    },
+    {
+      uid: 4111,
+      order_number: 23,
+      name: 'a frosted elf-shaped cookie',
+      description: 'A sweet cookie shaped like an elf and covered with colorful frosting.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Y'
+    },
+    {
+      uid: 4111,
+      order_number: 24,
+      name: 'a frosted sprite-shaped cookie',
+      description: 'A cookie shaped like a sprite, decorated with whimsical frosting.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Y'
+    },
+    {
+      uid: 4111,
+      order_number: 25,
+      name: 'a frosted gnome-shaped cookie',
+      description: 'A cookie shaped like a gnome, adorned with colorful frosting.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Y'
+    },
+    {
+      uid: 4111,
+      order_number: 26,
+      name: 'a spicy fruit and nut muffin',
+      description: 'A muffin filled with spiced fruit and crunchy nuts.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Y'
+    }
+  ],
+"Baker's Shop, Sitting Room" => [
+    {
+      uid: 4112,
+      order_number: 1,
+      name: 'a loaf of dark rye bread',
+      description: 'A dense loaf of dark rye bread with a hearty, earthy flavor.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4112,
+      order_number: 2,
+      name: 'a loaf of golden wheat bread',
+      description: 'A soft loaf of golden wheat bread with a slightly sweet taste.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4112,
+      order_number: 3,
+      name: 'a poppyseed muffin',
+      description: 'A light and fluffy muffin dotted with crunchy poppyseeds.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4112,
+      order_number: 4,
+      name: 'an iced chocolate muffin',
+      description: 'A rich chocolate muffin topped with a smooth layer of icing.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4112,
+      order_number: 5,
+      name: 'a maple walnut muffin',
+      description: 'A moist muffin filled with crunchy walnuts and sweetened with maple.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4112,
+      order_number: 6,
+      name: 'a banana nut muffin',
+      description: 'A soft muffin filled with ripe bananas and crunchy nuts.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4112,
+      order_number: 7,
+      name: 'a strawberry muffin',
+      description: 'A fluffy muffin bursting with sweet strawberry flavor.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4112,
+      order_number: 8,
+      name: 'a frosted peach muffin',
+      description: 'A light peach muffin topped with a sweet frosting.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4112,
+      order_number: 9,
+      name: 'a blueberry muffin',
+      description: 'A moist muffin filled with plump, juicy blueberries.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4112,
+      order_number: 10,
+      name: 'a honey bran muffin',
+      description: 'A hearty bran muffin sweetened with a touch of honey.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4112,
+      order_number: 11,
+      name: 'a piece of chocolate cream pie',
+      description: 'A rich slice of chocolate cream pie topped with whipped cream.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4112,
+      order_number: 12,
+      name: 'a piece of warm apple pie',
+      description: 'A slice of warm apple pie with a flaky crust and spiced filling.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4112,
+      order_number: 13,
+      name: 'a piece of spiced pumpkin pie',
+      description: 'A creamy slice of spiced pumpkin pie with hints of cinnamon and nutmeg.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4112,
+      order_number: 14,
+      name: 'a piece of sticky pecan pie',
+      description: 'A rich slice of sticky pecan pie with a sweet, nutty filling.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4112,
+      order_number: 15,
+      name: 'a piece of flaeshonberry pie',
+      description: 'A slice of flaeshonberry pie filled with tart berries.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4112,
+      order_number: 16,
+      name: 'a piece of lemon meringue pie',
+      description: 'A tangy slice of lemon meringue pie topped with a fluffy meringue.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4112,
+      order_number: 17,
+      name: 'a colorful iced birthday cake',
+      description: 'A festive birthday cake covered in colorful icing.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4112,
+      order_number: 18,
+      name: 'a chocolate iced birthday cake',
+      description: 'A birthday cake topped with a layer of rich chocolate icing.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4112,
+      order_number: 19,
+      name: 'a strawberry iced birthday cake',
+      description: 'A birthday cake covered with a sweet strawberry-flavored icing.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4112,
+      order_number: 20,
+      name: 'a chocolate iced wedding cake',
+      description: 'A tiered wedding cake iced with smooth chocolate frosting.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4112,
+      order_number: 21,
+      name: 'a pink-frosted wedding cake',
+      description: 'A delicate wedding cake decorated with pink frosting.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4112,
+      order_number: 22,
+      name: 'a white-frosted wedding cake',
+      description: 'A classic wedding cake covered with smooth white frosting.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    }
+  ],
+"Baker's Shop, Tea Room" => [
+    {
+      uid: 4114,
+      order_number: 1,
+      name: 'a cup of herbal tea',
+      description: 'A steaming cup of fragrant herbal tea with soothing aromas.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4114,
+      order_number: 2,
+      name: 'a mug of strong Elanthian coffee',
+      description: 'A robust mug of Elanthian coffee, strong and aromatic.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4114,
+      order_number: 3,
+      name: 'a glass of cold milk',
+      description: 'A refreshing glass of cold milk.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4114,
+      order_number: 4,
+      name: 'a chocolate chip cookie',
+      description: 'A freshly baked chocolate chip cookie with gooey chocolate pieces.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4114,
+      order_number: 5,
+      name: 'a cinnamon sugar cookie',
+      description: 'A sweet cinnamon sugar cookie dusted with a delicate layer of sugar.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4114,
+      order_number: 6,
+      name: 'an oatmeal raisin cookie',
+      description: 'A chewy oatmeal raisin cookie filled with plump raisins.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4114,
+      order_number: 7,
+      name: 'a frosted gingersnap cookie',
+      description: 'A spiced gingersnap cookie topped with sweet frosting.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4114,
+      order_number: 8,
+      name: 'a golden brown shortbread cookie',
+      description: 'A rich and buttery shortbread cookie with a golden brown color.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4114,
+      order_number: 9,
+      name: 'a crunchy peanut butter cookie',
+      description: 'A crunchy peanut butter cookie with a rich nutty flavor.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4114,
+      order_number: 10,
+      name: 'a cup of milky ginger tea',
+      description: 'A warm cup of ginger tea with a splash of milk.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4114,
+      order_number: 11,
+      name: 'a cup of frothy hazelnut coffee',
+      description: 'A frothy cup of hazelnut coffee with a smooth, nutty flavor.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4114,
+      order_number: 12,
+      name: 'a mug of buttery pecan coffee',
+      description: 'A rich mug of pecan-flavored coffee with buttery notes.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4114,
+      order_number: 13,
+      name: 'a lilac packet',
+      description: 'A decorative lilac-colored packet of tea.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4114,
+      order_number: 14,
+      name: 'an amber parchment packet',
+      description: 'A small amber-hued parchment packet of tea leaves.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4114,
+      order_number: 15,
+      name: 'a tree-motif grey parchment packet',
+      description: 'A grey parchment packet with a delicate tree motif.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4114,
+      order_number: 16,
+      name: 'a rose-motif ombre parchment packet',
+      description: 'A parchment packet adorned with a rose motif in ombre shades.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4114,
+      order_number: 17,
+      name: 'a slice of lemon',
+      description: 'A fresh slice of lemon to add to your tea.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4114,
+      order_number: 18,
+      name: 'a sugar cube',
+      description: 'A single cube of sugar for sweetening your drink.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4114,
+      order_number: 19,
+      name: 'a bottle of fresh cream',
+      description: 'A bottle of fresh cream, perfect for adding to your tea or coffee.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4114,
+      order_number: 20,
+      name: 'a light grey clay cup',
+      description: 'A simple light grey clay cup.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4114,
+      order_number: 21,
+      name: 'a dusky violet rose-etched tin',
+      description: 'A dusky violet tin etched with a rose motif, perfect for storing tea leaves.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Y'
+    },
+    {
+      uid: 4114,
+      order_number: 22,
+      name: 'a charcoal grey dead tree-motif tin',
+      description: 'A charcoal grey tin etched with a dead tree motif.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Y'
+    },
+    {
+      uid: 4114,
+      order_number: 23,
+      name: 'an amber doe-emblazoned tin',
+      description: 'An amber tin emblazoned with a delicate doe.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Y'
+    },
+    {
+      uid: 4114,
+      order_number: 24,
+      name: 'a lilac passion flower-motif tin',
+      description: 'A lilac-colored tin adorned with a passion flower motif.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Y'
+    }
+  ],
+"The Whining Elf, Bar" => [
+    {
+      uid: 3003076,
+      order_number: 1,
+      name: 'day old bread crusts',
+      description: 'A serving of stale, day-old bread crusts.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003076,
+      order_number: 2,
+      name: 'a fried rat... er, rabbit',
+      description: 'A crispy fried rabbit, humorously mislabeled as rat.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003076,
+      order_number: 3,
+      name: 'a glass of giantish ale',
+      description: 'A strong glass of ale favored by giants.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003076,
+      order_number: 4,
+      name: 'a shot of moonshine whiskey',
+      description: 'A potent shot of clear moonshine whiskey.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003076,
+      order_number: 5,
+      name: 'a mug of dwarven bitters',
+      description: 'A mug of bitter ale brewed in dwarven tradition.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003076,
+      order_number: 6,
+      name: 'a flute of elven moonflower wine',
+      description: 'A delicate flute of fragrant elven moonflower wine.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    }
+  ],
+"Chocolate Shop" => [
+    {
+      uid: 13010177,
+      order_number: 1,
+      name: 'an axe-shaped piece of chocolate',
+      description: 'A finely crafted piece of chocolate shaped like a small axe.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010177,
+      order_number: 2,
+      name: 'a block of dark chocolate',
+      description: 'A solid block of rich and bitter dark chocolate.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010177,
+      order_number: 3,
+      name: 'a block of white chocolate',
+      description: 'A creamy block of smooth white chocolate.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010177,
+      order_number: 4,
+      name: 'a milk chocolate bar',
+      description: 'A classic milk chocolate bar, sweet and smooth.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010177,
+      order_number: 5,
+      name: 'a piece of chocolate caramel',
+      description: 'A soft piece of caramel coated in chocolate.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010177,
+      order_number: 6,
+      name: 'a chocolate nut cluster',
+      description: 'A crunchy cluster of nuts covered in chocolate.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010177,
+      order_number: 7,
+      name: 'a chocolate macadamia nut',
+      description: 'A macadamia nut dipped in rich chocolate.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010177,
+      order_number: 8,
+      name: 'a dark chocolate bar',
+      description: 'A bar of smooth and bittersweet dark chocolate.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010177,
+      order_number: 9,
+      name: 'a handful of ale-flavored gumdrops',
+      description: 'A handful of gumdrops infused with ale flavor.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010177,
+      order_number: 10,
+      name: 'a chocolate dipped almond',
+      description: 'An almond dipped in sweet milk chocolate.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010177,
+      order_number: 11,
+      name: 'some dwarven rum crumb cake',
+      description: 'A slice of crumb cake soaked in rich dwarven rum.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010177,
+      order_number: 12,
+      name: 'a dwarven miner-shaped chocolate',
+      description: 'A piece of chocolate shaped like a dwarven miner.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010177,
+      order_number: 13,
+      name: 'a handful of whiskey drops',
+      description: 'A handful of chocolate drops infused with whiskey flavor.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010177,
+      order_number: 14,
+      name: 'a tiny chocolate stein',
+      description: 'A small chocolate shaped like a stein.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010177,
+      order_number: 15,
+      name: 'a tiny chocolate boulder',
+      description: 'A small, round piece of chocolate resembling a boulder.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010177,
+      order_number: 16,
+      name: 'a tiny chocolate ale keg',
+      description: 'A small chocolate shaped like an ale keg.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010177,
+      order_number: 17,
+      name: 'a tiny chocolate krynch',
+      description: 'A small chocolate shaped like a krynch.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010177,
+      order_number: 18,
+      name: 'a white chocolate toadstool',
+      description: 'A small toadstool made of white chocolate.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010177,
+      order_number: 19,
+      name: 'a dark chocolate toadstool',
+      description: 'A small toadstool made of dark chocolate.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010177,
+      order_number: 20,
+      name: 'a nutty beard-shaped chocolate',
+      description: 'A chocolate piece shaped like a dwarf’s beard with nuts embedded.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010177,
+      order_number: 21,
+      name: 'a black and white chocolate snail',
+      description: 'A snail-shaped chocolate made of black and white chocolate swirls.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    }
+  ],
+"Zul Logoth Salt Exporters" => [
+    {
+      uid: 13010119,
+      order_number: 1,
+      name: 'some colorful salted mushroom chips',
+      description: 'A handful of colorful mushroom chips lightly salted for flavor.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010119,
+      order_number: 2,
+      name: 'some salted roasted peanuts',
+      description: 'A portion of roasted peanuts coated with salt for a savory taste.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010119,
+      order_number: 3,
+      name: 'a salted strip of boar meat',
+      description: 'A tender strip of boar meat cured and salted for preservation.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010119,
+      order_number: 4,
+      name: 'a small cube of salt',
+      description: 'A small cube of pure salt, ideal for seasoning or preserving.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010119,
+      order_number: 5,
+      name: 'some salted miniature pretzels',
+      description: 'A handful of small pretzels dusted with coarse salt.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010119,
+      order_number: 6,
+      name: 'a large salted wheat cracker',
+      description: 'A large, crisp wheat cracker topped with a light sprinkle of salt.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010119,
+      order_number: 7,
+      name: 'some salted fried potato slivers',
+      description: 'Thin, fried potato slices with a savory salted coating.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010119,
+      order_number: 8,
+      name: 'some salted mushroom caps',
+      description: 'Tender mushroom caps salted and preserved for a flavorful snack.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 13010119,
+      order_number: 9,
+      name: 'a block of salted veaba meat',
+      description: 'A thick block of veaba meat cured and salted for storage.',
+      location: "Zul Logoth",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    }
+  ]
 
 }
