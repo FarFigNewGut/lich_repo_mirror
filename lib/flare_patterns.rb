@@ -39,6 +39,7 @@ NODMGFLARE_PATTERNS = {
   NightshroudCloak_Hide: /a cyclone of shadows emerge from your .*?.  The shadows swirl around in an attempt to conceal you/,
   ManaArmor_ManaShield: /latticework springs up from the surface of your .*? and shields you from some of the damage/,
   ManaArmor_ManaFlares: /radiates from your .*? and you feel .*? mana surge into you\!| returning to you with an audible \*WHOOSH\*/,
+  Lucky_Item: /You hear the soft tinkle of rolling dice, followed by the sound of coins dropping!/,
   Lathonian: /your .*? suddenly begins to glow with a polychromatic light/,
   KroderineChains: /Your kroderine chains rapidly consume the magical power of the attack/,
   Kroderine: /Your .*? cast. The magic of the spell is instantly devoured by the/,
