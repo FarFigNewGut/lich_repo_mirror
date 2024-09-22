@@ -37,6 +37,7 @@ NODMGFLARE_PATTERNS = {
   Parasitic_Bulwark: /Your .*? glisten as a sudden rush of blood spills across its surface, creating a magical bulwark against/,
   Parasitic_Defense: /Several .*? reinforce your .*? to defend you against the incoming attack/,
   NightshroudCloak_Hide: /a cyclone of shadows emerge from your .*?.  The shadows swirl around in an attempt to conceal you/,
+  MechanizedArm_Block: /Just as .*? attacks, your arm suddenly swings out and intercepts it!/,
   ManaArmor_ManaShield: /latticework springs up from the surface of your .*? and shields you from some of the damage/,
   ManaArmor_ManaFlares: /radiates from your .*? and you feel .*? mana surge into you\!| returning to you with an audible \*WHOOSH\*/,
   Lucky_Item: /You hear the soft tinkle of rolling dice, followed by the sound of coins dropping!/,
