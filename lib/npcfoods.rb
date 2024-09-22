@@ -4469,5 +4469,2195 @@ FOODS_DB = {
       real_world_equivalent: 'Exists in real life',
       backroom_access: 'N'
     }
-  ]
+  ],
+"Luinne Bheinn, Tavern" => [
+    {
+      uid: 4251110,
+      order_number: 1,
+      name: 'a glass of white wine',
+      description: 'A crisp glass of white wine, perfect for pairing with light meals or enjoying on its own.',
+      location: "Luinne Bheinn",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4251110,
+      order_number: 2,
+      name: 'a glass of red wine',
+      description: 'A rich and full-bodied glass of red wine, ideal for hearty meals or evening relaxation.',
+      location: "Luinne Bheinn",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4251110,
+      order_number: 3,
+      name: 'a tankard of Jock\'s bitter',
+      description: 'A classic tankard of Jock\'s bitter, offering a strong, malty flavor with a hint of bitterness.',
+      location: "Luinne Bheinn",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4251110,
+      order_number: 4,
+      name: 'a tankard of amber ale',
+      description: 'A smooth and flavorful amber ale, with a perfect balance of malt and hops.',
+      location: "Luinne Bheinn",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4251110,
+      order_number: 5,
+      name: 'a snifter of fine brandy',
+      description: 'A luxurious snifter of fine brandy, delivering a smooth, warming finish.',
+      location: "Luinne Bheinn",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 4251110,
+      order_number: 6,
+      name: 'a dram of Reiver\'s whisky',
+      description: 'A dram of Reiver\'s whisky, known for its smoky character and robust flavor.',
+      location: "Luinne Bheinn",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    }
+  ],
+"Rising Pint" => [
+    {
+      uid: 7118444,
+      order_number: 1,
+      name: 'a glass of foamy ginger beer',
+      description: 'A refreshing glass of ginger beer, bubbling with a spicy kick of ginger and a light sweetness.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118444,
+      order_number: 2,
+      name: 'a mug of dark ale',
+      description: 'A rich and hearty mug of dark ale, offering deep malt flavors with a touch of bitterness.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118444,
+      order_number: 3,
+      name: 'a glass of spiced cinnamon mead',
+      description: 'A sweet and warming glass of mead, infused with the comforting flavor of cinnamon spice.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118444,
+      order_number: 4,
+      name: 'a mug of bitter stout',
+      description: 'A bold and bitter stout, full-bodied with hints of roasted malt and coffee flavors.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118444,
+      order_number: 5,
+      name: 'a cup of pale rum',
+      description: 'A smooth and lightly flavored pale rum, perfect for sipping or mixing.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118444,
+      order_number: 6,
+      name: 'a shot of molasses whiskey',
+      description: 'A shot of molasses whiskey, offering a unique blend of sweetness and warmth.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118444,
+      order_number: 7,
+      name: 'a glass of spiked anise tea',
+      description: 'A glass of tea with a bold anise flavor, spiked for a stronger, more aromatic taste.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118444,
+      order_number: 8,
+      name: 'a glass of fruit juice',
+      description: 'A refreshing glass of chilled fruit juice, offering a natural sweetness.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    }
+  ],
+"The Rising Tart" => [
+    {
+      uid: 3003049,
+      order_number: 1,
+      name: 'a slice of blueberry pie',
+      description: 'A classic slice of blueberry pie with a sweet and tart filling.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 2,
+      name: 'a slice of cherry pie',
+      description: 'A delicious slice of cherry pie filled with tart cherries.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 3,
+      name: 'a slice of strawberry pie',
+      description: 'A sweet slice of strawberry pie with a rich and fruity filling.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 4,
+      name: 'a glazed donut',
+      description: 'A slightly tart yet sweet glazed donut with an intense, concentrated flavor.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 5,
+      name: 'a frosted donut',
+      description: 'A sugar-laden frosted donut sweet enough to make your teeth ache.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 6,
+      name: 'a chocolate donut',
+      description: 'A rich chocolate donut with a decadent chocolate glaze.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 7,
+      name: 'a slice of chocolate cake',
+      description: 'A moist and rich slice of chocolate cake.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 8,
+      name: 'a cinnamon bun',
+      description: 'A light and flaky cinnamon bun with layers of pastry that dissolve on your tongue.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 9,
+      name: 'a honey-covered bun',
+      description: 'A thick and satisfying honey-covered bun, both tasty and filling.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 10,
+      name: 'a buttered bread twist',
+      description: 'A twisted bread roll covered in melted butter.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 11,
+      name: 'a garlic breadstick',
+      description: 'A garlic-laden breadstick strong enough to keep unwanted advances at bay.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 12,
+      name: 'a cheese-covered breadstick',
+      description: 'A soft breadstick generously covered in melted cheese.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 13,
+      name: 'a honey-covered roll',
+      description: 'A sweet and sticky roll coated in honey that glues your teeth together.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 14,
+      name: 'a warm buttered roll',
+      description: 'A soft, warm roll covered in melted butter.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 15,
+      name: 'a chocolate cupcake',
+      description: 'A rich chocolate cupcake with a creamy frosting.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 16,
+      name: 'a peach muffin',
+      description: 'A tender muffin bursting with peach flavor, topped with caramelized muffin top.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 17,
+      name: 'a garlic-buttered roll',
+      description: 'A soft roll smothered in garlic butter, filling the air with garlic aroma.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 18,
+      name: 'a hard-crusted roll',
+      description: 'A crunchy roll with a chewy center and a strong aroma of sweet bread.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 19,
+      name: 'a lumpy cheese breadstick',
+      description: 'A barely cooked breadstick with lumps of cheese mixed with pepper and garlic.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 20,
+      name: 'a garlic-flavored breadstick',
+      description: 'A crunchy breadstick exploding with garlic flavor in every bite.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 21,
+      name: 'a yellow peach muffin',
+      description: 'A tender muffin bursting with yellow peach flavor and a crunchy muffin top.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 22,
+      name: 'a lemon muffin',
+      description: 'A tender muffin bursting with lemon flavor and a crunchy muffin top.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 23,
+      name: 'a cinnamon muffin',
+      description: 'A tender muffin bursting with cinnamon flavor and a crunchy muffin top.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 24,
+      name: 'a chocolate muffin',
+      description: 'A tender muffin bursting with chocolate flavor and a crunchy muffin top.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 25,
+      name: 'a Grishknel wolf head cookie',
+      description: 'A rich and hearty cookie in the shape of a Grishknel wolf head.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 26,
+      name: 'a hefty mug of rich Maeramil coffee',
+      description: 'A dark and powerful coffee with a smooth and savory flavor.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3003049,
+      order_number: 27,
+      name: 'some Toktrog traveling bread',
+      description: 'A soft bread with a slightly sweet taste and undertones of honey.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    }
+],
+"Rock Lobster" => [
+    {
+      uid: 7118426,
+      order_number: 1,
+      name: 'a stein of Octopus Ale',
+      description: 'A hearty ale brewed with a rich and complex flavor, perfect for sea-loving patrons.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118426,
+      order_number: 2,
+      name: 'a mug of Starfish Stout',
+      description: 'A deep and dark stout with a hint of saltwater, brewed to perfection.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118426,
+      order_number: 3,
+      name: 'a glass of Pufferfish Porter',
+      description: 'A dangerously delightful porter, strong and flavorful with a hint of the exotic.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118426,
+      order_number: 4,
+      name: 'a cup of Kraken\'s Fall Lager',
+      description: 'A light and crisp lager, brewed locally to celebrate the sea and its creatures.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118426,
+      order_number: 5,
+      name: 'some sugary jellyfish candy',
+      description: 'A sweet and chewy candy, shaped like jellyfish with a sugar coating.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118426,
+      order_number: 6,
+      name: 'some crispy stingray skin chips',
+      description: 'Crispy and salty stingray skin chips, perfect for snacking on the go.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118426,
+      order_number: 7,
+      name: 'a pickled dogfish croquett',
+      description: 'A savory croquett made from pickled dogfish, with a tangy and flavorful bite.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118426,
+      order_number: 8,
+      name: 'some grilled narwhal belly',
+      description: 'Tender and succulent narwhal belly, grilled to perfection with a hint of sea salt.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118426,
+      order_number: 9,
+      name: 'a tender sea robin filet',
+      description: 'A delicate and flavorful sea robin filet, cooked to perfection and served fresh.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118426,
+      order_number: 10,
+      name: 'some whale blubber toast',
+      description: 'A savory and rich toast topped with hearty whale blubber, perfect for the adventurous eater.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118426,
+      order_number: 11,
+      name: 'some spiced manta ray jerky',
+      description: 'Chewy and flavorful manta ray jerky, spiced to perfection for a long-lasting snack.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118426,
+      order_number: 12,
+      name: 'a fried catfish strip',
+      description: 'A crunchy fried strip of catfish, lightly breaded and fried to golden perfection.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118426,
+      order_number: 13,
+      name: 'some fragrant piranha soup',
+      description: 'A hearty soup made with fragrant spices and tender piranha meat, perfect for a cold day.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    }
+],
+"The Sea Hag's Roost, Kitchen" => [
+    {
+      uid: 7118325,
+      order_number: 1,
+      name: 'a glass of mint-infused water',
+      description: 'A refreshing glass of water infused with mint leaves, perfect for quenching your thirst.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118325,
+      order_number: 2,
+      name: 'a jar of New Myssar Delight',
+      description: 'A sweet and tangy jar of delight from New Myssar, perfect for spreading on toast or eating straight.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118325,
+      order_number: 3,
+      name: 'a glass of Oirean port',
+      description: 'A smooth and sweet glass of Oirean port, known for its rich and deep flavor.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118325,
+      order_number: 4,
+      name: 'a tankard of malty ale',
+      description: 'A robust and hearty ale with a strong malty flavor, perfect for pairing with seafood.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118325,
+      order_number: 5,
+      name: 'a chunk of garlic bread',
+      description: 'A warm and crispy chunk of bread slathered with garlic butter, perfect for dipping.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118325,
+      order_number: 6,
+      name: 'a fried spiny sea urchin',
+      description: 'A delicacy from the deep sea, fried and crispy with a hint of salt.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118325,
+      order_number: 7,
+      name: 'a skewer of spicy grilled shrimp',
+      description: 'Juicy shrimp grilled with a spicy marinade, served on a skewer.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118325,
+      order_number: 8,
+      name: 'some rich lobster bisque',
+      description: 'A creamy and rich lobster bisque, full of tender chunks of lobster meat.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118325,
+      order_number: 9,
+      name: 'a bowl of pitted cherries',
+      description: 'A simple bowl of fresh cherries, pitted and ready to eat.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118325,
+      order_number: 10,
+      name: 'a slice of banana rum cake',
+      description: 'A moist and flavorful cake made with ripe bananas and a hint of rum.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118325,
+      order_number: 11,
+      name: 'a cup of amaretto coffee',
+      description: 'A warm cup of coffee with a splash of amaretto liqueur, perfect for an after-dinner treat.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    }
+],
+"The Warren, The Sea Rat" => [
+    {
+      uid: 5009044,
+      order_number: 1,
+      name: 'some raw Maelstrom Bay oysters',
+      description: 'Freshly shucked raw oysters from Maelstrom Bay, served on a bed of crushed ice with lemon wedges.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 5009044,
+      order_number: 2,
+      name: 'a plate of breaded shrimp',
+      description: 'Crispy breaded shrimp served with a tangy dipping sauce.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 5009044,
+      order_number: 3,
+      name: 'a glass of iced lemonade',
+      description: 'A refreshing glass of chilled lemonade, perfect for a warm day.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 5009044,
+      order_number: 4,
+      name: 'a glass of chilled milk',
+      description: 'A cold glass of fresh milk, straight from the dairy.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 5009044,
+      order_number: 5,
+      name: 'a mug of dark river ale',
+      description: 'A full-bodied ale with a strong, malty flavor, perfect for unwinding after a long day.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 5009044,
+      order_number: 6,
+      name: 'a plate of pan-fried calamari',
+      description: 'Tender calamari rings lightly coated and pan-fried to golden perfection.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 5009044,
+      order_number: 7,
+      name: 'a buttered red lobster tail',
+      description: 'A succulent red lobster tail, steamed and served with a side of melted butter.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 5009044,
+      order_number: 8,
+      name: 'a crawfish tail',
+      description: 'A tender crawfish tail, lightly seasoned and perfect for a quick bite.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    }
+],
+"Sleeping Dragon Pub" => [
+    {
+      uid: 700101,
+      order_number: 1,
+      name: 'Dwarven whiskey',
+      description: 'A strong and robust whiskey brewed in the tradition of the dwarves, known for its smoky flavor and potent kick.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 700101,
+      order_number: 2,
+      name: 'Locksmehr porter',
+      description: 'A dark and malty porter beer with hints of chocolate and caramel, brewed locally.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 700101,
+      order_number: 3,
+      name: 'Port wine',
+      description: 'A sweet and full-bodied port wine, perfect for sipping slowly.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 700101,
+      order_number: 4,
+      name: 'Lemon gin fizz',
+      description: 'A refreshing cocktail made with gin, lemon juice, and soda water, finished with a frothy top.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 700101,
+      order_number: 5,
+      name: 'Salted almonds',
+      description: 'A small bowl of crunchy, lightly salted almonds, perfect for snacking.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 700101,
+      order_number: 6,
+      name: 'Crispy fried crabcake',
+      description: 'A golden, crispy fried crabcake with tender, flaky crab meat inside, served with a tangy dipping sauce.',
+      location: "Wehnimer's Landing",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    }
+],
+"The Soup Bone" => [
+    {
+      uid: 7118385,
+      order_number: 1,
+      name: 'a foamy mug of ale',
+      description: 'A refreshing mug of frothy ale with a thick head of foam, perfect for washing down hearty meals.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118385,
+      order_number: 2,
+      name: 'a thin dark beer',
+      description: 'A light-bodied dark beer with a subtle malt flavor, brewed locally.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118385,
+      order_number: 3,
+      name: 'a cup of dark black coffee',
+      description: 'A strong, rich cup of black coffee, served piping hot.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118385,
+      order_number: 4,
+      name: 'a shot of thick clear liquor',
+      description: 'A shot of clear, potent liquor with a strong kick.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118385,
+      order_number: 5,
+      name: 'a glass of spiced vodka',
+      description: 'A smooth glass of vodka infused with a blend of spices for a warm, savory finish.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118385,
+      order_number: 6,
+      name: 'a bowl of clam soup',
+      description: 'A hearty bowl of clam soup, rich with flavor and served with chunks of fresh clams.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118385,
+      order_number: 7,
+      name: 'a trencher of hearty beef stew',
+      description: 'A thick and savory beef stew served in a trencher of bread.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118385,
+      order_number: 8,
+      name: 'a flaky baked scorpion pie',
+      description: 'A unique savory pie made with scorpion meat and baked to a golden crisp.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118385,
+      order_number: 9,
+      name: 'a bowl of cubed eel',
+      description: 'Tender cubes of eel served in a savory broth.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118385,
+      order_number: 10,
+      name: 'a plate of crispy fried shrimp',
+      description: 'A plate of golden, crispy fried shrimp served with a tangy dipping sauce.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118385,
+      order_number: 11,
+      name: 'a slice of warm acorn bread',
+      description: 'A warm slice of nutty acorn bread, perfect for pairing with soups and stews.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118385,
+      order_number: 12,
+      name: 'some crispy fried cornmeal balls',
+      description: 'Golden cornmeal balls, fried to a crispy perfection.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118385,
+      order_number: 13,
+      name: 'a spicy grilled sausage sandwich',
+      description: 'A grilled sausage sandwich bursting with flavor, served on a soft roll.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118385,
+      order_number: 14,
+      name: 'a large grilled frog leg',
+      description: 'A large frog leg grilled to perfection, offering a tender and smoky flavor.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118385,
+      order_number: 15,
+      name: 'a pickled scarab skewer',
+      description: 'A skewer of pickled scarabs, an exotic and tangy treat.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118385,
+      order_number: 16,
+      name: 'a grilled squirrel kabob',
+      description: 'A kabob of grilled squirrel, tender and full of flavor.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 7118385,
+      order_number: 17,
+      name: 'a boar-wrapped boiled egg',
+      description: 'A boiled egg wrapped in savory boar meat and served warm.',
+      location: "Kraken's Fall",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    }
+],
+"The Stone Eye, Bar" => [
+    {
+      uid: 2101981,
+      order_number: 1,
+      name: 'a mug of Devil Chaser beer',
+      description: 'A mug of crisp and refreshing Devil Chaser beer, known for its smooth finish and robust flavor.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101981,
+      order_number: 2,
+      name: 'a mug of Rone\'s Own stout',
+      description: 'A dark, full-bodied stout with a creamy head, crafted locally with a rich malt flavor.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101981,
+      order_number: 3,
+      name: 'a tankard of winterberry ale',
+      description: 'A refreshing ale infused with the subtle sweetness of winterberries.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101981,
+      order_number: 4,
+      name: 'a glass of Lich Premium lager',
+      description: 'A smooth and flavorful lager, brewed to perfection with a light, crisp finish.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101981,
+      order_number: 5,
+      name: 'a stein of Stuck Pig ale',
+      description: 'A hearty ale with a bold, slightly bitter taste, perfect for enjoying with a meal.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101981,
+      order_number: 6,
+      name: 'a tankard of Myron\'s lager',
+      description: 'A well-balanced lager with a smooth and refreshing taste, brewed with a mix of local ingredients.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101981,
+      order_number: 7,
+      name: 'a glass of Aeia\'s Grace juice',
+      description: 'A refreshing glass of Aeia\'s Grace juice, made from a blend of rare fruits and herbs.',
+      location: "River's Rest",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101981,
+      order_number: 8,
+      name: 'a goblet of Magician\'s merlot',
+      description: 'A rich and velvety merlot with a hint of dark fruits and spices, crafted with care.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101981,
+      order_number: 9,
+      name: 'a glass of Terasian shiraz',
+      description: 'A bold shiraz with notes of blackberries, pepper, and a hint of oak, perfect for any occasion.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101981,
+      order_number: 10,
+      name: 'a flute of Baronial\'s Best zinfandel',
+      description: 'A light and fruity zinfandel with a slightly sweet finish, ideal for those who prefer a delicate wine.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101981,
+      order_number: 11,
+      name: 'a shot of Solhaven swill',
+      description: 'A strong and biting swill, known for its intense flavor and kick.',
+      location: "River's Rest",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101981,
+      order_number: 12,
+      name: 'a shot of Riverrust liqueur',
+      description: 'A smooth and sweet liqueur with a hint of rust, giving it a unique and unforgettable taste.',
+      location: "River's Rest",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101981,
+      order_number: 13,
+      name: 'a shot of Diamonddraught gin',
+      description: 'A crystal-clear gin with a sharp, clean taste and a hint of botanicals.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101981,
+      order_number: 14,
+      name: 'a shot of Kartagian whiskey',
+      description: 'A dark and smooth whiskey with a smoky finish and hints of oak and vanilla.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101981,
+      order_number: 15,
+      name: 'a shot of Liath Bheinn scotch',
+      description: 'A fine scotch with a peaty aroma and a rich, complex flavor, perfect for savoring.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101981,
+      order_number: 16,
+      name: 'a shot of Brown Mule sourmash',
+      description: 'A sourmash whiskey with a strong, earthy flavor and a warming finish.',
+      location: "River's Rest",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 2101981,
+      order_number: 17,
+      name: 'a snifter of Borthuum pear cognac',
+      description: 'A smooth and luxurious pear cognac with a subtle sweetness and a velvety texture.',
+      location: "River's Rest",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    }
+],
+"Suniel's Wine Cellar" => [
+    {
+      uid: 3008012,
+      order_number: 1,
+      name: 'a tumbler of mixed berry juice',
+      description: 'A refreshing blend of various berries, offering a balanced taste of sweet and tart flavors.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3008012,
+      order_number: 2,
+      name: 'a cannikin of tangy mango juice',
+      description: 'Bright and zesty mango juice with a tangy twist that invigorates the senses.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3008012,
+      order_number: 3,
+      name: 'a mug of honeyed mead',
+      description: 'A warm and smooth mead, infused with the richness of honey for a sweet and mellow finish.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3008012,
+      order_number: 4,
+      name: 'a stein of dark barley stout',
+      description: 'A rich and robust stout, brewed with dark roasted barley and offering a deep, malty flavor.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3008012,
+      order_number: 5,
+      name: 'a tankard of malty amber ale',
+      description: 'An amber ale with a smooth malty taste, featuring subtle notes of caramel and toasted grains.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3008012,
+      order_number: 6,
+      name: 'a chalice of tart pineapple wine',
+      description: 'A bright and tart pineapple wine, bursting with tropical flavor and a slight acidic finish.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3008012,
+      order_number: 7,
+      name: 'a goblet of haluilui flower wine',
+      description: 'A fragrant and floral wine made from haluilui flowers, with a delicate and aromatic bouquet.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3008012,
+      order_number: 8,
+      name: 'a glass of oak leaf wine',
+      description: 'A unique and earthy wine with subtle oak undertones, offering a simple and rustic flavor.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    },
+    {
+      uid: 3008012,
+      order_number: 9,
+      name: 'a tall glass of clear spring water',
+      description: 'Crystal clear and refreshingly cool spring water, perfect for quenching your thirst.',
+      location: "Kharam Dzu",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'N'
+    }
+],
+"Luck of the Draw, Tricks" => [
+    {
+      uid: 8084461,
+      order_number: 1,
+      name: 'a multicolored lollipop pinwheel',
+      description: 'A colorful lollipop in the shape of a pinwheel, with swirling vibrant hues. Contains 10 bites.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084461,
+      order_number: 2,
+      name: 'a round red lollipop',
+      description: 'A classic red lollipop with a sweet cherry flavor. Contains 10 bites.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084461,
+      order_number: 3,
+      name: 'a bulbous orange lollipop',
+      description: 'A large orange-flavored lollipop with a glossy sheen. Contains 10 bites.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084461,
+      order_number: 4,
+      name: 'a large yellow lollipop',
+      description: 'A bright yellow lollipop with a tart lemon flavor. Contains 10 bites.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084461,
+      order_number: 5,
+      name: 'a folded cream paper packet painted with raspberries',
+      description: 'A small packet of sun-ripened raspberry-flavored breath mints, dark raspberry in color. Contains 50 mints.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084461,
+      order_number: 6,
+      name: 'a striped red and white tin',
+      description: 'A tin of peppermint-flavored breath mints, colored white and red. Contains 50 mints.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084461,
+      order_number: 7,
+      name: 'a round spiral-carved canister',
+      description: 'A canister of cask-aged bourbon-flavored breath mints, caramel-hued. Contains 50 mints.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084461,
+      order_number: 8,
+      name: 'a pack of licorice candies',
+      description: 'A pack of inky black licorice-flavored breath mints. Contains 30 mints.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084461,
+      order_number: 9,
+      name: 'a tube of multicolored candies',
+      description: 'A tube of surprise-flavored breath mints, offering a mix of unexpected flavors and colors. Contains 30 mints.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    }
+],
+"Moorlyn Cottage, Kitchen" => [
+    {
+      uid: 8084244,
+      order_number: 1,
+      name: 'a cup of rich black coffee',
+      description: 'A freshly brewed cup of strong black coffee, bold and invigorating.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - FREE'
+    },
+    {
+      uid: 8084244,
+      order_number: 2,
+      name: 'a platter of spicy grilled shrimp',
+      description: 'A platter of succulent shrimp, grilled to perfection with a spicy seasoning.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - FREE'
+    },
+    {
+      uid: 8084244,
+      order_number: 3,
+      name: 'some farmhouse bread',
+      description: 'A rustic loaf of freshly baked farmhouse bread, with a crispy crust and soft interior.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - FREE'
+    }
+],
+"Nightfire Brews, Kitchen" => [
+    {
+      uid: 8084812,
+      order_number: 1,
+      name: 'a rosemary-sprinkled sweet potato scone',
+      description: 'A soft and savory sweet potato scone, sprinkled with fresh rosemary for added flavor. Bites Remaining: 4.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084812,
+      order_number: 2,
+      name: 'a crumble-covered cherry almond scone',
+      description: 'A delicious scone topped with a sweet crumble and filled with cherry and almond flavors. Bites Remaining: 4.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084812,
+      order_number: 3,
+      name: 'a cheddar-mixed shredded apple scone mixed with dried sage',
+      description: 'A unique scone combining sharp cheddar, shredded apple, and a touch of dried sage. Bites Remaining: 4.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084812,
+      order_number: 4,
+      name: 'a sugar-dusted strawberry and vanilla cream scone',
+      description: 'A sweet and creamy scone dusted with sugar and infused with strawberry and vanilla cream. Bites Remaining: 4.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084812,
+      order_number: 5,
+      name: 'a maple-glazed banana bread scone',
+      description: 'A tender banana bread scone drizzled with a rich maple glaze. Bites Remaining: 4.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084812,
+      order_number: 6,
+      name: 'a blackberry-glazed lavender honey scone',
+      description: 'A fragrant scone topped with blackberry glaze and infused with lavender honey. Bites Remaining: 4.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    }
+],
+"Nightfire Brews, Kitchen" => [
+    {
+      uid: 8084811,
+      order_number: 1,
+      name: 'a polished basalt jar',
+      description: 'The full-bodied black tea nibbles at your taste buds with the peppery bite of ginger and turmeric, swiftly followed by rich chocolate notes that soothe your palate. An earthy essence perseveres through the invigorating piquancy infusing the tea, blending harmoniously with the decadently dark aromas and flavors of roasted cacao nibs.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084811,
+      order_number: 2,
+      name: 'a foliated glowbark jar',
+      description: 'Its warm aroma evocative of golden wheat fields ripe for harvest, the mellow nettle infusion is illuminated by the tang of rosehips and faintly peppered, citrusy cardamom. Hay-like undertones whisper beneath the naturally honeyed flavors of rooibos. The bitter warmth of cloves interplays with a bright zest and the smoky spice of dianthus petals.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084811,
+      order_number: 3,
+      name: 'a two-toned marble jar',
+      description: 'Sweetly redolent from the vanilla comfortingly embracing the intense, malty base, the black and rooibos blend sings of creamy caramel and toasted almonds. A subtle hint of sea salt draws out the intricacies of the vanilla-caramel flavors imbued in the tea, the sweetness tempered by earthy hazelnuts and almonds.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084811,
+      order_number: 4,
+      name: 'a floral-etched glass jar',
+      description: 'As crisp as an autumn\'s day, the white tea shares its floral medley with that of green pear and steeped dreamphlox. Green pear lends citrusy sweet notes to the delicate florals of white tea and dreamphlox, finishing fresh and fruity on your tastebuds.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084811,
+      order_number: 5,
+      name: 'a rippled terracotta jar',
+      description: 'Complex chai spice permeates the roasted rooibois blend, warming the woody and savory hints of buckwheat and sweet potato that murmur below the pervasive pumpkin overtones. The scent of baked pumpkin wafts from the rooibos and honeybush chai, an aromatic preparation for the autumnal spices that wash over your palate.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084811,
+      order_number: 6,
+      name: 'a grey-dipped amber clay jar',
+      description: 'Bursting with apple, persimmon, and red currant, the herbal tea has a pleasantly fiery undercurrent of cinnamon and drake claw root. Drake claw root serves as a slightly bitter, herbal base complemented by musky mistbloom and brightened by a sweet-tart fruit melange.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084811,
+      order_number: 7,
+      name: 'a glossy striated onyx jar',
+      description: 'Sweetness creeps out from the tart mixture of cranberries, pomegranate, and blood orange, though it is quickly eclipsed by the dark, toasty hints of chicory suffused in the tea. Graced with a subtle earthiness, steeped direbloom nearly overpowers the citrusy, tangy notes of fall fruits with its potent, coffee-like presence.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084811,
+      order_number: 8,
+      name: 'a silver-spangled teacup in gradated twilight hues',
+      description: 'A decorative silver-spangled teacup with a gradated twilight hue, perfect for serving hot beverages.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084811,
+      order_number: 9,
+      name: 'an ember-hued ceramic teacup traced in copper',
+      description: 'An ember-hued ceramic teacup elegantly traced in copper, offering a stylish way to enjoy your tea.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084811,
+      order_number: 10,
+      name: 'a smoky glass mug painted with tiny ebon spiders',
+      description: 'A smoky glass mug adorned with tiny ebon spiders, ideal for those who prefer a darker aesthetic for their drinkware.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084811,
+      order_number: 11,
+      name: 'a constellation-etched midnight blue tea kettle',
+      description: 'A beautiful tea kettle etched with constellations, perfect for brewing a fine cup of tea.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084811,
+      order_number: 12,
+      name: 'a fiery ceramic kettle washed with a copper glaze',
+      description: 'A ceramic kettle with a copper glaze, designed to keep your tea piping hot while adding an elegant touch.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084811,
+      order_number: 13,
+      name: 'a tinted glass coffee press with a web-like crackle pattern',
+      description: 'A tinted glass coffee press featuring a delicate web-like crackle pattern, perfect for brewing a strong, flavorful cup of coffee.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    }
+],
+"Preserving Breads" => [
+    {
+      uid: 8084427,
+      order_number: 1,
+      name: 'a creamy leek soup riddled with potato dumplings',
+      description: 'A rich, creamy leek soup filled with tender potato dumplings, offering a hearty and satisfying meal. Quaffs remaining: 6.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084427,
+      order_number: 2,
+      name: 'a loaf of onion-infused mushroom and garlic bread',
+      description: 'A flavorful loaf of bread infused with onions, mushrooms, and garlic, creating a savory bite with each piece. Bites remaining: 3.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084427,
+      order_number: 3,
+      name: 'a lime and garlic-infused salmon',
+      description: 'Freshly cooked salmon infused with the bright flavors of lime and garlic, providing a zesty and savory dish. Bites remaining: 7.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084427,
+      order_number: 4,
+      name: 'an herb-riddled sausage and apple stuffing',
+      description: 'A savory stuffing made with herbs, sausage, and chunks of sweet apple, offering a deliciously balanced flavor profile. Bites remaining: 7.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084427,
+      order_number: 5,
+      name: 'a crusty herb and tomato flatbread',
+      description: 'A crusty flatbread topped with flavorful herbs and ripe tomatoes, perfect as a snack or side. Bites remaining: 3.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    }
+],
+"Spider Johnn's Tin Smoke Box" => [
+    {
+      uid: 8084616,
+      order_number: 1,
+      name: 'a simple light brown matchbook',
+      description: 'A simple, functional matchbook in a light brown hue. Matches remaining: 50.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084616,
+      order_number: 2,
+      name: 'an ivory rose-painted match box',
+      description: 'A delicate match box painted with ivory roses, perfect for storing matches. Matches remaining: 50.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084616,
+      order_number: 3,
+      name: 'a gold-foiled leaf-patterned matchbook',
+      description: 'A matchbook adorned with gold foil and a decorative leaf pattern. Matches remaining: 50.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084616,
+      order_number: 4,
+      name: 'a white skull-embossed black match box',
+      description: 'A striking black match box embossed with a white skull design. Matches remaining: 50.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084616,
+      order_number: 5,
+      name: 'a bundle of plain white wrappers',
+      description: 'A bundle of plain white cigar wrappers, suitable for wrapping cigars.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084616,
+      order_number: 6,
+      name: 'a bundle of pale pink-hued wrappers',
+      description: 'A bundle of pale pink-hued cigar wrappers, offering a delicate touch to any cigar.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084616,
+      order_number: 7,
+      name: 'a bundle of onyx-hued wrappers',
+      description: 'A bundle of dark, onyx-hued cigar wrappers, perfect for a bold statement.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084616,
+      order_number: 8,
+      name: 'a bundle of Shade\'s Embrace wrappers',
+      description: 'A bundle of cigar wrappers known as Shade\'s Embrace, adding an air of mystery to any cigar.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084616,
+      order_number: 9,
+      name: 'a black-labeled whiskey brown tin',
+      description: 'A sturdy tobacco tin with a black label, ideal for storing whiskey-scented tobacco.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084616,
+      order_number: 10,
+      name: 'a silver bay leaf-stamped tin',
+      description: 'A sleek silver tin stamped with a bay leaf design, perfect for tobacco storage.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084616,
+      order_number: 11,
+      name: 'a golden ginger-etched tin',
+      description: 'A gold-colored tin etched with intricate ginger designs, ideal for storing fragrant tobacco.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084616,
+      order_number: 12,
+      name: 'an aged lime-embossed tin',
+      description: 'An aged tin embossed with lime designs, providing a touch of vintage charm for tobacco storage.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    }
+],
+"Spider Johnn's Tin Smoke Box" => [
+    {
+      uid: 8084617,
+      order_number: 1,
+      name: 'some green valerian pipe tobacco',
+      description: 'A fragrant and calming pipe tobacco infused with the essence of green valerian.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084617,
+      order_number: 2,
+      name: 'some light red clover top pipe tobacco',
+      description: 'A smooth and light pipe tobacco with red clover top notes.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084617,
+      order_number: 3,
+      name: 'some frosted briny lime pipe tobacco',
+      description: 'A refreshing pipe tobacco infused with the frosty and briny essence of lime.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084617,
+      order_number: 4,
+      name: 'some umber malty hops pipe tobacco',
+      description: 'A rich and dark tobacco blend with hints of umber malty hops.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084617,
+      order_number: 5,
+      name: 'some ebon black haw pipe tobacco',
+      description: 'A deep, robust pipe tobacco featuring the distinctive flavors of black haw.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084617,
+      order_number: 6,
+      name: 'some golden davana pipe tobacco',
+      description: 'A rich and fragrant golden-hued tobacco with davana essence.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084617,
+      order_number: 7,
+      name: 'some pale green citrus-bay pipe tobacco',
+      description: 'A refreshing blend of pipe tobacco with notes of citrus and bay.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084617,
+      order_number: 8,
+      name: 'some amber fruity rum pipe tobacco',
+      description: 'A sweet and fragrant blend with fruity rum accents, giving the tobacco a rich and smooth taste.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084617,
+      order_number: 9,
+      name: 'an oval silvery green tin with a brushed finish',
+      description: 'A sleek and simple oval tin with a brushed silvery green finish, perfect for storing pipe tobacco. Store up to 13 pinches of pipe tobacco.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084617,
+      order_number: 10,
+      name: 'a clover-etched crimson tin edged in gold',
+      description: 'A luxurious crimson tin etched with clover patterns and trimmed in gold. Store up to 13 pinches of pipe tobacco.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084617,
+      order_number: 11,
+      name: 'a square lime green tin painted with picturesque seascapes',
+      description: 'A lime green square tin painted with intricate seascapes, ideal for storing pipe tobacco. Store up to 13 pinches of pipe tobacco.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084617,
+      order_number: 12,
+      name: 'an ale barrel-shaped tin textured with woodgrain',
+      description: 'A barrel-shaped tin with woodgrain texture, giving it a rustic and unique appearance. Store up to 13 pinches of pipe tobacco.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084617,
+      order_number: 13,
+      name: 'a murky black glass jar etched with a skull',
+      description: 'A murky black glass jar etched with an eerie skull design, perfect for storing pipe tobacco. Store up to 13 pinches of pipe tobacco.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084617,
+      order_number: 14,
+      name: 'a gold-leafed blushed glass jar with a floral motif',
+      description: 'A blushed glass jar adorned with gold leaf and floral motifs, ideal for storing pipe tobacco. Store up to 13 pinches of pipe tobacco.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084617,
+      order_number: 15,
+      name: 'a round pitted green jar ringed about the neck with leaves',
+      description: 'A pitted green jar with a leafy ring around its neck, perfect for keeping your pipe tobacco fresh. Store up to 13 pinches of pipe tobacco.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084617,
+      order_number: 16,
+      name: 'an old hazy liquor jar embossed with a cluster of fruit',
+      description: 'An old, hazy jar used for liquor, embossed with fruit designs. It provides a charming storage option for pipe tobacco. Store up to 13 pinches of pipe tobacco.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    }
+],
+"A. B. Witching, Tinkering" => [
+    {
+      uid: 8084610,
+      order_number: 1,
+      name: 'an onyx crimson flame-inlaid ring',
+      description: 'A ring inlaid with a crimson flame design, leaving a matchlight tattoo.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084610,
+      order_number: 2,
+      name: 'an onyx-hued crimson flame-embossed tin',
+      description: 'A small tin embossed with a crimson flame design containing fiery cinnamon breath mints. Contains 50 mints.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase',
+    },
+    {
+      uid: 8084610,
+      order_number: 3,
+      name: 'a pale gold leaf-wrapped cigar with a sun-stamped band',
+      description: 'A cigar wrapped in pale gold leaves with a sun-stamped band, giving off a blend of dried ginger, yellow sweetclover, agastache, and damiana.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase',
+    },
+    {
+      uid: 8084610,
+      order_number: 4,
+      name: 'a stout dark-leafed cigar with a mushroom-embossed band',
+      description: 'A stout cigar with dark leaves and a mushroom-embossed band. It exudes the earthy blend of labdanum, lichen, and mulberry.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase',
+    },
+    {
+      uid: 8084610,
+      order_number: 5,
+      name: 'a brilliant gold-leafed cigar with a strawberry-hued band',
+      description: 'A gold-leafed cigar with a strawberry-hued band, blending the aroma of crushed vanilla bean, strawberry geranium, and brandy.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase',
+    },
+    {
+      uid: 8084610,
+      order_number: 6,
+      name: 'a tawny leaf-wrapped cigar with a peach-embossed yellow band',
+      description: 'A tawny leaf-wrapped cigar with a peach-embossed yellow band, carrying the scent of ripe peaches, lemongrass, and rosemary.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase',
+    },
+    {
+      uid: 8084610,
+      order_number: 7,
+      name: 'a pitch black-leafed cigar with a cobalt moon-stamped band',
+      description: 'A black-leafed cigar with a cobalt moon-stamped band, giving off the bold scent of bitter chicory, spicy hops, and valerian root.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase',
+    },
+    {
+      uid: 8084610,
+      order_number: 8,
+      name: 'a delicate tan leaf-coiled cigar with silver foil band',
+      description: 'A delicately coiled cigar with tan leaves and a silver foil band. The scent features angelica root, wintergreen, peppermint, and styrax.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase',
+    }
+],
+"A. B. Witching, Workshop" => [
+    {
+      uid: 8084611,
+      order_number: 1,
+      name: 'a crystalline flute of warm blood',
+      description: 'A slender crystalline flute filled to the brim with thick, warm blood. The rich crimson liquid swirls gently within the delicate vessel, giving off an oddly enticing metallic scent.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'Paid Event - FREE'
+    },
+    {
+      uid: 8084611,
+      order_number: 2,
+      name: 'a glass of vivid green absinthe',
+      description: 'A glass filled with a vividly green absinthe, shimmering slightly as the light catches the liquid. Its herbal aroma is strong, with an underlying sharpness that promises a potent experience.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - FREE'
+    },
+    {
+      uid: 8084611,
+      order_number: 3,
+      name: 'a flute of pale moonflower wine',
+      description: 'A flute of pale wine, its fragrance delicate and floral, reminiscent of moonflowers blooming under a silver moon. The liquid glows faintly in the dim light, adding an ethereal touch to its allure.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'Paid Event - FREE'
+    },
+    {
+      uid: 8084611,
+      order_number: 4,
+      name: 'a cup of pink melon-berry punch',
+      description: 'A chilled cup of pink melon-berry punch, its refreshing fruity aroma wafting from the surface. The vibrant hue hints at the sweet and tangy blend of ripe melons and berries.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - FREE'
+    },
+    {
+      uid: 8084611,
+      order_number: 5,
+      name: 'a piece of lemon meringue pie',
+      description: 'A decadent slice of lemon meringue pie, its tangy lemon curd balanced perfectly beneath a cloud of golden-brown meringue. The crust is crisp, and the pie itself emits a sweet, citrusy aroma.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - FREE'
+    },
+    {
+      uid: 8084611,
+      order_number: 6,
+      name: 'a slice of pumpkin bread',
+      description: 'A moist, spiced slice of pumpkin bread, rich with the aromas of cinnamon, nutmeg, and cloves. The soft bread is dotted with hints of pumpkin puree, offering a warm and comforting taste.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - FREE'
+    },
+    {
+      uid: 8084611,
+      order_number: 7,
+      name: 'a dish of punch bowl cake',
+      description: 'A layered dessert of punch bowl cake, combining soft cake, sweetened cream, and an assortment of fresh fruits. Each spoonful brings a burst of flavors and textures, from juicy berries to airy whipped cream.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - FREE'
+    },
+    {
+      uid: 8084611,
+      order_number: 8,
+      name: 'a fresh blood-filled heart',
+      description: 'A raw, fresh heart still pulsing faintly with life, its surface slick with blood. The sight is visceral, and the texture yields easily to the touch, exuding warmth and iron-laden fluid.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'Paid Event - FREE'
+    },
+  ],
+"All Dogs Go To Naidem, Yard" => [
+    {
+      uid: 8084085,
+      order_number: 1,
+      name: 'some chunks of raw bloody meat',
+      description: 'Thick, sinewy chunks of raw meat, glistening with fresh blood. The cuts are uneven, still dripping, and carry the scent of iron and earth, as if freshly torn from a carcass.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'Paid Event - FREE'
+    }
+  ],
+"The Art of the Drapery" => [
+    {
+      uid: 8084161,
+      order_number: 1,
+      name: 'a vellum-labeled bottle of pear-infused champagne',
+      description: 'A crisp bottle of champagne infused with the sweet, subtle flavor of pears. Quaffs remaining: 20.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084161,
+      order_number: 2,
+      name: 'a vellum-labeled bottle of pale white wine',
+      description: 'A bottle of pale white wine offering a light, refreshing taste with floral undertones. Quaffs remaining: 20.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084161,
+      order_number: 3,
+      name: 'a vellum-labeled bottle of berry-colored wine',
+      description: 'A bottle of vibrant berry-colored wine, rich with fruity and sweet notes. Quaffs remaining: 20.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084161,
+      order_number: 4,
+      name: 'a vellum-labeled bottle of smoky red wine',
+      description: 'A smoky red wine with deep, earthy flavors and a bold finish. Quaffs remaining: 20.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084161,
+      order_number: 5,
+      name: 'a vellum-labeled bottle of plum-colored wine',
+      description: 'A rich plum-colored wine with a sweet and slightly tart flavor. Quaffs remaining: 20.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    }
+  ],
+"Both Sides Now, Studio" => [
+    {
+      uid: 8084642,
+      order_number: 1,
+      name: 'a glass of spiced apple cider',
+      description: 'A warm glass of spiced apple cider with hints of cinnamon and cloves.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - FREE'
+    },
+    {
+      uid: 8084642,
+      order_number: 2,
+      name: 'a chewy pumpkin cookie',
+      description: 'A soft and chewy pumpkin cookie spiced with nutmeg and cinnamon.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - FREE'
+    }
+  ],
+"Ember Ridge Candy Apple Shoppe" => [
+    {
+      uid: 8084601,
+      order_number: 1,
+      name: 'a tart green apple',
+      description: 'A crisp and tart green apple, perfect for dipping into bowls of caramel, chocolate, honey, and other sweet toppings to create a delicious candied apple. Bites remaining: 5.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    }
+  ],
+"Ember Ridge, Cider House" => [
+    {
+      uid: 8083209,
+      order_number: 1,
+      name: 'Ember Ridge Fresh Pressed Cider',
+      description: 'A crisp and refreshing cider made from freshly pressed apples, available in a variety of flavors.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Silvers to Purchase'
+    }
+  ],
+"The Gnome Depot, Workshop" => [
+    {
+      uid: 8084563,
+      order_number: 1,
+      name: 'a glass of rich cognac',
+      description: 'A glass of rich, amber-colored cognac with a deep, warming flavor.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - FREE'
+    },
+    {
+      uid: 8084563,
+      order_number: 2,
+      name: 'an apricot tart',
+      description: 'A sweet and tangy apricot tart with a flaky crust.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - FREE'
+    }
+  ],
+"Ghastly Groceries" => [
+    {
+      uid: 8084729,
+      order_number: 1,
+      name: 'some pristine white flour',
+      description: 'A bag of pristine white flour, finely ground for all baking needs.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084729,
+      order_number: 2,
+      name: 'some powdered cocoa',
+      description: 'A package of rich powdered cocoa, perfect for hot drinks or desserts.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084729,
+      order_number: 3,
+      name: 'some castor sugar',
+      description: 'A jar of fine castor sugar, ideal for baking and sweetening.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084729,
+      order_number: 4,
+      name: 'some dried oats',
+      description: 'A pouch of hearty dried oats, great for breakfast or baking.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084729,
+      order_number: 5,
+      name: 'some zest of lemon',
+      description: 'A small container of fresh lemon zest, full of citrusy aroma.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084729,
+      order_number: 6,
+      name: 'some sea salt',
+      description: 'A small jar of coarse sea salt, perfect for seasoning.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084729,
+      order_number: 7,
+      name: 'some brown sugar',
+      description: 'A container of soft brown sugar, ideal for sweetening and baking.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084729,
+      order_number: 8,
+      name: 'some ground nutmeg',
+      description: 'A small jar of freshly ground nutmeg, aromatic and spicy.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084729,
+      order_number: 9,
+      name: 'some aromatic cinnamon',
+      description: 'A container of aromatic cinnamon, ready for baking or spicing drinks.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084729,
+      order_number: 10,
+      name: 'some unsalted butter',
+      description: 'A block of unsalted butter, creamy and fresh for cooking or baking.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084729,
+      order_number: 11,
+      name: 'a bottle of rolton milk',
+      description: 'A bottle of fresh, creamy rolton milk.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Unique to Gemstone IV',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084729,
+      order_number: 12,
+      name: 'a carton of brown eggs',
+      description: 'A carton of fresh brown eggs, perfect for all cooking needs.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084729,
+      order_number: 13,
+      name: 'a bottle of heavy cream',
+      description: 'A bottle of rich heavy cream, ideal for cooking or desserts.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    }
+  ],
+"House of Twilight, Workroom" => [
+    {
+      uid: 8084614,
+      order_number: 1,
+      name: 'a tumbler of honey whiskey',
+      description: 'A tumbler filled with smooth honey-infused whiskey, offering a sweet warmth.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - FREE'
+    },
+    {
+      uid: 8084614,
+      order_number: 2,
+      name: 'a glass of lemon water',
+      description: 'A refreshing glass of chilled water with a hint of lemon.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - FREE'
+    }
+  ],
+"It's To Pie For, Dining" => [
+    {
+      uid: 8084125,
+      order_number: 1,
+      name: 'a sample of cranberry apple pie',
+      description: 'A small bite of tart cranberry and sweet apple pie with a flaky crust.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - FREE'
+    },
+    {
+      uid: 8084125,
+      order_number: 2,
+      name: 'a sample of coconut custard pie',
+      description: 'A creamy sample of rich coconut custard pie with a buttery crust.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - FREE'
+    },
+    {
+      uid: 8084125,
+      order_number: 3,
+      name: 'a sample of chocolate pie',
+      description: 'A decadent sample of smooth chocolate pie with a whipped topping.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - FREE'
+    },
+    {
+      uid: 8084125,
+      order_number: 4,
+      name: 'a small glass of milk',
+      description: 'A refreshing glass of cold, creamy milk served from a web-swept glass pitcher.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - FREE'
+    },
+    {
+      uid: 8084125,
+      order_number: 5,
+      name: 'a sample of almond pear pie',
+      description: 'A delicious sample of almond and pear pie, perfectly balanced between nutty and fruity flavors.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - FREE'
+    },
+    {
+      uid: 8084125,
+      order_number: 6,
+      name: 'a sample of peach cobbler',
+      description: 'A warm bite of peach cobbler with a crumbly topping and juicy peach filling.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - FREE'
+    },
+    {
+      uid: 8084125,
+      order_number: 7,
+      name: 'a sample of loganberry cobbler',
+      description: 'A sweet and tangy loganberry cobbler sample with a buttery crust.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - FREE'
+    },
+    {
+      uid: 8084125,
+      order_number: 8,
+      name: 'a sample of apple cobbler',
+      description: 'A delicious bite of warm apple cobbler with cinnamon and a golden topping.',
+      location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - FREE'
+    }
+  ],
+
 }
