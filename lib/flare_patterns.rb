@@ -81,6 +81,7 @@ NODMGFLARE_PATTERNS = {
   ForestArmor_MudSling: /A thick clump of mud catapults from your/,
   ForestArmor_WoodlandEmpathy: /you suddenly have a clearer understanding of nature/,
   FReward115: /The dull golden nimbus surrounding you flares into life as it glows brightly for a moment/,
+  FReproach312_WisdomBonus: /The .*? sphere begins to move in an ever-increasingly fast circle above your head until it shatters into a shower of brilliant energy/,
   Ethereal_Armor: /ethereal chains encase your body against/,
   EonakArm_Block: /your arm suddenly swings out and intercepts it/,
   Ensorcell_Health: /You feel healed/,
