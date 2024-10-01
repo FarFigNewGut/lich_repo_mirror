@@ -11,7 +11,7 @@
 	- Added all custom fatal afflares messaging.
   1.3.0 (2024-09-26)
 	- Excluded Symbol of Dreams conflict with Ensorcell_Spirit.
-	- Add Holy Water Flare tracking.
+	- Added Holy Water Flare tracking.
 	- Added lots of tracking for just about every spell with a native effect or spell with a lore benefit effect that functions similar to a flare.
 =end
 
@@ -128,8 +128,8 @@ NODMGFLARE_PATTERNS = {
 
 DMGFLARE_PATTERNS = {
   # Damaging flares
-  Acid_Flare: /\*\* Your .*? releases? a spray of acid\! \*\*|Luminescent green droplets dribble from your .*? and puddle mid-air, creating a large globule of sizzling liquid that bursts over|Without warning, an ominous cloud forms overhead and churns violently, raining blistering droplets of acid down upon .*? until the fog is sucked into your/,
-  Air_Flare: /\*\* Your .*? unleashes? a blast of air\! \*\*|Your ears pop as the air pressure suddenly drops, and a fierce tornado coalesces around .*?, spinning .*? violently in the air for a brief moment before the winds die down/,
+  Acid_Flare: /\*\* Your .*? releases? a spray of acid|Luminescent green droplets dribble from your .*? and puddle mid-air, creating a large globule of sizzling liquid that bursts over|Without warning, an ominous cloud forms overhead and churns violently, raining blistering droplets of acid down upon .*? until the fog is sucked into your/,
+  Air_Flare: /\*\* Your .*? unleashes? a blast of air|Your ears pop as the air pressure suddenly drops, and a fierce tornado coalesces around .*?, spinning .*? violently in the air for a brief moment before the winds die down/,
   Air_LoreFlare: /A fierce whirlwind erupts? around .*? encircling .*? in a suffocating cyclone/,
   Air_LoreFlareDoT: /The cyclone whirls around .*? anew/,
   Air_GEF: /\*\* A howling gale of steaming air rushes from .*?/,
@@ -139,20 +139,20 @@ DMGFLARE_PATTERNS = {
   ChainSpear: /The .*? head of your .*? catches across .*?/,
   ChronomageDagger: /Taking a chance you hurl .*? at .*? again and suddenly everything returns to normal speed as time catches up with itself/,
   CloakofShadows_Retribution: /A dark shadowy tendril rises up from your skin/,
-  Cold_Flare: /\*\* Your .*? glows? intensely with a cold blue light\! \*\*|A thin stream of icy cold liquid shoots forth from your/,
+  Cold_Flare: /\*\* Your .*? glows? intensely with a cold blue light|A thin stream of icy cold liquid shoots forth from your/,
   Cold_GEF: /\*\* A vortex of razor-sharp ice gusts from .*? and coalesces? around a .*?\! \*\*/,
 #  Coraesine_Old: /Coraesine_Old/,
   Coraesine_Pure: /A massive vortex of shrapnel-laden air coalesces around|You feel the .*? respond to your will, and suddenly it flares up with a blazing white-grey aura\! Vicious winds curl around you in a spiraling vortex, increasing your momentum as you let loose a lightning-quick strike/,
   CoraesineRelic: /\*\* The coraesine relic on your/,
-  Disintegration_Flare: /\*\* Your .*? releases? a shimmering beam of disintegration\! \*\*|Momentarily illuminated by a nefarious veil of light that emanates from your/,
+  Disintegration_Flare: /\*\* Your .*? releases? a shimmering beam of disintegration|Momentarily illuminated by a nefarious veil of light that emanates from your/,
   Dispel_Disruption: /\*\* Your .*? glows? brightly for a moment, consuming the magical energies around .*?\!|Afterimages of your .*? manifest around/,
   Dispel_FluxCrit: /fluxes chaotically/,
-  Disruption_Flare: /\*\* Your .*? releases? a quivering wave of disruption\! \*\*|An unnatural shift in atmospheric pressure causes intense and harsh bursts of air that yield a violent, resonant attack on/,
+  Disruption_Flare: /\*\* Your .*? releases? a quivering wave of disruption|An unnatural shift in atmospheric pressure causes intense and harsh bursts of air that yield a violent, resonant attack on/,
   Earth_LoreFlare: /Chunks of earth violently orbit .*? pelting .*? with heavy debris/,
   Earth_LoreFlareDoT: /The ground trembles violently, pelting .*? again/,
   Earth_GEF: /\*\* A violent explosion of frenetic energy rumbles from .*?/,
   Energy_Weapon: /A beam of .*? energy emits from the tip of your .*? and collides with .*?/,
-  Fire_Flare: /\*\* Your .*? flares? with a burst of flame\! \*\*|Emerging from your .*?, a massive ball of flames coalesces and launches straight toward|Flames form like deep scarlet-orange ribbons around your/,
+  Fire_Flare: /\*\* Your .*? flares? with a burst of flame|Emerging from your .*?, a massive ball of flames coalesces and launches straight toward|Flames form like deep scarlet-orange ribbons around your/,
   Fire_LoreFlare: /A blazing inferno erupts around .*? scorching everything in its wake/,
   Fire_LoreFlareDoT: /The inferno blazing around .*? ignites anew/,
   Fire_GEF: /\*\* Burning orbs of pure flame burst from .*?/,
@@ -166,13 +166,13 @@ DMGFLARE_PATTERNS = {
   HolyFire: /Your .*? bursts alight with leaping tongues of holy fire/,
   HolyWater: /Your .*? sprays? forth a shower of pure water/,
   Ice_GEF: /\*\* A vortex of razor-sharp ice gusts? from .*?/,
-  Impact_Flare: /\*\* Your .*? releases? a blast of vibrating energy\! \*\*|A thunderous boom emanates from your .*? as earthen rubble and debris surges upward/,
+  Impact_Flare: /\*\* Your .*? releases? a blast of vibrating energy|A thunderous boom emanates from your .*? as earthen rubble and debris surges upward/,
   Knockout: /Your .*? bounce off the head of .*?, causing .*? to reassess the situation for a moment while standing still|A solid strike from your .*? to the temple causes .*? to stumble|You land a vicious blow to the head of .*?|your .*? bounce off the head of .*? causing it to|bringing your .*? down across the head of .*? with a sickening thud|You feint left, then right, then crack .*? across the head|cracks? the .*? on the back of the head|Your .*? thump .*? in the head.  .*? stumbles around for a moment desperate to keep .*? balance but in the end .*? fails miserably, and collapses to the floor in a heap, looking dazed|then reverse direction and crack|Your .*? plow right into the forehead of/,
   Lightning_GEF: /\*\* A vicious torrent of crackling lightning surges from .*?/,
-  Lightning_Flare: /\*\* Your .*? emits? a searing bolt of lightning\! \*\*|Gathering around your .*?, a pulsating light grows in intensity until a shocking eruption of energized power scorches/,
+  Lightning_Flare: /\*\* Your .*? emits? a searing bolt of lightning|Gathering around your .*?, a pulsating light grows in intensity until a shocking eruption of energized power scorches/,
   LowSteel: /Your lowsteel .*? unleashes? a blast of psychic energy/,
   LowSteel_DoT: /convulses in horrified agony/,
-  Magma_Flare: /\*\* Your .*? expels? a glob of molten magma\! \*\*|Your .*? a blood red hue, and tall mounds of crimson and carmine liquid bubble up from beneath/,
+  Magma_Flare: /\*\* Your .*? expels? a glob of molten magma|Your .*? a blood red hue, and tall mounds of crimson and carmine liquid bubble up from beneath/,
   Mana_Flare: /Your .*? pulses with a white-blue light\!/,
   MindWrack_Flare: /Your .*? unleashes? a blast of psychic energy/,
   MinorAcid904_Melt: /Acid continues to eat away at .*?/,
@@ -185,7 +185,7 @@ DMGFLARE_PATTERNS = {
   Nerve: /Several thin, fibrous .*? filaments erupt from your/,
   Pestilence716_Reactive: /You exhale a virulent green mist toward/,
   Pestilence716_DoT: /Pus-filled sores erupt|Boils rupture all over|skin hardens into a black rot and begins to crumble|wails as painful boils form and erupt|begins hemorrhaging from multiple orifices/,
-  Plasma_Flare: /\*\* Your .*? pulses? with a burst of plasma energy\! \*\*/,
+  Plasma_Flare: /\*\* Your .*? pulses? with a burst of plasma energy/,
   Parasitic_BloodFlares: /You wince as .*? draws upon your blood as it strikes/,
   Religion_LoreFlare: /Divine flames kindle around .*? leaping forth to engulf/,
   Religion_LoreFlareDoT: /The sacred inferno surrounding .*? ignites anew/,
@@ -201,7 +201,8 @@ DMGFLARE_PATTERNS = {
   SpiritGauntlet: /Your bolt of energy suddenly bursts, scattering into particles|The diffuse golden particles swirl and collapse in on themselves, centered on/,
   Spore_Flare: /Nebulous .*? tendrils curl from your .*?, enswathing .*? in a shroud spangled with .*? spores/,
   Spore_Burst: /The .*? spores churning around simultaneously burst into an explosion of coruscating/,
-  Steam_Flare: /\*\* Your .*? erupts? with a plume of steam\! \*\*/,
+  SSlayer_240: /Abruptly, you sense the attention of your spirit slayer focus upon an .*?/,
+  Steam_Flare: /\*\* Your .*? erupts? with a plume of steam/,
   Steam_GEF: /\*\* A howling gale of steaming air rushes from/,
   Summoning_LoreFlare: /A radiant mist surrounds .*? unfurling into a whip of plasma/,
   Summoning_LoreFlareDoT: /The whip of plasma continues to wreathe/,
@@ -212,8 +213,8 @@ DMGFLARE_PATTERNS = {
   Tome_Spellvault: /is buffeted by the corruscating arcane energy/,
   TwinWeapon_Detonation: /colored energy lash out from your/,
   Twisted_Flare: /\*\* A scintillating .*? glow shimmers and oscillates across your/,
-  Unbalance_Flare: /\*\* Your .*? unleashes? an invisible burst of force\! \*\*|With a loud \*\*BOOM\*\* from your/,
-  Vacuum_Flare: /folds? inward and draws its surroundings closer\!|Thin strands of black matter surge forth from your .*? toward/,
+  Unbalance_Flare: /\*\* Your .*? unleashes? an invisible burst of force|With a loud \*\*BOOM\*\* from your/,
+  Vacuum_Flare: /your .*? seems to folds? inward and draws its surroundings closer|your .*? seems to fold inward upon itself drawing everything it touches along with it|Thin strands of black matter surge forth from your .*? toward/,
   Valence_LashofLoraetyr: /Several archaic sigils flash briefly along your .*? and you begin to grow translucent, shifting in and out of view as gnarled ethereal vines erupt from your body and lash out at .*?, each one solidifying before they strike/,
   Valence_SliceofShientyr: /A coil of spectral .*? energy bursts? out of thin air|A coil of ghostly .*? energy bursts? out of thin air|A coil of eerie .*? energy bursts? out of thin air|A coil of celestial .*? energy bursts? out of thin air/,
   Vethinye: /it entwines you in night blue wisps of ephemera/,
