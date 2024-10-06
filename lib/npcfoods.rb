@@ -5754,7 +5754,7 @@ FOODS_DB = {
       backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
     }
 ],
-"Nightfire Brews, Kitchen" => [
+"Nightfire Brews" => [
     {
       uid: 8084811,
       order_number: 1,
@@ -5873,6 +5873,7 @@ FOODS_DB = {
       backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
     }
 ],
+
 "Preserving Breads" => [
     {
       uid: 8084427,
@@ -5916,6 +5917,53 @@ FOODS_DB = {
       name: 'a crusty herb and tomato flatbread',
       description: 'A crusty flatbread topped with flavorful herbs and ripe tomatoes, perfect as a snack or side. Bites remaining: 3.',
       location: "Evermore Hollow",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    }
+],
+"Quinton Manse, Kitchen" => [
+    {
+      uid: 8084688,
+      order_number: 1,
+      name: 'a cocoa-colored cat-shaped pastry',
+      description: 'A delicately crafted pastry shaped like a cat and colored in cocoa, offering a sweet and light bite. Bites remaining: 3.',
+      location: "Quinton Manse, Kitchen",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084688,
+      order_number: 2,
+      name: 'a plump pumpkin-shaped pastry',
+      description: 'A plump pastry in the shape of a pumpkin, filled with a subtly sweet and spiced flavor. Bites remaining: 3.',
+      location: "Quinton Manse, Kitchen",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084688,
+      order_number: 3,
+      name: 'a wedge of cocoa shortbread',
+      description: 'A rich and crumbly cocoa shortbread wedge, providing a satisfying, melt-in-the-mouth experience. Bites remaining: 3.',
+      location: "Quinton Manse, Kitchen",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084688,
+      order_number: 4,
+      name: 'a skeleton-cut stark white cookie',
+      description: 'A stark white cookie cut in the shape of a skeleton, offering a crisp and sugary treat. Bites remaining: 3.',
+      location: "Quinton Manse, Kitchen",
+      real_world_equivalent: 'Exists in real life',
+      backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
+    },
+    {
+      uid: 8084688,
+      order_number: 5,
+      name: 'a ghost-shaped lemon cookie',
+      description: 'A spooky lemon cookie shaped like a ghost, delivering a tangy yet sweet flavor. Bites remaining: 3.',
+      location: "Quinton Manse, Kitchen",
       real_world_equivalent: 'Exists in real life',
       backroom_access: 'Paid Event - Requires Simucoin Currency to Purchase'
     }
