@@ -15,6 +15,9 @@
 	- Added lots of tracking for just about every spell with a native effect or spell with a lore benefit effect that functions similar to a flare.
   1.4.0 (2024-10-07)
 	- Added all custom flare messaging sold at the Ebon Gate Festival in the Quinton Manse.
+  1.5.0 (2024-10-11)
+	- Added Mechanical Quiver and moved Fire Mage Armor to damage pattern.
+	- Added attack pattern match for channeling spells.
 
 tags: tracking, item scripts, flares, data, abilities
 	
@@ -24,7 +27,7 @@ tags: tracking, item scripts, flares, data, abilities
 NODMGFLARE_PATTERNS = {
   # Non-damaging flares
   Xazkruvrixis: /Your xazkruvrixis .*? emits an ominous black-green glow/,
-  Wither_LoreBenefit: /A nebulous haze shimmers into view around .*?, plunging inward in a dizzying spiral to envelop .*? completely/,
+  Wither_LoreBenefit: /A nebulous haze shimmers into view around .*?\, plunging inward in a dizzying spiral to envelop .*? completely/,
   WThorns640_Poison: /One of the vines surrounding you lashes out at/,
   WThorns640_Block: /The thorny barrier surrounding you blocks the attack from/,
   VolnArmor_DSFlare: /Your .*? hums with spiritual force, filling you with a sense of divine vigilance and a preternatural awareness of/,
@@ -73,7 +76,6 @@ NODMGFLARE_PATTERNS = {
   ManaArmor_ManaShield: /latticework springs up from the surface of your .*? and shields you from some of the damage/,
   ManaArmor_ManaFlares: /radiates from your .*? and you feel .*? mana surge into you\!| returning to you with an audible \*WHOOSH\*/,
   MArmor520_Water: /The raw elemental energy surrounding you takes on a watery look as it/,
-  MArmor520_Fire: /The fiery torrent of energy surrounding you flares toward/,
   MArmor520_Earth: /The energy surrounding you condenses into hard stone/,
   LuckTalisman_Offensive: /You hear the soft tinkle of rolling dice, followed by the sound of coins dropping/,
   LuckTalisman_Defensive: /You hear the soft tinkle of rolling dice, followed by a faint lucky feeling/,
@@ -234,6 +236,7 @@ DMGFLARE_PATTERNS = {
   Fervor1618: /Your .*? surges with power as .*? radiance coalesces around it/,
   ELink1117_Overload: /An overload of mental energies pulse through your link/,
   ELink1117_Propagation: /Ripples of wavering energy coalesce around/,
+  MArmor520_Fire: /The fiery torrent of energy surrounding you flares toward/,
   BS_Reckoning: /With a deafening crack of thunder, a frayed bolt of violet-hazed lightning spears the .*?|Peals of laughter, bright and sharp, echo in your ears, transfixing the .*?|Falling like a hammer from the sky, a golden light strikes the .*? with resounding force\!|Tangled briars rise to catch the .*? on their thorns\!|Subtly tinted mists daub themselves upon the .*? , leeching away color\!|Cast in radiant outline, a massive silver fist closes tight around the .*?|Brazen and implacable, the light of judgment crashes down upon the .*?|A chill crystallizes the air, and the .*? is engulfed by a blazing, ice-bright vortex\!|Spinning rings of gem-bright color coalesce around the .*? and flare to brilliance\!|Warmth blooms at the .*?'s heart, quickly kindling into burning flame\!|Heat gathers and blossoms, bathing the .*? in the blistering brilliance of the sun\!|Darkness gathers around the .*? , speared through by pinpoints of white fire\!|The very air rips past the .*? in a gold-streaked blur, chased by an echo of wings\!|Striking swift and vicious, unseen claws rake at the .*? , and hidden teeth bite\!|Cruel, glittering flames born of darkness erupt around the .*?|Crackling and luminous, gold and silver threads of pure magic slice at the .*? with alacrity\!|Smoke drifts in languid coils, entangling the .*? in its smothering embrace\!|Glistening and dark, a soul-sucking maw manifests behind the .*? as attenuated fangs descend\!|Hissing darkness, acrid and caustic, assaults the .*? in a flurry of lashing tentacles\!|Laid open by sorrow made manifest, the .*? keens in pain\!|Night falls, bearing the .*? down beneath a crushing wave of fear\!|Harsh battle cries frenzied with bloodlust split the air and tear into the .*?|With a sonorous knell, a frigid wind overtakes the .*?|A bewildering frenzy of silver spins around the .*? in dizzying assault, moon-bright and night-dark by turns\!|A haze of golden motes envelops the .*? within its cloying embrace\!|A sinuous shimmer of violet scales slices across the .*? , bleeding crimson in its wake\!|Threads of glistening silk wind around the .*? and pull taut\!|Slithering whispers encircle the .*? in aqueous trails of silvery mist\!|With a vengeful hiss, a phantasmal arc of star-bright silver slices into the .*?|A ferocious downdraft assaults the .*? with the thunder of countless wings\!|Verdant vines enfold the .*? in their leafy embrace\!|A smothering veil of violet-sparked ash billows over the .*? , searing where it touches\!|The .*? is beset by a brilliant flurry of flashing blades\!|A liquid surge of silvery power breaks against the .*? , scattering in salty spray\!|Striking out of the darkness, unseen daggers stab at the .*? from behind\!|Motes of color swirl up around the .*? in a frenetic dance, bursting with sudden and percussive force\!|Flickering yellow and red, rebellious sparks billow up around the .*? in a blistering brume\!|Purifying white fire envelops the .*? , casting him in blackened silhouette\!|Rippling twilight envelops the .*? in banded hues of dusk and dawn\!/,
   BS_HallowedReprisal: /Fiery red barbs uncoil from the shadows nearby and lash out at/,
   BS_DivineBulwark: /.*? shield springs into being between you and your attacker to temper the blow\!/,
@@ -243,5 +246,5 @@ DMGFLARE_PATTERNS = {
 
 # Define ATTACK_PATTERNS as a constant to be used globally
 ATTACK_PATTERNS = {
-  Attack: /You (?:swing a|thrust with|slash with|hurl a|fire a)|You take aim and|You attempt to(?:jab|punch|grapple|kick)|You make a precise attempt to(?:jab|punch|grapple|kick)|You gesture at|You connect|Your .*? connects|You lunge forward|In a fluid whirl, you sweep your/i
+  Attack: /You (?:swing a|thrust with|slash with|hurl a|fire a)|You take aim and|You attempt to(?:jab|punch|grapple|kick)|You make a precise attempt to(?:jab|punch|grapple|kick)|You gesture at|You channel at|You connect|Your .*? connects|You lunge forward|In a fluid whirl, you sweep your/i
 }
