@@ -229,7 +229,7 @@ DMGFLARE_PATTERNS = {
   Tome_Spellglider: /your .*? unleashes a dazzling arcane projectile/,
   Tome_Spellweaver: /Arcane energy streaks toward .*? and collides in a volatile clash of mana and matter/,
   Tome_Spellvault: /is buffeted by the corruscating arcane energy/,
-  TwinWeapon_Detonation: /colored energy lash out from your/,
+  TwinWeapon_Detonation: /Tendrils .*? energy lash out from your/,
   Twisted_Flare: /\*\* A scintillating .*? glow shimmers and oscillates across your/,
   Unbalance_Flare: /\*\* Your .*? unleashes an invisible burst of force|With a loud \*\*BOOM\*\* from your|Cackling and cajoling herald a wavering energy wrought in the ethereal shape of ghosts that rise out of your .*? and sail through the air, passing in and out of .*? before dissipating with a low moan/,
   Vacuum_Flare: /your .*? seems to fold(s)? inward and draws its surroundings closer|your .*? seems to fold inward upon itself drawing everything it touches along with it|Thin strands of black matter surge forth from your .*? toward|Drawing the air from the area, ebon and orange ghosts rise out of your .*? and sail through the air, passing in and out of .*? before dissipating with a low moan/,
