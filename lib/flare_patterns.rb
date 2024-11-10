@@ -237,7 +237,7 @@ DMGFLARE_PATTERNS = {
   Valence_SliceofShientyr: /A coil of spectral .*? energy burst(s)? out of thin air|A coil of ghostly .*? energy burst(s)? out of thin air|A coil of eerie .*? energy burst(s)? out of thin air|A coil of celestial .*? energy burst(s)? out of thin air/,
   Vethinye: /it entwines you in night blue wisps of ephemera/,
   VibrationChant_Shatter: /You focus your voice on .*? with perfect resonance, causing it to shatter into thousands of tiny pieces/,
-  Void_GEF: /\*\* A nebulous dome of violet energy discharge(s)? from .*?/,
+  Void_GEF: /\*\* A nebulous dome of .*? discharge(s)? from .*?/,
   Water_Flare: /Your .*? shoot(s)? a blast of water|Funneling upward, a spout of water streams from your .*? and begins to spin rapidly as it moves forward, ravaging/,
   WildfireOil: /A swirl of alchemical fire, scintillating blue and orange in hue, erupts from your/,
   WebbingCaughtFire: /The webbing around .*? catches fire/,
