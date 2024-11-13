@@ -10,11 +10,18 @@ require 'ostruct'
 require 'digest/sha1'
 require 'monitor'
 
-$DEPENDENCY_VERSION = '1.6.0'
-$MIN_RUBY_VERSION = '2.5.5'
+$DEPENDENCY_VERSION = '1.7.10'
+$MIN_RUBY_VERSION = '3.2.2'
+DRINFOMON_IN_CORE_LICH ||= false
+DRINFOMON_CORE_LICH_DEFINES ||= []
 
 no_pause_all
 no_kill_all
+
+while Script.running?('repository')
+  echo("Repository is running, pausing for 10 seconds.")
+  pause 10
+end
 
 class Object
   # IMPORT FUTURE LAWLZ
@@ -130,7 +137,7 @@ class ArgParser
 
       # Check to see if a yaml profile has same name as script arg. Only matters when we're flexing
       # args and attempting to call a yaml profile with the flexed arg.
-      profiles = Dir['./scripts/profiles/*.*']
+      profiles = Dir[File.join(SCRIPT_DIR, 'profiles/*.*')]
       profiles.each do |profile|
         profile = profile[/.*#{checkname}-(\w*).yaml/, 1]
         args.to_h.values.each do |arg|
@@ -180,20 +187,30 @@ install = args.install
 
 class ScriptManager
   attr_reader :autostarts
-  attr_accessor :developer, :ignore_dependency
 
   def initialize(debug)
+    unless XMLData.game =~ /^DR/
+      echo("This script is not intended for usage with games other than Dragonrealms. Exiting now")
+      exit
+    end
+    unless LICH_VERSION.match?(/^5/)
+      _respond("<pushBold/>*****************************************************************************<popBold/>")
+      _respond("<pushBold/>* Unsupported Lich versions detected.                                       *<popBold/>")
+      _respond("<pushBold/>* Please see https://github.com/rpherbig/dr-scripts/wiki/First-Time-Setup   *<popBold/>")
+      _respond("<pushBold/>* For an update path.                                                       *<popBold/>")
+      _respond("<pushBold/>*****************************************************************************<popBold/>")
+      exit
+    end
+
     @debug = debug
     @paste_bin_token = 'dca351a27a8af501a8d3123e29af7981'
     @paste_bin_url = 'https://pastebin.com/api/api_post.php'
     @firebase_url = 'https://dr-scripts.firebaseio.com/'
     @status_repo = Settings['status_repo'] || 'rpherbig/dr-scripts'
-    @status_branch = Settings['status_branch'] || 'master'
+    @status_branch = Settings['status_branch'] || 'main'
     update_status_url
     # Gating setting lich_url on lich version
-    unless LICH_VERSION.match?(/^5/)
-      @lich_url = 'https://api.github.com/repos/dragon-realms/dr-lich/git/trees/master'
-    end
+
     UserVars.autostart_scripts ||= []
     UserVars.autostart_scripts.uniq!
     UserVars.autostart_scripts = UserVars.autostart_scripts - ['dependency']
@@ -202,15 +219,10 @@ class ScriptManager
     Settings['autostart'] = Settings['autostart'] - ['dependency']
 
     # Setting Settings['lich_fork_sha'] to nil if using lich5. This setting isn't used anymore.
-    if LICH_VERSION.match?(/^5/)
-      Settings['lich_fork_sha'] = nil if Settings['lich_fork_sha']
-    end
 
     Settings['base_versions'] ||= {}
     CharSettings['next_ruby_version_check_datetime'] = Time.now
 
-    @developer = Settings['dependency-developer'] || false
-    @ignore_dependency = Settings['ignore-dependency'] || false
     @add_autos = []
     @remove_autos = []
     update_autostarts
@@ -220,11 +232,6 @@ class ScriptManager
 
     @request_authorization = manage_github_token
     @versions = nil
-
-    # Gating lich fork code to non-lich5
-    unless LICH_VERSION.match?(/^5/)
-      @enable_fork = LICH_VERSION =~ /f/
-    end
   end
 
   def updated_dependency?
@@ -236,7 +243,41 @@ class ScriptManager
   end
 
   def update_status_url
-    @status_url = 'https://api.github.com/repos/' + @status_repo + '/git/trees/' + @status_branch
+    defaulturl = 'https://api.github.com/repos/' + @status_repo + '/git/trees/' + @status_branch
+    mainurl = 'https://api.github.com/repos/rpherbig/dr-scripts/git/trees/main'
+    eo_drscripts = 'https://api.github.com/repos/elanthia-online/dr-scripts/git/trees/main'
+
+    unless url_exist?(defaulturl)
+      _respond Lich::Messaging.monsterbold("Default URL #{defaulturl} not responding. Using an alternate repo+branch combination.")
+      _respond Lich::Messaging.monsterbold("Unsetting custom repo settings, if any.")
+      Settings['status_repo'] = nil if Settings['status_repo']
+      Settings['status_branch'] = nil if Settings['status_branch']
+      Settings.save
+    end
+
+    if url_exist?(defaulturl)
+      @status_url = defaulturl
+      _respond Lich::Messaging.monsterbold("Using set Status URL. #{defaulturl}")
+    elsif url_exist?(mainurl)
+      _respond Lich::Messaging.monsterbold("Using alternate Status URL. #{mainurl}")
+      @status_url = mainurl
+    elsif url_exist?(eo_drscripts)
+      _respond Lich::Messaging.monsterbold("Using Elanthia Online Status URL. #{eo_drscripts}")
+      @status_url = eo_drscripts
+    else
+      _respond Lich::Messaging.monsterbold("Could not set Status URL. Please seek help on Discord.")
+    end
+  end
+
+  def url_exist?(url_string)
+    url = URI.parse(URI::Parser.new.escape(url_string))
+    req = Net::HTTP.new(url.host, url.port)
+    req.use_ssl = (url.scheme == 'https')
+    path = url.path
+    res = req.request_head(path || '/')
+    res.code != "404" # false if returns 404 - not found
+  rescue Errno::ENOENT, URI::InvalidURIError
+    false # false if can't find the server, or URI invalid somehow
   end
 
   def set_custom_status_repo(repo, branch)
@@ -252,7 +293,7 @@ class ScriptManager
 
   def unset_custom_status
     @status_repo = 'rpherbig/dr-scripts'
-    @status_branch = 'master'
+    @status_branch = 'main'
     update_status_url
   end
 
@@ -277,9 +318,9 @@ class ScriptManager
   end
 
   def build_version_hash
-    Dir['./scripts/*.lic'].each_with_object({}) do |path, versions|
+    Dir[File.join(SCRIPT_DIR, '*.lic')].each_with_object({}) do |path, versions|
       file = File.basename(path)
-      body = File.open("./scripts/#{file}", 'r').readlines.join('')
+      body = File.open(File.join(SCRIPT_DIR, "#{file}"), 'r').readlines.join('')
       sha = Digest::SHA1.hexdigest('blob' + " #{body.size}" + "\0" + body)
       versions[file] = sha
     end
@@ -299,8 +340,6 @@ class ScriptManager
 
   def run_queue
     validate_supported_ruby_version
-    Settings['dependency-developer'] = @developer
-    Settings['ignore-dependency'] = @ignore_dependency
     Settings['status_repo'] = @status_repo
     Settings['status_branch'] = @status_branch
     update = false
@@ -314,16 +353,6 @@ class ScriptManager
       update = true
       @remove_autos.each { |script| Settings['autostart'].delete(script) }
       @remove_autos = []
-    end
-    # No lich fork with lich5
-    unless LICH_VERSION.match?(/^5/)
-      if @disable_fork
-        stop_download_lich
-        @disable_fork = nil
-      elsif @enable_fork
-        download_lich
-        @enable_fork = nil
-      end
     end
 
     submit_thieving_update(*@thievery_queue.pop) unless @thievery_queue.empty?
@@ -380,51 +409,17 @@ class ScriptManager
     end
   end
 
-  unless LICH_VERSION.match?(/^5/)
-    def queue_lich
-      @enable_fork = true
-    end
-
-    def unqueue_lich
-      @disable_fork = true
-    end
-
-    def download_lich
-      return if @developer
-
-      lich_data = make_request(@lich_url)['tree'].find { |data| data['path'] == 'lich.rbw' }
-      if LICH_VERSION =~ /f/ && Settings['lich_fork_sha'] == lich_data['sha']
-        echo('latest version of lich fork already downloaded.')
-        return
-      end
-      blob = make_request(lich_data['url'])
-      File.open('lich.rbw', 'w') { |file| file.print(Base64.decode64(blob['content'])) }
-      Settings['lich_fork_sha'] = lich_data['sha']
-      echo('New version of lich installed, please restart Lich.')
-    end
-
-    def stop_download_lich
-      Settings['lich_fork_sha'] = nil
-    end
-  end
-
   def download_script(filename, force = false)
     return if filename.nil? || filename.empty?
 
-    if filename == 'dependency.lic' && @ignore_dependency
-      respond 'ignoring dependency download due to ignore_dependency setting'
-      respond "use '#{$clean_lich_char}e check_dependency' to check the value."
-      return
-    end
     echo("downloading:#{filename}") if @debug
     info = get_file_status(filename)
     return unless info
-    return if @developer
     return if get_versions[filename] == info['sha'] && !force
 
     echo("info:#{info}") if @debug
     blob = make_request(info['url'])
-    File.open("./scripts/#{filename}", 'w') { |file| file.print(Base64.decode64(blob['content'])) }
+    File.open(File.join(SCRIPT_DIR, "#{filename}"), 'w') { |file| file.print(Base64.decode64(blob['content'])) }
 
     @self_updated = true if filename == 'dependency.lic'
   end
@@ -434,27 +429,30 @@ class ScriptManager
   end
 
   def setup_profiles
-    verify_or_make_dir './scripts/profiles'
+    verify_or_make_dir File.join(SCRIPT_DIR, 'profiles')
     profile_tree_url = get_status['tree'].find { |element| element['path'] == 'profiles' }['url']
-    make_request(profile_tree_url)['tree'].each do |setup_file|
-      echo("downloading #{setup_file}") if @debug
-      blob = make_request(setup_file['url'])
-      File.open("./scripts/profiles/#{setup_file['path']}", 'w') { |file| file.print(Base64.decode64(blob['content'])) }
-    end
+    make_request(profile_tree_url)['tree']
+      # Select only base.yaml and base-empty.yaml
+      .select { |data| /^base(?:-empty)?\.yaml/ =~ data['path'] }
+      .each do |setup_file|
+        echo("downloading #{setup_file}") if @debug
+        blob = make_request(setup_file['url'])
+        File.open(File.join(SCRIPT_DIR, "profiles/#{setup_file['path']}"), 'w') { |file| file.print(Base64.decode64(blob['content'])) }
+      end
   end
 
   def setup_data
-    verify_or_make_dir './scripts/data'
+    verify_or_make_dir File.join(SCRIPT_DIR, 'data')
     data_tree_url = get_status['tree'].find { |element| element['path'] == 'data' }['url']
     make_request(data_tree_url)['tree'].each do |setup_file|
       echo("downloading #{setup_file}") if @debug
       blob = make_request(setup_file['url'])
-      File.open("./scripts/data/#{setup_file['path']}", 'w') { |file| file.print(Base64.decode64(blob['content'])) }
+      File.open(File.join(SCRIPT_DIR, "data/#{setup_file['path']}"), 'w') { |file| file.print(Base64.decode64(blob['content'])) }
     end
   end
 
   def update_local_stealing_yaml(id, update, new_entry = false)
-    stealing_path = './scripts/data/base-stealing.yaml'
+    stealing_path = File.join(SCRIPT_DIR, 'data/base-stealing.yaml')
     stealing_data = $setupfiles.safe_load_yaml(stealing_path)
     result = nil
     if new_entry
@@ -472,33 +470,32 @@ class ScriptManager
   end
 
   def check_base_files
-    return if @developer
-
-    verify_or_make_dir './scripts/profiles'
+    verify_or_make_dir File.join(SCRIPT_DIR, 'profiles')
     profile_tree_url = get_status['tree'].find { |element| element['path'] == 'profiles' }['url']
     make_request(profile_tree_url)['tree']
-      .select { |data| /^base.+yaml/ =~ data['path'] }
-      .reject { |setup_file| setup_file['sha'] == Settings['base_versions'][setup_file['path']] }
+      # Select only base.yaml and base-empty.yaml
+      .select { |data| /^base(?:-empty)?\.yaml/ =~ data['path'] }
+      # Reject files that exist, and have the same shasum as those on the repo.
+      .reject { |setup_file| File.exist?("profiles/#{setup_file['path']}") && setup_file['sha'] == Settings['base_versions'][setup_file['path']] }
       .each do |setup_file|
         echo("downloading #{setup_file}") if @debug
         blob = make_request(setup_file['url'])
-        File.open("./scripts/profiles/#{setup_file['path']}", 'w') { |file| file.print(Base64.decode64(blob['content'])) }
+        File.open(File.join(SCRIPT_DIR, "profiles/#{setup_file['path']}"), 'w') { |file| file.print(Base64.decode64(blob['content'])) }
         Settings['base_versions'][setup_file['path']] = setup_file['sha']
       end
   end
 
   def check_data_files
-    return if @developer
-
-    verify_or_make_dir './scripts/data'
+    verify_or_make_dir File.join(SCRIPT_DIR, 'data')
     profile_tree_url = get_status['tree'].find { |element| element['path'] == 'data' }['url']
     make_request(profile_tree_url)['tree']
       .select { |data| /^base.+yaml/ =~ data['path'] }
-      .reject { |setup_file| setup_file['sha'] == Settings['base_versions'][setup_file['path']] }
+      # Reject files that exist, and have the same shasum as those on the repo.
+      .reject { |setup_file| File.exist?("data/#{setup_file['path']}") && setup_file['sha'] == Settings['base_versions'][setup_file['path']] }
       .each do |setup_file|
         echo("downloading #{setup_file}") if @debug
         blob = make_request(setup_file['url'])
-        File.open("./scripts/data/#{setup_file['path']}", 'w') { |file| file.print(Base64.decode64(blob['content'])) }
+        File.open(File.join(SCRIPT_DIR, "data/#{setup_file['path']}"), 'w') { |file| file.print(Base64.decode64(blob['content'])) }
         Settings['base_versions'][setup_file['path']] = setup_file['sha']
       end
   end
@@ -678,6 +675,40 @@ class ScriptManager
       return nil
     end
   end
+
+  def make_map_edits
+    echo("Applying personal map overrides")
+    # Get base and personal wayto overrides
+    base_wayto_overrides = get_settings.base_wayto_overrides
+    personal_wayto_overrides = get_settings.personal_wayto_overrides
+    # Merge the two hashes into a single hash, favoring personal overrides for duplicate keys.
+    wayto_overrides = base_wayto_overrides.merge(personal_wayto_overrides)
+    # Iterate through the aggregated map wayto overrides from above and set new stringprocs
+    wayto_overrides.each do |_key, values|
+      start_room_id = values['start_room'].to_i
+      end_room_id = values['end_room'].to_i
+      start_room = Map.list[start_room_id]
+      old_wayto = start_room.wayto["#{end_room_id}"]
+      old_timeto = start_room.timeto["#{end_room_id}"]
+      new_wayto = old_wayto
+      new_timeto = old_timeto
+      if values['str_proc']
+        new_wayto = StringProc.new("#{values['str_proc']}")
+      end
+      if values['travel_time']
+        new_timeto = values['travel_time'].to_f
+      end
+      start_room.wayto["#{end_room_id}"] = new_wayto
+      start_room.timeto["#{end_room_id}"] = new_timeto
+    end
+    # Pull personal map custom targets, if any
+    personal_map_targets = get_settings.personal_map_targets
+    if personal_map_targets
+      custom_targets = (GameSettings['custom targets'] || Hash.new)
+      custom_targets.merge!(personal_map_targets)
+      GameSettings['custom targets'] = custom_targets
+    end
+  end
 end
 
 class BankbotManager
@@ -715,14 +746,14 @@ class BankbotManager
   def save_transaction
     return unless @save
 
-    File.open("./#{checkname}-transactions.log", 'a') do |file|
+    File.open(File.join(LICH_DIR, "#{checkname}-transactions.log"), 'a') do |file|
       file.puts('----------')
       file.puts(Time.now)
       file.puts(@transaction)
       file.puts(@ledger)
       file.puts('----------')
     end
-    File.open("./#{checkname}-ledger.yaml", 'wb') { |file| file.puts(@ledger) }
+    File.open(File.join(LICH_DIR, "#{checkname}-ledger.yaml"), 'wb') { |file| file.puts(@ledger) }
     @save = false
   end
 
@@ -779,7 +810,7 @@ class ReportbotManager
   def save_whitelist
     return unless @save
 
-    File.open('./reportbot-whitelist.yaml', 'wb') { |file| file.puts(@whitelist) }
+    File.open(File.join(LICH_DIR, 'reportbot-whitelist.yaml'), 'wb') { |file| file.puts(@whitelist) }
     @save = false
   end
 
@@ -831,9 +862,10 @@ class SlackbotManager
   private
 
   def register_slackbot
-    return if @slackbot
     return unless @username
+    return unless @slackbot.nil?
 
+    echo("Registering Slackbot")
     custom_require.call('slackbot')
     @slackbot = SlackBot.new
   end
@@ -955,15 +987,15 @@ class SetupFiles
 
   private
 
-  SCRIPTS_DATA_PATH = File.join('.', 'scripts', 'data')
+  SCRIPTS_DATA_PATH = File.join(SCRIPT_DIR, 'data')
 
   # use alternate location for settings to allow folks to use lich with
   # alternate configurations in Test/Platinum/Fallen
-  if File.exist?("#{DATA_DIR}/#{XMLData.game}/base.yaml") && File.exist?("#{DATA_DIR}/#{XMLData.game}/base-empty.yaml") && File.exist?("#{DATA_DIR}/#{XMLData.game}/#{checkname}-setup.yaml")
+  if File.exist?(File.join(DATA_DIR, XMLData.game, "base.yaml")) && File.exist?(File.join(DATA_DIR, XMLData.game, "base-empty.yaml")) && File.exist?(File.join(DATA_DIR, XMLData.game, "#{checkname}-setup.yaml"))
     echo("Detected game instance-specific files. Loading settings from #{File.join(DATA_DIR, XMLData.game)}")
     SCRIPTS_PROFILES_PATH = File.join(DATA_DIR, XMLData.game)
   else
-    SCRIPTS_PROFILES_PATH = File.join('.', 'scripts', 'profiles')
+    SCRIPTS_PROFILES_PATH = File.join(SCRIPT_DIR, 'profiles')
   end
 
   # Reloads the base profiles plus any that match the filenames given.
@@ -1291,6 +1323,15 @@ class SetupFiles
     settings.hometown ||= UserVars.hometown
     settings.hometown = $HOMETOWN if $HOMETOWN
 
+    # Denylist for rooms we don't support being used as safe_rooms
+    disallowed_safe_rooms = [5713]
+    if disallowed_safe_rooms.include?(settings.safe_room) || disallowed_safe_rooms.include?(settings.safe_room_id)
+      _respond("<pushBold/>#{settings.safe_room} is not a valid safe room setting.<popBold/>")
+      _respond("<pushBold/>Exiting.<popBold/>")
+      _respond("<pushBold/>Please edit your yaml to use a different safe room.<popBold/>")
+      exit
+    end
+
     # If these room settings are defined as maps with a
     # room id configured per town, then grab the hometown room id
     # and assign it directly to the setting.
@@ -1444,11 +1485,71 @@ class MoonWatch
   end
 end
 
+class HornWatch
+  def initialize(debug)
+    @debug = debug
+    @firebase_url = 'https://dr-scripts.firebaseio.com/'
+  end
+
+  def debug
+    @debug = !@debug
+  end
+
+  def submit_horn_update(room, timestamp)
+    unless room && timestamp
+      echo('Nothing left to submit') if @debug
+      return
+    end
+
+    echo("submitting:#{room}:#{timestamp}") if @debug
+    uri = URI.parse("#{@firebase_url}/egg_warhorn/#{room}.json")
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = true
+    http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+
+    request = Net::HTTP::Put.new(uri.request_uri)
+    request['Content-Type'] = 'application/json'
+    request.body = timestamp.to_i.to_json
+    response = http.request(request)
+    unless response.body
+      echo("No response body for some reason. Returning nil.")
+      return nil
+    else
+      response.body.chomp
+    end
+  end
+
+  def get_horn_data(room)
+    echo("retrieving warhorn data for room:#{room}") if @debug
+    uri = URI.parse("#{@firebase_url}/egg_warhorn/#{room}.json")
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = true
+    http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+
+    request = Net::HTTP::Get.new(uri.request_uri)
+    request['Content-Type'] = 'application/json'
+    response = http.request(request)
+    return horn_data = Time.at(0) unless response.body
+
+    begin
+      return horn_data = Time.at(JSON.parse(response.body.chomp))
+    rescue
+      return horn_data = Time.at(0)
+    end
+    echo("warhorn data for room:#{room} is #{horn_data.inspect}") if @debug
+  rescue => e
+    echo("error in hornwatch #{e.inspect}")
+    echo("Returning time.at(0)")
+    return Time.at(0)
+  end
+end
+
 $setupfiles = SetupFiles.new(debug)
 $manager = ScriptManager.new(debug)
 $bankbot = BankbotManager.new(debug)
 $reportbot = ReportbotManager.new(debug)
 $slackbot = SlackbotManager.new(debug)
+$hornwatch = HornWatch.new(debug)
 
 def enable_moon_connection
   $turn_on_moon_watch = true
@@ -1502,6 +1603,10 @@ def custom_require
   lambda do |script_names|
     script_names = [script_names] unless script_names.is_a?(Array)
     respond("CR:starting:#{script_names}") if UserVars.bootstrap_debug
+    if DRINFOMON_IN_CORE_LICH
+      echo("DRInfomon in core lich detected. Skipping loading drinfomon and commons") if UserVars.bootstrap_debug
+      script_names -= DRINFOMON_CORE_LICH_DEFINES
+    end
     bootstrapper = force_start_script('bootstrap', script_names)
     pause 0.05
     while Script.running.include?(bootstrapper)
@@ -1520,17 +1625,19 @@ def verify_script(script_names)
     .each do |name|
       echo "Failed to find a script named '#{name}'"
       echo "Please report this to <https://github.com/rpherbig/dr-scripts/issues>"
-      echo "or to Discord <https://discord.gg/ffcEAYfK>"
+      echo "or to Discord <https://discord.gg/3UMbxypN>"
       state = false
     end
   state
 end
 
 def get_script(script_name)
+  echo("Force downloading #{script_name}")
   $manager.get_script(format_name(script_name), true)
 end
 
 def force_refresh_scripts
+  echo("Force refreshing all scripts.")
   $manager.start_scripts
 end
 
@@ -1563,14 +1670,9 @@ end
 def replace_all
   managed_scripts
     .each do |script|
-      if script == 'dependency.lic' && $manager.ignore_dependency
-        respond 'ignoring replace dependency due to ignore_dependency setting'
-        respond "use '#{$clean_lich_char}e check_dependency' to check the value."
-        next
-      end
       new_name = "#{script}.#{Time.now.to_i}.bak"
       respond "Renaming existing script #{script} to #{new_name}"
-      File.rename("./scripts/#{script}", "./scripts/#{new_name}")
+      File.rename(File.join(SCRIPT_DIR, "#{script}"), File.join(SCRIPT_DIR, "#{new_name}"))
     end
 
   respond "Downloading all scripts (This may take a few minutes. Please wait until you see \"Finished Install\" before doing anything else"
@@ -1578,7 +1680,7 @@ def replace_all
 end
 
 def managed_scripts
-  local_scripts = Dir['./scripts/*.lic'].map { |item| File.basename(item) }
+  local_scripts = Dir[File.join(SCRIPT_DIR, '*.lic')].map { |item| File.basename(item) }
   $manager.repo_scripts & local_scripts
 end
 
@@ -1609,74 +1711,7 @@ def stop_autostart(script_names)
   end
 end
 
-def set_dev_mode
-  echo "Now turning dev mode on"
-  $manager.developer = true
-  echo "Developer mode now set to: #{$manager.developer}"
-end
-
-def unset_dev_mode
-  echo "Now turning dev mode off"
-  $manager.developer = false
-  echo "Developer mode now set to: #{$manager.developer}"
-end
-
-def check_dev_mode
-  echo "Developer mode set to: #{$manager.developer}"
-end
-
-def toggle_developer_mode
-  echo "THIS METHOD IS NO LONGER USED. USE '#{$clean_lich_char}e set_dev_mode' and '#{$clean_lich_char}e unset_dev_mode'."
-end
-
-def ignore_dependency
-  echo "Now ignoring dependency updates"
-  $manager.ignore_dependency = true
-  echo "ignore_dependency now set to: #{$manager.ignore_dependency}"
-end
-
-def unignore_dependency
-  echo "Now processing dependency updates"
-  $manager.ignore_dependency = false
-  echo "ignore_dependency now set to: #{$manager.ignore_dependency}"
-end
-
-def check_dependency
-  echo "ignore_dependency is set to: #{$manager.ignore_dependency}"
-  echo "Use '#{$clean_lich_char}e ignore_dependency' and '#{$clean_lich_char}e unignore_dependency' to change."
-end
-
-unless LICH_VERSION.match?(/^5/)
-  def use_lich_fork
-    echo 'Now switching onto the DR lich fork...'
-    start_script('repository', ['unset-lich-updatable'])
-    pause 1 while Script.running?('repository')
-    echo 'Turning off updates from main lich branch on go2...'
-    start_script('repository', ['unset-updatable', 'go2'])
-    $manager.queue_lich
-  end
-
-  def use_lich_main
-    echo 'Now switching onto the lich mainline...'
-    start_script('repository', ['set-lich-updatable'])
-    pause 1 while Script.running?('repository')
-
-    echo 'Turning updates from main lich branch on go2 back on...'
-    start_script('repository', ['set-updatable', 'go2'])
-    pause 1 while Script.running?('repository')
-
-    start_script('repository', ['download-lich'])
-    pause
-    pause 1 while Script.running?('repository')
-    echo('New version of lich installed, please restart Lich.')
-  end
-
-  def toggle_lich_fork
-    echo "THIS METHOD IS NO LONGER USED. USE #{$clean_lich_char}e use_lich_fork and #{$clean_lich_char}e use_lich_main"
-  end
-end
-
-def set_custom_status_repo(repo, branch = 'master')
+def set_custom_status_repo(repo, branch = 'main')
   $manager.set_custom_status_repo(repo, branch)
 end
 
@@ -1697,6 +1732,7 @@ def setup_profiles
 end
 
 def setup_data
+  echo("Force checking scripts/data files.")
   $manager.setup_data
 end
 
@@ -1746,7 +1782,7 @@ end
 
 def update_d
   echo('Restarting Dependency in 2 seconds...')
-  force_start_script('bootstrap', ['wipe_constants'])
+  force_start_script('bootstrap', ['wipe_constants']) unless DRINFOMON_IN_CORE_LICH
   before_dying do
     sleep 2
     force_start_script('dependency')
@@ -1780,8 +1816,8 @@ def clear_hometown
 end
 
 def warn_custom_scripts
-  custom_scripts = Dir.entries('./scripts/custom').reject { |f| File.directory?(f) || File.basename(f).start_with?(".") }
-  curated_scripts = Dir.entries('./scripts').reject { |f| File.directory?(f) || File.basename(f).start_with?(".") }
+  custom_scripts = Dir.entries(File.join(SCRIPT_DIR, 'custom')).reject { |f| File.directory?(f) || File.basename(f).start_with?(".") }
+  curated_scripts = Dir.entries(SCRIPT_DIR).reject { |f| File.directory?(f) || File.basename(f).start_with?(".") }
   include_list = []
 
   custom_scripts.each do |script|
@@ -1796,24 +1832,29 @@ end
 
 full_install if install
 
-force_start_script('bootstrap', ['wipe_constants'])
+force_start_script('bootstrap', ['wipe_constants']) unless DRINFOMON_IN_CORE_LICH
 
 # Proactively starting DRinfomon as script zero to prevent
 # race conditions involving this script which so many other
 # scripts depend on, and which is slow to start on its own
-echo("Starting DRinfomon, this will take a few seconds.")
-custom_require.call('drinfomon')
-echo("DRinfomon ready.")
+unless DRINFOMON_IN_CORE_LICH
+  echo("Starting DRinfomon, this will take a few seconds.")
+
+  custom_require.call('drinfomon')
+
+  echo("DRinfomon ready.")
+end
+
+if DRINFOMON_IN_CORE_LICH
+  Lich::Util.issue_command("exp all 0", /^Circle: \d+/, /^Rested EXP Stored|Unlock Rested Experience|type: AWAKEN/, quiet: true)
+  Lich::Util.issue_command("info", /^Name/, /^<output class=""/, quiet: true)
+  Lich::Util.issue_command("ability", /^You (know the Berserks|recall the spells you have learned from your training)/, /^You (recall that you have \d+ training sessions|can use SPELL STANCE \[HELP\]|have \d+ available slot)/, quiet: true)
+end
 
 $manager.check_base_files
 $manager.check_data_files
 $manager.start_scripts
-
-if LICH_VERSION.match?(/^4/)
-  respond("Lich version 4 detected. This version of lich was deprecated in mid-2022.")
-  respond("Please see <https://github.com/rpherbig/dr-scripts/wiki/First-Time-Setup>")
-  respond("For an update path")
-end
+$manager.make_map_edits
 
 if $manager.updated_dependency?
   echo('Update found for dependency.lic')
