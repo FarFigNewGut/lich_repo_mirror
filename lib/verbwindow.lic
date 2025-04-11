@@ -1,0 +1,253 @@
+=begin
+   This script creates a dedicated window to display all signature and regular verbs with VERB INFO available to the player.
+
+IMPORTANT: You must run the script the first time with the command ;verbwindow build
+   
+   Features:
+   - Automatically parses the output of the SIGNATURE and VERB LIST LETTER(a-z) commands and populates a dynamic Wrayth window with all signature verbs known by the player as well as all verbs in the game with VERB INFO.
+   - Displays an alphabetical clickable list of all signature verbs and regular verbs that shows SIGNATURE VIEW or VERB INFO for a preview of each verb.
+   - Verbs that do not require a target can be activated by clicking the ( ! ).
+   - Tags signature verbs that require a player target with (T).
+   - Allows the player to customize the list by clicking an [ X ] to hide signature or regular verbs.
+   - Hidden verbs are populated at the very bottom of the window and can be clicked to make them unhidden.
+   
+author: Phocosoen, ChatGPT
+contributors: Tysong, Nisgui
+tags: wrayth, frontend, mod, window, signature, emote, verb
+=end
+
+# verbwindow.lic
+require 'yaml'
+
+# Set up the path to your YAML file.
+$signature_yaml_path = File.join(DATA_DIR, XMLData.game, Char.name, "verbwindow.yaml")
+WINDOW_ID = 'VerbWindow'
+HOOK_ID   = 'verbwindow_hook'
+CMD_QUEUE = Queue.new
+$update_mutex = Mutex.new
+$update_cv = ConditionVariable.new
+
+# ============================================================================
+# Module to handle in-memory toggle state for signature & regular verbs.
+# ============================================================================
+module VerbAPI
+  @hidden_verbs_in_memory = []
+
+  # Returns the hidden verbs array.
+  def self.hidden_verbs
+    @hidden_verbs_in_memory
+  end
+
+  # Load the list of hidden verbs from the YAML file into our in-memory store.
+  def self.load_from_yaml(path)
+    if File.exist?(path)
+      data = YAML.load_file(path)
+      @hidden_verbs_in_memory = data["hidden_verbs"] || []
+    else
+      @hidden_verbs_in_memory = []
+    end
+  end
+
+  # Save the entire data structure to the YAML file (signature verbs, regular verbs, and hidden verbs).
+  def self.save_to_yaml(path, signature_verbs, regular_verbs)
+    data = {
+      "signature_verbs" => signature_verbs,
+      "regular_verbs"   => regular_verbs,
+      "hidden_verbs"    => @hidden_verbs_in_memory
+    }
+    File.write(path, data.to_yaml)
+  end
+
+  # Toggle a verb's hidden state in memory and trigger an update of the window.
+  def self.toggle(verb)
+    verb = verb.to_s
+    if @hidden_verbs_in_memory.include?(verb)
+      @hidden_verbs_in_memory.delete(verb)
+      echo "[verbwindow] Un-hid: #{verb}"
+    else
+      @hidden_verbs_in_memory << verb
+      echo "[verbwindow] Hid: #{verb}"
+    end
+
+    CMD_QUEUE.push(:update)
+  end
+end
+
+# ============================================================================
+# Load Data from YAML at startup.
+# ============================================================================
+@data = if File.exist?($signature_yaml_path)
+          YAML.load_file($signature_yaml_path)
+        else
+          { "signature_verbs" => {}, "regular_verbs" => [], "hidden_verbs" => [] }
+        end
+
+@signature_verbs = @data["signature_verbs"] || {}
+@regular_verbs   = @data["regular_verbs"]   || []
+
+# Load the in-memory hidden verbs from the YAML file.
+VerbAPI.load_from_yaml($signature_yaml_path)
+
+# ============================================================================
+# Open the Verb Window.
+# ============================================================================
+puts("<closeDialog id='#{WINDOW_ID}'/>")
+puts("<openDialog type='dynamic' id='#{WINDOW_ID}' title='Verbs' target='#{WINDOW_ID}' scroll='auto' location='main' justify='3' height='500' resident='true'><dialogData id='#{WINDOW_ID}'></dialogData></openDialog>")
+
+# ============================================================================
+# Downstream hook to capture data from the server output.
+# ============================================================================
+DownstreamHook.add(HOOK_ID, proc { |line|
+  # Capture signature verbs (with target type).
+  if line =~ /<d cmd="signature view ([^"]+)">([^<]+)<\/d>\s+(player|none)/i
+    verb = $1.strip
+    label = $2.strip
+    target_type = $3.strip.downcase
+    label += " (T)" if target_type == "player"
+    unless @signature_verbs.key?(verb)
+      @signature_verbs[verb] = { "label" => label, "description" => nil, "target" => target_type }
+      CMD_QUEUE.push(:update)
+    end
+
+  # Capture regular verbs.
+  elsif line =~ /^\s*(\w[\w'-]+)\s+\*\*/
+    verb = $1.strip
+    unless @regular_verbs.include?(verb)
+      @regular_verbs << verb
+      CMD_QUEUE.push(:update)
+    end
+  end
+  line
+})
+
+# ============================================================================
+# Method to render/update the Verb Window.
+# This method uses the in-memory list of hidden verbs (VerbAPI.hidden_verbs)
+# so that the display is always up-to-date even before the YAML file is saved.
+# ============================================================================
+def render_signature_window
+  hidden = VerbAPI.hidden_verbs
+  echo "[verbwindow] Rendering window with #{hidden.size} hidden verb(s)."
+  output = "<dialogData id='#{WINDOW_ID}' clear='t'>"
+  top = 0
+
+  # Header information.
+  output += "<label id='header1' value='Click on verb for preview.' justify='left' left='0' top='#{top}' />"
+  top += 20
+  output += "<label id='header2' value='Click on ( ! ) to activate.' justify='left' left='0' top='#{top}' />"
+  top += 20
+  output += "<label id='header3' value='Click on [ X ] to hide.' justify='left' left='0' top='#{top}' />"
+  top += 20
+  output += "<label id='sig_header' value='Signature Verbs:' justify='left' left='0' top='#{top}' />"
+  top += 20
+
+  # Split signature verbs into visible and hidden.
+  visible_signature = @signature_verbs.sort.reject { |(verb, info)| hidden.include?(verb) }
+  hidden_signature  = @signature_verbs.sort.select { |(verb, info)| hidden.include?(verb) }
+
+  # Render visible signature verbs.
+  visible_signature.each_with_index do |(verb, info), i|
+    if info["target"] == "none"
+      output += "<link id='exec_sig_#{i}' value='( ! )' cmd='signature #{verb}' echo='signature #{verb}' justify='left' left='0' top='#{top}' />"
+    end
+    output += "<link id='sig_#{i}' value='#{info['label']}' cmd='signature view #{verb}' echo='signature view #{verb}' justify='left' left='30' top='#{top}' />"
+    output += "<link id='hide_sig_#{i}' value='[ X ]' cmd=';eq VerbAPI.toggle(:#{verb})' echo='[Hiding #{verb}]' justify='left' left='140' top='#{top}' />"
+    top += 20
+  end
+
+  # If there are any hidden signature verbs, add a header and then list them.
+  unless hidden_signature.empty?
+    output += "<label id='hidden_sig_header' value='Hidden Signature Verbs:' justify='left' left='0' top='#{top}' />"
+    top += 20
+    hidden_signature.each_with_index do |(verb, info), i|
+      output += "<link id='hidden_sig_#{i}' value='( HIDDEN ) #{info['label']}' cmd=';eq VerbAPI.toggle(:#{verb})' echo='[Unhiding #{verb}]' justify='left' left='30' top='#{top}' />"
+      top += 20
+    end
+  end
+
+  # Render regular verbs – first non-hidden, then hidden verbs.
+  output += "<label id='reg_header' value='Regular Verbs:' justify='left' left='0' top='#{top}' />"
+  top += 20
+
+  # Build a list of non-hidden regular verbs.
+  visible_non_hidden = @regular_verbs.uniq.reject { |v| hidden.include?(v) }
+  visible_non_hidden.each_with_index do |verb, i|
+    output += "<link id='exec_reg_#{i}' value='( ! )' cmd='#{verb}' echo='#{verb}' justify='left' left='0' top='#{top}' />"
+    output += "<link id='reg_#{i}' value='#{verb}' cmd='verb info #{verb}' echo='verb info #{verb}' justify='left' left='30' top='#{top}' />"
+    output += "<link id='hide_reg_#{i}' value='[ X ]' cmd=';eq VerbAPI.toggle(:#{verb})' echo='[Hiding #{verb}]' justify='left' left='140' top='#{top}' />"
+    top += 20
+  end
+
+  # Now, if any regular verbs are hidden, add a header and list them.
+  visible_hidden = @regular_verbs.uniq.select { |v| hidden.include?(v) }
+  unless visible_hidden.empty?
+    output += "<label id='hidden_reg_header' value='Hidden Regular Verbs:' justify='left' left='0' top='#{top}' />"
+    top += 20
+    visible_hidden.each_with_index do |verb, i|
+      output += "<link id='hidden_reg_#{i}' value='( HIDDEN ) #{verb}' cmd=';eq VerbAPI.toggle(:#{verb})' echo='[Unhiding #{verb}]' justify='left' left='30' top='#{top}' />"
+      top += 20
+    end
+  end
+
+  output += "</dialogData>"
+  puts(output)
+end
+
+# ============================================================================
+# Optional build mode for initially populating the verb list.
+# ============================================================================
+def build_verb_list
+  ('a'..'z').each do |letter|
+    fput "verb list #{letter}"
+    sleep 0.4
+  end
+end
+
+build_mode = Script.current.vars.include?("build")
+echo "Verb Window script active."
+
+if build_mode
+  fput "signature"
+  build_verb_list
+  wait_while { CMD_QUEUE.empty? == false }
+  render_signature_window
+  echo "[verbwindow: Verb Window population complete.]"
+  DownstreamHook.remove(HOOK_ID)
+  VerbAPI.save_to_yaml($signature_yaml_path, @signature_verbs, @regular_verbs)
+elsif Script.current.vars[0] == "refresh"
+  if File.exist?($signature_yaml_path)
+    @data = YAML.load_file($signature_yaml_path)
+    @signature_verbs = @data["signature_verbs"] || {}
+    @regular_verbs   = @data["regular_verbs"]   || []
+    VerbAPI.load_from_yaml($signature_yaml_path)
+    CMD_QUEUE.push(:update)
+  end
+end
+
+# Clear any queued update events to avoid a duplicate render.
+until CMD_QUEUE.empty?
+  CMD_QUEUE.pop
+end
+
+# ============================================================================
+# Save to YAML when the script is shutting down.
+# ============================================================================
+before_dying do
+  echo "[verbwindow] Final hidden verbs: #{VerbAPI.hidden_verbs.inspect}"
+  VerbAPI.save_to_yaml($signature_yaml_path, @signature_verbs, @regular_verbs)
+  echo "[verbwindow: Saved final data to #{$signature_yaml_path}.]"
+  DownstreamHook.remove(HOOK_ID)
+end
+
+# ============================================================================
+# Main loop – watches for update commands to refresh the window.
+# ============================================================================
+# Force a single initial update.
+render_signature_window()
+
+# Main loop – process events as they arrive.
+loop do
+  # This call blocks until an event is pushed into CMD_QUEUE.
+  action = CMD_QUEUE.pop
+  render_signature_window if action == :update || action.is_a?(Array)
+end
