@@ -6,17 +6,25 @@
   Features:
   - Continuously updates with current creatures in the room.
   - Displays statuses (stunned, calmed, frozen, held, prone) in a standardized format.
-  - Automatically removes creatures that leave.
+  - Automatically removes creatures that leave or die.
   - Your TARGET is denoted by ** CREATURE **.
   - Tracks Avg TTK (Time to Kill) and Last TTK.
-  - If killtracker.lic is running it displays output relating to ascension searches, weekly ascension searches, searches since jewel, and searches since dust. (Thanks Nisugi!)
-
+  - Displays pertinent bounty task information in order to eliminate built in bounty window.
+		
   Commands:
-  ttk avg
-  ttk last
+		ttk - Enable or disable time to kill information.
+		bty - Enable or disable bounty task information.
+
+ Changelog:
+  1.2.0 (2025-05-03)
+  - Bounty information added to creaturewindow output.  It takes a second to update but if its not displaying correctly, I'm probably missing the current match from the npc.  Just shoot me a DM with what the in-game BOUNTY command tells you.
+  1.1.0 (2025-04-26)
+		- Killtracker output removed from creaturewindow and moved to treasurewindow.
+  1.0.0 (2025-02-11)
+  - Initial release.
 
 author: Phocosoen, ChatGPT
-tags: wrayth, frontend, mod, window, target, creature, mob
+tags: wrayth, frontend, mod, window, target, creature, mob, bounty, bounties, advguild, adventurer's guild
 =end
 
 hide_me
@@ -33,19 +41,56 @@ CMD_QUEUE = Queue.new
 
 @display_avg_ttk = true
 @display_last_ttk = true
+@display_bounty = true
 
-def status_fix(status)
-  case status
-  when /calmed/i then "calmed"
-  when /frozen|immobilized|terrified/i then "frozen"
-  when /held/i then "held"
-  when /prone|lying down|knocked to the ground/i then "prone"
-  when /rooted/i then "rooted"
-  when /stunned/i then "stunned"
-  when /unconscious|slumber|sleeping/i then "unconscious"
-  when /webbed|webbing/i then "webbed"
-  else nil
+@recent_lines ||= []
+
+Thread.new do
+  loop do
+    begin
+      line = get.strip
+      @recent_lines << line
+      @recent_lines.shift if @recent_lines.size > 25
+    rescue => e
+      echo "Line monitor error: #{e.message}"
+    end
+    sleep 0.01
   end
+end
+
+def creature_status_fix(status, name = nil)
+  custom_statuses = []
+
+  if name&.match?(/cold wyrm/i)
+    custom_statuses << "grounded" if @recent_lines.any? { |line|
+      line =~ /cold wyrm plummets toward the ground.*radiating wall of devastation/i
+    }
+    custom_statuses << "airborne" if @recent_lines.any? { |line|
+      line =~ /cold wyrm's muscles bunch and she launches herself into the air/i
+    }
+    custom_statuses << "shielded" if @recent_lines.any? { |line|
+      line =~ /Corruscations of color play along a silver-scaled cold wyrm's scaled hide.*disrupting the attack/i
+    }
+  end
+
+  standard_status = case status
+    when /calmed/i then "calmed"
+				when /flying/i then "flying"
+    when /frozen|immobilized|terrified/i then "frozen"
+    when /held/i then "held"
+    when /prone|lying down|knocked to the ground/i then "prone"
+    when /rooted/i then "rooted"
+    when /stunned/i then "stunned"
+    when /unconscious|slumber|sleeping/i then "unconscious"
+    when /webbed|webbing/i then "webbed"
+    else nil
+  end
+
+  # Combine standard and custom statuses
+  all_statuses = []
+  all_statuses << standard_status if standard_status
+  all_statuses.concat(custom_statuses)
+  return all_statuses.empty? ? nil : all_statuses.join(", ")
 end
 
 def calculate_avg_ttk
@@ -68,19 +113,223 @@ def track_creature_exit(creature_id, creature_name)
   @creature_targeted.delete(creature_id)
 end
 
-def get_killtracker_ascsearchstats
-  asc = $killtracker[:ascension_searches]
-  weekly = $killtracker[:weekly_ascension_searches]
-  return nil unless asc && weekly
-		"Weekly ASC Searches: #{weekly}"
-  #"Total ASC Searches: #{asc} | Weekly ASC Searches: #{weekly}"
+def sanitize_xml(value)
+  value.to_s.gsub("&", "&amp;").gsub("<", "&lt;").gsub(">", "&gt;").gsub("'", "&apos;").gsub('"', "&quot;")
 end
 
-def get_killtracker_jewelduststats
-  jewel = $killtracker[:searches_since_jewel]
-  dust = $killtracker[:searches_since_dust]
-  return nil unless jewel && dust
-  "Since Jewel: #{jewel} | Since Dust: #{dust}"
+
+def parse_bounty_from_checkbounty
+  bounty_text = checkbounty
+
+  # Clear everything first
+@bounty_task_type = nil
+@bounty_total = nil
+@bounty_remaining = nil
+@bounty_location = nil
+@bounty_gem = nil
+@bounty_skin = nil
+@bounty_heirloom = nil
+@bounty_target_creature = nil
+@bounty_herb = nil
+@bounty_kills_total = nil
+@bounty_kills_remaining = nil
+
+  if bounty_text =~ /You are not currently assigned a task/i
+    @bounty_task_type = :none
+
+  elsif bounty_text =~ /You have located (.*?) and should bring it back/i
+    @bounty_task_type = :completeheirloom
+				@bounty_heirloom = bounty_text.match(/You have located (.*?) and should bring it back/i)[1]
+
+  elsif bounty_text =~ /report back to the/i
+    @bounty_task_type = :completeguard
+
+  elsif bounty_text =~ /Guild to receive your reward/i
+    @bounty_task_type = :completeguild
+
+  elsif bounty_text =~ /task here from the town of (.*?)\.  It appears they have a bandit problem/i
+    @bounty_task_type = :bandit
+				@bounty_remaining = "Talk to guard for specifics."
+				@bounty_location = bounty_text.match(/task here from the town of (.*?)\.  It appears they have a bandit problem/i)[1]
+
+  elsif bounty_text =~ /You have been tasked to suppress bandit activity in the (.*?) (?:near|between)/i && bounty_text =~ /You need to kill (\d+)/i
+    @bounty_task_type = :banditspecifics
+				@bounty_location = bounty_text.match(/You have been tasked to suppress bandit activity in the (.*?) (?:near|between)/i)[1]
+				@bounty_remaining = bounty_text.match(/You need to kill (\d+)/i)[1].to_i
+
+  elsif bounty_text =~ /(?:town|outpost) of ([^\.]+)\.\s+The local gem dealer/i
+    @bounty_task_type = :gem
+				@bounty_remaining = "Talk to gem dealer for specifics."
+				@bounty_location = bounty_text.match(/(?:town|outpost) of ([^\.]+)\.\s+The local gem dealer/i)[1]
+				
+		elsif bounty_text =~ /The gem dealer in (.+?),/i && bounty_text =~ /The gem dealer in .*? requesting (.*?)\./i && bounty_text =~ /You have been tasked to retrieve (\d+) (?:more )?of them/i
+				@bounty_task_type = :gemspecifics
+				@bounty_gem = bounty_text.match(/The gem dealer in .*? requesting (.*?)\./i)[1]
+				@bounty_remaining = bounty_text.match(/You have been tasked to retrieve (\d+) (?:more )?of them/i)[1].to_i
+				@bounty_location = bounty_text.match(/The gem dealer in (.+?),/i)[1]
+
+		elsif bounty_text =~ /task here from the (?:town|outpost) of (.*?)\.  The local .*(?:alchemist|healer)/i
+    @bounty_task_type = :herb
+				@bounty_remaining = "Talk to healer for specifics."
+				@bounty_location = bounty_text.match(/task here from the (?:town|outpost) of (.*?)\.  The local .*(?:alchemist|healer)/i)[1]
+
+  elsif bounty_text =~ /concoction that requires (?:an?|some) (.*?) found/i && bounty_text =~ /found in the (.*?) near/i && bounty_text =~ /You have been tasked to retrieve (\d+) (?:more )?samples/i
+    @bounty_task_type = :herbspecifics
+				@bounty_herb = bounty_text.match(/concoction that requires (?:an?|some) (.*?) found/i)[1]
+				@bounty_remaining = bounty_text.match(/You have been tasked to retrieve (\d+) (?:more )?samples/i)[1].to_i
+				@bounty_location = bounty_text.match(/found in the (.*?) near/i)[1]
+					
+  elsif bounty_text =~ /The local furrier .* has an order to fill and wants our help/i && bounty_text =~ /of (.*?)\.  The local furrier/i
+    @bounty_task_type = :skin
+				@bounty_remaining = "Talk to furrier for specifics."
+				@bounty_location = bounty_text.match(/of (.*?)\.  The local furrier/i)[1]
+
+		elsif bounty_text =~ /You have been tasked to retrieve (\d+) .* of at/i && bounty_text =~ /retrieve \d+ (.*?) (?:more )?of/i && bounty_text =~ /quality for .* in (.*?)\.  You/i
+		  @bounty_task_type = :skinspecifics
+				@bounty_skin = bounty_text.match(/retrieve \d+ (.*?) of/i)[1]
+				@bounty_remaining = bounty_text.match(/You have been tasked to retrieve (\d+) .*? (?:more )?of at/i)[1].to_i
+    @bounty_location = bounty_text.match(/quality for .* in (.*?)\.  You/i)[1]
+####################CREATURE
+  elsif bounty_text =~ /It appears they have a creature problem/i && bounty_text =~ /(?:town|outpost) of ([^\.]+)\.\s+It/i
+    @bounty_task_type = :creature
+				@bounty_remaining = "Talk to guard for specifics."
+				@bounty_location = bounty_text.match(/(?:town|outpost) of ([^\.]+)\.\s+It/i)[1]
+####################DANGEROUS				
+  elsif bounty_text =~ /hunt down and kill a particularly dangerous (.*?) that has/i && bounty_text =~ /(?:activity|territory) in the (.*?) near/
+    @bounty_task_type = :dangerous
+    @bounty_target_creature = bounty_text.match(/hunt down and kill a particularly dangerous (.*?) that has/i)[1]
+				@bounty_location = bounty_text.match(/territory in the (.*?) near/i)[1]
+    @bounty_kills_total = nil
+    @bounty_kills_remaining = nil
+####################KILL
+  elsif bounty_text =~ /(?:tasked to|by) (?:suppressing|suppress) (.*?) activity/i && bounty_text =~ /You need to kill (\d+)/i && bounty_text =~ /(?:activity|territory) in the (.*?) near/
+    @bounty_task_type = :kill
+    @bounty_target_creature = bounty_text.match(/(?:tasked to|by) (?:suppressing|suppress) (.*?) activity/i)[1]
+    @bounty_remaining = bounty_text.match(/You need to kill (\d+)/i)[1].to_i
+				@bounty_location = bounty_text.match(/(?:activity|territory) in the (.*?) near/i)[1]
+
+  elsif bounty_text =~ /It appears (?:that a local resident|they need your help in tracking down some king of lost heirloom)/i && bounty_text =~ /(?:town|outpost) of ([^\.]+)\.\s+It/i
+    @bounty_task_type = :resident
+				@bounty_remaining = "Talk to guard for specifics."
+				@bounty_location = bounty_text.match(/(?:town|outpost) of ([^\.]+)\.\s+It/i)[1]
+
+		elsif bounty_text =~ /rescue/i && bounty_text =~ /the child fleeing from an? (.*?) in the/i && bounty_text =~ /in the (.*?) near/i
+				@bounty_task_type = :rescue
+				@bounty_target_creature = bounty_text.match(/the child fleeing from an? (.*?) in the/i)[1]
+				@bounty_location = bounty_text.match(/in the (.*?) near/i)[1]
+
+  elsif bounty_text =~ /town of (.*?)\.  It appears they need your help in tracking down some kind of lost heirloom/i
+				@bounty_task_type = :heirloom
+				@bounty_remaining = "Talk to guard for specifics."
+				@bounty_location = bounty_text.match(/town of (.*?)\.  It appears they need your help in tracking down some kind of lost heirloom/i)[1]
+
+		elsif bounty_text =~ /tasked to recover (.*?) that/i && bounty_text =~ /attacked by an? (.*?) in the/i
+				@bounty_task_type = :heirloomkill
+				@bounty_heirloom = bounty_text.match(/tasked to recover (.*?) that/i)[1]
+				@bounty_target_creature = bounty_text.match(/attacked by an? (.*?) in the/i)[1]
+				@bounty_location = bounty_text.match(/in the (.*?) near/i)[1]
+				
+		elsif bounty_text =~ /tasked to recover (.*?) that/i && bounty_text =~ /attacked by an? (.*?) in the/i
+				@bounty_task_type = :heirloomsearch
+				@bounty_heirloom = bounty_text.match(/tasked to recover (.*?) that/i)[1]
+				@bounty_target_creature = bounty_text.match(/attacked by an? (.*?) in the/i)[1]
+				@bounty_location = bounty_text.match(/in the (.*?) near/i)[1]
+		end
+end
+
+def bounty_task_line
+  case @bounty_task_type
+		when :bandit
+		  "#{@bounty_location} - Bandit Bounty"
+		when :banditspecifics
+		  "#{@bounty_location} - Bandit Bounty"
+  when :gem
+    "#{@bounty_location} - Gem Bounty"
+  when :gemspecifics
+    "#{@bounty_location} - Gem Bounty"
+  when :herb
+    "#{@bounty_location} - Foraging Bounty"
+  when :herbspecifics
+    "#{@bounty_location} - Foraging Bounty"
+  when :skin
+    "#{@bounty_location} - Skinning Bounty"
+  when :skinspecifics
+    "#{@bounty_location} - Skinning Bounty"
+		when :creature
+		  "#{@bounty_location} - Creature Bounty"
+  when :kill
+    "#{@bounty_location} - Culling Bounty"
+  when :dangerous
+    "#{@bounty_location} - Dangerous Bounty"
+  when :resident
+    "#{@bounty_location} - Resident Bounty"
+  when :rescue
+    "#{@bounty_location} - Rescue Bounty"
+  when :heirloom
+    "#{@bounty_location} - Heirloom Bounty"
+  when :heirloomkill
+    "Find - #{@bounty_heirloom}"
+  when :heirloomsearch
+    "Find - #{@bounty_heirloom}"
+  when :completeheirloom
+    "Found! - #{@bounty_heirloom}"
+  when :completeguard
+    "Task Complete!"
+  when :completeguild
+    "Task Complete!"
+  else
+    "No Bounty"
+  end
+end
+
+def bounty_status_line
+  case @bounty_task_type
+		when :bandit
+		  "#{@bounty_remaining}"
+		when :banditspecifics
+		  "Kill #{@bounty_remaining} - Bandit"
+  when :gem
+    "#{@bounty_remaining}"
+  when :gemspecifics
+    "Find #{@bounty_remaining} - #{@bounty_gem}"
+		when :herb
+		  "#{@bounty_remaining}"
+		when :herbspecifics
+		  "Find #{@bounty_remaining} - #{@bounty_herb}"
+		when :skin
+		  "#{@bounty_remaining}"
+		when :skinspecifics
+		  "Find #{@bounty_remaining} - #{@bounty_skin}"
+		when :creature
+		  "#{@bounty_remaining}"
+  when :kill
+    "Kill #{@bounty_remaining} - #{@bounty_target_creature}"
+  when :dangerous
+    "Kill - #{@bounty_target_creature}"
+  when :resident
+    "#{@bounty_remaining}"
+  when :rescue
+    "Kill - #{@bounty_target_creature}"
+  when :heirloom
+    "#{@bounty_remaining}"
+  when :heirloomkill
+    "#{@bounty_location} - #{@bounty_target_creature}"
+  when :heirloomsearch
+    "Search - #{@bounty_location}"
+  when :completeguard
+    "Return it to the guard!"
+  when :completeguard
+    "Report to the guard!"
+  when :completeguild
+    "Report to the guild!"
+  else
+    ""
+  end
+end
+
+def completed_amount
+  return 0 unless @bounty_total
+  @bounty_total - (@bounty_remaining || 0)
 end
 
 def push_creatures_to_window(targets)
@@ -95,34 +344,36 @@ def push_creatures_to_window(targets)
     current_top += 20
   end
 
-  if @display_last_ttk && @last_kill_time && @last_kill_name
-    last_ttk_display = format("%.2f sec", @last_kill_time)
-    output += "<label id='last_ttk' value='Last TTK: #{last_ttk_display}' justify='left' left='0' top='#{current_top}' />"
-    current_top += 20
-				output += "<label id='last_kill_name' value='(#{@last_kill_name})' justify='left' left='0' top='#{current_top}' />"
-				current_top += 20
-  end
+if @display_last_ttk
+  last_ttk_display = @last_kill_time ? format("%.2f sec", @last_kill_time) : "N/A"
+  output += "<label id='last_ttk' value='Last TTK: #{last_ttk_display}' justify='left' left='0' top='#{current_top}' />"
+  current_top += 20
 
-  if Script.running?("killtracker") && defined?($killtracker) && $killtracker.is_a?(Hash)
-    killtracker_ascsearchstats = get_killtracker_ascsearchstats
-	
-if (line = get_killtracker_ascsearchstats)
-  output += "<label id='kt_asc' value='#{line}' justify='left' left='0' top='#{current_top}' />"
+  if @last_kill_name
+   output += "<label id='last_kill_name' value='(#{@last_kill_name})' justify='left' left='0' top='#{current_top}' />"
+   current_top += 20
+  end
+  output += "<label id='div1' value='--------------------------------------' justify='left' left='0' top='#{current_top}' />"
+		current_top += 20
+end
+
+if @display_bounty && (line = bounty_task_line)
+  output += "<label id='bounty_type' value='#{sanitize_xml(line)}' justify='left' left='0' top='#{current_top}' wrap='true' />"
   current_top += 20
 end
 
-if (line = get_killtracker_jewelduststats)
-  output += "<label id='kt_drops' value='#{line}' justify='left' left='0' top='#{current_top}' />"
+if @display_bounty && (line = bounty_status_line)
+  output += "<label id='bounty_status' value='#{sanitize_xml(line)}' justify='left' left='0' top='#{current_top}' wrap='true' />"
   current_top += 20
+  output += "<label id='div2' value='--------------------------------------' justify='left' left='0' top='#{current_top}' />"
+		current_top += 20
 end
-
-  end
 
   output += "<label id='total' value='Creatures: #{targets.size}' justify='left' left='0' top='#{current_top}' />"
   current_top += 20
 
   targets.each_with_index do |t, index|
-    status = t.status ? status_fix(t.status) : nil
+				status = t.status ? creature_status_fix(t.status, t.name) : creature_status_fix(nil, t.name)
     label_value = status ? "#{t.name} (#{status})" : t.name
 
     if t.id == curr_target_id
@@ -147,18 +398,25 @@ end
 end
 
 UPSTREAM_HOOK_ID = "creaturewindow::upstream"
+
 UpstreamHook.add(UPSTREAM_HOOK_ID, proc do |command|
   case command
-  when /ttk avg/i
+when /bty/i
+  @display_bounty = !@display_bounty
+  CMD_QUEUE.push("update_window")
+respond "Bounty display: #{@display_bounty ? 'ON' : 'OFF'}"
+  nil
+
+  when /ttk/i
     @display_avg_ttk = !@display_avg_ttk
     CMD_QUEUE.push("update_window")
-    echo "Average TTK display: #{ @display_avg_ttk ? 'ON' : 'OFF' }"
-    nil
+    respond "Average TTK display: #{@display_avg_ttk ? 'ON' : 'OFF'}"
 
-  when /ttk last/i
+
     @display_last_ttk = !@display_last_ttk
     CMD_QUEUE.push("update_window")
-    echo "Last TTK display: #{ @display_last_ttk ? 'ON' : 'OFF' }"
+    respond "Last TTK display: #{@display_last_ttk ? 'ON' : 'OFF'}"
+
     nil
 
   else
@@ -171,6 +429,9 @@ before_dying do
 end
 
 echo "Creature Window with Avg/Last TTK and killtracker display (if running) is active."
+parse_bounty_from_checkbounty
+
+@last_bounty_check ||= Time.now
 
 loop do
   current_targets = GameObj.targets
@@ -182,6 +443,13 @@ loop do
   unless CMD_QUEUE.empty?
     command = CMD_QUEUE.pop
     push_creatures_to_window(@last_targets) if command == "update_window"
+  end
+
+  # Every 5 seconds, issue a BOUNTY command to refresh
+  if Time.now - @last_bounty_check > 5
+    parse_bounty_from_checkbounty
+    CMD_QUEUE.push("update_window")
+    @last_bounty_check = Time.now
   end
 
   sleep 0.025
