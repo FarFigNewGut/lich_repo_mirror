@@ -7,26 +7,30 @@
     - 88 different flare patterns added.
   1.1.0 (2024-09-8)
     - Added lots of new flares to track, mainly armor scripts.
-	- Separated non-damaging flares into a separate global constant.
+  - Separated non-damaging flares into a separate global constant.
   1.2.0 (2024-09-11)
-	- Added all custom fatal afflares messaging.
+  - Added all custom fatal afflares messaging.
   1.3.0 (2024-09-26)
-	- Excluded Symbol of Dreams conflict with Ensorcell_Spirit.
-	- Added Holy Water Flare tracking.
-	- Added lots of tracking for just about every spell with a native effect or spell with a lore benefit effect that functions similar to a flare.
+  - Excluded Symbol of Dreams conflict with Ensorcell_Spirit.
+  - Added Holy Water Flare tracking.
+  - Added lots of tracking for just about every spell with a native effect or spell with a lore benefit effect that functions similar to a flare.
   1.4.0 (2024-10-07)
-	- Added all custom flare messaging sold at the Ebon Gate Festival in the Quinton Manse.
+  - Added all custom flare messaging sold at the Ebon Gate Festival in the Quinton Manse.
   1.5.0 (2024-10-11)
-	- Added Mechanical Quiver and moved Fire Mage Armor to damage pattern.
-	- Added attack pattern match for channeling spells.
+  - Added Mechanical Quiver and moved Fire Mage Armor to damage pattern.
+  - Added attack pattern match for channeling spells.
     - Added Wildfire Oil available from the Hinterwilds Alchemist.
   1.6.0 (2024-10-28)
-	- Covert Arts Deadly Poisons added.
-	- Ball Spell Splash added.
-	
+  - Covert Arts Deadly Poisons added.
+  - Ball Spell Splash added.
+  1.7.0 (2025-2-11)
+    - Updated for Duskruin Feb 2025.
+  1.7.0 (2025-5-15)
+    - Updated for Bloodstone Jewelry.  SanguineSacrifice and SanguineSacrifice_Overflow.
+
 tags: tracking, item scripts, flares, data, abilities
-version: 1.6.0
-	
+version: 1.7.0
+
 =end
 
 # Define FLARE_PATTERNS as a constant to be used globally
@@ -34,6 +38,7 @@ NODMGFLARE_PATTERNS = {
   # Non-damaging flares
   Xazkruvrixis: /Your xazkruvrixis .*? emits an ominous black-green glow/,
   Wither_LoreBenefit: /A nebulous haze shimmers into view around .*?\, plunging inward in a dizzying spiral to envelop .*? completely/,
+  Warding_Flare: /You hear a deafening wail as a ghostly white vapor surrounds you, swirling around your/,
   WThorns640_Poison: /One of the vines surrounding you lashes out at/,
   WThorns640_Block: /The thorny barrier surrounding you blocks the attack from/,
   VolnArmor_DSFlare: /Your .*? hums with spiritual force, filling you with a sense of divine vigilance and a preternatural awareness of/,
@@ -53,6 +58,7 @@ NODMGFLARE_PATTERNS = {
   Terror_Flare: /Your .*? releases a distorted black shadow at|A wave of wicked power surges forth from your/,
   TReversion540: /Your surroundings melt away as the air around you shivers with a large flux of mana. Abruptly, time wrenches violently to give you a second chance. This time, you're better prepared/,
   TVerdict1603_Zealot: /Your surroundings take on a violet sheen as you burn with zealous fervor/,
+  SteelSkin_Flare: /You exhale in pain as your skin rapidly hardens into a shimmering barrier/,
   Sprite_DefensiveFlares: /The .*? sprite on your shoulder projects a .*? barrier in front of you/,
   Spritely_Maneuvering: /The .*? sprite on your shoulder projects a .*? barrier, shielding you/,
   Spritely_Intervention: /You feel yourself being pulled upright as an .*? barrier appears in front of you/,
@@ -67,7 +73,8 @@ NODMGFLARE_PATTERNS = {
   Sigil_of_Binding: /A bolt of energy leaps from your .*? within bands of concentric geometry/,
   ShieldCape_Block: /forms a shield in front of you that turns solid enough to block .*? incoming blow/,
   SerendipitousHex_GS: /your forearms as your spell reforms into a hex/,
-  Rusalkan: /Exploding in a tumbling current of frothy foam, a wave of sea water suddenly materializes at the call of your/,
+  SanguineSacrifice_Overflow: /Sanguine brilliance strikes .*? a rupturing blow!/,
+		Rusalkan: /Exploding in a tumbling current of frothy foam, a wave of sea water suddenly materializes at the call of your/,
   RangerTrinket_Resistance: /pulses briefly, deflecting some/,
   RangerTrinket_ManaAbsorb: /The .*? essence is drawn toward your/,
   RFire515_NoCooldown: /Moisture beads on the surface of your skin then evaporates away, taking with it your recent elemental fatigue/,
@@ -158,7 +165,7 @@ DMGFLARE_PATTERNS = {
   CloakofShadows_Retribution: /A dark shadowy tendril rises up from your skin/,
   Cold_Flare: /\*\* Your .*? glow(s)? intensely with a cold blue light|A thin stream of icy cold liquid shoots forth from your|Trailing snowflakes in their wake, bright purple and azure ghosts rise out of your .*? and sail through the air, passing in and out of .*? before dissipating with a low moan/,
   Cold_GEF: /\*\* A vortex of razor-sharp ice gusts from .*? and coalesce(s)? around a .*?\! \*\*/,
-#  Coraesine_Old: /Coraesine_Old/,
+  #  Coraesine_Old: /Coraesine_Old/,
   Coraesine_Pure: /A massive vortex of shrapnel-laden air coalesces around|You feel the .*? respond to your will, and suddenly it flares up with a blazing white-grey aura\! Vicious winds curl around you in a spiraling vortex, increasing your momentum as you let loose a lightning-quick strike/,
   CoraesineRelic: /\*\* The coraesine relic on your/,
   Daybringer_Script: /\*\* A torrent of .*?\-colored plasma bursts forth from your .*? at/,
@@ -215,6 +222,7 @@ DMGFLARE_PATTERNS = {
   Parasitic_BloodFlares: /You wince as .*? draws upon your blood as it strikes/,
   Religion_LoreFlare: /Divine flames kindle around .*? leaping forth to engulf/,
   Religion_LoreFlareDoT: /The sacred inferno surrounding .*? ignites anew/,
+  SanguineSacrifice: /suffers an additional .*? damage!/,
   ShieldCape_BroochFlare: /attached to the left shoulder of your .*? suddenly explodes with a brilliant flash/,
   ShadowDeathWeapon: /Ravenous tendrils of shadow burst forth from .*?, draining the very life from .*?/,
   SigilStaff_Dispel: /Tendrils of .*?? energy lash out from your .*?? toward .*?? and cage/,
