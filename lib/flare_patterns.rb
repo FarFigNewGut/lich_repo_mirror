@@ -158,7 +158,7 @@ DMGFLARE_PATTERNS = {
   Balefire_DemonAttack: /shudders slightly as chaotic energy is drawn from its form and fused with the attack/,
   BallSpell_Splash: /A burst of .*? from your .*? flies off and hits/,
   Blessing_LoreFlare: /A reassuring feeling of mental acuity settles over you|Your mind clears as a wave of energy washes over you|Your resolve feels bolstered as the energy courses through you|The pulse leaves you feeling spiritually emboldened|A stirring force ignites within you|A resonant force ripples through you|A surge of spiritual power rushes through your veins|The charge resonates with your spirit| The current resonates with your spirit|An electrified aura coalesces around you/,
-  Briar: /Vines of vicious briars whip out from your/,
+  Briar: /Vines of vicious briars whip out from your|A spiritual resonance warms your core/,
   ChainSpear: /The .*? head of your .*? catches across .*?/,
   ChronomageDagger: /Taking a chance you hurl .*? at .*? again and suddenly everything returns to normal speed as time catches up with itself/,
   CloakofShadows_Retribution: /A dark shadowy tendril rises up from your skin/,
