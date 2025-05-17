@@ -144,7 +144,16 @@ NODMGFLARE_PATTERNS = {
   Animalistic_InstinctFlares: /up from the point of impact, spreading over the chest of your/,
   Aganjira: /Mana cascades across your .*?, causing the fabric to shiver against your skin as it draws the scattered power into it and transforms it into mana/,
   Adamantine: /the incredibly hard surface of your adamantine/,
-  Acuity_Flare: /Your .*? glows intensely with a verdant light\!|form before shifting its focus toward you, setting your .*? aflame for a brief momen/
+  Acuity_Flare: /Your .*? glows intensely with a verdant light\!|form before shifting its focus toward you, setting your .*? aflame for a brief momen/,
+		BindingShot_GS: /Released from the projectile\, a slim canister splits in flight and unfurls a net to envelop/,
+		GrandTheftKobold_GS: /You feel like you could try that again/,
+		MephiticBrume_GS: /A noxious brume\, murky and foul-smelling\, erupts from your body/,
+		MetamorphicShield_GS: /A distorted ripple of metamorphic energy races across your/,
+		TerrorsTribute_GS: /Countless phantasms peel away from you and lurch disjointedly outward in all directions\, their features contorted and their mouths agape/,
+		ChameleonShroud_GS: /A tenebrous shroud stitches itself into existence around you as you gracefully retreat into the shadows/,
+		HuntersAfterimage_GS: /A radiant afterimage of the arrow appears in your ready hand\, coalescing to replace its predecessor/,
+		MirrorImage_GS: /Fleeting and insubstantial\, a mirror image of you shimmers into view at your side\, echoing your attack with one of its own/,
+		OneShotOneKill_GS: /With the singular precision of an assassin/,
 }
 
 DMGFLARE_PATTERNS = {
@@ -157,8 +166,8 @@ DMGFLARE_PATTERNS = {
   Animalistic_FuryFlares: /slender tendrils rising up to coalesce into the ethereal form of/,
   Balefire_DemonAttack: /shudders slightly as chaotic energy is drawn from its form and fused with the attack/,
   BallSpell_Splash: /A burst of .*? from your .*? flies off and hits/,
-  Blessing_LoreFlare: /A reassuring feeling of mental acuity settles over you|Your mind clears as a wave of energy washes over you|Your resolve feels bolstered as the energy courses through you|The pulse leaves you feeling spiritually emboldened|A stirring force ignites within you|A resonant force ripples through you|A surge of spiritual power rushes through your veins|The charge resonates with your spirit| The current resonates with your spirit|An electrified aura coalesces around you/,
-  Briar: /Vines of vicious briars whip out from your|A spiritual resonance warms your core/,
+  Blessing_LoreFlare: /A reassuring feeling of mental acuity settles over you|Your mind clears as a wave of energy washes over you|Your resolve feels bolstered as the energy courses through you|The pulse leaves you feeling spiritually emboldened|A stirring force ignites within you|A resonant force ripples through you|A surge of spiritual power rushes through your veins|The charge resonates with your spirit| The current resonates with your spirit|An electrified aura coalesces around you|A spiritual resonance warms your core/,
+  Briar: /Vines of vicious briars whip out from your/,
   ChainSpear: /The .*? head of your .*? catches across .*?/,
   ChronomageDagger: /Taking a chance you hurl .*? at .*? again and suddenly everything returns to normal speed as time catches up with itself/,
   CloakofShadows_Retribution: /A dark shadowy tendril rises up from your skin/,
@@ -274,7 +283,17 @@ DMGFLARE_PATTERNS = {
   CA_OphidiansKiss: /Afflicted by your .*? reels as the indigo-tinted poison does its work/,
   CA_RavagersRevenge: /Afflicted by your .*? reels as the maroon-swirled poison does its work/,
   CA_ShatterlimbPoison: /Afflicted by your .*? reels as the murky blue poison does its work/,
-  CA_MajorPoison_Dot: /wavers with infirmity and pales slightly|suffers visibly from the poison afflicting|A spasm of pain overtakes|study of agonized misery|sweats copiously and groans in pain/
+  CA_MajorPoison_Dot: /wavers with infirmity and pales slightly|suffers visibly from the poison afflicting|A spasm of pain overtakes|study of agonized misery|sweats copiously and groans in pain/,
+		BloodBoil_GS: /\*\* A fiery aura spirals from your hands/,
+		BurningBlood_GS: /\*\* Your blood ignites as it sprays through the air/,
+		EtherFlux_GS: /\*\* Rapidly fluctuating elemental power blooms/,
+		Infusion_GS: /place holder/,
+		Relentless_GS: /place holder/,
+		RelentlessWarder_GS: /place holder/,
+		ChargedPresence_GS: /A powerful jolt of electricity erupts from your crackling aura|A sphere of snapping and crackling ethereal ripples expands outward from you/,
+		StolenPower_GS: /place holder/,
+		Thorns_GS: /place holder/,
+		Trueshot_GS: /place holder/,
 }
 
 # Define ATTACK_PATTERNS as a constant to be used globally
