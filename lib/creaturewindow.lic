@@ -88,29 +88,14 @@ $use_gtk_window = $creature_window["use_gtk_window"] || false
 @display_avg_ttk  = $creature_window.fetch("display_avg_ttk",  false)
 @display_last_ttk = $creature_window.fetch("display_last_ttk", false)
 
-# if they’ve explicitly enabled GTK, always launch it
-if $use_gtk_window
+if $use_gtk_window || $frontend != "stormfront"
   respond ""
   respond " Initiating GTK window."
   respond ""
   respond " GTK Creaturewindow is active."
   respond ""
-  Gtk.queue do
-    CreatureWindowGtk.create_main_window
-    Gtk.main
-  end
-
-# otherwise fall back to “if non-Stormfront” auto-GTK
-elsif $frontend != "stormfront"
-  respond ""
-  respond " Using a frontend other than Wrayth."
-  respond ""
-  respond " Initiating GTK window."
-  respond ""
-  Gtk.queue do
-    CreatureWindowGtk.create_main_window
-    Gtk.main
-  end
+  Gtk.queue { CreatureWindowGtk.create_main_window }
+  Gtk.main unless Gtk.main_level > 0
 end
 
 if $frontend == "stormfront"
@@ -136,6 +121,23 @@ class CreatureWindowGtk
   # Regenerates & reapplies our CSS (called after font‐size, mode, etc. change)
   def self.reload_css
     css = <<~CSS
+/* Light-mode headerbar */
+window#creaturewindow:not(.dark) headerbar {
+  background-color: #393939;
+  color:            #FFFFFF;
+}
+
+/* Dark-mode headerbar */
+window#creaturewindow.dark headerbar {
+  background-color: #000000;
+  color:            #FFFFFF;
+}
+
+/* And keep your toggles white on dark */
+window#creaturewindow.dark headerbar .header-toggle {
+  color:            #FFFFFF;
+}
+
 						/* tighten up header-bar buttons */
 						window#creaturewindow headerbar .header-toggle {
 								margin: 0 2px;    /* horiz space between buttons */
@@ -144,7 +146,7 @@ class CreatureWindowGtk
 
 						/* give the whole window a 2px solid grey border */
 						window#creaturewindow {
-								border: 2px solid #888888;
+								border: 0px solid #888888;
 								border-radius: 4px;
 						}
 
@@ -155,15 +157,15 @@ class CreatureWindowGtk
 
       /* Light-mode background */
       window#creaturewindow:not(.dark),
-      window#creaturewindow:not(.dark), headerbar,
-      window#creaturewindow:not(.dark), GtkScrolledWindow,
-      window#creaturewindow:not(.dark), GtkFlowBox {
-        background-color: #C0C0C0;
+      window#creaturewindow:not(.dark) headerbar,
+      window#creaturewindow:not(.dark) GtkScrolledWindow,
+      window#creaturewindow:not(.dark) GtkFlowBox {
+        background-color: #393939;
       }
 
       /* Light mode text */
       window#creaturewindow:not(.dark) label {
-        color: #000000;
+        color: #FFFFFF;
       }
 
       /* Dark-mode background */
@@ -218,6 +220,7 @@ class CreatureWindowGtk
     header = Gtk::HeaderBar.new
     header.show_close_button = true
     header.title = "CW"
+				header.style_context.add_class("dark") if dark_mode
 
     # — Font size buttons —
     dec_btn = Gtk::Button.new(label: "A−")
@@ -241,8 +244,10 @@ class CreatureWindowGtk
     theme_switch.signal_connect("notify::active") do |sw, _|
       if sw.active?
         @window.style_context.add_class("dark")
+								header.style_context.add_class("dark")
       else
         @window.style_context.remove_class("dark")
+								header.style_context.remove_class("dark")
       end
       cw["dark_mode"] = sw.active?; save_window_settings(settings)
       reload_css
@@ -265,10 +270,15 @@ class CreatureWindowGtk
     @window.resize(cw["width"], cw["height"]) if cw["width"] && cw["height"]
     @window.move(cw["x"], cw["y"]) if cw["x"] && cw["y"]
 
+    # — bounty box (standalone) —
+    @bounty_box = Gtk::Box.new(:vertical, 2)
+    @bounty_box.set_hexpand(true)
+    @bounty_box.hide # start hidden, until we actually have bounty info
+
+    # — scroll + two-column flow for creatures —
     @scroll = Gtk::ScrolledWindow.new
     @scroll.set_policy(Gtk::PolicyType::AUTOMATIC, Gtk::PolicyType::AUTOMATIC)
-    @scroll.set_hexpand(true)
-    @scroll.set_vexpand(true)
+    @scroll.set_hexpand(true); @scroll.set_vexpand(true)
 
     @flow = Gtk::FlowBox.new
     @flow.selection_mode        = :none
@@ -276,11 +286,14 @@ class CreatureWindowGtk
     @flow.column_spacing        = 0
     @flow.row_spacing           = 0
     @flow.set_vexpand(true)
-    @flow.valign                = Gtk::Align::START
-    @flow.homogeneous           = false
+    @flow.valign = Gtk::Align::START
     @scroll.add(@flow)
 
-    @window.add(@scroll)
+    # — pack bounty_box ABOVE the scroll+flow —
+    container = Gtk::Box.new(:vertical, 1)
+    container.pack_start(@bounty_box, expand: false, fill: true, padding: 0)
+    container.pack_start(@scroll,     expand: true,  fill: true, padding: 0)
+    @window.add(container)
 
     # — save geometry on move/resize —
     @ignore_next_configure = true
@@ -298,10 +311,17 @@ class CreatureWindowGtk
       false
     end
 
-    @window.signal_connect("destroy") do
+     @window.signal_connect("destroy") do
+      # just clear our reference…
       @window = nil
-      Gtk.main_quit
-    end
+
+      # …and only quit GTK if *this* was the last open toplevel
+      remaining = Gdk::Window.list_toplevels.
+                  reject { |w| w.name == "" || w.name == "default" }
+      if remaining.empty?
+        Gtk.main_quit
+      end
+     end
     @window.show_all
   end # ← end create_main_window
 
@@ -327,29 +347,24 @@ class CreatureWindowGtk
     return unless @window
 
     Gtk.queue do
-      # clear old widgets
-      @flow.children.each { |c| @flow.remove(c) }
-
-      # 1) Avg TTK
-      add_full_row("Avg TTK: #{avg_ttk}") if display_avg_ttk
-
-      # 2) Last TTK
-      if display_last_ttk
-        @last_kill_time ? format("%.2f sec", @last_kill_time) : "N/A"
-        add_full_row("Last TTK: #{last_ttk}") if display_last_ttk
-        add_full_row("(#{@last_kill_name})") if @last_kill_name
-      end
-
-      # 3) Bounty (now uses the method parameter!)
+      # — first, clear & repopulate bounty_box —
+      @bounty_box.each { |c| @bounty_box.remove(c) }
       if display_bounty
-        bounty_task_line
-        bounty_status_line
-        # optionally skip the “No Bounty” placeholder:
-        add_full_row("#{bounty_task}")
-        add_full_row("#{bounty_status}")
+        @bounty_box.show
+        [bounty_task, bounty_status].each do |txt|
+          lbl = Gtk::Label.new(txt)
+          lbl.set_xalign(0)
+          @bounty_box.add(lbl)
+        end
+
+        # <— here:
+        @bounty_box.show_all
+      else
+        @bounty_box.hide
       end
 
       # 4) Creature count
+      @flow.children.each { |c| @flow.remove(c) }
       add_full_row("Creatures: #{targets.size}")
 
       # 5) Current target
@@ -374,7 +389,7 @@ class CreatureWindowGtk
 
       # 7) Dead creatures – force a full row for the count, then list
       dead = GameObj.npcs.select { |n| n.status.to_s.downcase == "dead" }
-						add_full_row("")
+      add_full_row("")
       add_full_row("Dead Creatures: #{dead.size}")
       dead.each do |t|
         lbl = Gtk::Label.new(t.noun.capitalize)
@@ -866,20 +881,30 @@ UpstreamHook.add(UPSTREAM_HOOK_ID, proc do |command|
     nil
 
   when /\*cwgtk/i
-    # toggle GTK window on/off
-    @use_gtk_window = !@use_gtk_window
-    window_settings["creaturewindow"]["use_gtk_window"] = @use_gtk_window
-    save_window_settings(window_settings)
+    $use_gtk_window = !$use_gtk_window
+    respond "GTK Creaturewindow is now #{$use_gtk_window ? 'ENABLED' : 'DISABLED'}."
 
-    if @use_gtk_window
-      respond "GTK window: ON"
-      Gtk.queue { CreatureWindowGtk.create_main_window }
+    # persist the new setting
+    settings = load_window_settings
+    settings["creaturewindow"] ||= {}
+    settings["creaturewindow"]["use_gtk_window"] = $use_gtk_window
+    save_window_settings(settings)
+
+    if $use_gtk_window
+      # launch it if not already up
+      Gtk.queue do
+        CreatureWindowGtk.create_main_window
+        Gtk.main
+      end
     else
-      respond "GTK window: OFF"
+      # close it if it exists
       if defined?(CreatureWindowGtk) && CreatureWindowGtk.instance_variable_get(:@window)
-        Gtk.queue { CreatureWindowGtk.instance_variable_get(:@window).close }
+        Gtk.queue do
+          CreatureWindowGtk.instance_variable_get(:@window).close
+        end
       end
     end
+
     nil
 
   else
@@ -890,8 +915,8 @@ end)
 before_dying do
   UpstreamHook.remove("#{Script.current.name}_upstream")
 
-  if defined?(CreatureWindowGtk) && CreatureWindowGtk.instance_variable_get(:@window)
-    Gtk.queue { CreatureWindowGtk.instance_variable_get(:@window).close }
+  if defined?(CreatureWindowGtk) && cw = CreatureWindowGtk.instance_variable_get(:@window)
+    Gtk.queue { cw.hide }
   end
 end
 
