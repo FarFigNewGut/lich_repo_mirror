@@ -91,12 +91,12 @@ $use_gtk_window = $creature_window["use_gtk_window"] || false
 # if they’ve explicitly enabled GTK, always launch it
 if $use_gtk_window
   respond ""
-  respond " GTK exits window is enabled."
-  respond ""
   respond " Initiating GTK window."
   respond ""
+  respond " GTK Creaturewindow is active."
+  respond ""
   Gtk.queue do
-    CreatureWindowGtk.create_main_window
+    PlayerWindowGtk.create_main_window
     Gtk.main
   end
 
@@ -127,6 +127,265 @@ end
 CMD_QUEUE = Queue.new
 
 @recent_lines ||= []
+
+class CreatureWindowGtk
+  @window       = nil
+  @css_provider = nil
+  @font_size    = nil
+
+  # Regenerates & reapplies our CSS (called after font‐size, mode, etc. change)
+  def self.reload_css
+    css = <<~CSS
+						/* tighten up header-bar buttons */
+						window#creaturewindow headerbar .header-toggle {
+								margin: 0 2px;    /* horiz space between buttons */
+								padding: 2px 4px; /* shrink the click target */
+						}
+
+						/* give the whole window a 2px solid grey border */
+						window#creaturewindow {
+								border: 2px solid #888888;
+								border-radius: 4px;
+						}
+
+      /* Base label font size */
+      window#creaturewindow label {
+        font-size: #{@font_size}px;
+      }
+
+      /* Light-mode background */
+      window#creaturewindow:not(.dark),
+      window#creaturewindow:not(.dark), headerbar,
+      window#creaturewindow:not(.dark), GtkScrolledWindow,
+      window#creaturewindow:not(.dark), GtkFlowBox {
+        background-color: #C0C0C0;
+      }
+
+      /* Light mode text */
+      window#creaturewindow:not(.dark) label {
+        color: #000000;
+      }
+
+      /* Dark-mode background */
+      window#creaturewindow.dark,
+      window#creaturewindow.dark headerbar,
+      window#creaturewindow.dark GtkScrolledWindow,
+      window#creaturewindow.dark GtkFlowBox {
+        background-color: #000000;
+      }
+
+      /* Dark-mode text */
+      window#creaturewindow.dark label {
+        color: #FFFFFF;
+      }
+
+      /* HeaderBar toggles/buttons in dark mode */
+      window#creaturewindow.dark headerbar .header-toggle {
+        background-image: none;
+        background-color: transparent;
+        color:            #FFFFFF;
+        border:           none;
+        box-shadow:       none;
+      }
+
+      /* Highlight “on” state */
+      window#creaturewindow.dark headerbar .header-toggle:checked {
+        background-color: #444444;
+      }
+
+    CSS
+
+    @css_provider.load(data: css)
+  end
+
+  def self.create_main_window
+    return if @window
+
+    # ——— load persisted settings ———
+    settings = load_window_settings
+    cw = settings["creaturewindow"] ||= {}
+
+    dark_mode = cw["dark_mode"] || false
+    @font_size = cw["font_size"] || 14
+
+    # ——— build top‐level window & HeaderBar ———
+    @window = Gtk::Window.new(:toplevel)
+    @window.set_name("creaturewindow")
+    @window.set_border_width(10)
+    @window.set_type_hint(Gdk::WindowTypeHint::UTILITY)
+    @window.set_keep_above(true)
+
+    header = Gtk::HeaderBar.new
+    header.show_close_button = true
+    header.title = "CW"
+
+    # — Font size buttons —
+    dec_btn = Gtk::Button.new(label: "A−")
+    inc_btn = Gtk::Button.new(label: "A+")
+    [dec_btn, inc_btn].each { |b| b.style_context.add_class("header-toggle"); header.pack_start(b) }
+    dec_btn.signal_connect("clicked") do
+      @font_size = [@font_size - 1, 8].max
+      cw["font_size"] = @font_size; save_window_settings(settings)
+      reload_css
+    end
+    inc_btn.signal_connect("clicked") do
+      @font_size = [@font_size + 1, 30].min
+      cw["font_size"] = @font_size; save_window_settings(settings)
+      reload_css
+    end
+
+    # — Dark/Light switch —
+    theme_switch = Gtk::Switch.new
+    theme_switch.active = dark_mode
+    @window.style_context.add_class("dark") if dark_mode
+    theme_switch.signal_connect("notify::active") do |sw, _|
+      if sw.active?
+        @window.style_context.add_class("dark")
+      else
+        @window.style_context.remove_class("dark")
+      end
+      cw["dark_mode"] = sw.active?; save_window_settings(settings)
+      reload_css
+    end
+    header.pack_end(theme_switch)
+
+    @window.set_titlebar(header)
+
+    # — CSS provider & initial styling —
+    @css_provider = Gtk::CssProvider.new
+    reload_css
+    screen = Gdk::Screen.default
+    Gtk::StyleContext.add_provider_for_screen(
+      screen,
+      @css_provider,
+      Gtk::StyleProvider::PRIORITY_APPLICATION
+    )
+
+    # — Restore geometry —
+    @window.resize(cw["width"], cw["height"]) if cw["width"] && cw["height"]
+    @window.move(cw["x"], cw["y"]) if cw["x"] && cw["y"]
+
+    @scroll = Gtk::ScrolledWindow.new
+    @scroll.set_policy(Gtk::PolicyType::AUTOMATIC, Gtk::PolicyType::AUTOMATIC)
+    @scroll.set_hexpand(true)
+    @scroll.set_vexpand(true)
+
+    @flow = Gtk::FlowBox.new
+    @flow.selection_mode        = :none
+    @flow.max_children_per_line = 2
+    @flow.column_spacing        = 0
+    @flow.row_spacing           = 0
+    @flow.set_vexpand(true)
+    @flow.valign                = Gtk::Align::START
+    @flow.homogeneous           = false
+    @scroll.add(@flow)
+
+    @window.add(@scroll)
+
+    # — save geometry on move/resize —
+    @ignore_next_configure = true
+    @window.signal_connect("configure_event") do |_w, _ev|
+      if @ignore_next_configure
+        @ignore_next_configure = false
+      else
+        x, y = @window.position
+        w, h = @window.size
+        s = load_window_settings
+        s["creaturewindow"] ||= {}
+        s["creaturewindow"].merge!("x" => x, "y" => y, "width" => w, "height" => h)
+        save_window_settings(s)
+      end
+      false
+    end
+
+    @window.signal_connect("destroy") do
+      @window = nil
+      Gtk.main_quit
+    end
+    @window.show_all
+  end # ← end create_main_window
+
+  # -----------------------------------------------------------------------
+  # now the updater lives _outside_ of create_main_window
+  def self.add_full_row(text = "")
+    lbl = Gtk::Label.new(text)
+    lbl.set_xalign(0)
+    @flow.add(lbl)
+    # second column is always a blank label
+    @flow.add(Gtk::Label.new(""))
+  end
+
+  # ─── completely replace your old update_creatures with this ───
+  def self.update_creatures(targets,
+                            avg_ttk:,
+                            last_ttk:,
+                            bounty_task:,
+                            bounty_status:,
+                            display_avg_ttk:,
+                            display_last_ttk:,
+                            display_bounty:)
+    return unless @window
+
+    Gtk.queue do
+      # clear old widgets
+      @flow.children.each { |c| @flow.remove(c) }
+
+      # 1) Avg TTK
+      add_full_row("Avg TTK: #{avg_ttk}") if display_avg_ttk
+
+      # 2) Last TTK
+      if display_last_ttk
+        @last_kill_time ? format("%.2f sec", @last_kill_time) : "N/A"
+        add_full_row("Last TTK: #{last_ttk}") if display_last_ttk
+        add_full_row("(#{@last_kill_name})") if @last_kill_name
+      end
+
+      # 3) Bounty (now uses the method parameter!)
+      if display_bounty
+        bounty_task_line
+        bounty_status_line
+        # optionally skip the “No Bounty” placeholder:
+        add_full_row("#{bounty_task}")
+        add_full_row("#{bounty_status}")
+      end
+
+      # 4) Creature count
+      add_full_row("Creatures: #{targets.size}")
+
+      # 5) Current target
+      if (curr = targets.find { |t| t.id == XMLData.current_target_id })
+        st   = creature_status_fix(curr.status, curr.name, curr.id)
+        txt  = st ? "#{curr.noun.capitalize} (#{st})" : curr.noun.capitalize
+        add_full_row("**#{txt}**")
+      end
+
+      # 6) Other living – these will flow into both columns
+      (targets - [curr]).each do |t|
+        st   = creature_status_fix(t.status, t.name, t.id)
+        text = st ? "#{t.noun.capitalize} (#{st})" : t.noun.capitalize
+        l    = Gtk::Label.new(text); l.set_xalign(0); @flow.add(l)
+      end
+
+      # ── if we’re in the middle of a row, finish it off ──
+      if @flow.children.size.odd?
+        # push us onto a fresh row for the dead header
+        @flow.add(Gtk::Label.new(""))
+      end
+
+      # 7) Dead creatures – force a full row for the count, then list
+      dead = GameObj.npcs.select { |n| n.status.to_s.downcase == "dead" }
+						add_full_row("")
+      add_full_row("Dead Creatures: #{dead.size}")
+      dead.each do |t|
+        lbl = Gtk::Label.new(t.noun.capitalize)
+        lbl.set_xalign(0)
+        @flow.add(lbl)
+      end
+
+      @flow.show_all
+    end
+  end
+end
 
 Thread.new do
   loop do
@@ -244,9 +503,9 @@ def parse_bounty_from_checkbounty
     @bounty_location = bounty_text.match(/You have been tasked to suppress bandit activity (?:on|in the|in) (.+?) (?:near|between)/i)[1]
     @bounty_remaining = bounty_text.match(/You need to kill (\d+)/i)[1].to_i
   # ###################escort
-  elsif bounty_text =~ /protective escort/i && bounty_text =~ /safety to (.+?) as/i && bounty_text =~ /(?:inside the |area just )(.+?) and wait/i
+  elsif bounty_text =~ /protective escort/i && bounty_text =~ /safety to (.+?) as/i && bounty_text =~ /(?:inside the |area just |south end )(.+?) and wait/i
     @bounty_task_type = :escort
-    @bounty_escort = bounty_text.match(/(?:inside the |area just )(.+?) and wait/i)[1]
+    @bounty_escort = bounty_text.match(/(?:inside the |area just |south end )(.+?) and wait/i)[1]
     @bounty_location = bounty_text.match(/safety to (.+?) as/i)[1].to_i
 
   elsif bounty_text =~ /(?:town|outpost) of ([^\.]+)\.\s+The local gem dealer/i
@@ -628,265 +887,6 @@ UpstreamHook.add(UPSTREAM_HOOK_ID, proc do |command|
   end
 end)
 
-class CreatureWindowGtk
-  @window       = nil
-  @css_provider = nil
-  @font_size    = nil
-
-  # Regenerates & reapplies our CSS (called after font‐size, mode, etc. change)
-  def self.reload_css
-    css = <<~CSS
-						/* tighten up header-bar buttons */
-						window#creaturewindow headerbar .header-toggle {
-								margin: 0 2px;    /* horiz space between buttons */
-								padding: 2px 4px; /* shrink the click target */
-						}
-
-						/* give the whole window a 2px solid grey border */
-						window#creaturewindow {
-								border: 2px solid #888888;
-								border-radius: 4px;
-						}
-
-      /* Base label font size */
-      window#creaturewindow label {
-        font-size: #{@font_size}px;
-      }
-
-      /* Light-mode background */
-      window#creaturewindow:not(.dark),
-      window#creaturewindow:not(.dark), headerbar,
-      window#creaturewindow:not(.dark), GtkScrolledWindow,
-      window#creaturewindow:not(.dark), GtkFlowBox {
-        background-color: #C0C0C0;
-      }
-
-      /* Light mode text */
-      window#creaturewindow:not(.dark) label {
-        color: #000000;
-      }
-
-      /* Dark-mode background */
-      window#creaturewindow.dark,
-      window#creaturewindow.dark headerbar,
-      window#creaturewindow.dark GtkScrolledWindow,
-      window#creaturewindow.dark GtkFlowBox {
-        background-color: #000000;
-      }
-
-      /* Dark-mode text */
-      window#creaturewindow.dark label {
-        color: #FFFFFF;
-      }
-
-      /* HeaderBar toggles/buttons in dark mode */
-      window#creaturewindow.dark headerbar .header-toggle {
-        background-image: none;
-        background-color: transparent;
-        color:            #FFFFFF;
-        border:           none;
-        box-shadow:       none;
-      }
-
-      /* Highlight “on” state */
-      window#creaturewindow.dark headerbar .header-toggle:checked {
-        background-color: #444444;
-      }
-
-    CSS
-
-    @css_provider.load(data: css)
-  end
-
-  def self.create_main_window
-    return if @window
-
-    # ——— load persisted settings ———
-    settings = load_window_settings
-    cw = settings["creaturewindow"] ||= {}
-
-    dark_mode = cw["dark_mode"] || false
-    @font_size = cw["font_size"] || 14
-
-    # ——— build top‐level window & HeaderBar ———
-    @window = Gtk::Window.new(:toplevel)
-    @window.set_name("creaturewindow")
-    @window.set_border_width(10)
-    @window.set_type_hint(Gdk::WindowTypeHint::UTILITY)
-    @window.set_keep_above(true)
-
-    header = Gtk::HeaderBar.new
-    header.show_close_button = true
-    header.title = "CW"
-
-    # — Font size buttons —
-    dec_btn = Gtk::Button.new(label: "A−")
-    inc_btn = Gtk::Button.new(label: "A+")
-    [dec_btn, inc_btn].each { |b| b.style_context.add_class("header-toggle"); header.pack_start(b) }
-    dec_btn.signal_connect("clicked") do
-      @font_size = [@font_size - 1, 8].max
-      cw["font_size"] = @font_size; save_window_settings(settings)
-      reload_css
-    end
-    inc_btn.signal_connect("clicked") do
-      @font_size = [@font_size + 1, 30].min
-      cw["font_size"] = @font_size; save_window_settings(settings)
-      reload_css
-    end
-
-    # — Dark/Light switch —
-    theme_switch = Gtk::Switch.new
-    theme_switch.active = dark_mode
-    @window.style_context.add_class("dark") if dark_mode
-    theme_switch.signal_connect("notify::active") do |sw, _|
-      if sw.active?
-        @window.style_context.add_class("dark")
-      else
-        @window.style_context.remove_class("dark")
-      end
-      cw["dark_mode"] = sw.active?; save_window_settings(settings)
-      reload_css
-    end
-    header.pack_end(theme_switch)
-
-    @window.set_titlebar(header)
-
-    # — CSS provider & initial styling —
-    @css_provider = Gtk::CssProvider.new
-    reload_css
-    screen = Gdk::Screen.default
-    Gtk::StyleContext.add_provider_for_screen(
-      screen,
-      @css_provider,
-      Gtk::StyleProvider::PRIORITY_APPLICATION
-    )
-
-    # — Restore geometry —
-    @window.resize(cw["width"], cw["height"]) if cw["width"] && cw["height"]
-    @window.move(cw["x"], cw["y"]) if cw["x"] && cw["y"]
-
-    @scroll = Gtk::ScrolledWindow.new
-    @scroll.set_policy(Gtk::PolicyType::AUTOMATIC, Gtk::PolicyType::AUTOMATIC)
-    @scroll.set_hexpand(true)
-    @scroll.set_vexpand(true)
-
-    @flow = Gtk::FlowBox.new
-    @flow.selection_mode        = :none
-    @flow.max_children_per_line = 2
-    @flow.column_spacing        = 0
-    @flow.row_spacing           = 0
-    @flow.set_vexpand(true)
-    @flow.valign                = Gtk::Align::START
-    @flow.homogeneous           = false
-    @scroll.add(@flow)
-
-    @window.add(@scroll)
-
-    # — save geometry on move/resize —
-    @ignore_next_configure = true
-    @window.signal_connect("configure_event") do |_w, _ev|
-      if @ignore_next_configure
-        @ignore_next_configure = false
-      else
-        x, y = @window.position
-        w, h = @window.size
-        s = load_window_settings
-        s["creaturewindow"] ||= {}
-        s["creaturewindow"].merge!("x" => x, "y" => y, "width" => w, "height" => h)
-        save_window_settings(s)
-      end
-      false
-    end
-
-    @window.signal_connect("destroy") do
-      @window = nil
-      Gtk.main_quit
-    end
-    @window.show_all
-  end # ← end create_main_window
-
-  # -----------------------------------------------------------------------
-  # now the updater lives _outside_ of create_main_window
-  def self.add_full_row(text = "")
-    lbl = Gtk::Label.new(text)
-    lbl.set_xalign(0)
-    @flow.add(lbl)
-    # second column is always a blank label
-    @flow.add(Gtk::Label.new(""))
-  end
-
-  # ─── completely replace your old update_creatures with this ───
-  def self.update_creatures(targets,
-                            avg_ttk:,
-                            last_ttk:,
-                            bounty_task:,
-                            bounty_status:,
-                            display_avg_ttk:,
-                            display_last_ttk:,
-                            display_bounty:)
-    return unless @window
-
-    Gtk.queue do
-      # clear old widgets
-      @flow.children.each { |c| @flow.remove(c) }
-
-      # 1) Avg TTK
-      add_full_row("Avg TTK: #{avg_ttk}") if display_avg_ttk
-
-      # 2) Last TTK
-      if display_last_ttk
-        @last_kill_time ? format("%.2f sec", @last_kill_time) : "N/A"
-        add_full_row("Last TTK: #{last_ttk}") if display_last_ttk
-        add_full_row("(#{@last_kill_name})") if @last_kill_name
-      end
-
-      # 3) Bounty (now uses the method parameter!)
-      if display_bounty
-        bounty_task_line
-        bounty_status_line
-        # optionally skip the “No Bounty” placeholder:
-        add_full_row("#{bounty_task}")
-        add_full_row("#{bounty_status}")
-      end
-
-      # 4) Creature count
-      add_full_row("Creatures: #{targets.size}")
-
-      # 5) Current target
-      if (curr = targets.find { |t| t.id == XMLData.current_target_id })
-        st   = creature_status_fix(curr.status, curr.name, curr.id)
-        txt  = st ? "#{curr.noun.capitalize} (#{st})" : curr.noun.capitalize
-        add_full_row("**#{txt}**")
-      end
-
-      # 6) Other living – these will flow into both columns
-      (targets - [curr]).each do |t|
-        st   = creature_status_fix(t.status, t.name, t.id)
-        text = st ? "#{t.noun.capitalize} (#{st})" : t.noun.capitalize
-        l    = Gtk::Label.new(text); l.set_xalign(0); @flow.add(l)
-      end
-
-      # ── if we’re in the middle of a row, finish it off ──
-      if @flow.children.size.odd?
-        # push us onto a fresh row for the dead header
-        @flow.add(Gtk::Label.new(""))
-      end
-
-      # 7) Dead creatures – force a full row for the count, then list
-      dead = GameObj.npcs.select { |n| n.status.to_s.downcase == "dead" }
-						add_full_row("")
-      add_full_row("Dead Creatures: #{dead.size}")
-      dead.each do |t|
-        lbl = Gtk::Label.new(t.noun.capitalize)
-        lbl.set_xalign(0)
-        @flow.add(lbl)
-      end
-
-      @flow.show_all
-    end
-  end
-end
-
 before_dying do
   UpstreamHook.remove("#{Script.current.name}_upstream")
 
@@ -895,7 +895,7 @@ before_dying do
   end
 end
 
-echo "Creature Window with Avg/Last TTK and killtracker display (if running) is active."
+echo "Creaturewindow is active." if $frontend == "stormfront"
 
 parse_bounty_from_checkbounty
 @last_bounty_check ||= Time.now
