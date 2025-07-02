@@ -1,0 +1,182 @@
+=begin
+
+  This script throttles repeated game messages in your familiar window using a shared SQLite database.
+		
+		*IMPORTANT* 
+		- This script will not pass a script check for you.  You still have to pay attention to the game.
+		- The purpose of this script is to help old people with bad eyes or dedicated enthusiasts of flarestone.
+		
+		*SUPER IMPORTANT NOTE*
+		- I should probably just state if you can't pass a script check with this script you are probably actually afk scripting.
+
+  Features:
+  - Captures all incoming StormFront lines via a DownstreamHook.
+  - Filters out XML noise, anchor tags, numerical and pronoun variations.
+  - Normalizes each line and counts occurrences across all characters.
+  - Batches writes to an on-disk SQLite DB every 30 s for performance.
+  - Streams unique messages up to a configurable threshold (default 5).
+  - Emits a one-time "crossed threshold" notice when a line is muted.
+  - Persists counts across script reloads and client restarts.
+
+  Changelog:
+     1.0.0 (2025-07-02)
+           Initial release: shared DB, in-memory batching, verb filtering, normalize anchors & pronouns, threshold notices.
+
+author: Phocosoen, ChatGPT
+tags: filter, spam, scripting, sqlite
+version: 1.0.0
+
+=end
+
+require 'engtagger'
+require 'sqlite3'
+require 'fileutils'
+no_kill_all
+
+# -------------------------------------------------------------------
+# 1) Open (or create) your shared DB under Lich’s data dir
+# -------------------------------------------------------------------
+base_dir = File.join($data_dir, XMLData.game)
+FileUtils.mkdir_p(base_dir)
+
+db_path = File.join(base_dir, 'action_spamfilter.db')
+db      = SQLite3::Database.new(db_path)
+db.execute <<~SQL
+  CREATE TABLE IF NOT EXISTS action_counts (
+    mod_line TEXT PRIMARY KEY,
+    count    INTEGER NOT NULL
+  );
+SQL
+
+# -------------------------------------------------------------------
+# 2) Batching parameters
+# -------------------------------------------------------------------
+CACHE       = {}
+FLUSH_ISEC  = 30 # seconds between flushes
+db_mutex    = Mutex.new
+last_flush  = Time.now
+
+# -------------------------------------------------------------------
+# 3) Shared queue and NLP setup
+# -------------------------------------------------------------------
+BUFFER     = Queue.new
+THRESHOLD  = 5
+TGR        = EngTagger.new
+HOOK_ID    = "#{Script.current.name}_action_spamfilter"
+DownstreamHook.remove(HOOK_ID) rescue nil
+DownstreamHook.add(HOOK_ID, proc { |node, _|
+  BUFFER << node.to_s
+  node
+})
+
+# Hide script from /scripts and keep alive
+hide_me
+
+echo "action_spamfilter: hook installed, batching thread started"
+
+# -------------------------------------------------------------------
+# 4) Single thread: process and periodic flush
+# -------------------------------------------------------------------
+Thread.new do
+  loop do
+    # 4a) Non-blocking dequeue and process
+    begin
+      text = BUFFER.pop(true).to_s.strip
+
+      # skip lines ending with 'special characters'
+      next if text.end_with?(':')
+      next if text.end_with?(')')
+      next if text.end_with?(']')
+      #						next if text.end_with?('</a>')
+      #						next if text.end_with?('...')
+
+      # skip lines with creatures during combat
+      next if text =~ /^The\s.*(?:<pushBold\/>\s*)?<a exist=.*?<\/a>(?:\s*<popBold\/>)?.*!$/
+      next if text =~ /^A\s.*(?:<pushBold\/>\s*)?<a exist=.*?<\/a>(?:\s*<popBold\/>)?.*.$/
+
+      # skip XML noise
+      next if text =~ /^<compass><dir value="|^<nav rm=|<style id="roomDesc"|<style id="roomName"|<component id='room objs'|<component id='room players'|^<roundTime value='|^<dialogData id=|<d cmd=|^<indicator id='|<a href=|noun="disk">|<pushStream id="thoughts|Also here: <a exist="|^(?:a|an|some)\s+<a exist=|Stream id='inv'|^You.*<a exist=|(registered)|(marked)|^\*\*.*!\s*\*\*$|\*\*.*.\s*\*\*$|<pushStream id="death"/
+
+      # These filters might block too much
+      # <a exist=|<clearStream id=|<pushStream id=|<closeDialog id=
+
+      # skip lines with your name
+      next if text =~ /\b#{Regexp.escape(Char.name)}\b/
+
+      # require a verb
+      tagged = TGR.add_tags(text)
+      next if TGR.get_verbs(tagged).empty?
+
+      # normalize
+      mod_line = text
+                 .gsub(/[0-9\s]+/, '')
+																	.gsub(/<a exist="[^"]+" noun="[^"]+">.*?<\/a>/, '')
+                 .gsub(/\b(?:he|she|him|her|his|hers)\b/i, '')
+
+      # update cache
+      db_mutex.synchronize do
+        CACHE[mod_line] = (CACHE[mod_line] || 0) + 1
+        row = db.get_first_row("SELECT count FROM action_counts WHERE mod_line = ?", [mod_line])
+        on_disk = row ? row[0] : 0
+        total_so_far = on_disk + CACHE[mod_line]
+        # echo if under threshold, else debug
+        if total_so_far <= THRESHOLD
+          # still under (or at) the limit: echo normally
+          Lich::Messaging.stream_window(text, 'familiar')
+        elsif total_so_far == THRESHOLD + 1
+          echo "#{total_so_far} occurrences of '#{mod_line}' (Threshold = #{THRESHOLD}) {?!}"
+          Lich::Messaging.stream_window("          #{total_so_far} occurrences of '#{mod_line}' (Threshold = #{THRESHOLD})", 'familiar')
+        end
+      end
+    rescue ThreadError
+      # queue empty, move on
+    end
+
+    # 4b) Periodic flush
+    if Time.now - last_flush >= FLUSH_ISEC
+      db_mutex.synchronize do
+        db.transaction
+        CACHE.each do |mod_line, delta|
+          row       = db.get_first_row("SELECT count FROM action_counts WHERE mod_line = ?", [mod_line])
+          existing  = row ? row[0] : 0
+          new_total = existing + delta
+          db.execute(
+            "REPLACE INTO action_counts (mod_line, count) VALUES (?, ?)",
+            [mod_line, new_total]
+          )
+        end
+        db.commit
+        CACHE.clear
+        last_flush = Time.now
+      end
+    end
+
+    sleep 0.1
+  end
+end
+
+# -------------------------------------------------------------------
+# 5) Cleanup on script shutdown
+# -------------------------------------------------------------------
+before_dying do
+  DownstreamHook.remove(HOOK_ID)
+  # final flush
+  db_mutex.synchronize do
+    db.transaction
+    CACHE.each do |mod_line, delta|
+      row       = db.get_first_row("SELECT count FROM action_counts WHERE mod_line = ?", [mod_line])
+      existing  = row ? row[0] : 0
+      new_total = existing + delta
+      db.execute(
+        "REPLACE INTO action_counts (mod_line, count) VALUES (?, ?)",
+        [mod_line, new_total]
+      )
+    end
+    db.commit
+  end
+  db.close
+end
+
+loop do
+  sleep 1
+end
