@@ -22,6 +22,8 @@
 
 =end
 
+
+
 require 'net/http'
 require 'uri'
 require 'json'
@@ -39,7 +41,8 @@ class CartographerManager
   def run(args = [])
     force_download = args.include?('--force')
 
-    case args.first
+    # Use args[1] for the command since args[0] is the full command string
+    case args[1]
     when '--help', '-h'
       show_help
     when '--list', '-l'
@@ -53,15 +56,15 @@ class CartographerManager
     when '--force'
       download_and_load_latest(true)
     when '--load'
-      if args[1]
-        load_version(args[1])
+      if args[2]
+        load_version(args[2])
       else
         echo "Error: --load requires a version number"
         echo "Example: ;cartographer --load 0.2.0"
       end
     when '--version', '-v'
-      if args[1]
-        download_and_load_version(args[1], force_download)
+      if args[2]
+        download_and_load_version(args[2], force_download)
       else
         echo "Error: --version requires a version number"
         echo "Example: ;cartographer --version 0.2.0"
@@ -102,11 +105,25 @@ class CartographerManager
 
     echo "Downloaded cartographer versions:"
     versions.each do |version|
-      file_path = version_file_path(version)
-      size = File.size(file_path)
-      mtime = File.mtime(file_path)
-      current = (defined?(Map) && Map.respond_to?(:cartographer_version) && Map.cartographer_version == version) ? " (current)" : ""
-      echo "  #{version} (#{format_size(size)}, #{mtime.strftime('%Y-%m-%d %H:%M:%S')})#{current}"
+      version_dir = version_dir_path(version)
+      mapdb_path = version_mapdb_path(version)
+      stringprocs_path = version_stringprocs_path(version)
+
+      if Dir.exist?(version_dir)
+        # Calculate total size of version directory
+        total_size = Dir.glob(File.join(version_dir, '**', '*')).select { |f| File.file?(f) }.sum { |f| File.size(f) }
+        mtime = File.mtime(version_dir)
+        current = (defined?(Map) && Map.respond_to?(:cartographer_version) && Map.cartographer_version == version) ? " (current)" : ""
+
+        # Check what components are available
+        components = []
+        components << "mapdb" if File.exist?(mapdb_path)
+        components << "stringprocs" if Dir.exist?(stringprocs_path)
+
+        echo "  #{version} (#{format_size(total_size)}, #{mtime.strftime('%Y-%m-%d %H:%M:%S')}, #{components.join('+')})#{current}"
+      else
+        echo "  #{version} (missing directory)"
+      end
     end
   end
 
@@ -133,11 +150,11 @@ class CartographerManager
     echo "Directory exists: #{Dir.exist?(@cartographer_dir) ? 'Yes' : 'No'}"
 
     if Dir.exist?(@cartographer_dir)
-      # Calculate total directory size
+      # Calculate total directory size recursively
       total_size = 0
       file_count = 0
 
-      Dir.glob(File.join(@cartographer_dir, '*')).each do |file|
+      Dir.glob(File.join(@cartographer_dir, '**', '*')).each do |file|
         if File.file?(file)
           total_size += File.size(file)
           file_count += 1
@@ -159,11 +176,28 @@ class CartographerManager
         if defined?(Map) && Map.respond_to?(:cartographer_version)
           current = Map.cartographer_version
           if current
+            current_dir = version_dir_path(current)
             current_file = version_file_path(current)
-            if File.exist?(current_file)
-              current_size = File.size(current_file)
-              current_mtime = File.mtime(current_file)
+            if File.exist?(current_file) && Dir.exist?(current_dir)
+              # Calculate total size of current version directory
+              current_size = Dir.glob(File.join(current_dir, '**', '*')).select { |f| File.file?(f) }.sum { |f| File.size(f) }
+              current_mtime = File.mtime(current_dir)
               echo "Currently loaded: #{current} (#{format_size(current_size)}, downloaded #{current_mtime.strftime('%Y-%m-%d %H:%M:%S')})"
+
+              # Show 5 largest stringprocs for current version
+              stringprocs_dir = version_stringprocs_path(current)
+              if Dir.exist?(stringprocs_dir)
+                stringprocs = Dir.glob(File.join(stringprocs_dir, '**', '*.rb')).map do |file|
+                  { path: file.sub(stringprocs_dir + '/', ''), size: File.size(file) }
+                end.sort_by { |sp| -sp[:size] }.first(5)
+
+                if stringprocs.any?
+                  echo "5 Largest StringProcs:"
+                  stringprocs.each_with_index do |sp, index|
+                    echo "  #{index + 1}. #{sp[:path]} (#{format_size(sp[:size])})"
+                  end
+                end
+              end
             end
           else
             echo "Currently loaded: None"
@@ -228,9 +262,9 @@ class CartographerManager
     # Calculate space to be freed
     space_freed = 0
     versions_to_remove.each do |version|
-      file_path = version_file_path(version)
-      if File.exist?(file_path)
-        space_freed += File.size(file_path)
+      version_dir = version_dir_path(version)
+      if Dir.exist?(version_dir)
+        space_freed += Dir.glob(File.join(version_dir, '**', '*')).select { |f| File.file?(f) }.sum { |f| File.size(f) }
       end
     end
 
@@ -240,17 +274,17 @@ class CartographerManager
 
     removed_count = 0
     versions_to_remove.each do |version|
-      file_path = version_file_path(version)
-      if File.exist?(file_path)
+      version_dir = version_dir_path(version)
+      if Dir.exist?(version_dir)
         begin
-          File.delete(file_path)
-          echo "  Removed #{version}.json"
+          FileUtils.rm_rf(version_dir)
+          echo "  Removed version #{version}/"
           removed_count += 1
         rescue => e
-          echo "  Error removing #{version}.json: #{e.message}"
+          echo "  Error removing #{version}/: #{e.message}"
         end
       else
-        echo "  #{version}.json already missing"
+        echo "  Version #{version}/ already missing"
       end
     end
 
@@ -321,6 +355,7 @@ class CartographerManager
     assets = release_info['assets']
 
     mapdb_asset = assets.find { |asset| asset['name'] == 'mapdb.json' }
+    stringprocs_asset = assets.find { |asset| asset['name'] == 'stringprocs.tar.gz' }
 
     unless mapdb_asset
       echo "Error: mapdb.json not found in release"
@@ -328,38 +363,80 @@ class CartographerManager
       return
     end
 
-    download_url = mapdb_asset['browser_download_url']
-    file_size = mapdb_asset['size']
+    # Create version directory
+    version_dir = version_dir_path(version)
+    FileUtils.mkdir_p(version_dir) unless Dir.exist?(version_dir)
 
-    echo "Downloading mapdb.json (#{format_size(file_size)}) for version #{version}..."
+    # Download mapdb.json
+    mapdb_url = mapdb_asset['browser_download_url']
+    mapdb_size = mapdb_asset['size']
+    echo "Downloading mapdb.json (#{format_size(mapdb_size)}) for version #{version}..."
 
-    temp_file = File.join(@cartographer_dir, "#{version}.tmp")
-    final_file = version_file_path(version)
+    temp_mapdb = File.join(version_dir, "mapdb.tmp")
+    final_mapdb = version_mapdb_path(version)
 
-    if download_file(download_url, temp_file)
-      if validate_mapdb(temp_file)
-        File.rename(temp_file, final_file)
-        echo "Successfully downloaded and validated #{version}.json"
+    unless download_file(mapdb_url, temp_mapdb)
+      FileUtils.rm_rf(version_dir) if Dir.exist?(version_dir)
+      echo "Error: Failed to download mapdb.json"
+      return
+    end
 
-        load_cartographer_data(final_file, version)
+    unless validate_mapdb(temp_mapdb)
+      FileUtils.rm_rf(version_dir) if Dir.exist?(version_dir)
+      echo "Error: Downloaded mapdb.json failed validation"
+      return
+    end
+
+    File.rename(temp_mapdb, final_mapdb)
+    echo "Successfully downloaded and validated mapdb.json"
+
+    # Download stringprocs if available
+    if stringprocs_asset
+      stringprocs_url = stringprocs_asset['browser_download_url']
+      stringprocs_size = stringprocs_asset['size']
+      echo "Downloading stringprocs.tar.gz (#{format_size(stringprocs_size)})..."
+
+      temp_stringprocs = File.join(version_dir, "stringprocs.tar.gz")
+
+      if download_file(stringprocs_url, temp_stringprocs)
+        # Extract stringprocs
+        echo "Extracting StringProc files..."
+        if system("cd '#{version_dir}' && tar -xzf stringprocs.tar.gz")
+          File.delete(temp_stringprocs)
+          echo "Successfully extracted StringProc files"
+        else
+          echo "Warning: Failed to extract stringprocs.tar.gz"
+        end
       else
-        File.delete(temp_file) if File.exist?(temp_file)
-        echo "Error: Downloaded file failed validation"
+        echo "Warning: Failed to download stringprocs.tar.gz - continuing without StringProcs"
       end
     else
-      File.delete(temp_file) if File.exist?(temp_file)
-      echo "Error: Failed to download mapdb.json"
+      echo "Note: No stringprocs.tar.gz found in release - using legacy format"
     end
+
+    load_cartographer_data(final_mapdb, version)
   end
 
   def load_cartographer_data(file_path, version)
     echo "Loading cartographer version #{version}..."
 
     begin
+      # Set the base path for Cartographer StringProc evaluation
+      version_dir = version_dir_path(version)
+      Cartographer.set_base_path(version_dir)
+      echo "Set Cartographer base path: #{version_dir}"
+
       if defined?(Map) && Map.respond_to?(:load_cartographer)
         if Map.load_cartographer(version)
           room_count = Map.list.compact.length
           echo "Successfully loaded #{room_count} rooms from cartographer version #{version}"
+
+          # Show StringProc cache stats
+          stats = Cartographer.cache_stats
+          if stats[:cached_procs] > 0
+            echo "StringProc cache: #{stats[:cached_procs]} procedures loaded"
+          end
+
           echo "Map database is now ready for use!"
 
           test_map_functionality
@@ -378,14 +455,29 @@ class CartographerManager
 
   def get_local_versions
     Dir.entries(@cartographer_dir)
-       .select { |f| f =~ /^[\d.]+\.json$/ }
-       .map { |f| f.sub(/\.json$/, '') }
+       .reject { |f| f.start_with?('.') }
+       .select { |entry|
+         path = File.join(@cartographer_dir, entry)
+         File.directory?(path) && entry =~ /^[\d.]+$/
+       }
        .sort_by { |v| Gem::Version.new(v) rescue v }
        .reverse
   end
 
+  def version_dir_path(version)
+    File.join(@cartographer_dir, version)
+  end
+
+  def version_mapdb_path(version)
+    File.join(version_dir_path(version), "mapdb.json")
+  end
+
+  def version_stringprocs_path(version)
+    File.join(version_dir_path(version), "stringprocs")
+  end
+
   def version_file_path(version)
-    File.join(@cartographer_dir, "#{version}.json")
+    version_mapdb_path(version)
   end
 
   def fetch_json(url)
@@ -555,8 +647,11 @@ if defined?(Map)
       if version.nil?
         # Load newest version by default
         versions = Dir.entries(cartographer_dir)
-                     .select { |f| f =~ /^[\d.]+\.json$/ }
-                     .map { |f| f.sub(/\.json$/, '') }
+                     .reject { |f| f.start_with?('.') }
+                     .select { |entry|
+                       path = File.join(cartographer_dir, entry)
+                       File.directory?(path) && entry =~ /^[\d.]+$/
+                     }
                      .sort_by { |v| Gem::Version.new(v) rescue v }
                      .reverse
 
@@ -569,11 +664,17 @@ if defined?(Map)
         respond "Loading newest cartographer version: #{version}"
       end
 
-      file_path = File.join(cartographer_dir, "#{version}.json")
+      file_path = File.join(cartographer_dir, version, "mapdb.json")
 
       unless File.exist?(file_path)
         respond "Cartographer version not found: #{version}"
-        respond "Available versions: #{Dir.entries(cartographer_dir).select { |f| f =~ /^[\d.]+\.json$/ }.map { |f| f.sub(/\.json$/, '') }.join(', ')}"
+        available_versions = Dir.entries(cartographer_dir)
+                               .reject { |f| f.start_with?('.') }
+                               .select { |entry|
+                                 path = File.join(cartographer_dir, entry)
+                                 File.directory?(path) && entry =~ /^[\d.]+$/
+                               }
+        respond "Available versions: #{available_versions.join(', ')}"
         return false
       end
 
@@ -613,10 +714,57 @@ if defined?(Map)
   end
 end
 
+# Cartographer class for userland StringProc evaluation
+class Cartographer
+  @@base_path ||= nil
+
+  def self.set_base_path(path)
+    @@base_path = path
+  end
+
+  def self.evaluate_script(relative_path)
+    if @@base_path.nil?
+      error_msg = "Cartographer base path not set"
+      respond "Error: #{error_msg}"
+      if relative_path.include?('timeto/')
+        return 0.2  # Default timing fallback for timeto only
+      else
+        raise error_msg  # Throw error for wayto
+      end
+    end
+
+    full_path = File.join(@@base_path, 'stringprocs', relative_path)
+    unless File.exist?(full_path)
+      error_msg = "StringProc file not found: #{full_path}"
+      respond "Error: #{error_msg}"
+      if relative_path.include?('timeto/')
+        return 0.2  # Default timing fallback for timeto only
+      else
+        raise error_msg  # Throw error for wayto
+      end
+    end
+
+    begin
+      script_content = File.read(full_path)
+      # Evaluate the script content directly - no caching since state can change
+      result = eval(script_content)
+      return result
+    rescue => e
+      error_msg = "Failed to evaluate StringProc #{relative_path}: #{e.message}"
+      respond "Error: #{error_msg}"
+      if relative_path.include?('timeto/')
+        return 0.2  # Default timing fallback for timeto only
+      else
+        raise error_msg  # Throw error for wayto
+      end
+    end
+  end
+end
+
 # Main execution
 if defined?(Script.current)
   manager = CartographerManager.new
-  manager.run(script.vars)
+  manager.run(Script.current.vars)
 else
   respond "This script must be run within Lich"
 end
