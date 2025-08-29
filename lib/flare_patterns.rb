@@ -316,7 +316,8 @@ DMGFLARE_PATTERNS = {
 		EtherFlux_GS: /\*\* Rapidly fluctuating elemental power blooms/,
 		Infusion_GS: /place holder/,
 		ChargedPresence_GS: /A powerful jolt of electricity erupts from your crackling aura|A sphere of snapping and crackling ethereal ripples expands outward from you/,
-		Thorns_GS: /place holder/,
+		ThornsDisruption_GS: /\*\* Light and shadow flicker erratically around you as a wave of pure disruptive force rolls toward .*?\! \*\*/,
+		ThornsPlasma_GS: /\*\* Plasmatic tendrils of blinding light radiate from your vicinity\, lashing toward .*?\! \*\*/,
 		Trueshot_GS: /place holder/,
 }
 
