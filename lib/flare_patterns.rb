@@ -315,8 +315,10 @@ DMGFLARE_PATTERNS = {
 		BurningBlood_GS: /\*\* Your blood ignites as it sprays through the air/,
 		EtherFlux_GS: /\*\* Rapidly fluctuating elemental power blooms/,
 		Infusion_GS: /place holder/,
-		ChargedPresence_GS: /A powerful jolt of electricity erupts from your crackling aura|A sphere of snapping and crackling ethereal ripples expands outward from you/,
+		ChargedPresence_GS: /A powerful jolt of electricity erupts from your crackling aura|A sphere of snapping and crackling ethereal ripples expands outward from you|A wave of snapping and crackling ethereal ripples moves outward from you/,
 		ThornsDisruption_GS: /\*\* Light and shadow flicker erratically around you as a wave of pure disruptive force rolls toward .*?\! \*\*/,
+		ThornsFrost_GS: /\*\* Frost crystallizes beneath .*? as a howling arctic wind buffets it\! \*\*/,
+		ThornsImpact_GS: /\*\* The air around .*? pulses rapidly with violent oscillations\! \*\*/,
 		ThornsPlasma_GS: /\*\* Plasmatic tendrils of blinding light radiate from your vicinity\, lashing toward .*?\! \*\*/,
 		Trueshot_GS: /place holder/,
 }
