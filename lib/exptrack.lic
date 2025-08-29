@@ -1,0 +1,615 @@
+=begin
+
+  Experience Tracker Commands:
+   ;exptrack help     - Show this help
+   ;exptrack session  - Show current session stats
+   ;exptrack last     - Show last 10 entries
+   ;exptrack instant  - Show last 10 instant/bounty entries
+   ;exptrack today    - Show today's totals
+   ;exptrack daily    - Show daily totals for last 10 days
+   ;exptrack hour     - Show last hour's gains
+   ;exptrack report <start> <end> - Show exp report for time range
+      Examples: ;exptrack report "2025-08-28 13:05:52" "2025-08-30 15:02:22"
+                ;exptrack report "08-28 13:05" "08-30 15:02"
+                ;exptrack report "13:05" "15:02"  (today)
+   ;exptrack addgain <gain> - Manually add exp gain (no exp value)
+   ;exptrack clean    - Remove entries with 0 exp gained
+   ;exptrack reset    - Clear all data (WARNING: permanent)
+
+        author: Nisugi
+          game: Gemstone
+          tags: experience, tracking, data
+       version: 1.0
+
+=end
+
+require 'sqlite3'
+require 'time'
+
+# Database setup
+DATABASE_PATH = File.join(DATA_DIR, "exptrack.db3")
+DOWNSTREAM_HOOK_ID = "exptrack_#{Time.now.to_i}"
+
+@db = SQLite3::Database.new(DATABASE_PATH)
+@db.busy_timeout = 5000
+
+# Create table if it doesn't exist
+@db.execute <<-SQL
+  CREATE TABLE IF NOT EXISTS experience_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    experience INTEGER NOT NULL,
+    experience_gained INTEGER,
+    character_name TEXT,
+    source_type TEXT DEFAULT 'normal'
+  )
+SQL
+
+# Create index for faster queries
+@db.execute <<-SQL
+  CREATE INDEX IF NOT EXISTS idx_timestamp#{' '}
+  ON experience_log(timestamp)
+SQL
+
+@db.execute <<-SQL
+  CREATE INDEX IF NOT EXISTS idx_character_timestamp#{' '}
+  ON experience_log(character_name, timestamp)
+SQL
+
+# Track last experience value
+@last_exp = nil
+
+# Command queue for processing outside of hooks
+@command_queue = Queue.new
+
+bounty_exp_regex = %r{<progressBar id='nextLvlPB' value='100' text='(?<exp>\d+) experience' top='20' left='3' align='n' width='160' height='15'/></dialogData><pushBold/><a exist="\d+" noun="\w+">[^<]+</a><popBold/> says, "All done with that assignment\?  Good job, <a exist="\-\d+" noun="\w+">[^<]+</a>!"}
+
+exp_regex = %r{<progressBar id='nextLvlPB' value='100' text='(?<exp>\d+) experience' top='20' left='3' align='n' width='160' height='15'/>}
+
+downstream_proc = proc do |server_string|
+  case server_string
+  when bounty_exp_regex
+    match = Regexp.last_match
+    exp = match[:exp].to_i
+    exp_gained = @last_exp ? exp - @last_exp : 0
+    @last_exp = exp
+
+    # Only log if experience actually changed
+    if exp_gained != 0
+      @db.execute(
+        "INSERT INTO experience_log (timestamp, experience, experience_gained, character_name, source_type) VALUES (?, ?, ?, ?, ?)",
+        [Time.now.to_s, exp, exp_gained, Char.name || "Unknown", "bounty"]
+      )
+    end
+
+  when exp_regex
+    match = Regexp.last_match
+    exp = match[:exp].to_i
+    exp_gained = @last_exp ? exp - @last_exp : 0
+    source = (exp_gained > 400) ? "instant" : "normal"
+    @last_exp = exp
+
+    # Only log if experience actually changed
+    if exp_gained != 0
+      @db.execute(
+        "INSERT INTO experience_log (timestamp, experience, experience_gained, character_name, source_type) VALUES (?, ?, ?, ?, ?)",
+        [Time.now.to_s, exp, exp_gained, Char.name || "Unknown", source]
+      )
+    end
+  end
+  server_string
+end
+
+DownstreamHook.add(DOWNSTREAM_HOOK_ID, downstream_proc)
+
+# Add command handling using UpstreamHook
+UPSTREAM_HOOK_ID = "exptrack_upstream_#{Time.now.to_i}"
+upstream_proc = proc do |client_string|
+  if client_string =~ /^(?:<c>)?;exptrack\s*(.*)/
+    command = $1.strip
+    @command_queue.push(command)
+    nil # Don't send the command to the server
+  else
+    client_string # Pass through other commands unchanged
+  end
+end
+
+UpstreamHook.add(UPSTREAM_HOOK_ID, upstream_proc)
+
+# Process commands from the queue
+def process_command(command)
+  case command
+  when 'help', ''
+    echo "Experience Tracker Commands:"
+    echo "  ;exptrack help     - Show this help"
+    echo "  ;exptrack session  - Show current session stats"
+    echo "  ;exptrack last     - Show last 10 entries"
+    echo "  ;exptrack instant  - Show last 10 instant/bounty entries"
+    echo "  ;exptrack today    - Show today's totals"
+    echo "  ;exptrack daily    - Show daily totals for last 10 days"
+    echo "  ;exptrack hour     - Show last hour's gains"
+    echo "  ;exptrack report <start> <end> - Show exp report for time range"
+    echo "     Examples: ;exptrack report \"2025-08-28 13:05:52\" \"2025-08-30 15:02:22\""
+    echo "               ;exptrack report \"08-28 13:05\" \"08-30 15:02\""
+    echo "               ;exptrack report \"13:05\" \"15:02\"  (today)"
+    echo "  ;exptrack addgain <gain> - Manually add exp gain (no exp value)"
+    echo "  ;exptrack clean    - Remove entries with 0 exp gained"
+    echo "  ;exptrack reset    - Clear all data (WARNING: permanent)"
+
+  when 'session'
+    # Get session start time (first entry since script started)
+    session_start = @db.execute("SELECT MIN(timestamp) FROM experience_log WHERE timestamp >= datetime('now', '-24 hours')").first.first
+
+    results = @db.execute(<<-SQL, [Char.name, session_start])
+        SELECT#{' '}
+          MIN(experience) as start_exp,
+          MAX(experience) as current_exp,
+          MAX(experience) - MIN(experience) as gained,
+          COUNT(*) as pulses,
+          SUM(CASE WHEN source_type LIKE '%bounty%' THEN experience_gained ELSE 0 END) as bounty_exp,
+          SUM(CASE WHEN source_type LIKE '%instant%' THEN experience_gained ELSE 0 END) as instant_exp
+        FROM experience_log#{' '}
+        WHERE character_name = ?#{' '}
+          AND timestamp >= ?
+      SQL
+
+    if results && results.first
+      _start_exp, current_exp, gained, _pulses, bounty_exp, instant_exp = results.first
+      echo "Session Report for #{Char.name}:"
+      echo "  Started: #{session_start}"
+      echo "  Current exp: #{current_exp}"
+      echo "  Gained: #{gained}"
+      echo "  Bounty exp: #{bounty_exp || 0}"
+      echo "  Instant exp: #{instant_exp || 0}"
+      echo "  Normal exp: #{gained - (bounty_exp || 0) - (instant_exp || 0)}"
+    end
+
+  when 'last'
+    results = @db.execute(<<-SQL, [Char.name])
+        SELECT timestamp, experience, experience_gained, source_type
+        FROM experience_log
+        WHERE character_name = ?
+        ORDER BY timestamp DESC
+        LIMIT 10
+      SQL
+
+    echo "Last 10 experience updates:"
+    echo sprintf("%-20s %12s %10s %10s", "Time", "Total Exp", "Gained", "Type")
+    echo "-" * 55
+    results.each do |row|
+      time = Time.parse(row[0]).strftime("%H:%M:%S")
+      echo sprintf("%-20s %12d %10d %10s", time, row[1], row[2], row[3])
+    end
+
+  when 'instant'
+    results = @db.execute(<<-SQL, [Char.name])
+        SELECT timestamp, experience, experience_gained, source_type
+        FROM experience_log
+        WHERE character_name = ?
+          AND (source_type LIKE '%instant%' OR source_type LIKE '%bounty%')
+        ORDER BY timestamp DESC
+        LIMIT 10
+      SQL
+
+    echo "Last 10 instant/bounty experience updates:"
+    echo sprintf("%-20s %12s %10s %10s", "Time", "Total Exp", "Gained", "Type")
+    echo "-" * 55
+
+    results.each do |row|
+      time = Time.parse(row[0]).strftime("%H:%M:%S")
+      echo sprintf("%-20s %12d %10d %10s", time, row[1], row[2], row[3])
+    end
+
+    if results.empty?
+      echo "No instant or bounty entries found for #{Char.name}"
+    end
+
+  when 'today'
+    now = Time.now
+    today_start = Time.new(now.year, now.month, now.day, 0, 0, 0, now.utc_offset).to_s
+
+    # Get the actual experience gained today by summing experience_gained
+    results = @db.execute(<<-SQL, [Char.name, today_start])
+        SELECT#{' '}
+          SUM(experience_gained) as gained,
+          SUM(CASE WHEN source_type LIKE '%bounty%' THEN experience_gained ELSE 0 END) as bounty_exp,
+          SUM(CASE WHEN source_type LIKE '%instant%' THEN experience_gained ELSE 0 END) as instant_exp,
+          COUNT(*) as pulses,
+          MIN(experience) as min_exp,
+          MAX(experience) as max_exp
+        FROM experience_log
+        WHERE character_name = ?
+          AND timestamp >= ?
+      SQL
+
+    if results && results.first
+      gained, bounty_exp, instant_exp, pulses, _min_exp, max_exp = results.first
+
+      # Use the sum of experience_gained for accurate total
+      total_gained = gained || 0
+
+      echo "Today's totals for #{Char.name} (since midnight):"
+      echo "  Total gained: #{total_gained}"
+      echo "  Bounty exp: #{bounty_exp || 0}"
+      echo "  Instant exp: #{instant_exp || 0}"
+      echo "  Normal exp: #{total_gained - (bounty_exp || 0) - (instant_exp || 0)}"
+      echo "  Updates: #{pulses}"
+      echo "  Current exp: #{max_exp}" if max_exp
+    end
+
+  when 'daily'
+    # Show daily totals for the last 10 days
+    # First get all records, then group by date in Ruby
+    ten_days_ago = (Time.now - (10 * 24 * 3600)).to_s
+    results = @db.execute(<<-SQL, [Char.name, ten_days_ago])
+        SELECT#{' '}
+          timestamp,
+          experience_gained,
+          source_type
+        FROM experience_log
+        WHERE character_name = ?
+          AND timestamp >= ?
+        ORDER BY timestamp DESC
+      SQL
+
+    if results && !results.empty?
+      # Group results by date in Ruby
+      daily_data = {}
+
+      results.each do |row|
+        timestamp_str, exp_gained, source_type = row
+
+        # Parse the timestamp and get just the date
+        timestamp = Time.parse(timestamp_str)
+        date_key = timestamp.strftime("%Y-%m-%d")
+
+        # Initialize the day's data if not exists
+        daily_data[date_key] ||= {
+          :total   => 0,
+          :normal  => 0,
+          :bounty  => 0,
+          :instant => 0,
+          :pulses  => 0
+        }
+
+        # Add to the appropriate totals
+        daily_data[date_key][:total] += exp_gained || 0
+        daily_data[date_key][:pulses] += 1
+
+        case source_type
+        when 'normal'
+          daily_data[date_key][:normal] += exp_gained || 0
+        when /bounty/
+          daily_data[date_key][:bounty] += exp_gained || 0
+        when /instant/
+          daily_data[date_key][:instant] += exp_gained || 0
+        end
+      end
+
+      # Sort by date descending and take first 10
+      sorted_days = daily_data.keys.sort.reverse.first(10)
+
+      echo "=" * 70
+      echo sprintf("%-12s %10s %10s %10s %10s %6s", "Date", "Total", "Normal", "Bounty", "Instant", "Pulses")
+      echo "-" * 70
+
+      grand_total = 0
+      today = Time.now.strftime("%Y-%m-%d")
+
+      sorted_days.each do |date_key|
+        data = daily_data[date_key]
+        grand_total += data[:total]
+
+        # Format the date nicely
+        date_str = Time.parse(date_key).strftime("%m/%d/%Y")
+
+        # Mark today with asterisk
+        if date_key == today
+          date_str += "*"
+        end
+
+        echo sprintf("%-12s %10d %10d %10d %10d %6d",
+                     date_str,
+                     data[:total],
+                     data[:normal],
+                     data[:bounty],
+                     data[:instant],
+                     data[:pulses])
+      end
+
+      echo "-" * 70
+      echo sprintf("%-12s %10d", "Total:", grand_total)
+      echo "=" * 70
+      echo "* = Today" if sorted_days.include?(today)
+    else
+      echo "No experience data found for the last 10 days."
+    end
+
+  when 'hour'
+    one_hour_ago = (Time.now - 3600).to_s
+    results = @db.execute(<<-SQL, [Char.name, one_hour_ago])
+        SELECT#{' '}
+          MAX(experience) - MIN(experience) as gained,
+          SUM(CASE WHEN source_type LIKE '%bounty%' THEN experience_gained ELSE 0 END) as bounty_exp,
+          SUM(CASE WHEN source_type LIKE '%instant%' THEN experience_gained ELSE 0 END) as instant_exp,
+          COUNT(*) as pulses
+        FROM experience_log
+        WHERE character_name = ?
+          AND timestamp >= ?
+      SQL
+
+    if results && results.first
+      gained, bounty_exp, instant_exp, _pulses = results.first
+      echo "Last hour for #{Char.name}:"
+      echo "  Total gained: #{gained || 0}"
+      echo "  Bounty exp: #{bounty_exp || 0}"
+      echo "  Instant exp: #{instant_exp || 0}"
+      echo "  Normal exp: #{(gained || 0) - (bounty_exp || 0) - (instant_exp || 0)}"
+      echo "  Rate: #{gained || 0} exp/hour"
+    end
+
+  when /^report\s+(.+)/
+    args = $1.strip
+
+    # Parse the date/time arguments - support various formats
+    parts = args.scan(/"([^"]+)"|(\S+)/).flatten.compact
+
+    if parts.size < 2
+      echo "Usage: ;exptrack report <start_time> <end_time>"
+      echo "Examples:"
+      echo '  ;exptrack report "2025-08-28 13:05:52" "2025-08-30 15:02:22"'
+      echo '  ;exptrack report "08-28 13:05" "08-30 15:02"'
+      echo '  ;exptrack report 13:05 15:02  (assumes today)'
+      return
+    end
+
+    start_str, end_str = parts[0], parts[1]
+
+    # Helper to parse flexible date/time formats
+    parse_datetime = lambda do |str|
+      now = Time.now
+      case str
+      when /^\d{1,2}:\d{2}(?::\d{2})?$/
+        # Time only (HH:MM or HH:MM:SS) - assume today
+        time_parts = str.split(':').map(&:to_i)
+        Time.new(now.year, now.month, now.day, time_parts[0], time_parts[1], time_parts[2] || 0)
+      when /^(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?$/
+        # MM-DD HH:MM[:SS] - assume current year
+        Time.new(now.year, $1.to_i, $2.to_i, $3.to_i, $4.to_i, $5 ? $5.to_i : 0)
+      when /^(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?$/
+        # YYYY-MM-DD HH:MM[:SS] - full format
+        Time.new($1.to_i, $2.to_i, $3.to_i, $4.to_i, $5.to_i, $6 ? $6.to_i : 0)
+      else
+        # Try to parse with Time.parse as fallback
+        Time.parse(str)
+      end
+    end
+
+    begin
+      start_time = parse_datetime.call(start_str)
+      end_time = parse_datetime.call(end_str)
+
+      # Get starting experience from first entry in range
+      start_exp_result = @db.execute(<<-SQL, [Char.name, start_time.to_s, end_time.to_s])
+        SELECT experience#{' '}
+        FROM experience_log#{' '}
+        WHERE character_name = ? AND timestamp >= ? AND timestamp <= ?#{' '}
+        ORDER BY timestamp ASC#{' '}
+        LIMIT 1
+      SQL
+      start_exp = start_exp_result.first&.first
+
+      # Get the experience data for the time range
+      results = @db.execute(<<-SQL, [Char.name, start_time.to_s, end_time.to_s])
+          SELECT#{' '}
+            MIN(timestamp) as first_time,
+            MAX(timestamp) as last_time,
+            MAX(experience) as end_exp,
+            SUM(experience_gained) as total_gained,
+            SUM(CASE WHEN LOWER(source_type) IN ('normal', 'manual') THEN experience_gained ELSE 0 END) as normal_exp,
+            SUM(CASE WHEN source_type LIKE '%bounty%' THEN experience_gained ELSE 0 END) as bounty_exp,
+            SUM(CASE WHEN source_type LIKE '%instant%' THEN experience_gained ELSE 0 END) as instant_exp,
+            COUNT(*) as total_pulses,
+            COUNT(DISTINCT DATE(timestamp)) as days_active
+          FROM experience_log
+          WHERE character_name = ?
+            AND timestamp >= ?
+            AND timestamp <= ?
+        SQL
+
+      if results && results.first && results.first[3]
+        first_time, last_time, end_exp, total_gained, normal_exp, bounty_exp, instant_exp, total_pulses, days_active = results.first
+
+        # Get individual pulses for multiplier analysis (excluding instant and bounty, including manual as normal)
+        pulse_results = @db.execute(<<-SQL, [Char.name, start_time.to_s, end_time.to_s])
+          SELECT experience_gained, source_type
+          FROM experience_log
+          WHERE character_name = ?
+            AND timestamp >= ?
+            AND timestamp <= ?
+            AND source_type NOT LIKE '%instant%'
+            AND source_type NOT LIKE '%bounty%'
+            AND experience_gained > 0
+          ORDER BY timestamp ASC
+        SQL
+
+        # Analyze pulse multipliers based on known maximums
+        multiplier_counts = Hash.new(0)
+
+        pulse_results.each do |row|
+          pulse_amount = row[0]
+
+          # Determine multiplier based on known maximum values
+          # 1x: < 75
+          # 2x: 122 ± 15 (107-137)
+          # 3x: 184 ± 15 (169-199)
+          # 4x: 244 ± 15 (229-259)
+          # 5x: 305 ± 15 (290-320) estimated
+          # 6x: 366 ± 15 (351-381) estimated, this is the cap
+
+          multiplier = case pulse_amount
+                       when 0..74
+                         "1x"
+                       when 75..106
+                         "1.5x"  # Between 1x and 2x
+                       when 107..137
+                         "2x"    # 122 ± 15
+                       when 138..168
+                         "2.5x"  # Between 2x and 3x
+                       when 169..199
+                         "3x"    # 184 ± 15
+                       when 200..228
+                         "3.5x"  # Between 3x and 4x
+                       when 229..259
+                         "4x"    # 244 ± 15
+                       when 260..289
+                         "4.5x"  # Between 4x and 5x
+                       when 290..320
+                         "5x"    # 305 ± 15 (estimated)
+                       when 321..350
+                         "5.5x"  # Between 5x and 6x
+                       when 351..381
+                         "6x"    # 366 ± 15 (estimated, cap)
+                       else
+                         "6x+"   # Over cap (special events/errors)
+                       end
+
+          multiplier_counts[multiplier] += 1
+        end
+
+        # Calculate duration
+        if first_time && last_time
+          duration_seconds = Time.parse(last_time) - Time.parse(first_time)
+          hours = (duration_seconds / 3600).to_i
+          minutes = ((duration_seconds % 3600) / 60).to_i
+          duration_str = "#{hours}h #{minutes}m"
+          exp_per_hour = duration_seconds > 0 ? (total_gained * 3600 / duration_seconds).to_i : 0
+        else
+          duration_str = "N/A"
+          exp_per_hour = 0
+        end
+
+        # Build the report message
+        msg = []
+        msg << "=" * 60
+        msg << "Experience Report for #{Char.name}"
+        msg << "Period: #{start_time.strftime('%Y-%m-%d %H:%M:%S')} to #{end_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        msg << "-" * 60
+        msg << "Starting Experience: #{start_exp || 'N/A'}"
+        msg << "Ending Experience:   #{end_exp || 'N/A'}"
+        msg << "Total Gained:        #{total_gained || 0}"
+        msg << ""
+        msg << "Breakdown by Type:"
+        msg << "  Normal:   #{normal_exp || 0} (#{total_gained > 0 ? ((normal_exp || 0) * 100.0 / total_gained).round(2) : 0}%)"
+        msg << "  Bounty:   #{bounty_exp || 0} (#{total_gained > 0 ? ((bounty_exp || 0) * 100.0 / total_gained).round(2) : 0}%)"
+        msg << "  Instant:  #{instant_exp || 0} (#{total_gained > 0 ? ((instant_exp || 0) * 100.0 / total_gained).round(2) : 0}%)"
+        msg << ""
+
+        # Add multiplier breakdown if we have normal pulses
+        if multiplier_counts.any?
+          msg << "Pulse Multiplier Breakdown (excluding instant/bounty):"
+          total_normal_pulses = multiplier_counts.values.sum
+
+          # Define ranges for display
+          multiplier_ranges = {
+            "1x"   => "0-74",
+            "1.5x" => "75-106",
+            "2x"   => "107-137",
+            "2.5x" => "138-168",
+            "3x"   => "169-199",
+            "3.5x" => "200-228",
+            "4x"   => "229-259",
+            "4.5x" => "260-289",
+            "5x"   => "290-320",
+            "5.5x" => "321-350",
+            "6x"   => "351-381",
+            "6x+"  => ">381"
+          }
+
+          ["1x", "1.5x", "2x", "2.5x", "3x", "3.5x", "4x", "4.5x", "5x", "5.5x", "6x", "6x+"].each do |mult|
+            if multiplier_counts[mult] > 0
+              percentage = (multiplier_counts[mult] * 100.0 / total_normal_pulses).round(2)
+              range = multiplier_ranges[mult]
+              msg << sprintf("  %-5s: %6d pulses (%6.2f%%) [%s]", mult, multiplier_counts[mult], percentage, range)
+            end
+          end
+          msg << sprintf("  Total: %5d normal pulses", total_normal_pulses)
+          msg << ""
+        end
+
+        msg << "Statistics:"
+        msg << "  Duration:     #{duration_str}"
+        msg << "  Rate:         #{exp_per_hour} exp/hour"
+        msg << "  Total Pulses: #{total_pulses}"
+        msg << "  Days Active:  #{days_active}"
+        msg << "=" * 60
+
+        # Check if this might be an RPA orb period (high sustained exp gain)
+        if exp_per_hour > 5000 && normal_exp > instant_exp + bounty_exp
+          msg << ""
+          msg << "Note: High sustained experience rate detected."
+          msg << "This may indicate RPA orb or other exp bonus was active."
+        end
+
+        # Output as monospace
+        Lich::Messaging.mono(msg.join("\n"))
+      else
+        echo "No experience data found for the specified time period."
+        echo "Period: #{start_time.strftime('%Y-%m-%d %H:%M:%S')} to #{end_time.strftime('%Y-%m-%d %H:%M:%S')}"
+      end
+    rescue => e
+      echo "Error parsing dates: #{e.message}"
+      echo "Please use one of these formats:"
+      echo '  "YYYY-MM-DD HH:MM:SS" - Full date and time'
+      echo '  "MM-DD HH:MM" - Month, day and time (current year)'
+      echo '  "HH:MM" - Time only (today)'
+    end
+
+  when /^addgain\s+(\d+)$/
+    exp_gained = $1.to_i
+
+    @db.execute(
+      "INSERT INTO experience_log (timestamp, experience, experience_gained, character_name, source_type) VALUES (?, ?, ?, ?, ?)",
+      [Time.now.to_s, 0, exp_gained, Char.name, "manual"]
+    )
+
+    echo "Manually added experience gain: #{exp_gained}"
+
+  when 'clean'
+    # Remove entries with 0 experience gained
+    @db.execute("DELETE FROM experience_log WHERE experience_gained = 0")
+    deleted_count = @db.changes
+    echo "Removed #{deleted_count} entries with 0 experience gained"
+
+  when 'reset'
+    echo "WARNING: This will permanently delete ALL experience tracking data!"
+    echo "Type 'YES' to confirm (case sensitive):"
+
+    # Wait for confirmation - this is tricky in an upstream hook
+    # For now, just warn them to use a separate confirmation
+    echo "To confirm reset, type: ;exptrack confirm_reset"
+
+  when 'confirm_reset'
+    @db.execute("DELETE FROM experience_log")
+    deleted_count = @db.changes
+    echo "Database reset complete. Removed #{deleted_count} entries."
+    @last_exp = nil # Reset tracking
+  end
+end
+
+before_dying {
+  DownstreamHook.remove(DOWNSTREAM_HOOK_ID)
+  UpstreamHook.remove(UPSTREAM_HOOK_ID)
+  @db.close if @db
+}
+
+echo "Experience tracking started. Type ';exptrack help' for commands."
+
+# Main loop to process commands
+loop do
+  unless @command_queue.empty?
+    command = @command_queue.pop
+    process_command(command)
+  end
+  sleep(0.1)
+end
