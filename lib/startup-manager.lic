@@ -1,0 +1,508 @@
+=begin
+  Startup Manager - GitHub Actions-style script dependency management
+  
+  Manages script startup with dependency resolution and proper load ordering.
+  Replaces ;autostart with sophisticated dependency management.
+  
+  Usage:
+    ;startup-manager                    # Load global + current character
+    ;startup-manager --character=Name   # Load global + specific character  
+    ;startup-manager --global-only      # Only global scripts
+    ;startup-manager --dry-run          # Show resolved load order
+    ;startup-manager --init             # Create empty config files
+    ;startup-manager --validate         # Check for circular dependencies
+    ;startup-manager --help             # Show help
+    
+  Config files: $lich_data_dir/startup-manager/
+    - global.yml         # Scripts for all characters
+    - <character>.yml    # Character-specific scripts
+    
+  version: 1.0.0
+  author: Ondreian
+  tags: startup, dependencies, management
+=end
+
+require 'yaml'
+require 'fileutils'
+
+module StartupManager
+  VERSION = "1.0.0"
+  
+  # Directory and file management
+  def self.data_dir
+    File.join(LICH_DIR, 'data', 'startup-manager')
+  end
+  
+  def self.global_config_file
+    File.join(data_dir, 'global.yml')
+  end
+  
+  def self.character_config_file(character = nil)
+    character ||= Char.name.downcase
+    File.join(data_dir, "#{character}.yml")
+  end
+  
+  def self.ensure_data_dir
+    FileUtils.mkdir_p(data_dir) unless Dir.exist?(data_dir)
+  end
+  
+  # Configuration parsing
+  def self.load_config(file_path)
+    return {} unless File.exist?(file_path)
+    
+    config = YAML.load_file(file_path) || {}
+    scripts = config['scripts'] || {}
+    
+    # Ensure depends_on defaults to empty array if missing
+    scripts.each do |script_name, script_config|
+      script_config['depends_on'] ||= []
+    end
+    
+    scripts
+  rescue => e
+    respond "Error loading config #{file_path}: #{e.message}"
+    {}
+  end
+  
+  def self.save_config(scripts, file_path)
+    ensure_data_dir
+    config = { 'scripts' => scripts }
+    File.write(file_path, YAML.dump(config))
+    respond "Configuration saved to: #{file_path}"
+  end
+  
+  # Dependency resolution using topological sort (Kahn's algorithm)  
+  def self.resolve_dependencies(scripts)
+    # Build dependency graph
+    dependencies = {}
+    dependents = {}
+    in_degree = {}
+    
+    # Initialize structures
+    scripts.each do |script_name, config|
+      dependencies[script_name] = config['depends_on'] || []
+      dependents[script_name] = []
+      in_degree[script_name] = 0
+    end
+    
+    # Build reverse dependency graph and calculate in-degrees
+    dependencies.each do |script_name, deps|
+      deps.each do |dep|
+        if scripts.key?(dep)
+          dependents[dep] << script_name
+          in_degree[script_name] += 1
+        else
+          respond "Warning: #{script_name} depends on missing script: #{dep}"
+        end
+      end
+    end
+    
+    # Kahn's algorithm for topological sort
+    queue = []
+    result = []
+    
+    # Find scripts with no dependencies
+    in_degree.each do |script_name, degree|
+      queue << script_name if degree == 0
+    end
+    
+    while !queue.empty?
+      current = queue.shift
+      result << current
+      
+      # Process scripts that depend on current
+      dependents[current].each do |dependent|
+        in_degree[dependent] -= 1
+        queue << dependent if in_degree[dependent] == 0
+      end
+    end
+    
+    # Check for circular dependencies
+    if result.length != scripts.length
+      remaining = scripts.keys - result
+      raise "Circular dependency detected in scripts: #{remaining.join(', ')}"
+    end
+    
+    result
+  end
+  
+  # Script execution
+  def self.start_script(script_name, args)
+    if args && !args.empty?
+      if args.is_a?(Array)
+        Script.start(script_name, args)
+      else
+        Script.start(script_name, args.split)
+      end
+    else
+      Script.start(script_name)
+    end
+  end
+  
+  def self.execute_scripts(ordered_scripts, all_scripts, dry_run: false)
+    ordered_scripts.each do |script_name|
+      script_config = all_scripts[script_name]
+      args = script_config['args']
+      
+      # Check if script exists
+      unless Script.exists?(script_name)
+        respond "  [SKIP] #{script_name} - script not found"
+        next
+      end
+      
+      # Check if already running
+      if Script.running?(script_name)
+        respond "  [SKIP] #{script_name} - already running"
+        next
+      end
+      
+      if dry_run
+        args_display = args ? " #{args}" : ""
+        respond "  [DRY-RUN] Would start: #{script_name}#{args_display}"
+      else
+        begin
+          start_script(script_name, args)
+          args_display = args ? " #{args}" : ""
+          respond "  [STARTED] #{script_name}#{args_display}"
+          
+          # Small delay between script starts
+          sleep 0.3
+        rescue => e
+          respond "  [ERROR] #{script_name} - #{e.message}"
+        end
+      end
+    end
+  end
+  
+  # Main loading logic
+  def self.load_scripts(character: nil, global_only: false, dry_run: false, validate_only: false)
+    character_name = character || Char.name
+    
+    respond ""
+    respond "=== Startup Manager v#{VERSION} ==="
+    respond "Target: #{character_name}"
+    respond "(Dry run mode)" if dry_run
+    respond "(Validation only)" if validate_only
+    respond ""
+    
+    begin
+      # Load configurations
+      global_scripts = load_config(global_config_file)
+      character_scripts = global_only ? {} : load_config(character_config_file(character))
+      
+      # Combine scripts (character scripts override global if same name)
+      all_scripts = global_scripts.merge(character_scripts)
+      
+      if all_scripts.empty?
+        respond "No scripts configured. Use --init to create config files."
+        return
+      end
+      
+      # Resolve dependencies
+      ordered_scripts = resolve_dependencies(all_scripts)
+      
+      respond "=== Dependency Resolution ==="
+      ordered_scripts.each_with_index do |script_name, index|
+        config = all_scripts[script_name]
+        deps = config['depends_on']
+        deps_display = deps.empty? ? "none" : deps.join(", ")
+        args_display = config['args'] ? " (args: #{config['args']})" : ""
+        respond "  #{index + 1}. #{script_name}#{args_display} - depends on: #{deps_display}"
+      end
+      respond ""
+      
+      return if validate_only
+      
+      # Execute scripts in dependency order
+      respond "=== Script Execution ==="
+      execute_scripts(ordered_scripts, all_scripts, dry_run: dry_run)
+      
+      respond ""
+      respond "=== Startup Complete ==="
+      respond ""
+      
+    rescue => e
+      respond "Startup Manager Error: #{e.message}"
+      raise e if Script.current.vars.include?("--debug")
+    end
+  end
+  
+  # Initialize empty config files
+  def self.init_configs
+    ensure_data_dir
+    
+    # Create global config if it doesn't exist
+    unless File.exist?(global_config_file)
+      global_example = {
+        'scripts' => {
+          'tilde' => {
+            'args' => nil,
+            'depends_on' => []
+          },
+          'shiva' => {
+            'args' => '--load',
+            'depends_on' => ['tilde']
+          }
+        }
+      }
+      File.write(global_config_file, YAML.dump(global_example))
+      respond "Created: #{global_config_file}"
+    end
+    
+    # Create character config if it doesn't exist
+    character_file = character_config_file
+    unless File.exist?(character_file)
+      character_example = {
+        'scripts' => {
+          'eloot' => {
+            'args' => 'start',
+            'depends_on' => []
+          }
+        }
+      }
+      File.write(character_file, YAML.dump(character_example))
+      respond "Created: #{character_file}"
+    end
+    
+    respond ""
+    respond "Configuration files initialized."
+    respond "Edit them to customize your startup scripts:"
+    respond "  Global: #{global_config_file}"
+    respond "  Character: #{character_file}"
+    respond ""
+  end
+  
+  
+  # Migration from autostart
+  def self.extract_autostart_data
+    autostart_data = {}
+    
+    begin      
+      # Get all autostart entries
+      all_autostart = Lich.db.execute('SELECT script, scope, hash FROM script_auto_settings WHERE script = "autostart";')
+      
+      current_character_scope = "#{XMLData.game}:#{XMLData.name}"
+      
+      all_autostart.each do |row|
+        script_name = row[0]
+        scope = row[1]  
+        blob = row[2]
+        
+        # Try to unmarshal the data
+        begin
+          settings = Marshal.load(blob)
+          
+          if scope == ':'
+            # Global scope
+            autostart_data[:global] = settings['scripts'] || []
+          elsif scope == current_character_scope
+            # Current character scope
+            autostart_data[:character] = settings['scripts'] || []
+          end
+          
+        rescue => marshal_error
+          respond "Warning: Could not read autostart data for scope '#{scope}': #{marshal_error.message}"
+        end
+      end
+      
+    rescue => e
+      respond "Error extracting autostart data: #{e.message}"
+      respond e.backtrace.join("\n") if Script.current.vars.include?("--debug")
+      return {}
+    end
+    
+    autostart_data
+  end
+  
+  def self.convert_scripts(scripts)
+    # Convert autostart script format to startup-manager format
+    # No dependency inference - let users configure dependencies manually
+    scripts.map do |script_info|
+      script_name = script_info[:name]
+      
+      {
+        script_name => {
+          'args' => script_info[:args].empty? ? nil : script_info[:args].join(' '),
+          'depends_on' => []  # No dependencies - user must configure manually
+        }
+      }
+    end.reduce(&:merge) || {}
+  end
+  
+  def self.migrate_from_autostart(dry_run: false)
+    respond ""
+    respond "=== Autostart Migration ==="
+    if dry_run
+      _respond "<b>DRY RUN</b>"
+      respond "(Dry run mode - no files will be written)"
+    end
+    respond ""
+    
+    # Ensure directory exists for migration
+    ensure_data_dir unless dry_run
+    
+    # Extract autostart data  
+    autostart_data = extract_autostart_data
+    
+    if autostart_data.empty?
+      respond "No autostart configuration found to migrate."
+      return
+    end
+    
+    # Process global scripts
+    if autostart_data[:global] && !autostart_data[:global].empty?
+      respond "Found #{autostart_data[:global].length} global autostart scripts:"
+      autostart_data[:global].each do |script_info|
+        args_display = script_info[:args].empty? ? "" : " (args: #{script_info[:args].join(' ')})"
+        respond "  - #{script_info[:name]}#{args_display}"
+      end
+      
+      # Convert scripts and create config
+      global_scripts = convert_scripts(autostart_data[:global])
+      global_config = { 'scripts' => global_scripts }
+      
+      if dry_run
+        respond ""
+        respond "Would create global config:"
+        respond YAML.dump(global_config)
+      else
+        File.write(global_config_file, YAML.dump(global_config))
+        respond ""
+        respond "Created: #{global_config_file}"
+      end
+    end
+    
+    # Process character scripts
+    if autostart_data[:character] && !autostart_data[:character].empty?
+      respond ""
+      respond "Found #{autostart_data[:character].length} character autostart scripts:"
+      autostart_data[:character].each do |script_info|
+        args_display = script_info[:args].empty? ? "" : " (args: #{script_info[:args].join(' ')})"
+        respond "  - #{script_info[:name]}#{args_display}"
+      end
+      
+      # Convert scripts and create config  
+      character_scripts = convert_scripts(autostart_data[:character])
+      character_config = { 'scripts' => character_scripts }
+      
+      if dry_run
+        respond ""
+        respond "Would create character config (#{character_config_file}):"
+        respond YAML.dump(character_config)
+      else
+        File.write(character_config_file, YAML.dump(character_config))
+        respond ""
+        respond "Created: #{character_config_file}"
+      end
+    end
+    
+    unless dry_run
+      respond ""
+      respond "=== Cleaning up autostart configuration ==="
+      
+      # Remove all migrated scripts from autostart
+      scripts_to_remove = []
+      scripts_to_remove.concat(autostart_data[:global].map { |s| s[:name] }) if autostart_data[:global]
+      scripts_to_remove.concat(autostart_data[:character].map { |s| s[:name] }) if autostart_data[:character]
+      
+      scripts_to_remove.each do |script_name|
+        respond "Removing #{script_name} from autostart..."
+        # Remove from global
+        Script.run('autostart', "remove --global #{script_name}")
+        # Remove from character (will show warning if not there, which is fine)
+        Script.run('autostart', "remove #{script_name}")
+      end
+      
+      # Add startup-manager to global autostart
+      respond "Adding startup-manager to global autostart..."
+      Script.run('autostart', 'add --global startup-manager')
+      
+      respond ""
+      respond "=== Migration Complete ==="
+      respond ""
+      respond "Configuration files created:"
+      respond "  Global: #{global_config_file}"
+      respond "  Character: #{character_config_file}"
+      respond ""
+      respond "Autostart has been updated - startup-manager will now run at login."
+      respond "Run: ;startup-manager --validate to check the dependency resolution."
+      respond ""
+    end
+  end
+end
+
+# Command line argument parsing
+
+# Help text
+if Script.current.vars.include?("--help")
+  respond <<~HELP
+    Startup Manager v#{StartupManager::VERSION}
+    
+    Usage:
+      ;startup-manager                    # Load global + current character
+      ;startup-manager --character=Name   # Load global + specific character  
+      ;startup-manager --global-only      # Load only global scripts
+      ;startup-manager --dry-run          # Show what would be loaded
+      ;startup-manager --validate         # Check dependencies only
+      ;startup-manager --init             # Create config files
+      ;startup-manager --migrate          # Migrate from autostart
+      ;startup-manager --migrate --dry-run # Preview migration
+      ;startup-manager --help             # Show this help
+    
+    Configuration:
+      Config files: #{StartupManager.data_dir}/
+        - global.yml        # Scripts for all characters
+        - <character>.yml   # Character-specific scripts
+      
+    Example config format:
+      scripts:
+        tilde:
+          args: null
+          depends_on: []        # No dependencies
+          
+        shiva:  
+          args: "--load"
+          depends_on: [tilde]   # Must load after tilde
+          
+        eloot:
+          args: "start"
+          # Missing depends_on defaults to: depends_on: []
+          
+    Migration:
+      Use --migrate to convert existing ;autostart configuration
+      to startup-manager format with intelligent dependency inference.
+  HELP
+  exit
+end
+
+# Main execution
+begin
+  vars = Script.current.vars
+  
+  if vars.include?("--init")
+    StartupManager.init_configs
+  elsif vars.include?("--migrate")
+    dry_run = vars.include?("--dry-run")
+    StartupManager.migrate_from_autostart(dry_run: dry_run)
+  elsif vars.include?("--validate")
+    character = vars.find { |v| v.start_with?("--character=") }&.split("=")&.[](1)
+    global_only = vars.include?("--global-only")
+    StartupManager.load_scripts(
+      character: character,
+      global_only: global_only,
+      validate_only: true
+    )
+  else
+    character = vars.find { |v| v.start_with?("--character=") }&.split("=")&.[](1)
+    global_only = vars.include?("--global-only")
+    dry_run = vars.include?("--dry-run")
+    StartupManager.load_scripts(
+      character: character,
+      global_only: global_only,
+      dry_run: dry_run
+    )
+  end
+rescue => e
+  respond "Startup Manager Fatal Error: #{e.message}"
+  respond e.backtrace.join("\n") if vars&.include?("--debug")
+end
