@@ -27,6 +27,8 @@
     - Updated for Duskruin Feb 2025.
   1.7.0 (2025-5-15)
     - Updated for Bloodstone Jewelry.  SanguineSacrifice and SanguineSacrifice_Overflow.
+	 1.7.1 (2025-9-13)
+		  - Updated for Rogue Feats Sidestep.
 
 tags: tracking, item scripts, flares, data, abilities
 version: 1.7.0
@@ -71,7 +73,8 @@ NODMGFLARE_PATTERNS = {
   Somnis: /For a split second, the striations of your .*? expand into a sinuous pearlescent mist that rushes towards the/,
   SigilStaff_DoubleCast: /twining into an echo of your last spell/,
   Sigil_of_Binding: /A bolt of energy leaps from your .*? within bands of concentric geometry/,
-  ShieldCape_Block: /forms a shield in front of you that turns solid enough to block .*? incoming blow/,
+  Sidestep: /With a reflexive sidestep, you elude the attack!/,
+		ShieldCape_Block: /forms a shield in front of you that turns solid enough to block .*? incoming blow/,
 		Rusalkan: /Exploding in a tumbling current of frothy foam, a wave of sea water suddenly materializes at the call of your/,
   RangerTrinket_Resistance: /pulses briefly, deflecting some/,
   RangerTrinket_ManaAbsorb: /The .*? essence is drawn toward your/,
