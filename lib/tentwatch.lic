@@ -1,0 +1,509 @@
+# Enhanced Tentwatch Script
+# Comprehensive tent protection with advanced features
+# Author: Fulmen
+
+#Enhanced version based on tablewatch
+
+VERSION = "2.0"
+
+# Handle command line arguments
+if defined?(Script) && Script.current && Script.current.vars
+  case Script.current.vars[0].to_s.downcase
+  when 'help', '-h', '--help'
+    respond <<~HELP
+      
+      Tentwatch - Enhanced Tent Protection Script v#{VERSION}
+      
+      USAGE:
+        ;tentwatch                Start monitoring your tent
+        ;tentwatch help           Show this help message
+        ;tentwatch timer <min>    Set timer reminder interval (default: 15)
+        ;tentwatch location <min> Set location reminder interval (default: 1)
+        ;tentwatch quiet          Disable audio alerts
+        ;tentwatch noisy          Enable audio alerts
+        ;tentwatch collapse <min> Set collapse warning threshold (default: 20)
+      
+      WHAT IT DOES:
+        - Blocks the EXIT command while your tent is deployed
+        - Tracks which room you deployed your tent in
+        - Warns when you leave the tent room behind
+        - Reminds you regularly if you stay away
+        - Automatically shuts down when you FOLD your tent
+        - Restores normal exit functionality when done
+        - Monitors tent timer (5 minutes default)
+        - Warns about potential tent collapse after extended absence
+      
+      HOW TO USE:
+        1. Deploy your tent in a room with STAND TENT
+        2. Start the script: ;tentwatch
+        3. Script blocks exit and tracks your location
+        4. When done, FOLD your tent to pack it up
+        5. Script automatically removes exit blocking
+      
+      TIP:
+        I recommend adding an alias like:
+        ;alias add tent=;e start_script("tentwatch"); fput "stand tent"
+        This will make sure to start the script whenever you deploy
+        your tent.
+      
+      ALERTS:
+        - Visual warning when you leave the tent room
+        - Audio beep to get your attention (can be disabled)
+        - Speech window notification for visibility
+        - Repeated reminders while away (customizable intervals)
+        - Timer warnings (customizable intervals)
+        - Collapse warnings when away too long
+      
+      The script prevents accidental logouts while your tent is
+      deployed, ensuring you don't lose it by exiting carelessly.
+      
+    HELP
+    exit
+  end
+end
+
+class EnhancedTentwatch
+  def initialize(args = [])
+    @tent_room = nil
+    @tent_room_name = nil
+    @tent_name = "tent"
+    @away_from_tent = false
+    @last_reminder_time = Time.now
+    @tent_start_time = nil
+    @last_timer_reminder = Time.now
+    @away_started_at = nil
+    @last_collapse_reminder = Time.at(0)
+    @paused = false
+    @quiet_mode = false
+    @shutting_down = false
+    
+    # Customizable intervals (in minutes, converted to seconds)
+    @timer_interval = 15 * 60     # 15 minutes default
+    @location_interval = 1 * 60   # 1 minute default (more frequent for tents)
+    @collapse_threshold = 20 * 60 # 20 minutes default
+    @tent_duration = 5 * 60       # 5 minutes tent timer
+    @collapse_warn_interval = 3 * 60 # 3 minutes between collapse warnings
+    @collapse_urgent_threshold = 18 * 60 # Urgent warning at 18 minutes
+    
+    # Handle command line arguments
+    handle_runtime_commands(args)
+    if @shutting_down
+      return
+    end
+    
+    # Set global references
+    $enhanced_tentwatch = self
+    $tentwatch_active = true
+    
+    echo "Enhanced Tentwatch v#{VERSION} ready"
+    
+    # Check for existing tent first
+    if check_for_existing_tent
+      echo "Found existing tent! Monitoring started."
+    else
+      echo "Waiting for tent deployment... Use STAND TENT to begin monitoring"
+    end
+    
+    setup_tent_detection
+  end
+
+  def handle_runtime_commands(args)
+    return unless args && args.length > 0
+    
+    case args[0].to_s.downcase
+    when 'timer'
+      if args[1] && args[1].to_i > 0
+        @timer_interval = args[1].to_i * 60
+        echo "Timer reminder interval set to #{args[1]} minutes"
+      else
+        echo "Usage: ;tentwatch timer <minutes>"
+      end
+      @shutting_down = true
+    when 'location'
+      if args[1] && args[1].to_i > 0
+        @location_interval = args[1].to_i * 60
+        echo "Location reminder interval set to #{args[1]} minutes"
+      else
+        echo "Usage: ;tentwatch location <minutes>"
+      end
+      @shutting_down = true
+    when 'collapse'
+      if args[1] && args[1].to_i > 0
+        @collapse_threshold = args[1].to_i * 60
+        echo "Collapse warning threshold set to #{args[1]} minutes"
+      else
+        echo "Usage: ;tentwatch collapse <minutes>"
+      end
+      @shutting_down = true
+    when 'quiet'
+      @quiet_mode = true
+      echo "Audio alerts disabled"
+      @shutting_down = true
+    when 'noisy'
+      @quiet_mode = false
+      echo "Audio alerts enabled"
+      @shutting_down = true
+    end
+  end
+
+  def check_for_existing_tent
+    current_room = get_current_room
+    return false unless current_room
+    
+    # Look for tents in the current room
+    tents = GameObj.loot.find_all { |obj| obj.noun == 'tent' }
+    
+    if tents.length > 0
+      @tent_room = current_room
+      @tent_room_name = get_room_name(@tent_room)
+      @tent_name = tents.first.name
+      @tent_start_time = Time.now  # Start timer from script start since we don't know actual deployment time
+      @last_timer_reminder = Time.now
+      @away_started_at = nil
+      @last_collapse_reminder = Time.at(0)
+      
+      echo "Found tent '#{tent_name}' in #{@tent_room_name}"
+      echo "Exit command blocked until tent is packed"
+      echo "Tent is safe while you remain in this room or inside tent"
+      echo "WARNING: Tent will collapse after 20 minutes if you leave the area!"
+      
+      setup_exit_alias
+      
+      # Send to speech window
+      if defined?(Lich) && defined?(Lich::Messaging)
+        Lich::Messaging.stream_window("Existing tent found - Exit blocked!", "speech")
+      end
+      
+      return true
+    end
+    
+    false
+  end
+
+  def get_current_room
+    if defined?(Room) && Room.current
+      Room.current.id
+    else
+      nil
+    end
+  end
+
+  def get_room_name(room_id)
+    return "Unknown Room" unless room_id
+    
+    if defined?(Room) && Room[room_id] && Room[room_id].title
+      title = Room[room_id].title.to_s.strip
+      # Clean up any array formatting or brackets
+      title = title.gsub(/^\[+|]+$/, '').gsub(/^"|"$/, '')
+      
+      # Ensure room number is included
+      if title.include?(room_id.to_s)
+        return title
+      else
+        return "#{title} - #{room_id}"
+      end
+    else
+      "Room #{room_id}"
+    end
+  end
+
+  def get_tent_name(room_id)
+    return "tent" unless room_id
+    
+    # Try multiple times with delays to handle GameObj lag
+    3.times do |attempt|
+      if get_current_room == room_id
+        tents = GameObj.loot.find_all { |obj| obj.noun == 'tent' }
+        if tents.length == 1
+          return tents.first.name
+        elsif tents.length > 1
+          return "tent (multiple found)"
+        end
+      end
+      
+      # Wait before retry, except on last attempt
+      sleep 0.5 if attempt < 2
+    end
+    
+    "tent"
+  end
+
+  def tent_name
+    # Lazy loading - refresh tent name if it's still generic
+    if @tent_name == "tent" && @tent_room
+      refreshed_name = get_tent_name(@tent_room)
+      @tent_name = refreshed_name if refreshed_name != "tent"
+    end
+    # Clean up any XML/HTML tags that might still be present
+    clean_name = @tent_name.to_s.gsub(/<[^>]*>/, '').strip
+    # Remove any trailing commas or extra text
+    clean_name = clean_name.split(',').first.strip if clean_name.include?(',')
+    clean_name.empty? ? "tent" : clean_name
+  end
+
+  def setup_exit_alias
+    # Exit blocking with enhanced room and tent names
+    alias_cmd = 'if $tentwatch_active; $enhanced_tentwatch.show_exit_blocked_message; else; exit; end'
+    
+    do_client(";alias add exit=;e #{alias_cmd}")
+    echo "Exit blocking alias installed"
+  end
+
+  def show_exit_blocked_message
+    echo "Exit blocked - Your '#{tent_name}' is still deployed at #{@tent_room_name}! FOLD TENT to pack it up first."
+  end
+
+  def setup_tent_detection
+    hook_proc = proc { |line|
+      if line
+        # Capture tent name from deployment text - clean up XML tags
+        if line =~ /You quickly unfold the.*?(?:noun="tent">)?(.*?tent.*?)(?:<\/a>)?\s*(?:,|and)/i
+          captured_name = $1.strip
+          # Clean up any remaining XML or HTML tags
+          captured_name = captured_name.gsub(/<[^>]*>/, '').strip
+          if captured_name && captured_name.length > 0 && !captured_name.include?('pull out')
+            @tent_name = captured_name
+            echo "Captured tent name from deployment: '#{@tent_name}'"
+          end
+        end
+        
+        # Tent deployment detection - broader pattern to catch variations
+        if line =~ /You quickly unfold.*tent.*upright and ready to go/i
+          @tent_room = get_current_room
+          @tent_room_name = get_room_name(@tent_room)
+          @tent_start_time = Time.now
+          @last_timer_reminder = Time.now
+          @away_started_at = nil
+          @last_collapse_reminder = Time.at(0)
+          
+          # Try to get a clean tent name from the room after deployment
+          sleep 0.5  # Brief delay to let the room update
+          clean_tent_name = get_tent_name(@tent_room)
+          if clean_tent_name && clean_tent_name != "tent"
+            @tent_name = clean_tent_name
+          end
+          
+          echo "Tent deployed in #{@tent_room_name}!"
+          echo "Exit command blocked until tent is packed"
+          echo "Tent is safe while you remain here or inside tent (GO TENT)"
+          echo "WARNING: Tent will collapse after 20 minutes if you leave the area!"
+          
+          setup_exit_alias
+          
+          # Send to speech window
+          if defined?(Lich) && defined?(Lich::Messaging)
+            Lich::Messaging.stream_window("Tent deployed - Exit blocked!", "speech")
+          end
+          
+          # Audio alert
+          print "\a" unless @quiet_mode
+          
+        elsif line =~ /You methodically unhook.*tent.*fold it back up into a neat bundle/i
+          if @tent_room_name
+            echo "Your '#{tent_name}' at #{@tent_room_name} folded! Shutting down..."
+          else
+            echo "Tent folded! Shutting down..."
+          end
+          shutdown
+        end
+      end
+      line
+    }
+    
+    DownstreamHook.add('enhanced_tentwatch', hook_proc)
+  end
+
+  def run
+    # Monitoring loop
+    while !@shutting_down
+      if @tent_room  # Only check if tent is deployed
+        check_location unless @paused
+        check_timer_reminder unless @paused
+        check_collapse_warnings unless @paused
+      end
+      sleep 1  # Fast checking for immediate warnings
+    end
+  rescue Interrupt
+    shutdown
+  end
+
+  def check_location
+    return unless @tent_room
+    
+    current = get_current_room
+    return unless current
+    
+    # Check if we're inside the tent (room name contains "Tent" and has negative room ID)
+    inside_tent = false
+    if current && current.to_s.start_with?('-') && defined?(Room) && Room[current]
+      room_title = Room[current].title.to_s
+      inside_tent = room_title.include?("Tent")
+    end
+    
+    # We're "safe" if we're in the tent room OR inside the tent
+    safe_location = (current == @tent_room) || inside_tent
+    
+    if !safe_location && !@away_from_tent
+      # First time leaving the tent area (room or inside tent)
+      @away_from_tent = true
+      @away_started_at = Time.now
+      @last_reminder_time = Time.now
+      @last_collapse_reminder = Time.now
+      
+      if inside_tent
+        warning_msg = "WARNING: You just left your tent area! Collapse timer started - you have 20 minutes before tent collapses."
+      else
+        warning_msg = "WARNING: You just left your '#{tent_name}' behind at #{@tent_room_name}! Collapse timer started - you have 20 minutes."
+      end
+      
+      echo warning_msg
+      
+      # Send to speech window
+      if defined?(Lich) && defined?(Lich::Messaging)
+        Lich::Messaging.stream_window(warning_msg, "speech")
+      end
+      
+      # Audio alert
+      print "\a" unless @quiet_mode
+      
+    elsif !safe_location && @away_from_tent
+      # Still away from tent area - check for reminder
+      time_since_reminder = Time.now - @last_reminder_time
+      if time_since_reminder >= @location_interval
+        echo "REMINDER: Your '#{tent_name}' collapse timer is running! Return to #{@tent_room_name} or go inside tent."
+        @last_reminder_time = Time.now
+      end
+      
+    elsif safe_location && @away_from_tent
+      # Returned to tent area (either tent room or inside tent)
+      @away_from_tent = false
+      @away_started_at = nil
+      @last_collapse_reminder = Time.at(0)
+      
+      if inside_tent
+        echo "You are inside your tent - collapse timer stopped"
+      else
+        echo "You are back at your '#{tent_name}' at #{@tent_room_name} - collapse timer stopped"
+      end
+    end
+  end
+
+  def check_timer_reminder
+    return unless @tent_start_time
+    
+    # Only show tent deployment timer reminders, not collapse warnings
+    # (collapse warnings are handled separately in check_collapse_warnings)
+    time_since_timer_reminder = Time.now - @last_timer_reminder
+    if time_since_timer_reminder >= @timer_interval
+      elapsed_minutes = ((Time.now - @tent_start_time) / 60).floor
+      echo "Tent status: #{elapsed_minutes} minutes since deployment in #{@tent_room_name}"
+      @last_timer_reminder = Time.now
+    end
+  end
+
+  def check_collapse_warnings
+    return unless @away_from_tent && @away_started_at
+    
+    elapsed = Time.now - @away_started_at
+    remaining = @collapse_threshold - elapsed
+    
+    # Critical warning at 2 minutes remaining (18 minutes elapsed)
+    if elapsed >= @collapse_urgent_threshold && elapsed < @collapse_threshold
+      remaining_mins = (remaining / 60).ceil
+      warning_msg = "URGENT: Your tent will collapse in #{remaining_mins} minute(s)! Return to #{@tent_room_name} or GO TENT immediately!"
+      echo warning_msg
+      
+      # Send to speech window and audio alert
+      if defined?(Lich) && defined?(Lich::Messaging)
+        Lich::Messaging.stream_window(warning_msg, "speech")
+      end
+      print "\a" unless @quiet_mode
+      
+      @last_collapse_reminder = Time.now
+      return
+    end
+    
+    # Regular collapse warnings every 3 minutes while away
+    if Time.now - @last_collapse_reminder >= @collapse_warn_interval && elapsed < @collapse_threshold
+      remaining_mins = (remaining / 60).floor
+      elapsed_mins = (elapsed / 60).floor
+      
+      if remaining_mins > 0
+        warning_msg = "COLLAPSE WARNING: #{remaining_mins} minute(s) remaining until tent collapse! (Away for #{elapsed_mins} minutes)"
+      else
+        warning_msg = "COLLAPSE WARNING: Less than 1 minute until tent collapse! Return immediately!"
+      end
+      
+      echo warning_msg
+      
+      if defined?(Lich) && defined?(Lich::Messaging)
+        Lich::Messaging.stream_window(warning_msg, "speech")
+      end
+      print "\a" unless @quiet_mode
+      
+      @last_collapse_reminder = Time.now
+    end
+    
+    # Final collapse threshold reached
+    if elapsed >= @collapse_threshold
+      warning_msg = "TENT COLLAPSED: Your tent at #{@tent_room_name} has collapsed after 20 minutes away!"
+      echo warning_msg
+      
+      if defined?(Lich) && defined?(Lich::Messaging)
+        Lich::Messaging.stream_window(warning_msg, "speech")
+      end
+      print "\a" unless @quiet_mode
+      
+      # Reset timer to avoid spam, but keep checking
+      @last_collapse_reminder = Time.now
+    end
+  end
+
+  def calculate_remaining_time
+    return 0 unless @tent_start_time
+    
+    # Tents last 5 minutes (300 seconds)
+    elapsed_seconds = Time.now - @tent_start_time
+    remaining_seconds = @tent_duration - elapsed_seconds
+    remaining_minutes = (remaining_seconds / 60).floor
+    [remaining_minutes, 0].max
+  end
+
+  def shutdown
+    return if @shutting_down
+    @shutting_down = true
+    
+    # Remove exit alias if it was set
+    if @tent_room
+      do_client(";alias delete exit")
+      echo "Exit blocking removed. You can now exit normally."
+    end
+    
+    # Remove hook
+    DownstreamHook.remove('enhanced_tentwatch')
+    
+    # Clear globals
+    $enhanced_tentwatch = nil
+    $tentwatch_active = false
+  end
+end
+
+# Handle cleanup on script exit
+before_dying { 
+  if $tentwatch_active
+    do_client(";alias delete exit") rescue nil
+    DownstreamHook.remove('enhanced_tentwatch') rescue nil
+    $enhanced_tentwatch = nil
+    $tentwatch_active = false
+    echo "Cleanup completed"
+  end
+}
+
+# Run the script
+args = []
+if defined?(Script) && Script.current && Script.current.vars
+  args = Script.current.vars[1..-1] || []
+end
+
+tentwatch = EnhancedTentwatch.new(args)
+tentwatch.run unless tentwatch.instance_variable_get(:@shutting_down)
