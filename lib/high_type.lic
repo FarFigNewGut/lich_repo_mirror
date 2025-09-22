@@ -14,6 +14,8 @@
     ;high_type help                - Show comprehensive help
 
   Revision History:
+    v2.5.0 - 2025-09-20 - Added character default color feature (setcharcolor/clearcharcolor commands)
+    v2.4.1 - 2025-09-20 - Internal refactoring
     v2.4.0 - 2025-09-20 - Added showconfig, remove commands and HT alias for runtime processing
     v2.3.0 - 2025-09-19 - Added runtime command processing for inline configuration
     v2.2.1 - 2025-09-18 - Fixed startup delay logic to only wait when session is recent (< 10 seconds)
@@ -31,7 +33,7 @@
             game: GS
             tags: highlighting, colors, links, item_types
         required: Lich >= 4.6
-         version: 2.4.0
+         version: 2.5.0
 =end
 script.want_downstream_xml = true
 script.want_downstream = false
@@ -97,7 +99,7 @@ end
 #------------------------------------------------------------------------------#
 # Configuration display and testing
 #------------------------------------------------------------------------------#
-def self.show_config
+def self.display_configuration
   echo "=== High Type Configuration ==="
   echo "Item types configured for highlighting: #{UserVars.types_to_color.keys.size}"
   UserVars.types_to_color.each { |type, color|
@@ -108,6 +110,13 @@ def self.show_config
   echo "  - Colors ALL links with 'link' preset when enabled"
   echo "  - Item types override with specific colors"
   echo "  - Replaces linktothefast functionality"
+
+  if UserVars.character_default_color
+    echo "Character default color: #{UserVars.character_default_color}"
+    echo "  - All character names use this color instead of link default"
+  else
+    echo "Character default color: not set (using link default)"
+  end
   echo ""
   echo "Available colors: #{%w[speech whisper thought link selectedlink bold monsterbold].join(', ')}"
   echo ""
@@ -127,9 +136,9 @@ if script.vars[0]
   when "reset"
     echo "Resetting types_to_color configuration to defaults..."
     UserVars.types_to_color = nil
-    self.initialize_color_config
+    self.setup_color_defaults
     echo "Configuration reset complete!"
-    self.show_config
+    self.display_configuration
     exit
   when "add"
     if args[1] && args[2]
@@ -138,7 +147,7 @@ if script.vars[0]
       UserVars.types_to_color[type_name] = color_name
       UserVars.save
       echo "Added: #{type_name} => #{color_name}"
-      self.show_config
+      self.display_configuration
     else
       echo "Usage: ;high_type add <type> <color>"
       echo "Example: ;high_type add boatcrate whisper"
@@ -156,7 +165,7 @@ if script.vars[0]
     echo "Testing 'salvage crate' items:"
     test_names = ["a cheap salvage crate", "a shoddy salvage crate", "a silver salvage crate"]
     test_names.each { |name|
-      type = self.get_item_type(name, "crate")
+      type = self.identify_item_category(name, "crate")
       echo "  '#{name}' => type: #{type || 'nil (no match)'}"
     }
     echo "=== End Debug ==="
@@ -190,7 +199,7 @@ if script.vars[0]
     echo "=== End Color Examples ==="
     exit
   when "help"
-    echo "=== High Type v2.4.0 Help ==="
+    echo "=== High Type v2.5.0 Help ==="
     echo ""
     echo "USAGE: ;high_type [command]"
     echo ""
@@ -204,6 +213,8 @@ if script.vars[0]
     echo "  ;high_type add <type> <color> Add or update type color"
     echo "  ;high_type reset  Reset configuration to defaults"
     echo "  ;high_type colors Show color examples"
+    echo "  ;high_type setcharcolor <color> Set default color for all characters"
+    echo "  ;high_type clearcharcolor    Clear character color (use link default)"
     echo ""
     echo "FEATURES:"
     echo "  - Runtime command processing for dynamic configuration"
@@ -225,16 +236,17 @@ if script.vars[0]
     exit
   end
 else
-  self.show_config
+  self.display_configuration
 end
 
 #------------------------------------------------------------------------------#
 # Item type to color mapping configuration in UserVars for shared access
 #------------------------------------------------------------------------------#
-def self.initialize_color_config
+def self.setup_color_defaults
   # Initialize UserVars with default color mappings if not already set
   UserVars.types_to_color ||= {}
   UserVars.color_all_links ||= true  # Enable universal link coloring
+  UserVars.character_default_color ||= nil  # Default color for all character names (negative exist IDs)
 
   # Set defaults if UserVars is empty
   if UserVars.types_to_color.empty?
@@ -254,7 +266,7 @@ def self.initialize_color_config
 end
 
 # Initialize configuration on script load
-self.initialize_color_config
+self.setup_color_defaults
 
 
 #------------------------------------------------------------------------------#
@@ -262,7 +274,7 @@ self.initialize_color_config
 #------------------------------------------------------------------------------#
 @high_type_data = GameObj.type_data.select{ |k,v| k if UserVars.types_to_color.keys.include?(k) }
 
-def self.get_item_type(name,noun)
+def self.identify_item_category(name,noun)
     list = @high_type_data.keys.find_all { |t| (name =~ @high_type_data[t][:name] or noun =~ @high_type_data[t][:noun]) and (@high_type_data[t][:exclude].nil? or name !~ @high_type_data[t][:exclude]) }
     return nil if list.empty?
     type = list.include?('collectible') ? 'collectible' : list.join(',');
@@ -271,47 +283,61 @@ end
 #------------------------------------------------------------------------------#
 # hook proc
 #------------------------------------------------------------------------------#
-@patterns = Hash.new
-@patterns[:link_basic] = /<a exist="(?<id>-?\d+)" noun="(?<noun>[^"]+)">(?<name>[^<]+)<\/a>/;
+@match_patterns = Hash.new
+@match_patterns[:item_link] = /<a exist="(?<id>-?\d+)" noun="(?<noun>[^"]+)">(?<name>[^<]+)<\/a>/;
 
-type_highlight = proc {|server_string|
-  # First Pass: Color ALL links with generic link color (if enabled)
-  if UserVars.color_all_links && server_string =~ /<[ad](?: [^>]*)?>.*?<\/[ad]>/
-    server_string = server_string.gsub(/(<[ad](?: [^>]*)?>.*?<\/[ad]>)/, "<preset id='link'>\\1</preset>")
+# Main processing pipeline for game output colorization
+# Applies multi-phase enhancement to links and items based on configuration
+apply_type_colors = proc {|game_output|
+  # Phase 1: Universal link enhancement - Apply base coloring to all link elements
+  if UserVars.color_all_links && game_output =~ /<[ad](?: [^>]*)?>.*?<\/[ad]>/
+    game_output = game_output.gsub(/(<[ad](?: [^>]*)?>.*?<\/[ad]>)/, "<preset id='link'>\\1</preset>")
 
-    # Handle bold text exclusions - remove link presets from bold sections
-    server_string = server_string.gsub(/<pushBold\s*\/>.*?<popBold\s*\/>/) do |bold_section|
-      bold_section.gsub(/<preset id='link'>(.*?)<\/preset>/, "\\1")
+    # Bold text exclusion: Remove link coloring from bold sections to prevent conflicts
+    game_output = game_output.gsub(/<pushBold\s*\/>.*?<popBold\s*\/>/) do |bold_content|
+      bold_content.gsub(/<preset id='link'>(.*?)<\/preset>/, "\\1")
     end
 
-    # Handle <b> tags too
-    server_string = server_string.gsub(/<b\s*>.*?<\/b\s*>/) do |bold_section|
-      bold_section.gsub(/<preset id='link'>(.*?)<\/preset>/, "\\1")
+    # Additional bold tag handling for compatibility
+    game_output = game_output.gsub(/<b\s*>.*?<\/b\s*>/) do |bold_content|
+      bold_content.gsub(/<preset id='link'>(.*?)<\/preset>/, "\\1")
     end
   end
 
-  # Second Pass: Override with type-specific colors for items
-  if server_string =~ /<a exist="(?:-?\d+)" noun="(?:[^"]+)">(?:[^<]+)<\/a>/
-    tosub = []
-    server_string.scan(@patterns[:link_basic]).each { |id,noun,name|
-      type = self.get_item_type(name,noun)
+  # Phase 2: Character default color - Apply color to all character names (negative exist IDs)
+  if UserVars.character_default_color && game_output =~ /<[ad] exist="-\d+"/
+    game_output = game_output.gsub(/<([ad]) exist="(-\d+)"([^>]*)>([^<]+)<\/\1>/) do |match|
+      tag_type = $1
+      exist_id = $2
+      attributes = $3
+      name = $4
+      # Apply character color to negative exist IDs
+      "<preset id='#{UserVars.character_default_color}'><#{tag_type} exist=\"#{exist_id}\"#{attributes}>#{name}</#{tag_type}></preset>"
+    end
+  end
+
+  # Phase 3: Type-specific colorization - Override colors based on GameObj classification
+  if game_output =~ /<a exist="(?:-?\d+)" noun="(?:[^"]+)">(?:[^<]+)<\/a>/
+    color_queue = []
+    game_output.scan(@match_patterns[:item_link]).each { |id,noun,name|
+      type = self.identify_item_category(name,noun)
       UserVars.types_to_color.each { |k,v|
         if type =~ /#{k}/
-          tosub << [id,v]
+          color_queue << [id,v]
           break
         end
       }
     }
-    if tosub.size > 0
-      tosub.each { |id,color_type|
+    if color_queue.size > 0
+      color_queue.each { |id,color_type|
         # Remove any existing preset wrapper and apply type-specific color
         item_pattern = /(<preset id='link'>)?(<a exist="#{id}".*?<\/a>)(<\/preset>)?/
-        server_string.gsub!(item_pattern, self.color('\\2', color_type, true))
+        game_output.gsub!(item_pattern, self.color('\\2', color_type, true))
       }
     end
   end
 
-  server_string
+  game_output
 }
 
 #------------------------------------------------------------------------------#
@@ -328,7 +354,7 @@ end
 #------------------------------------------------------------------------------#
 # Runtime command processing hook (using recolor.lic proven pattern)
 #------------------------------------------------------------------------------#
-def self.process_runtime_args(args, running=true)
+def self.handle_runtime_command(args, running=true)
   return unless args
 
   # Parse the arguments if they come as a single string
@@ -337,7 +363,7 @@ def self.process_runtime_args(args, running=true)
 
   case args[0].downcase
   when "help"
-    _respond "[high_type: === High Type v2.4.0 Runtime Commands ===]"
+    _respond "[high_type: === High Type v2.5.0 Runtime Commands ===]"
     _respond "[high_type: ]"
     _respond "[high_type: While script is running, use:]"
     _respond "[high_type:   ;high_type (or ;ht)         - Show current configuration]"
@@ -347,6 +373,8 @@ def self.process_runtime_args(args, running=true)
     _respond "[high_type:   ;high_type showconfig        - Show current configuration]"
     _respond "[high_type:   ;high_type reset            - Reset to defaults]"
     _respond "[high_type:   ;high_type colors           - Show color examples]"
+    _respond "[high_type:   ;high_type setcharcolor <color> - Set default color for all characters]"
+    _respond "[high_type:   ;high_type clearcharcolor  - Clear character color (use link default)]"
     _respond "[high_type: ]"
     _respond "[high_type: Script continues running after commands.]"
     _respond "[high_type: === End Runtime Help ===]"
@@ -369,11 +397,11 @@ def self.process_runtime_args(args, running=true)
   when "reset"
     echo "Resetting types_to_color configuration to defaults..."
     UserVars.types_to_color = nil
-    self.initialize_color_config
+    self.setup_color_defaults
     # Reload type data after reset
     @high_type_data = GameObj.type_data.select{ |k,v| k if UserVars.types_to_color.keys.include?(k) }
     echo "Configuration reset complete! (script continues running)"
-    self.show_config
+    self.display_configuration
 
   when "colors", "examples"
     echo "=== High Type Color Examples ==="
@@ -397,7 +425,7 @@ def self.process_runtime_args(args, running=true)
     echo "=== End Color Examples ==="
 
   when "showconfig", "config", "show"
-    self.show_config
+    self.display_configuration
 
   when "remove"
     if args[1]
@@ -417,9 +445,32 @@ def self.process_runtime_args(args, running=true)
       echo "Example: ;high_type remove weapon"
     end
 
+  when "setcharcolor"
+    if args[1]
+      color_name = args[1].gsub(/[\"']/, '')
+      valid_colors = %w[speech whisper thought link selectedlink bold monsterbold]
+      if valid_colors.include?(color_name)
+        UserVars.character_default_color = color_name
+        UserVars.save
+        echo "Character default color set to: #{color_name}"
+        echo "All character names will now use #{color_name} color"
+      else
+        echo "Invalid color: #{color_name}"
+        echo "Valid colors: #{valid_colors.join(', ')}"
+      end
+    else
+      echo "Usage: ;high_type setcharcolor <color>"
+      echo "Example: ;high_type setcharcolor whisper"
+    end
+
+  when "clearcharcolor"
+    UserVars.character_default_color = nil
+    UserVars.save
+    echo "Character default color cleared - characters will use link default"
+
   else
     # Default to showing configuration
-    self.show_config
+    self.display_configuration
   end
 end
 
@@ -428,11 +479,11 @@ end
 #------------------------------------------------------------------------------#
 runtime_pattern = /^(?:<c>)?\s*#{Regexp.escape($lich_char)}(?:#{Regexp.escape(script.name)}|ht)(\s+.*)?$/
 
-DownstreamHook.add('high_type', type_highlight)
+DownstreamHook.add('high_type', apply_type_colors)
 UpstreamHook.add('high_type_commands', proc { |cmd|
   if cmd =~ runtime_pattern
     if $1
-      self.process_runtime_args($1, true)
+      self.handle_runtime_command($1, true)
     else
       _respond "[#{script.name} is already running. Type ;#{script.name} help for runtime commands.]"
     end
