@@ -1,0 +1,372 @@
+=begin
+  Terror Watch - Monitor eerie cry effects and display enemy IDs with SSR results and TTL
+
+  Watches for "You let loose an eerie, modulating cry!" trigger and then
+  monitors subsequent lines for creatures that "look at you in utter terror!"
+  to display their GameObj IDs and SSR results for targeting purposes.
+  Also tracks time to live (TTL) when fear wears off.
+
+  Examples:
+    ;terror_watch                 - Start monitoring
+    ;terror_watch help            - Show help
+
+  Revision History:
+    v1.2.5 - 2025-09-23 - Updated TTL to show tenths of seconds precision (e.g., 12.3s)
+    v1.2.4 - 2025-09-23 - Added before_dying hook to ensure cleanup works with ;kill command
+    v1.2.3 - 2025-09-23 - Added cleanup command to remove orphaned hooks manually
+    v1.2.2 - 2025-09-23 - Added proper DownstreamHook cleanup on script exit and duplicate prevention
+    v1.2.1 - 2025-09-23 - Fixed data_dir compatibility issue for older Lich versions
+    v1.2.0 - 2025-09-23 - Added CSV logging functionality and log viewing commands
+    v1.1.3 - 2025-09-23 - Added support for 'himself' in recovery messages (covers itself/herself/himself)
+    v1.1.2 - 2025-09-23 - Fixed regex to handle both 'itself' and 'herself' in recovery messages
+    v1.1.1 - 2025-09-23 - Added SSR result display to shakes off fear line for complete tracking
+    v1.1.0 - 2025-09-23 - Fixed regex to handle 'itself' in separate XML tag, removed debug output
+    v1.0.8 - 2025-09-23 - Added debug output to diagnose TTL tracking issues
+    v1.0.7 - 2025-09-23 - Fixed indentation issues for proper TTL tracking
+    v1.0.6 - 2025-09-23 - Fixed TTL tracking to work outside monitoring window for proper duration display
+    v1.0.5 - 2025-09-23 - Added time tracking (TTL) display when fear wears off, showing terror duration
+    v1.0.4 - 2025-09-23 - Added SSR result capture and display alongside creature IDs
+    v1.0.3 - 2025-09-23 - Fixed XML modification to properly insert IDs while preserving XML structure
+    v1.0.2 - 2025-09-23 - Modified to replace game output directly with ID-enhanced lines, removed echo notifications
+    v1.0.1 - 2025-09-23 - Fixed XML parsing to extract creature IDs from exist attribute
+    v1.0.0 - 2025-09-23 - Initial implementation for eerie cry monitoring
+
+          author: Ensayn
+            game: GS
+            tags: monitoring, combat, targeting, terror
+        required: Lich >= 4.6
+         version: 1.2.5
+=end
+
+# Helper function to show usage
+def show_help
+  output = "\n"
+  output.concat "USAGE: ;terror_watch [help]\n"
+  output.concat "\n"
+  output.concat "DESCRIPTION:\n"
+  output.concat "  Monitors for eerie cry effects and shows enemy IDs\n"
+  output.concat "  when creatures are affected by terror.\n"
+  output.concat "\n"
+  output.concat "TRIGGER:\n"
+  output.concat "  'You let loose an eerie, modulating cry!'\n"
+  output.concat "\n"
+  output.concat "OUTPUT:\n"
+  output.concat "  Shows GameObj ID, SSR result, and TTL in creature lines\n"
+  output.concat "\n"
+  output.concat "COMMANDS:\n"
+  output.concat "  ;terror_watch                Start monitoring\n"
+  output.concat "  ;terror_watch help           Show this help\n"
+  output.concat "  ;terror_watch log            Show last 10 terror log entries\n"
+  output.concat "  ;terror_watch log25          Show last 25 terror log entries\n"
+  output.concat "  ;terror_watch cleanup        Remove orphaned hooks\n"
+  output.concat "\n"
+  output.concat "CSV LOG:\n"
+  output.concat "  Terror recovery data is automatically logged to:\n"
+  output.concat "  #{CSV_FILE}\n"
+  output.concat "\n"
+  respond output
+  exit
+end
+
+# CSV file for logging terror data
+CSV_FILE = "#{$data_dir}terror_log.csv"
+
+# Initialize CSV file with headers if it doesn't exist
+unless File.exist?(CSV_FILE)
+  File.open(CSV_FILE, 'w') do |file|
+    file.puts "Timestamp,Name,ID,SSR,TTL"
+  end
+end
+
+# Function to log terror recovery to CSV
+def log_terror_recovery(creature_name, creature_id, ssr, ttl)
+  timestamp = Time.now.strftime("%Y-%m-%d %H:%M:%S")
+  File.open(CSV_FILE, 'a') do |file|
+    file.puts "#{timestamp},#{creature_name},#{creature_id},#{ssr},#{ttl}"
+  end
+end
+
+# Function to show last X entries from CSV
+def show_recent_entries(count = 10)
+  unless File.exist?(CSV_FILE)
+    respond "No terror log file found."
+    return
+  end
+
+  lines = File.readlines(CSV_FILE)
+  header = lines.first
+  entries = lines[1..-1] || []
+
+  if entries.empty?
+    respond "No terror entries recorded yet."
+    return
+  end
+
+  # Get last X entries
+  recent = entries.last(count)
+
+  output = "\n"
+  output.concat "=== RECENT TERROR LOG (Last #{recent.length} entries) ===\n"
+  output.concat header
+  output.concat "-" * 60 + "\n"
+  recent.each { |line| output.concat line }
+  output.concat "=== END LOG ===\n"
+
+  respond output
+end
+
+# Parse command line arguments
+script.vars[1..-1].each do |arg|
+  if arg =~ /^help$/i
+    show_help
+  elsif arg =~ /^log$/i
+    show_recent_entries(10)
+    exit
+  elsif arg =~ /^log(\d+)$/i
+    show_recent_entries($1.to_i)
+    exit
+  elsif arg =~ /^cleanup$/i
+    if DownstreamHook.list.include?("terror_watch")
+      DownstreamHook.remove("terror_watch")
+      respond "Removed orphaned terror_watch hook."
+    else
+      respond "No terror_watch hook found."
+    end
+    exit
+  end
+end
+
+# State tracking
+watching_for_terror = false
+terror_start_time = nil
+ssr_results = []  # Array to store SSR results
+current_ssr = nil  # Current SSR result being processed
+terror_times = {}  # Hash to track when each creature was first terrified {id => time}
+terror_ssr = {}  # Hash to track SSR result for each creature {id => ssr}
+
+echo "Terror Watch started - monitoring for eerie cry effects..."
+echo "Use ;kill terror_watch to stop monitoring"
+
+# Remove any existing hook before adding new one
+DownstreamHook.remove("terror_watch") if DownstreamHook.list.include?("terror_watch")
+
+# Main monitoring loop using DownstreamHook
+DownstreamHook.add("terror_watch", proc { |xml|
+  # Check for the eerie cry trigger
+  if xml =~ /You let loose an eerie, modulating cry!/
+    watching_for_terror = true
+    terror_start_time = Time.now
+    ssr_results = []  # Reset SSR results for new cry
+    current_ssr = nil
+    # Silent activation - no echo needed
+  end
+
+  # Clean up old terror times (anything over 60 seconds) - always do this
+  terror_times.delete_if { |id, time| Time.now - time > 60 }
+  # Clean up matching SSR entries
+  terror_ssr.delete_if { |id, ssr| !terror_times.has_key?(id) }
+
+  # If we're watching for terror effects
+  if watching_for_terror
+    # Stop watching after 10 seconds (reasonable time for terror effects)
+    if Time.now - terror_start_time > 10
+      watching_for_terror = false
+      ssr_results = []
+      current_ssr = nil
+      # Silent expiration - no echo needed
+    end
+
+    # Capture SSR results
+    if xml =~ /\[SSR result: (\d+)/
+      current_ssr = $1
+      ssr_results << current_ssr
+    end
+
+    # Look for terror effect lines
+    if xml =~ /looks at you in utter terror!/
+      # Extract creature ID from the XML if it has an exist attribute
+      creature_id = nil
+
+      if xml =~ /exist="(\d+)"/
+        creature_id = $1
+      end
+
+      if creature_id
+        # Track the time this creature was first terrified
+        terror_times[creature_id] ||= Time.now
+
+        # Build the enhancement string with ID and SSR if available
+        enhancement = "(ID: #{creature_id})"
+        if current_ssr
+          enhancement = "(ID: #{creature_id}) (SSR result: #{current_ssr})"
+          # Track SSR for this creature
+          terror_ssr[creature_id] = current_ssr
+          current_ssr = nil  # Clear after use so next creature gets next SSR
+        end
+
+        # Find where the creature name ends and insert the enhancement
+        # Look for patterns like: >creature name</a>
+        if xml =~ />([^<]+)<\/a>.*?looks at you in utter terror!/
+          creature_name = $1
+          # Insert the enhancement right after the creature name, before </a>
+          modified_xml = xml.gsub(/>#{Regexp.escape(creature_name)}<\/a>/, ">#{creature_name} #{enhancement}</a>")
+          next modified_xml
+        elsif xml =~ />([^<]+)<\/.*?>.*?looks at you in utter terror!/
+          creature_name = $1
+          # Handle other tag types
+          modified_xml = xml.gsub(/>#{Regexp.escape(creature_name)}</, ">#{creature_name} #{enhancement}<")
+          next modified_xml
+        end
+      else
+        # No exist attribute - try to find creature in GameObj.npcs
+        clean_text = xml.gsub(/<[^>]+>/, '').strip
+        if clean_text =~ /^(.*?) looks at you in utter terror!/
+          creature_name = $1.strip
+
+          matching_creatures = GameObj.npcs.find_all { |npc|
+            npc.name == creature_name
+          }
+
+          if matching_creatures.length == 1
+            creature = matching_creatures.first
+            # Track the time this creature was first terrified
+            terror_times[creature.id] ||= Time.now
+
+            # Build the enhancement string with ID and SSR if available
+            enhancement = "(ID: #{creature.id})"
+            if current_ssr
+              enhancement = "(ID: #{creature.id}) (SSR result: #{current_ssr})"
+              # Track SSR for this creature
+              terror_ssr[creature.id] = current_ssr
+              current_ssr = nil
+            end
+            # Find and replace the creature name in the XML
+            if xml =~ />#{Regexp.escape(creature_name)}</
+              modified_xml = xml.gsub(/>#{Regexp.escape(creature_name)}</, ">#{creature_name} #{enhancement}<")
+              next modified_xml
+            end
+          end
+        end
+      end
+    end
+  end
+
+  # Look for fear wearing off lines (always check, not just during monitoring window)
+  if xml =~ /gathers.*?(?:itself|herself|himself).*?and shakes off the fear/
+    # Extract creature ID from the XML if it has an exist attribute
+    creature_id = nil
+
+    if xml =~ /exist="(\d+)"/
+      creature_id = $1
+    end
+
+    if creature_id && terror_times[creature_id]
+      # Calculate time since terror started with tenths precision
+      ttl = (Time.now - terror_times[creature_id]).round(1)
+
+      # Build the enhancement string with ID, SSR, and TTL
+      if terror_ssr[creature_id]
+        enhancement = "(ID: #{creature_id}) (SSR: #{terror_ssr[creature_id]}) (TTL: #{ttl}s)"
+      else
+        enhancement = "(ID: #{creature_id}) (TTL: #{ttl}s)"
+      end
+
+      # Find where the creature name ends and insert the enhancement
+      # Handle case where "itself/herself" is in a separate tag
+      if xml =~ />([^<]+)<\/a>.*?gathers.*?(?:itself|herself|himself).*?and shakes off the fear/
+        creature_name = $1
+        # Insert the enhancement right after the FIRST occurrence of creature name
+        modified_xml = xml.sub(/>#{Regexp.escape(creature_name)}<\/a>/, ">#{creature_name} #{enhancement}</a>")
+
+        # Log to CSV
+        ssr_value = terror_ssr[creature_id] || "N/A"
+        log_terror_recovery(creature_name, creature_id, ssr_value, ttl)
+
+        # Remove from tracking
+        terror_times.delete(creature_id)
+        terror_ssr.delete(creature_id)
+
+        next modified_xml
+      elsif xml =~ />([^<]+)<\/.*?>.*?gathers.*?(?:itself|herself|himself).*?and shakes off the fear/
+        creature_name = $1
+        # Handle other tag types
+        modified_xml = xml.gsub(/>#{Regexp.escape(creature_name)}</, ">#{creature_name} #{enhancement}<")
+
+        # Log to CSV
+        ssr_value = terror_ssr[creature_id] || "N/A"
+        log_terror_recovery(creature_name, creature_id, ssr_value, ttl)
+
+        # Remove from tracking
+        terror_times.delete(creature_id)
+        terror_ssr.delete(creature_id)
+
+        next modified_xml
+      end
+    else
+      # No exist attribute or not tracked - try to find creature in GameObj.npcs
+      clean_text = xml.gsub(/<[^>]+>/, '').strip
+      if clean_text =~ /^(.*?) gathers (?:itself|herself|himself) and shakes off the fear/
+        creature_name = $1.strip
+
+        matching_creatures = GameObj.npcs.find_all { |npc|
+          npc.name == creature_name
+        }
+
+        if matching_creatures.length == 1
+          creature = matching_creatures.first
+          if terror_times[creature.id]
+            ttl = (Time.now - terror_times[creature.id]).round(1)
+            if terror_ssr[creature.id]
+              enhancement = "(ID: #{creature.id}) (SSR: #{terror_ssr[creature.id]}) (TTL: #{ttl}s)"
+            else
+              enhancement = "(ID: #{creature.id}) (TTL: #{ttl}s)"
+            end
+
+            if xml =~ />#{Regexp.escape(creature_name)}</
+              modified_xml = xml.gsub(/>#{Regexp.escape(creature_name)}</, ">#{creature_name} #{enhancement}<")
+
+              # Log to CSV
+              ssr_value = terror_ssr[creature.id] || "N/A"
+              log_terror_recovery(creature_name, creature.id, ssr_value, ttl)
+
+              terror_times.delete(creature.id)
+              terror_ssr.delete(creature.id)
+              next modified_xml
+            end
+          end
+        end
+      end
+    end
+  end
+
+  # Pass the original XML through unchanged
+  xml
+})
+
+# Use before_dying to ensure cleanup on ;kill
+before_dying {
+  DownstreamHook.remove("terror_watch") if DownstreamHook.list.include?("terror_watch")
+}
+
+# Cleanup function for manual exit
+def cleanup_and_exit
+  DownstreamHook.remove("terror_watch") if DownstreamHook.list.include?("terror_watch")
+  echo "Terror Watch stopped - hook removed"
+  exit
+end
+
+# Set up signal handling for proper cleanup
+Signal.trap("INT") { cleanup_and_exit }
+Signal.trap("TERM") { cleanup_and_exit }
+
+begin
+  # Keep script running
+  loop {
+    sleep 1
+  }
+rescue SystemExit, Interrupt
+  cleanup_and_exit
+rescue Exception => e
+  echo "Terror Watch error: #{e}"
+  cleanup_and_exit
+end
