@@ -1,0 +1,275 @@
+=begin
+  Target Numbers - Monster targeting overlay system
+
+  Adds numbered identifiers to monsters in game output for easier targeting.
+  Scans and numbers monsters as they appear in room descriptions and actions.
+  Shows (tgt) on your currently targeted monster.
+
+  Examples:
+    ;target_numbers              - Start numbering monsters
+    ;target_numbers help         - Show help
+
+  The script will display monsters like:
+    A spotted lynx(1) prowls nearby...
+    A hobgoblin shaman(1) casts a spell...
+    A hobgoblin shaman(2) attacks...
+    A mongrel hobgoblin(1) charges...
+    A hobgoblin(1)(tgt) looks terrified...  [currently targeted]
+
+  Debug mode (;target_numbers debug) shows:
+    A hobgoblin(1)(ID:410215806)(tgt) with GameObj IDs...
+
+  Revision History:
+    v2.3.6 - 2025-09-24 - Fixed monster_id capture using match() instead of $1 global variable - action lines now work!
+    v2.3.5 - 2025-09-24 - Fixed critical regex bug - added missing quotes around monster_id in Pattern 1
+    v2.3.4 - 2025-09-24 - Simplified action line XML replacement using ID-based matching for better precision
+    v2.3.3 - 2025-09-24 - Fixed action line numbering - creatures now show numbers in combat actions
+    v2.3.2 - 2025-09-24 - Fixed duplicate ID handling - same creature ID gets same number across all occurrences
+    v2.3.1 - 2025-09-24 - Fixed to use GameObj.targets as filter, parse XML exist attributes for actual IDs/positioning
+    v2.3.0 - 2025-09-24 - Switched to GameObj.targets for monster detection, no IDs by default, per-type numbering
+    v2.2.0 - 2025-09-24 - Changed default to show IDs, added lynx and animal support, per-type numbering
+    v2.1.7 - 2025-09-24 - Added debug mode switch - IDs only shown when launched with 'debug' parameter
+    v2.1.6 - 2025-09-24 - Fixed room description target indicator to use ID matching instead of name+position
+    v2.1.5 - 2025-09-23 - Improved fallback to handle action lines with and without exist attributes
+    v2.1.4 - 2025-09-23 - Fixed room descriptions and added simple fallback for action lines
+    v2.1.3 - 2025-09-23 - Skip articles in regex matching for cleaner monster name handling
+    v2.1.2 - 2025-09-23 - Fixed pushBold regex to handle capital A properly
+    v2.1.1 - 2025-09-23 - Fixed regex to match pushBold XML structure properly
+    v2.1.0 - 2025-09-23 - Added GameObj ID display alongside numbers (number)(ID:xxxxx) format
+    v2.0.3 - 2025-09-23 - Fixed PC numbering and improved double numbering prevention
+    v2.0.2 - 2025-09-23 - Fixed double numbering in action lines
+    v2.0.1 - 2025-09-23 - Fixed numbering to reset properly and track IDs from room descriptions
+    v2.0.0 - 2025-09-23 - Rewritten to scan monsters as they appear, not rely on GameObj.targets
+    v1.2.0 - 2025-09-23 - Added ID display for tracking (number:id) format
+    v1.1.2 - 2025-09-23 - Dead monsters now keep their numbers until gone from room
+    v1.1.1 - 2025-09-23 - Fixed numbering to exclude dead monsters, reassign properly
+    v1.1.0 - 2025-09-23 - Added (tgt) indicator for currently targeted monster
+    v1.0.2 - 2025-09-23 - Fixed double numbering by separating room vs action processing
+    v1.0.1 - 2025-09-23 - Fixed duplicate numbering in room descriptions
+    v1.0.0 - 2025-09-23 - Initial implementation with DownstreamHook
+
+          author: Ensayn
+            game: GS
+            tags: targeting, combat, UI
+        required: Lich >= 4.6
+         version: 2.3.6
+=end
+
+# Helper function to show usage
+def show_help
+  output = "\n"
+  output.concat "USAGE: ;target_numbers [help]\n"
+  output.concat "\n"
+  output.concat "DESCRIPTION:\n"
+  output.concat "  Adds numbered identifiers to monsters in game output\n"
+  output.concat "  for easier targeting. Numbers monsters as they appear.\n"
+  output.concat "\n"
+  output.concat "EXAMPLES:\n"
+  output.concat "  A black-winged daggerbeak becomes:\n"
+  output.concat "  A black-winged daggerbeak(1)\n"
+  output.concat "\n"
+  output.concat "COMMANDS:\n"
+  output.concat "  ;target_numbers         Start numbering (IDs hidden by default)\n"
+  output.concat "  ;target_numbers debug   Start with GameObj IDs shown\n"
+  output.concat "  ;target_numbers help    Show this help\n"
+  output.concat "  ;kill target_numbers    Stop numbering\n"
+  output.concat "\n"
+  respond output
+  exit
+end
+
+# Parse command line arguments
+@debug_mode = false  # Default to no IDs
+script.vars[1..-1].each do |arg|
+  if arg =~ /^help$/i
+    show_help
+  elsif arg =~ /^debug$/i
+    @debug_mode = true
+    echo "Debug mode enabled - showing GameObj IDs"
+  end
+end
+
+# Track monster assignments by ID if we have it, otherwise by occurrence
+@monster_assignments = {}  # {id => {noun: "daggerbeak", number: 1}}
+@noun_counters = {}        # {noun => next_number}
+@room_monsters = []        # Track what we've seen in current room
+
+echo "Target Numbers started - adding numbered identifiers to monsters..."
+echo "Use ;kill target_numbers to stop"
+
+# Remove any existing hook before adding new one
+DownstreamHook.remove("target_numbers") if DownstreamHook.list.include?("target_numbers")
+
+# Main monitoring hook
+DownstreamHook.add("target_numbers", proc { |xml|
+  modified_xml = xml
+
+  # Clear counters when entering a new room (detect room title pattern FIRST)
+  if xml =~ /^\[.*?\]\s+\([u#]\d+\)/
+    @noun_counters.clear
+    @monster_assignments.clear
+    @room_monsters.clear
+  end
+
+  # Process "You also see" lines - this is where we number monsters in room descriptions
+  if xml =~ /You also see/
+    modified_xml = xml
+
+    # Get all current targets (monsters) from GameObj as filter
+    target_ids = GameObj.targets.map(&:id)
+
+    # Extract creature IDs and names from exist attributes in order of appearance
+    creatures_in_xml = []
+    seen_ids = {}
+    xml.scan(/<a exist="(\d+)"[^>]*noun="([^"]+)"[^>]*>([^<]+)<\/a>/) do |id, noun, name|
+      # Only add if we haven't seen this ID before
+      unless seen_ids[id]
+        creatures_in_xml << {id: id, noun: noun, name: name.strip}
+        seen_ids[id] = true
+      end
+    end
+
+    # Group by noun for numbering
+    noun_numbers = {}
+
+    # Process each creature as it appears in the XML
+    creatures_in_xml.each do |creature|
+      # Only number if this creature is in GameObj.targets
+      if target_ids.include?(creature[:id])
+        # Get the next number for this noun type
+        noun_numbers[creature[:noun]] ||= 0
+        noun_numbers[creature[:noun]] += 1
+        number = noun_numbers[creature[:noun]]
+
+        # Store the assignment
+        @monster_assignments[creature[:id]] = {noun: creature[:noun], number: number}
+
+        # Build suffix
+        if @debug_mode
+          suffix = "(#{number})(ID:#{creature[:id]})"
+        else
+          suffix = "(#{number})"
+        end
+
+        # Add target indicator if this is the current target
+        if GameObj.target && GameObj.target.id == creature[:id]
+          if @debug_mode
+            suffix = "(#{number})(ID:#{creature[:id]})(tgt)"
+          else
+            suffix = "(#{number})(tgt)"
+          end
+        end
+
+        # Find and replace ALL occurrences of this creature ID in the XML
+        creature_name = creature[:name]
+        # Replace all occurrences of this specific creature (by ID)
+        modified_xml = modified_xml.gsub(/<a exist="#{creature[:id]}"[^>]*>#{Regexp.escape(creature_name)}<\/a>/, "<a exist=\"#{creature[:id]}\">#{creature_name}#{suffix}</a>")
+      end
+    end
+
+    # Now handle any remaining creatures that didn't get processed (fallback)
+    creatures_in_xml.each do |creature|
+      if target_ids.include?(creature[:id]) && @monster_assignments[creature[:id]]
+        assignment = @monster_assignments[creature[:id]]
+        suffix = @debug_mode ? "(#{assignment[:number]})(ID:#{creature[:id]})" : "(#{assignment[:number]})"
+
+        # Add target indicator if needed
+        if GameObj.target && GameObj.target.id == creature[:id]
+          suffix = @debug_mode ? "(#{assignment[:number]})(ID:#{creature[:id]})(tgt)" : "(#{assignment[:number]})(tgt)"
+        end
+
+        # Replace any remaining unprocessed instances
+        creature_name = creature[:name]
+        modified_xml = modified_xml.gsub(/<a exist="#{creature[:id]}"[^>]*>#{Regexp.escape(creature_name)}<\/a>/, "<a exist=\"#{creature[:id]}\">#{creature_name}#{suffix}</a>")
+      end
+    end
+
+    # Store the final counts for use in action lines
+    @noun_counters = noun_numbers
+
+    next modified_xml
+  end
+
+  # Process exist attributes for action lines (attacks, movements, etc.)
+  if (match = xml.match(/exist="(\d+)"/)) && xml !~ /You also see/
+    monster_id = match[1]
+    modified_xml = xml
+
+    # Try to extract monster name from the XML - handle both patterns
+    noun = nil
+    full_name = nil
+
+    # Pattern 1: <a exist="id" noun="noun">name</a>
+    if xml =~ /<a exist="#{monster_id}"[^>]*noun="([^"]+)"[^>]*>([^<]+)<\/a>/
+      noun = $1
+      full_name = $2.strip
+    # Pattern 2: <pushBold/>A <a exist="id" noun="noun">name</a><popBold/> (article between tags)
+    elsif xml =~ /<pushBold\/>(?:A|An|The) <a exist="#{monster_id}"[^>]*noun="([^"]+)"[^>]*>([^<]+)<\/a><popBold\/>/
+      noun = $1
+      full_name = $2.strip
+    end
+
+    if noun && full_name
+
+      # Skip if already numbered
+      unless full_name =~ /\(\d+\)/
+
+        # Check if this ID is in our monster assignments (from GameObj.targets)
+        if @monster_assignments[monster_id]
+          number = @monster_assignments[monster_id][:number]
+          # Build suffix with ID and target indicator
+          if @debug_mode
+            suffix = "(#{number})(ID:#{monster_id})"
+            if GameObj.target && GameObj.target.id == monster_id
+              suffix = "(#{number})(ID:#{monster_id})(tgt)"
+            end
+          else
+            suffix = "(#{number})"
+            if GameObj.target && GameObj.target.id == monster_id
+              suffix = "(#{number})(tgt)"
+            end
+          end
+
+          # Insert the number into the XML - use ID-based replacement for precision
+          modified_xml = modified_xml.gsub(
+            /<a exist="#{monster_id}"[^>]*>#{Regexp.escape(full_name)}<\/a>/,
+            "<a exist=\"#{monster_id}\">#{full_name}#{suffix}</a>"
+          )
+          next modified_xml
+        end
+      end
+    end
+  end
+
+  # Pass through unchanged if no processing occurred
+  xml
+})
+
+# Use before_dying to ensure cleanup on ;kill
+before_dying {
+  DownstreamHook.remove("target_numbers") if DownstreamHook.list.include?("target_numbers")
+  echo "Target Numbers stopped - monster numbering disabled"
+}
+
+# Cleanup function for manual exit
+def cleanup_and_exit
+  DownstreamHook.remove("target_numbers") if DownstreamHook.list.include?("target_numbers")
+  echo "Target Numbers stopped - hook removed"
+  exit
+end
+
+# Set up signal handling for proper cleanup
+Signal.trap("INT") { cleanup_and_exit }
+Signal.trap("TERM") { cleanup_and_exit }
+
+begin
+  # Keep script running
+  loop {
+    sleep 1
+  }
+rescue SystemExit, Interrupt
+  cleanup_and_exit
+rescue Exception => e
+  echo "Target Numbers error: #{e}"
+  cleanup_and_exit
+end
