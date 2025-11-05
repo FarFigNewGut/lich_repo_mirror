@@ -324,6 +324,7 @@ DMGFLARE_PATTERNS = {
 		ThornsImpact_GS: /\*\* The air around .*? pulses rapidly with violent oscillations\! \*\*/,
 		ThornsPlasma_GS: /\*\* Plasmatic tendrils of blinding light radiate from your vicinity\, lashing toward .*?\! \*\*/,
 		Trueshot_GS: /place holder/,
+		Arcane_Sidearm: /^You .*? with a vapor\-haloed .*? at/,
 }
 
 # Define ATTACK_PATTERNS as a constant to be used globally
