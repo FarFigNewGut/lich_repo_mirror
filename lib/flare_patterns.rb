@@ -264,7 +264,7 @@ DMGFLARE_PATTERNS = {
 		SanguineSacrifice_Overflow: /Sanguine brilliance strikes .*? a rupturing blow!/,
   ShieldCape_BroochFlare: /attached to the left shoulder of your .*? suddenly explodes with a brilliant flash/,
   ShadowDeathWeapon: /Ravenous tendrils of shadow burst forth from .*?, draining the very life from .*?/,
-  SigilStaff_Dispel: /Tendrils of .*?? energy lash out from your .*?? toward .*?? and cage/,
+  SigilStaff_Dispel: /Tendrils of .*? energy lash out from your .*? toward .*? and cage/,
   Smite302_Infusion: /With a sudden burst of divine insight, you're able to amplify the power of your/,
   Smite302_InstantDeath: /A minuscule blue-white star slowly ascends from the floor directly under the|A triad of ebony orbs conjoined by crackling ribbons of violet energy suddenly appear out of nowhere/,
   SolarWeapon: /Searing hot, the golden power of the sun is channeled through your/,
@@ -324,7 +324,6 @@ DMGFLARE_PATTERNS = {
 		ThornsImpact_GS: /\*\* The air around .*? pulses rapidly with violent oscillations\! \*\*/,
 		ThornsPlasma_GS: /\*\* Plasmatic tendrils of blinding light radiate from your vicinity\, lashing toward .*?\! \*\*/,
 		Trueshot_GS: /place holder/,
-		Arcane_Sidearm: /^You .*? with a vapor\-haloed .*? at/,
 }
 
 # Define ATTACK_PATTERNS as a constant to be used globally
