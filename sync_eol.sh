@@ -18,4 +18,5 @@ for repo in https://repo.elanthia.online https://extras.repo.elanthia.online ;do
 		echo $repoFile >> lib/.gitignore
 	done
 done
+touch lib/.gitignore
 sort -u -o lib/.gitignore lib/.gitignore
