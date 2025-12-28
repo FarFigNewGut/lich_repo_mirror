@@ -8,7 +8,7 @@ get_repo_manifest_files () {
 	curl -s ${REPO}/manifest.json | jq '.available[] | select (.type == "data" or .type == "script") | .file | split("/")[-1]' -r
 }
 echo "Removing any scripts actively maintained by EO to avoid download conflicts"
-rm lib/.gitignore
+rm -f lib/.gitignore
 for repo in https://repo.elanthia.online https://extras.repo.elanthia.online ;do
 	get_repo_manifest_files "${repo}" | while read repoFile;do
 		if [ "$repoFile" == "gameobj-data.xml" ];then
