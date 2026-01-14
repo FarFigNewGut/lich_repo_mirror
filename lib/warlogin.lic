@@ -1,6 +1,12 @@
 =begin
   warlogin.lic
-  Temporarily forces Warlock3 launch by editing entry.dat, launches lich.rbw, then restores entry.dat after a delay.
+
+  Temporarily forces Warlock3 launch by editing saved entry data, launches lich.rbw,
+  then restores the entry after a delay.
+
+  Supports ONLY:
+    - entry.yaml (NEW format: top-level "accounts" => { ... "characters" => [ ... ] })
+    - entry.dat  (LEGACY format: marshal+base64 array of hashes)
 
   Usage:
     ;warlogin <character name>
@@ -8,8 +14,11 @@
 
   Notes:
     - Defaults realm to prime if not set.
-    - Restoration is done by a detached helper process (reliable).
+    - Does not decrypt passwords. Only changes custom_launch and restores it.
 =end
+
+require 'rbconfig'
+require 'yaml'
 
 WARLOCK_LAUNCH = 'warlock --host localhost --port %port% --key %key%'
 DEFAULT_RESTORE_DELAY = 8
@@ -28,7 +37,90 @@ def realm_to_game_code(realm)
   end
 end
 
-# ---- args ----
+def rubyw_path
+  RbConfig::CONFIG['bindir'] + '/' +
+    (RbConfig::CONFIG['RUBYW_INSTALL_NAME'].empty? ? RbConfig::CONFIG['RUBY_INSTALL_NAME'] : RbConfig::CONFIG['RUBYW_INSTALL_NAME']) +
+    RbConfig::CONFIG['EXEEXT']
+end
+
+def lich_spawn_string(realm, char_name, rubyw)
+  instance =
+    case realm
+    when "shattered" then "--gemstone --shattered"
+    when "platinum"  then "--gemstone --platinum"
+    when "test"      then "--gemstone --test"
+    else                  "--gemstone"
+    end
+  "\"#{rubyw}\" \"#{File.join(LICH_DIR, 'lich.rbw')}\" #{instance} --login #{char_name}"
+end
+
+def deep_copy(obj)
+  Marshal.load(Marshal.dump(obj))
+rescue
+  obj.is_a?(Hash) ? obj.dup : obj
+end
+
+# -------- entry.dat (legacy) --------
+def load_entry_dat(path)
+  return [] unless File.exist?(path)
+  File.open(path, 'r') do |file|
+    begin
+      Marshal.load(file.read.unpack('m').first)
+    rescue
+      []
+    end
+  end
+end
+
+def write_entry_dat(path, ary)
+  File.open(path, 'w') { |f| f.write([Marshal.dump(ary)].pack('m')) }
+end
+
+def find_entry_dat(ary, char_name, game_code)
+  ary.find { |d| d.is_a?(Hash) && d[:char_name] == char_name && d[:game_code] == game_code }
+end
+
+# -------- entry.yaml (new accounts format) --------
+def load_entry_yaml_accounts(path)
+  data = YAML.load_file(path)
+  unless data.is_a?(Hash) && data['accounts'].is_a?(Hash)
+    return [nil, nil]
+  end
+  [data, data['accounts']]
+end
+
+# returns [character_hash_reference, locator_hash]
+def find_entry_yaml(accounts_hash, char_name, game_code)
+  accounts_hash.each do |acct_key, acct|
+    next unless acct.is_a?(Hash)
+    chars = acct['characters']
+    next unless chars.is_a?(Array)
+
+    chars.each_with_index do |c, idx|
+      next unless c.is_a?(Hash)
+      cn = c['char_name'].to_s
+      gc = c['game_code'].to_s
+      if cn == char_name && gc == game_code
+        return [c, { acct_key: acct_key, index: idx }]
+      end
+    end
+  end
+  [nil, nil]
+end
+
+def refind_entry_yaml(accounts_hash, locator)
+  acct = accounts_hash[locator[:acct_key]]
+  return nil unless acct.is_a?(Hash)
+  chars = acct['characters']
+  return nil unless chars.is_a?(Array)
+  chars[locator[:index]]
+end
+
+def write_entry_yaml(path, container)
+  File.open(path, 'w') { |f| f.write(YAML.dump(container)) }
+end
+
+# -------- args --------
 if script.vars[1].nil? || script.vars[1].to_s =~ /^help$/i
   echo "Usage:"
   echo "  ;warlogin <character name>"
@@ -43,126 +135,171 @@ char_name = script.vars[1].to_s.capitalize
 delay = (script.vars[2] && script.vars[2].to_s =~ /^\d+$/) ? script.vars[2].to_i : DEFAULT_RESTORE_DELAY
 delay = DEFAULT_RESTORE_DELAY if delay < 1
 
-# ---- realm default prime ----
 realm = (CharSettings['realm'] || 'prime').to_s.downcase
 game_code = realm_to_game_code(realm)
 
-# ---- load entry.dat ----
-entry_path = File.join(DATA_DIR, "entry.dat")
-die "Error: missing entry.dat in #{DATA_DIR}" unless File.exist?(entry_path)
+yaml_path = File.join(DATA_DIR, 'entry.yaml')
+dat_path  = File.join(DATA_DIR, 'entry.dat')
 
-entry_data = File.open(entry_path, 'r') do |file|
-  begin
-    Marshal.load(file.read.unpack('m').first)
-  rescue
-    []
+store =
+  if File.exist?(yaml_path)
+    :yaml
+  elsif File.exist?(dat_path)
+    :dat
+  else
+    die "Error: No entry store found (missing entry.yaml and entry.dat in #{DATA_DIR})."
   end
-end
 
-# ---- find target entry ----
-idx = entry_data.index { |d| d.is_a?(Hash) && d[:char_name] == char_name && d[:game_code] == game_code }
-die "Error: No saved entry found for #{char_name} in realm #{realm} (#{game_code})." unless idx
-
-original = entry_data[idx].dup
-
-# ---- apply temporary change ----
-entry_data[idx][:custom_launch] = WARLOCK_LAUNCH
-# Optional:
-# entry_data[idx][:custom_launch_dir] = "C:\\Path\\To\\Warlock3"
-
-File.open(entry_path, 'w') { |file| file.write([Marshal.dump(entry_data)].pack('m')) }
-
-# ---- build rubyw path ----
-rubyw = RbConfig::CONFIG['bindir'] + '/' +
-        (RbConfig::CONFIG['RUBYW_INSTALL_NAME'].empty? ? RbConfig::CONFIG['RUBY_INSTALL_NAME'] : RbConfig::CONFIG['RUBYW_INSTALL_NAME']) +
-        RbConfig::CONFIG['EXEEXT']
+rubyw = rubyw_path
 die "Error: failed to find rubyw.exe" unless File.exist?(rubyw)
 
-# ---- spawn lich.rbw (same style as elogin) ----
-instance =
-  case realm
-  when "shattered" then "--gemstone --shattered"
-  when "platinum"  then "--gemstone --platinum"
-  when "test"      then "--gemstone --test"
-  else                  "--gemstone"
-  end
-
-spawn_string = "\"#{rubyw}\" \"#{File.join(LICH_DIR, 'lich.rbw')}\" #{instance} --login #{char_name}"
+spawn_string = lich_spawn_string(realm, char_name, rubyw)
 echo spawn_string
 
-begin
-  Process.spawn(spawn_string)
-rescue => e
-  # If launch fails, restore immediately
-  entry_data[idx] = original
-  File.open(entry_path, 'w') { |file| file.write([Marshal.dump(entry_data)].pack('m')) }
-  die "Error launching lich.rbw: #{e.class}: #{e.message}"
-end
-
-# ---- write restore helper + state ----
 stamp = Time.now.to_i
 state_path  = File.join(DATA_DIR, "warlogin_restore_#{stamp}.bin")
 helper_path = File.join(DATA_DIR, "warlogin_restore_#{stamp}.rb")
 
-# Store enough info to restore exactly the original entry
-restore_state = {
-  entry_path: entry_path,
-  char_name: char_name,
-  game_code: game_code,
-  original: original,
-  delay: delay
-}
-File.open(state_path, 'wb') { |f| f.write(Marshal.dump(restore_state)) }
+if store == :dat
+  entry_data = load_entry_dat(dat_path)
+  die "Error: entry.dat did not load as an Array" unless entry_data.is_a?(Array)
 
+  entry = find_entry_dat(entry_data, char_name, game_code)
+  die "Error: No saved entry found for #{char_name} (#{realm}/#{game_code})." unless entry
+
+  original = deep_copy(entry)
+
+  entry[:custom_launch] = WARLOCK_LAUNCH
+  write_entry_dat(dat_path, entry_data)
+
+  begin
+    Process.spawn(spawn_string)
+  rescue => e
+    entry.clear
+    original.each { |k,v| entry[k] = v }
+    write_entry_dat(dat_path, entry_data)
+    die "Error launching lich.rbw: #{e.class}: #{e.message}"
+  end
+
+  File.open(state_path, 'wb') do |f|
+    f.write(Marshal.dump({
+      store: :dat,
+      path: dat_path,
+      char_name: char_name,
+      game_code: game_code,
+      delay: delay,
+      original: original
+    }))
+  end
+
+else # :yaml
+  container, accounts = load_entry_yaml_accounts(yaml_path)
+  die "Error: entry.yaml is not in the expected accounts/characters format." unless container && accounts
+
+  entry, locator = find_entry_yaml(accounts, char_name, game_code)
+  die "Error: No saved entry found in entry.yaml for #{char_name} (#{realm}/#{game_code})." unless entry
+
+  original = deep_copy(entry)
+
+  # entry.yaml uses string keys; set custom_launch as string key
+  entry['custom_launch'] = WARLOCK_LAUNCH
+  write_entry_yaml(yaml_path, container)
+
+  begin
+    Process.spawn(spawn_string)
+  rescue => e
+    e2 = refind_entry_yaml(accounts, locator)
+    if e2
+      e2.clear
+      original.each { |k,v| e2[k] = v }
+      write_entry_yaml(yaml_path, container)
+    end
+    die "Error launching lich.rbw: #{e.class}: #{e.message}"
+  end
+
+  File.open(state_path, 'wb') do |f|
+    f.write(Marshal.dump({
+      store: :yaml,
+      path: yaml_path,
+      locator: locator,
+      delay: delay,
+      original: original
+    }))
+  end
+end
+
+# -------- detached restore helper --------
 File.open(helper_path, 'w') do |f|
   f.write <<~RUBY
-    # warlogin restore helper (auto-generated)
+    require 'yaml'
+
     state_path = ARGV[0]
+
+    def refind_entry_yaml(accounts, locator)
+      acct = accounts[locator[:acct_key]]
+      return nil unless acct.is_a?(Hash)
+      chars = acct['characters']
+      return nil unless chars.is_a?(Array)
+      chars[locator[:index]]
+    end
 
     begin
       state = Marshal.load(File.binread(state_path))
-      entry_path = state[:entry_path]
-      char_name  = state[:char_name]
-      game_code  = state[:game_code]
-      original   = state[:original]
-      delay      = state[:delay].to_i
+      store    = state[:store]
+      path     = state[:path]
+      delay    = state[:delay].to_i
+      original = state[:original]
 
       sleep(delay)
 
-      entry_data =
-        if File.exist?(entry_path)
-          File.open(entry_path, 'r') do |file|
-            begin
-              Marshal.load(file.read.unpack('m').first)
-            rescue
-              []
+      if store == :dat
+        char_name = state[:char_name]
+        game_code = state[:game_code]
+
+        entry_data =
+          if File.exist?(path)
+            File.open(path, 'r') do |file|
+              begin
+                Marshal.load(file.read.unpack('m').first)
+              rescue
+                []
+              end
             end
+          else
+            []
           end
-        else
-          []
+
+        if entry_data.is_a?(Array)
+          entry = entry_data.find { |d| d.is_a?(Hash) && d[:char_name] == char_name && d[:game_code] == game_code }
+          if entry
+            entry.clear
+            original.each { |k,v| entry[k] = v }
+            File.open(path, 'w') { |out| out.write([Marshal.dump(entry_data)].pack('m')) }
+          end
         end
 
-      idx = entry_data.index { |d| d.is_a?(Hash) && d[:char_name] == char_name && d[:game_code] == game_code }
-      if idx
-        entry_data[idx] = original
-        File.open(entry_path, 'w') { |file| file.write([Marshal.dump(entry_data)].pack('m')) }
+      else # :yaml
+        locator = state[:locator]
+        container = YAML.load_file(path)
+        accounts = container.is_a?(Hash) ? container['accounts'] : nil
+        if accounts.is_a?(Hash)
+          entry = refind_entry_yaml(accounts, locator)
+          if entry
+            entry.clear
+            original.each { |k,v| entry[k] = v }
+            File.open(path, 'w') { |out| out.write(YAML.dump(container)) }
+          end
+        end
       end
+
     rescue
       # ignore
     ensure
-      begin
-        File.delete(state_path) if File.exist?(state_path)
-      rescue
-      end
-      begin
-        File.delete(__FILE__) if File.exist?(__FILE__)
-      rescue
-      end
+      begin; File.delete(state_path) if File.exist?(state_path); rescue; end
+      begin; File.delete(__FILE__) if File.exist?(__FILE__); rescue; end
     end
   RUBY
 end
 
-# ---- spawn helper detached so it survives this script ending ----
 Process.spawn("\"#{rubyw}\" \"#{helper_path}\" \"#{state_path}\"")
-
 exit
