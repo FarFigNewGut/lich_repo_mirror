@@ -1,0 +1,1987 @@
+=begin
+
+  Goals Tracker - Track skill and ascension training goals
+
+  Displays progress toward skill and ascension training goals, calculating
+  experience needed based on current training points and profession costs.
+
+  Usage:
+    ;goalstracker        - Show priority goals with EXP needed
+    ;goalstracker full   - Show all goals
+    ;goalstracker next   - Show next goal with trainable ranks
+    ;goalstracker edit   - Open GTK editor to manage goals
+    ;goalstracker update - Re-detect profession and MATP from game
+
+   author: Morvik
+     game: Gemstone
+     tags: training, skills, ascension, goals
+  version: 0.1.0
+
+=end
+
+require 'yaml'
+require 'fileutils'
+
+GOALS_FILE = "#{$lich_dir}data/GSIV/#{Char.name}/goalstracker.yaml"
+
+# Magic number constants
+EXP_PER_ATP = 50_000
+EXP_PER_3_PTP = 2500
+RANK_TIER_1_MAX = 100  # Ranks 1-100: 1x cost
+RANK_TIER_2_MAX = 201  # Ranks 101-201: 2x cost
+                       # Ranks 202-303: 4x cost
+
+module Goals
+  module SkillHelpers
+    module_function
+
+    def normalize_skill_name(name)
+      normalized = name.downcase.strip
+      SKILL_ALIASES[normalized] || normalized
+    end
+
+    # Returns the parent skill for subcategory skills (spell circles -> 'spell research', sublores -> parent lore)
+    def get_parent_skill(skill_name)
+      normalized = skill_name.downcase.strip
+      # Check if it's a spell circle
+      SPELL_CIRCLES.each_value do |circles|
+        return 'spell research' if circles.include?(normalized)
+      end
+      # Check if it's a sublore
+      LORE_SUBLORES.each do |parent, sublores|
+        return parent if sublores.include?(normalized)
+      end
+      nil
+    end
+
+    # Returns sibling skills that share the same cost/max pool
+    def get_sibling_skills(skill_name, profession)
+      normalized = skill_name.downcase.strip
+      # Check if it's a spell circle
+      circles = SPELL_CIRCLES[profession]
+      if circles&.include?(normalized)
+        return circles.reject { |c| c == normalized }
+      end
+      # Check if it's a sublore
+      LORE_SUBLORES.each_value do |sublores|
+        if sublores.include?(normalized)
+          return sublores.reject { |s| s == normalized }
+        end
+      end
+      []
+    end
+
+    # Returns the available max rank accounting for sibling skill ranks
+    def get_available_max_rank(profession, skill_name)
+      parent = get_parent_skill(skill_name)
+      return get_max_rank(profession, skill_name) unless parent
+
+      max = get_max_rank(profession, parent)
+      siblings = get_sibling_skills(skill_name, profession)
+      used = siblings.sum { |s| get_skill_rank(s) }
+      [max - used, 0].max
+    end
+
+    def get_skill_cost(profession, skill_name)
+      normalized = normalize_skill_name(skill_name)
+      prof_costs = SKILL_COSTS[profession]
+      return nil unless prof_costs
+
+      # Use parent skill cost for sublores and spell circles
+      parent = get_parent_skill(normalized)
+      lookup_skill = parent || normalized
+      prof_costs[lookup_skill]
+    end
+
+    def get_max_rank(profession, skill_name)
+      normalized = normalize_skill_name(skill_name)
+      prof_max = SKILL_MAX_RANKS[profession]
+      return 303 unless prof_max
+
+      # Use parent skill max for sublores and spell circles
+      parent = get_parent_skill(normalized)
+      lookup_skill = parent || normalized
+      prof_max[lookup_skill] || 303
+    end
+
+    def get_skill_rank(skill_name)
+      normalized = normalize_skill_name(skill_name)
+
+      # Spell circles use Spells module
+      spell_ranks = {
+        'minor spiritual' => Spells.minor_spiritual,
+        'major spiritual' => Spells.major_spiritual,
+        'minor elemental' => Spells.minor_elemental,
+        'major elemental' => Spells.major_elemental,
+        'minor mental' => Spells.minor_mental,
+        'wizard base' => Spells.wizard,
+        'sorcerer base' => Spells.sorcerer,
+        'cleric base' => Spells.cleric,
+        'empath base' => Spells.empath,
+        'ranger base' => Spells.ranger,
+        'bard base' => Spells.bard,
+        'paladin base' => Spells.paladin
+      }
+      return spell_ranks[normalized] if spell_ranks.key?(normalized)
+
+      # Skills module mappings
+      method_name = normalized.gsub(' ', '_').gsub('-', '_')
+      method_name = case normalized
+                    when 'spiritual lore - blessing lore' then 'spiritual_lore_blessings'
+                    when 'spiritual lore - summoning lore' then 'spiritual_lore_summoning'
+                    when 'spiritual lore - religion lore' then 'spiritual_lore_religion'
+                    when 'elemental lore - air lore' then 'elemental_lore_air'
+                    when 'elemental lore - earth lore' then 'elemental_lore_earth'
+                    when 'elemental lore - fire lore' then 'elemental_lore_fire'
+                    when 'elemental lore - water lore' then 'elemental_lore_water'
+                    when 'sorcerous lore - necromancy lore' then 'sorcerous_lore_necromancy'
+                    when 'sorcerous lore - demonology lore' then 'sorcerous_lore_demonology'
+                    when 'mental lore - divination lore' then 'mental_lore_divination'
+                    when 'mental lore - telepathy lore' then 'mental_lore_telepathy'
+                    when 'mental lore - manipulation lore' then 'mental_lore_manipulation'
+                    when 'mental lore - transformation lore' then 'mental_lore_transformation'
+                    when 'mental lore - transference lore' then 'mental_lore_transference'
+                    else method_name
+                    end
+
+      Skills.send(method_name)
+    rescue StandardError
+      respond "Warning: Unknown skill '#{skill_name}'"
+      0
+    end
+  end
+
+  module_function
+
+  # Calculate ATP cost for common ascension skills (all except Transcend Destiny)
+  # Each rank costs: (current_rank / 5).floor + 1 points
+  # Ranks 0-4: 1 pt each, 5-9: 2 pts each, 10-14: 3 pts each, etc.
+  def asc_common_cost(from_rank, to_rank)
+    total = 0
+    from_rank.upto(to_rank - 1) do |rank|
+      total += (rank / 5) + 1
+    end
+    total
+  end
+
+  # Calculate ATP cost for elite ascension skills (Transcend Destiny)
+  # Costs: 10, 20, 30, 40, 50, 50, 50, 50, 50, 50 for ranks 1-10
+  def asc_elite_cost(from_rank, to_rank)
+    total = 0
+    from_rank.upto(to_rank - 1) do |rank|
+      total += [(rank + 1) * 10, 50].min
+    end
+    total
+  end
+
+  # Calculate ATP cost for an ascension skill
+  def asc_skill_cost(skill_name, from_rank, to_rank)
+    skill_data = ASCENSION_SKILLS[skill_name.downcase]
+    return 0 unless skill_data
+
+    if skill_data[:elite]
+      asc_elite_cost(from_rank, to_rank)
+    else
+      asc_common_cost(from_rank, to_rank)
+    end
+  end
+
+  # Convert ATP to ascension experience (1 ATP = 50,000 exp)
+  def atp_to_exp(atps)
+    atps * EXP_PER_ATP
+  end
+
+  def load_goals
+    unless File.exist?(GOALS_FILE)
+      FileUtils.mkdir_p(File.dirname(GOALS_FILE))
+      File.write(GOALS_FILE, <<~YAML)
+        # Character profession (auto-detected on first run)
+        profession:
+
+        # Milestone Ascension Training Points (auto-detected on first run)
+        matp: 0
+
+        # Skill goals
+        # Format:
+        #   skill name:
+        #     target: target rank number
+        #     priority: true/false (priority shown in ;info and ;goalstracker, all shown in ;goalstracker full)
+        #
+        # Example:
+        #   picking locks:
+        #     target: 303
+        #     priority: true
+        #   climbing:
+        #     target: 202
+        #     priority: false
+        skills: {}
+
+        # Ascension skill goals
+        # Format:
+        #   skill name:
+        #     target: target rank number
+        #     priority: true/false
+        #
+        # Example:
+        #   stalking and hiding:
+        #     target: 50
+        #     priority: true
+        #   discipline:
+        #     target: 40
+        #     priority: false
+        ascension_skills: {}
+
+        # Transcend Destiny ignore threshold (minimum 150)
+        # When calculating TD progress, treats all ATPs above this threshold
+        # as "TD points", ignoring how they're actually allocated.
+        transcend_ignore_threshold: 150
+      YAML
+      respond "Created empty goals file: #{GOALS_FILE}"
+      respond "Edit this file to add your goals, then run ;goalstracker again."
+      exit
+    end
+
+    YAML.load_file(GOALS_FILE) || {}
+  end
+
+  def get_profession_from_game
+    lines = Lich::Util.quiet_command_xml('info', /Name:/)
+    lines.each do |line|
+      match = line.match(/Profession:\s*(\w+)/)
+      return match[1] if match
+    end
+    nil
+  end
+
+  def get_matp_from_game
+    lines = Lich::Util.quiet_command_xml('asc milestone', /Ascension Milestones/)
+    lines.count { |line| line =~ /Yes\s*$/ }
+  end
+
+  def save_goals(data)
+    File.write(GOALS_FILE, data.to_yaml)
+  end
+
+  # Get ascension exp info from game (single call)
+  # Returns hash { absorption_rate: X, available_atps: Y, total_atps: Z, current_exp: W }
+  def get_asc_exp_info
+    result = { absorption_rate: 0, available_atps: 0, total_atps: 0, current_exp: 0 }
+    lines = Lich::Util.quiet_command_xml('asc exp', /your Ascension experience/)
+    lines.each do |line|
+      if (match = line.match(/Absorption Rate:\s*(\d+)%/))
+        result[:absorption_rate] = match[1].to_i
+      elsif (match = line.match(/ATPs Available:\s*(\d+)/))
+        result[:available_atps] = match[1].to_i
+      elsif (match = line.match(/ATPs Earned:\s*(\d+)/))
+        result[:total_atps] = match[1].to_i
+      elsif (match = line.match(/Ascension Experience:\s*([\d,]+)/))
+        result[:current_exp] = match[1].delete(',').to_i
+      end
+    end
+    result
+  end
+
+  # Get current ascension skill ranks from game
+  # Returns hash of { 'skill name' => current_rank }
+  def get_ascension_ranks
+    ranks = {}
+    lines = Lich::Util.quiet_command_xml('asc info', /your Ascension Abilities/)
+    lines.each do |line|
+      # Match lines like: "  Transcend Destiny    <d cmd='...'>trandest</d>        2/10..."
+      # The mnemonic is wrapped in <d> XML tags from quiet_command_xml
+      match = line.match(%r{^\s{2}(.+?)\s+<d[^>]*>[a-z]+</d>\s+(\d+)/\d+})
+      next unless match
+
+      skill_name = match[1].strip.downcase
+      current_rank = match[2].to_i
+      ranks[skill_name] = current_rank
+    end
+    ranks
+  end
+
+  # Get available training points from game
+  # Returns hash { ptp: X, mtp: Y, effective_ptp: Z }
+  # effective_ptp = ptp + (2 * mtp) since 2 PTP -> 1 MTP conversion
+  def get_available_training_points
+    result = { ptp: 0, mtp: 0, effective_ptp: 0 }
+    lines = Lich::Util.quiet_command_xml('exp', /Level:/)
+    lines.each do |line|
+      if (match = line.match(%r{PTPs/MTPs: (\d+)/(\d+)}))
+        result[:ptp] = match[1].to_i
+        result[:mtp] = match[2].to_i
+        result[:effective_ptp] = result[:ptp] + (2 * result[:mtp])
+      end
+    end
+    result
+  end
+
+  # Calculate how many ranks can be trained with available points
+  # Accounts for 2 PTP -> 1 MTP conversion when needed
+  def calculate_trainable_skill_ranks(skill_name, current_rank, target_rank, cost_str, available_ptp, available_mtp)
+    rank_ptp, rank_mtp = cost_str.split('/').map(&:to_i)
+    trainable = 0
+    remaining_ptp = available_ptp
+    remaining_mtp = available_mtp
+
+    current_rank.upto(target_rank - 1) do |i|
+      multiplier = if i < RANK_TIER_1_MAX then 1
+                   elsif i < RANK_TIER_2_MAX then 2
+                   else 4
+                   end
+      cost_ptp = rank_ptp * multiplier
+      cost_mtp = rank_mtp * multiplier
+
+      # Check if we need to convert PTPs to MTPs
+      mtp_shortfall = [cost_mtp - remaining_mtp, 0].max
+      ptp_for_conversion = mtp_shortfall * 2
+      total_ptp_needed = cost_ptp + ptp_for_conversion
+
+      break if remaining_ptp < total_ptp_needed
+
+      remaining_ptp -= total_ptp_needed
+      remaining_mtp = [remaining_mtp - cost_mtp, 0].max
+      trainable += 1
+    end
+    trainable
+  end
+
+  # Calculate how many ascension ranks can be trained with available ATPs
+  def calculate_trainable_asc_ranks(skill_name, current_rank, target_rank, available_atps)
+    skill_data = ASCENSION_SKILLS[skill_name.downcase]
+    return 0 unless skill_data
+
+    trainable = 0
+    remaining_atps = available_atps
+
+    current_rank.upto(target_rank - 1) do |rank|
+      cost = if skill_data[:elite]
+               [(rank + 1) * 10, 50].min
+             else
+               (rank / 5) + 1
+             end
+      break if remaining_atps < cost
+
+      remaining_atps -= cost
+      trainable += 1
+    end
+    trainable
+  end
+
+  # Calculate effective free ATPs for Transcend Destiny with ignore threshold
+  # Returns: { effective_free: X, effective_current_rank: Y }
+  def calculate_td_effective_progress(asc_current_ranks, total_atps, ignore_threshold)
+    ignore_threshold = [ignore_threshold || 150, 150].max
+
+    # Calculate total ATPs spent on common (non-elite) skills
+    common_atps_spent = 0
+    asc_current_ranks.each do |skill_name, current_rank|
+      skill_data = ASCENSION_SKILLS[skill_name]
+      next unless skill_data && !skill_data[:elite] && current_rank > 0
+
+      common_atps_spent += asc_common_cost(0, current_rank)
+    end
+
+    # ATPs above threshold are considered TD points
+    atps_above_threshold = [total_atps - ignore_threshold, 0].max
+
+    # Calculate actual TD cost for current ranks
+    td_current = asc_current_ranks['transcend destiny'] || 0
+    td_cost_for_current = asc_elite_cost(0, td_current)
+
+    # Effective free points for TD = points above threshold - cost of TD ranks
+    effective_free = [atps_above_threshold - td_cost_for_current, 0].max
+
+    { effective_free: effective_free, effective_current_rank: td_current }
+  end
+
+  def calculate_ptp(current_rank, target_rank, cost_str)
+    rank_ptp, rank_mtp = cost_str.split('/').map(&:to_i)
+    ptp = 0
+
+    current_rank.upto(target_rank - 1) do |i|
+      multiplier = if i < RANK_TIER_1_MAX
+                     1
+                   elsif i < RANK_TIER_2_MAX
+                     2
+                   elsif i <= 303
+                     4
+                   else
+                     echo 'BAD CALCULATION: rank > 303'
+                     exit 1
+                   end
+      ptp += (rank_ptp + (rank_mtp * 2)) * multiplier
+    end
+
+    ptp
+  end
+
+  class GoalsEditor
+    include SkillHelpers
+
+    def initialize(goals_data)
+      @goals_data = goals_data
+      @skills = deep_copy(goals_data['skills'] || {})
+      @ascension_skills = deep_copy(goals_data['ascension_skills'] || {})
+      @transcend_ignore_threshold = goals_data['transcend_ignore_threshold'] || 150
+      @profession = goals_data['profession']
+      @running = false
+
+      # Skills tab state
+      @skill_editing = nil
+      @skill_list_store = nil
+      @skill_tree_view = nil
+      @skill_combo = nil
+      @skill_label = nil
+      @skill_target_spin = nil
+      @skill_max_label = nil
+      @skill_priority_check = nil
+      @skill_add_btn = nil
+      @skill_cancel_edit_btn = nil
+      @skill_add_frame = nil
+      @skill_up_btn = nil
+      @skill_down_btn = nil
+      @skill_edit_btn = nil
+      @skill_delete_btn = nil
+
+      # Ascension tab state
+      @asc_editing = nil
+      @asc_list_store = nil
+      @asc_tree_view = nil
+      @asc_combo = nil
+      @asc_label = nil
+      @asc_target_spin = nil
+      @asc_max_label = nil
+      @asc_priority_check = nil
+      @asc_add_btn = nil
+      @asc_cancel_edit_btn = nil
+      @asc_add_frame = nil
+      @asc_up_btn = nil
+      @asc_down_btn = nil
+      @asc_edit_btn = nil
+      @asc_delete_btn = nil
+      @asc_subcategory_combo = nil
+      @asc_current_ranks = {}
+      @asc_threshold_spin = nil
+
+      @window = nil
+    end
+
+    def run
+      unless defined?(Gtk) && Gtk::Version::MAJOR == 3
+        respond 'GTK3 is required for the goals editor.'
+        return
+      end
+      # Fetch current ascension ranks
+      @asc_current_ranks = Goals.get_ascension_ranks
+      Gtk.queue { build_ui }
+      @running = true
+      wait_while { @running }
+    end
+
+    def deep_copy(obj)
+      case obj
+      when Hash
+        obj.transform_values { |v| deep_copy(v) }
+      when Array
+        obj.map { |v| deep_copy(v) }
+      else
+        obj
+      end
+    end
+
+    def available_skills
+      base_skills = (SKILL_COSTS[@profession]&.keys || []) - PARENT_SKILLS
+      spell_circles = SPELL_CIRCLES[@profession] || []
+      sublores = LORE_SUBLORES.values.flatten
+
+      all_skills = base_skills + spell_circles + sublores
+      all_skills.reject do |skill|
+        available_max = get_available_max_rank(@profession, skill)
+        @skills.key?(skill) || get_skill_rank(skill) >= available_max || available_max <= 0
+      end.sort
+    end
+
+    def available_ascension_skills(subcategory = 'All')
+      ASCENSION_SKILLS.keys.select do |skill|
+        next false if @ascension_skills.key?(skill)
+
+        skill_data = ASCENSION_SKILLS[skill]
+        current = @asc_current_ranks[skill] || 0
+        next false if current >= skill_data[:max]
+
+        subcategory == 'All' || skill_data[:subcategory] == subcategory
+      end.sort
+    end
+
+    def get_asc_skill_rank(skill_name)
+      @asc_current_ranks[skill_name.downcase] || 0
+    end
+
+    def build_ui
+      @window = Gtk::Window.new(:toplevel)
+      @window.title = 'Goals Editor'
+      @window.set_default_size(550, 450)
+      @window.keep_above = true
+
+      main_box = Gtk::Box.new(:vertical, 8)
+      main_box.margin = 10
+      @window.add(main_box)
+
+      # Notebook for tabs
+      notebook = Gtk::Notebook.new
+      main_box.pack_start(notebook, expand: true, fill: true, padding: 0)
+
+      # Skills tab
+      skills_page = build_skills_tab
+      notebook.append_page(skills_page, Gtk::Label.new('Skills'))
+
+      # Ascension tab
+      asc_page = build_ascension_tab
+      notebook.append_page(asc_page, Gtk::Label.new('Ascension'))
+
+      # Dialog buttons
+      dialog_box = Gtk::Box.new(:horizontal, 6)
+      dialog_box.halign = :end
+      main_box.pack_start(dialog_box, expand: false, fill: false, padding: 0)
+
+      cancel_btn = Gtk::Button.new(label: 'Cancel')
+      cancel_btn.signal_connect('clicked') { on_cancel }
+      dialog_box.pack_start(cancel_btn, expand: false, fill: false, padding: 0)
+
+      save_btn = Gtk::Button.new(label: 'Save')
+      save_btn.signal_connect('clicked') { on_save }
+      dialog_box.pack_start(save_btn, expand: false, fill: false, padding: 0)
+
+      @window.signal_connect('destroy') { on_cancel }
+      @window.show_all
+    end
+
+    # ========== Skills Tab ==========
+
+    def build_skills_tab
+      tab_box = Gtk::Box.new(:vertical, 8)
+      tab_box.margin = 8
+
+      # Add/Edit goal section
+      @skill_add_frame = Gtk::Frame.new('Add Goal')
+      tab_box.pack_start(@skill_add_frame, expand: false, fill: true, padding: 0)
+
+      add_box = Gtk::Box.new(:horizontal, 6)
+      add_box.margin = 8
+      @skill_add_frame.add(add_box)
+
+      @skill_combo = Gtk::ComboBoxText.new
+      skill_refresh_dropdown
+      add_box.pack_start(@skill_combo, expand: true, fill: true, padding: 0)
+
+      @skill_label = Gtk::Label.new('')
+      @skill_label.xalign = 0
+      @skill_label.no_show_all = true
+      add_box.pack_start(@skill_label, expand: true, fill: true, padding: 0)
+
+      target_label = Gtk::Label.new('Target:')
+      add_box.pack_start(target_label, expand: false, fill: false, padding: 0)
+
+      adjustment = Gtk::Adjustment.new(50, 1, 303, 1, 10, 0)
+      @skill_target_spin = Gtk::SpinButton.new(adjustment, 1, 0)
+      add_box.pack_start(@skill_target_spin, expand: false, fill: false, padding: 0)
+
+      @skill_max_label = Gtk::Label.new('/ 303')
+      add_box.pack_start(@skill_max_label, expand: false, fill: false, padding: 0)
+
+      @skill_priority_check = Gtk::CheckButton.new('Priority')
+      add_box.pack_start(@skill_priority_check, expand: false, fill: false, padding: 0)
+
+      @skill_add_btn = Gtk::Button.new(label: 'Add')
+      @skill_add_btn.signal_connect('clicked') { skill_add_or_update }
+      add_box.pack_start(@skill_add_btn, expand: false, fill: false, padding: 0)
+
+      @skill_cancel_edit_btn = Gtk::Button.new(label: 'Cancel')
+      @skill_cancel_edit_btn.signal_connect('clicked') { skill_cancel_edit }
+      @skill_cancel_edit_btn.no_show_all = true
+      add_box.pack_start(@skill_cancel_edit_btn, expand: false, fill: false, padding: 0)
+
+      @skill_combo.signal_connect('changed') { skill_update_target_range }
+      skill_update_target_range
+
+      # Goals list
+      list_frame = Gtk::Frame.new('Goals')
+      tab_box.pack_start(list_frame, expand: true, fill: true, padding: 0)
+
+      list_box = Gtk::Box.new(:vertical, 6)
+      list_box.margin = 8
+      list_frame.add(list_box)
+
+      scroll = Gtk::ScrolledWindow.new
+      scroll.set_policy(:automatic, :automatic)
+      list_box.pack_start(scroll, expand: true, fill: true, padding: 0)
+
+      @skill_list_store = Gtk::ListStore.new(String, Integer, String, Integer)
+      @skill_tree_view = Gtk::TreeView.new(@skill_list_store)
+      @skill_tree_view.selection.mode = :single
+      scroll.add(@skill_tree_view)
+
+      renderer = Gtk::CellRendererText.new
+      col = Gtk::TreeViewColumn.new('Skill', renderer, text: 0)
+      col.expand = true
+      @skill_tree_view.append_column(col)
+      @skill_tree_view.append_column(Gtk::TreeViewColumn.new('Target', renderer, text: 1))
+      @skill_tree_view.append_column(Gtk::TreeViewColumn.new('Pri', renderer, text: 2))
+      @skill_tree_view.append_column(Gtk::TreeViewColumn.new('Current', renderer, text: 3))
+
+      skill_refresh_list
+
+      btn_box = Gtk::Box.new(:horizontal, 6)
+      list_box.pack_start(btn_box, expand: false, fill: false, padding: 0)
+
+      @skill_up_btn = Gtk::Button.new(label: 'Up')
+      @skill_up_btn.signal_connect('clicked') { skill_move(:up) }
+      btn_box.pack_start(@skill_up_btn, expand: false, fill: false, padding: 0)
+
+      @skill_down_btn = Gtk::Button.new(label: 'Down')
+      @skill_down_btn.signal_connect('clicked') { skill_move(:down) }
+      btn_box.pack_start(@skill_down_btn, expand: false, fill: false, padding: 0)
+
+      @skill_edit_btn = Gtk::Button.new(label: 'Edit')
+      @skill_edit_btn.signal_connect('clicked') { skill_start_edit }
+      btn_box.pack_start(@skill_edit_btn, expand: false, fill: false, padding: 0)
+
+      @skill_delete_btn = Gtk::Button.new(label: 'Delete')
+      @skill_delete_btn.signal_connect('clicked') { skill_delete }
+      btn_box.pack_start(@skill_delete_btn, expand: false, fill: false, padding: 0)
+
+      @skill_tree_view.selection.signal_connect('changed') { skill_update_button_sensitivity }
+      skill_update_button_sensitivity
+
+      tab_box
+    end
+
+    def skill_refresh_dropdown
+      @skill_combo.remove_all
+      available_skills.each { |s| @skill_combo.append_text(s) }
+      @skill_combo.active = 0 if available_skills.any?
+    end
+
+    def skill_update_target_range
+      return if @skill_editing
+
+      skill = @skill_combo.active_text
+      return unless skill
+
+      current = get_skill_rank(skill)
+      available_max = get_available_max_rank(@profession, skill)
+      adj = @skill_target_spin.adjustment
+      adj.upper = available_max
+      adj.lower = current
+      adj.value = current
+      @skill_max_label.text = "/ #{available_max}"
+    end
+
+    def skill_refresh_list
+      @skill_list_store.clear
+      @skills.each do |name, data|
+        iter = @skill_list_store.append
+        iter[0] = name
+        iter[1] = data['target']
+        iter[2] = data['priority'] ? 'x' : ''
+        iter[3] = get_skill_rank(name)
+      end
+    end
+
+    def skill_update_button_sensitivity
+      sel = @skill_tree_view.selection
+      has_sel = !!sel.selected
+      idx = has_sel ? sel.selected.path.indices[0] : nil
+      in_edit = !@skill_editing.nil?
+
+      @skill_up_btn.sensitive = !in_edit && has_sel && idx && idx > 0
+      @skill_down_btn.sensitive = !in_edit && has_sel && idx && idx < @skills.size - 1
+      @skill_edit_btn.sensitive = !in_edit && has_sel
+      @skill_delete_btn.sensitive = !in_edit && has_sel
+    end
+
+    def skill_add_or_update
+      target = @skill_target_spin.value.to_i
+      priority = @skill_priority_check.active?
+
+      if @skill_editing
+        @skills[@skill_editing]['target'] = target
+        @skills[@skill_editing]['priority'] = priority
+        skill_cancel_edit
+      else
+        skill = @skill_combo.active_text
+        return unless skill
+
+        @skills[skill] = { 'target' => target, 'priority' => priority }
+        skill_refresh_dropdown
+        skill_update_target_range
+      end
+      skill_refresh_list
+    end
+
+    def skill_start_edit
+      sel = @skill_tree_view.selection
+      return unless sel.selected
+
+      name = sel.selected[0]
+      data = @skills[name]
+      return unless data
+
+      @skill_editing = name
+      @skill_add_frame.label = 'Edit Goal'
+      @skill_combo.hide
+      @skill_label.text = name
+      @skill_label.show
+      @skill_add_btn.label = 'Update'
+      @skill_cancel_edit_btn.show
+
+      current = get_skill_rank(name)
+      available_max = get_available_max_rank(@profession, name)
+      adj = @skill_target_spin.adjustment
+      adj.lower = current
+      adj.upper = available_max
+      adj.value = data['target']
+      @skill_max_label.text = "/ #{available_max}"
+      @skill_priority_check.active = data['priority'] || false
+
+      skill_update_button_sensitivity
+    end
+
+    def skill_cancel_edit
+      @skill_editing = nil
+      @skill_add_frame.label = 'Add Goal'
+      @skill_label.hide
+      @skill_combo.show
+      @skill_add_btn.label = 'Add'
+      @skill_cancel_edit_btn.hide
+      @skill_priority_check.active = false
+      skill_refresh_dropdown
+      skill_update_target_range
+      skill_update_button_sensitivity
+    end
+
+    def skill_move(direction)
+      sel = @skill_tree_view.selection
+      return unless sel.selected
+
+      name = sel.selected[0]
+      keys = @skills.keys
+      idx = keys.index(name)
+      return unless idx
+
+      new_idx = direction == :up ? idx - 1 : idx + 1
+      return if new_idx < 0 || new_idx >= keys.length
+
+      keys[idx], keys[new_idx] = keys[new_idx], keys[idx]
+      @skills = keys.map { |k| [k, @skills[k]] }.to_h
+      skill_refresh_list
+      @skill_tree_view.selection.select_iter(@skill_list_store.get_iter(Gtk::TreePath.new(new_idx.to_s)))
+      skill_update_button_sensitivity
+    end
+
+    def skill_delete
+      sel = @skill_tree_view.selection
+      return unless sel.selected
+
+      @skills.delete(sel.selected[0])
+      skill_refresh_list
+      skill_refresh_dropdown
+      skill_update_button_sensitivity
+    end
+
+    # ========== Ascension Tab ==========
+
+    def build_ascension_tab
+      tab_box = Gtk::Box.new(:vertical, 8)
+      tab_box.margin = 8
+
+      # Subcategory filter
+      filter_box = Gtk::Box.new(:horizontal, 6)
+      tab_box.pack_start(filter_box, expand: false, fill: false, padding: 0)
+
+      filter_label = Gtk::Label.new('Subcategory:')
+      filter_box.pack_start(filter_label, expand: false, fill: false, padding: 0)
+
+      @asc_subcategory_combo = Gtk::ComboBoxText.new
+      ASCENSION_SUBCATEGORIES.each { |cat| @asc_subcategory_combo.append_text(cat) }
+      @asc_subcategory_combo.active = 0
+      @asc_subcategory_combo.signal_connect('changed') { asc_refresh_dropdown }
+      filter_box.pack_start(@asc_subcategory_combo, expand: false, fill: false, padding: 0)
+
+      # Spacer
+      filter_box.pack_start(Gtk::Label.new(''), expand: true, fill: true, padding: 0)
+
+      # Transcend Destiny ignore threshold
+      threshold_label = Gtk::Label.new('TD Ignore Threshold:')
+      filter_box.pack_start(threshold_label, expand: false, fill: false, padding: 0)
+
+      threshold_adj = Gtk::Adjustment.new(@transcend_ignore_threshold, 150, 500, 1, 10, 0)
+      @asc_threshold_spin = Gtk::SpinButton.new(threshold_adj, 1, 0)
+      filter_box.pack_start(@asc_threshold_spin, expand: false, fill: false, padding: 0)
+
+      # Add/Edit goal section
+      @asc_add_frame = Gtk::Frame.new('Add Goal')
+      tab_box.pack_start(@asc_add_frame, expand: false, fill: true, padding: 0)
+
+      add_box = Gtk::Box.new(:horizontal, 6)
+      add_box.margin = 8
+      @asc_add_frame.add(add_box)
+
+      @asc_combo = Gtk::ComboBoxText.new
+      asc_refresh_dropdown
+      add_box.pack_start(@asc_combo, expand: true, fill: true, padding: 0)
+
+      @asc_label = Gtk::Label.new('')
+      @asc_label.xalign = 0
+      @asc_label.no_show_all = true
+      add_box.pack_start(@asc_label, expand: true, fill: true, padding: 0)
+
+      target_label = Gtk::Label.new('Target:')
+      add_box.pack_start(target_label, expand: false, fill: false, padding: 0)
+
+      adjustment = Gtk::Adjustment.new(10, 1, 50, 1, 5, 0)
+      @asc_target_spin = Gtk::SpinButton.new(adjustment, 1, 0)
+      add_box.pack_start(@asc_target_spin, expand: false, fill: false, padding: 0)
+
+      @asc_max_label = Gtk::Label.new('/ 50')
+      add_box.pack_start(@asc_max_label, expand: false, fill: false, padding: 0)
+
+      @asc_priority_check = Gtk::CheckButton.new('Priority')
+      add_box.pack_start(@asc_priority_check, expand: false, fill: false, padding: 0)
+
+      @asc_add_btn = Gtk::Button.new(label: 'Add')
+      @asc_add_btn.signal_connect('clicked') { asc_add_or_update }
+      add_box.pack_start(@asc_add_btn, expand: false, fill: false, padding: 0)
+
+      @asc_cancel_edit_btn = Gtk::Button.new(label: 'Cancel')
+      @asc_cancel_edit_btn.signal_connect('clicked') { asc_cancel_edit }
+      @asc_cancel_edit_btn.no_show_all = true
+      add_box.pack_start(@asc_cancel_edit_btn, expand: false, fill: false, padding: 0)
+
+      @asc_combo.signal_connect('changed') { asc_update_target_range }
+      asc_update_target_range
+
+      # Goals list
+      list_frame = Gtk::Frame.new('Goals')
+      tab_box.pack_start(list_frame, expand: true, fill: true, padding: 0)
+
+      list_box = Gtk::Box.new(:vertical, 6)
+      list_box.margin = 8
+      list_frame.add(list_box)
+
+      scroll = Gtk::ScrolledWindow.new
+      scroll.set_policy(:automatic, :automatic)
+      list_box.pack_start(scroll, expand: true, fill: true, padding: 0)
+
+      @asc_list_store = Gtk::ListStore.new(String, Integer, String, Integer)
+      @asc_tree_view = Gtk::TreeView.new(@asc_list_store)
+      @asc_tree_view.selection.mode = :single
+      scroll.add(@asc_tree_view)
+
+      renderer = Gtk::CellRendererText.new
+      col = Gtk::TreeViewColumn.new('Skill', renderer, text: 0)
+      col.expand = true
+      @asc_tree_view.append_column(col)
+      @asc_tree_view.append_column(Gtk::TreeViewColumn.new('Target', renderer, text: 1))
+      @asc_tree_view.append_column(Gtk::TreeViewColumn.new('Pri', renderer, text: 2))
+      @asc_tree_view.append_column(Gtk::TreeViewColumn.new('Current', renderer, text: 3))
+
+      asc_refresh_list
+
+      btn_box = Gtk::Box.new(:horizontal, 6)
+      list_box.pack_start(btn_box, expand: false, fill: false, padding: 0)
+
+      @asc_up_btn = Gtk::Button.new(label: 'Up')
+      @asc_up_btn.signal_connect('clicked') { asc_move(:up) }
+      btn_box.pack_start(@asc_up_btn, expand: false, fill: false, padding: 0)
+
+      @asc_down_btn = Gtk::Button.new(label: 'Down')
+      @asc_down_btn.signal_connect('clicked') { asc_move(:down) }
+      btn_box.pack_start(@asc_down_btn, expand: false, fill: false, padding: 0)
+
+      @asc_edit_btn = Gtk::Button.new(label: 'Edit')
+      @asc_edit_btn.signal_connect('clicked') { asc_start_edit }
+      btn_box.pack_start(@asc_edit_btn, expand: false, fill: false, padding: 0)
+
+      @asc_delete_btn = Gtk::Button.new(label: 'Delete')
+      @asc_delete_btn.signal_connect('clicked') { asc_delete }
+      btn_box.pack_start(@asc_delete_btn, expand: false, fill: false, padding: 0)
+
+      @asc_tree_view.selection.signal_connect('changed') { asc_update_button_sensitivity }
+      asc_update_button_sensitivity
+
+      tab_box
+    end
+
+    def asc_refresh_dropdown
+      @asc_combo.remove_all
+      subcategory = @asc_subcategory_combo.active_text || 'All'
+      available_ascension_skills(subcategory).each { |s| @asc_combo.append_text(s) }
+      @asc_combo.active = 0 if available_ascension_skills(subcategory).any?
+      asc_update_target_range
+    end
+
+    def asc_update_target_range
+      return if @asc_editing
+
+      skill = @asc_combo.active_text
+      return unless skill
+
+      skill_data = ASCENSION_SKILLS[skill]
+      return unless skill_data
+
+      current = get_asc_skill_rank(skill)
+      max_rank = skill_data[:max]
+      adj = @asc_target_spin.adjustment
+      adj.upper = max_rank
+      adj.lower = current
+      adj.value = [current, max_rank].min
+      @asc_max_label.text = "/ #{max_rank}"
+    end
+
+    def asc_refresh_list
+      @asc_list_store.clear
+      @ascension_skills.each do |name, data|
+        iter = @asc_list_store.append
+        iter[0] = name
+        iter[1] = data['target']
+        iter[2] = data['priority'] ? 'x' : ''
+        iter[3] = get_asc_skill_rank(name)
+      end
+    end
+
+    def asc_update_button_sensitivity
+      sel = @asc_tree_view.selection
+      has_sel = !!sel.selected
+      idx = has_sel ? sel.selected.path.indices[0] : nil
+      in_edit = !@asc_editing.nil?
+
+      @asc_up_btn.sensitive = !in_edit && has_sel && idx && idx > 0
+      @asc_down_btn.sensitive = !in_edit && has_sel && idx && idx < @ascension_skills.size - 1
+      @asc_edit_btn.sensitive = !in_edit && has_sel
+      @asc_delete_btn.sensitive = !in_edit && has_sel
+    end
+
+    def asc_add_or_update
+      target = @asc_target_spin.value.to_i
+      priority = @asc_priority_check.active?
+
+      if @asc_editing
+        @ascension_skills[@asc_editing]['target'] = target
+        @ascension_skills[@asc_editing]['priority'] = priority
+        asc_cancel_edit
+      else
+        skill = @asc_combo.active_text
+        return unless skill
+
+        @ascension_skills[skill] = { 'target' => target, 'priority' => priority }
+        asc_refresh_dropdown
+        asc_update_target_range
+      end
+      asc_refresh_list
+    end
+
+    def asc_start_edit
+      sel = @asc_tree_view.selection
+      return unless sel.selected
+
+      name = sel.selected[0]
+      data = @ascension_skills[name]
+      return unless data
+
+      @asc_editing = name
+      @asc_add_frame.label = 'Edit Goal'
+      @asc_combo.hide
+      @asc_label.text = name
+      @asc_label.show
+      @asc_add_btn.label = 'Update'
+      @asc_cancel_edit_btn.show
+
+      skill_data = ASCENSION_SKILLS[name]
+      current = get_asc_skill_rank(name)
+      max_rank = skill_data ? skill_data[:max] : 50
+      adj = @asc_target_spin.adjustment
+      adj.lower = current
+      adj.upper = max_rank
+      adj.value = data['target']
+      @asc_max_label.text = "/ #{max_rank}"
+      @asc_priority_check.active = data['priority'] || false
+
+      asc_update_button_sensitivity
+    end
+
+    def asc_cancel_edit
+      @asc_editing = nil
+      @asc_add_frame.label = 'Add Goal'
+      @asc_label.hide
+      @asc_combo.show
+      @asc_add_btn.label = 'Add'
+      @asc_cancel_edit_btn.hide
+      @asc_priority_check.active = false
+      asc_refresh_dropdown
+      asc_update_target_range
+      asc_update_button_sensitivity
+    end
+
+    def asc_move(direction)
+      sel = @asc_tree_view.selection
+      return unless sel.selected
+
+      name = sel.selected[0]
+      keys = @ascension_skills.keys
+      idx = keys.index(name)
+      return unless idx
+
+      new_idx = direction == :up ? idx - 1 : idx + 1
+      return if new_idx < 0 || new_idx >= keys.length
+
+      keys[idx], keys[new_idx] = keys[new_idx], keys[idx]
+      @ascension_skills = keys.map { |k| [k, @ascension_skills[k]] }.to_h
+      asc_refresh_list
+      @asc_tree_view.selection.select_iter(@asc_list_store.get_iter(Gtk::TreePath.new(new_idx.to_s)))
+      asc_update_button_sensitivity
+    end
+
+    def asc_delete
+      sel = @asc_tree_view.selection
+      return unless sel.selected
+
+      @ascension_skills.delete(sel.selected[0])
+      asc_refresh_list
+      asc_refresh_dropdown
+      asc_update_button_sensitivity
+    end
+
+    # ========== Common ==========
+
+    def on_save
+      @goals_data['skills'] = @skills
+      @goals_data['ascension_skills'] = @ascension_skills
+      @goals_data['transcend_ignore_threshold'] = @asc_threshold_spin.value.to_i
+      # Remove old ascension format if present
+      @goals_data.delete('ascension')
+      Goals.save_goals(@goals_data)
+      respond 'Goals saved.'
+      close_window
+    end
+
+    def on_cancel
+      close_window
+    end
+
+    def close_window
+      @window&.destroy
+      @running = false
+    end
+  end
+
+  # =============================================================================
+  # DATA CONSTANTS - Game data tables (costs, max ranks, skill mappings)
+  # =============================================================================
+
+  # Training point costs by profession (PTP/MTP)
+  # Source: ~/trainingpoints.csv
+  SKILL_COSTS = {
+    'Warrior' => {
+      'two weapon combat' => '2/2', 'armor use' => '2/0', 'shield use' => '2/0',
+      'combat maneuvers' => '4/3', 'edged weapons' => '2/1', 'blunt weapons' => '2/1',
+      'two-handed weapons' => '3/1', 'ranged weapons' => '2/1', 'thrown weapons' => '2/1',
+      'polearm weapons' => '3/1', 'brawling' => '2/1', 'ambush' => '3/4',
+      'multi opponent combat' => '4/3', 'physical fitness' => '2/0', 'dodging' => '4/2',
+      'arcane symbols' => '0/7', 'magic item use' => '0/8', 'spell aiming' => '4/8',
+      'harness power' => '0/10', 'elemental mana control' => '0/10', 'mental mana control' => '0/15',
+      'spirit mana control' => '0/10', 'spell research' => '0/120', 'elemental lore' => '0/15',
+      'spiritual lore' => '0/15', 'sorcerous lore' => '0/30', 'mental lore' => '0/40',
+      'survival' => '1/3', 'disarming traps' => '2/4', 'picking locks' => '2/3',
+      'stalking and hiding' => '3/2', 'perception' => '0/3', 'climbing' => '3/0',
+      'swimming' => '2/0', 'first aid' => '1/2', 'trading' => '0/3', 'pickpocketing' => '2/3'
+    },
+    'Rogue' => {
+      'two weapon combat' => '2/2', 'armor use' => '5/0', 'shield use' => '4/0',
+      'combat maneuvers' => '4/4', 'edged weapons' => '2/1', 'blunt weapons' => '3/1',
+      'two-handed weapons' => '6/2', 'ranged weapons' => '3/1', 'thrown weapons' => '2/1',
+      'polearm weapons' => '7/2', 'brawling' => '3/1', 'ambush' => '2/1',
+      'multi opponent combat' => '10/3', 'physical fitness' => '3/0', 'dodging' => '2/1',
+      'arcane symbols' => '0/7', 'magic item use' => '0/8', 'spell aiming' => '4/5',
+      'harness power' => '0/9', 'elemental mana control' => '0/10', 'mental mana control' => '0/15',
+      'spirit mana control' => '0/10', 'spell research' => '0/67', 'elemental lore' => '0/15',
+      'spiritual lore' => '0/15', 'sorcerous lore' => '0/30', 'mental lore' => '0/40',
+      'survival' => '2/2', 'disarming traps' => '1/1', 'picking locks' => '1/1',
+      'stalking and hiding' => '1/1', 'perception' => '0/1', 'climbing' => '1/0',
+      'swimming' => '2/0', 'first aid' => '1/2', 'trading' => '0/3', 'pickpocketing' => '1/0'
+    },
+    'Monk' => {
+      'two weapon combat' => '2/2', 'armor use' => '10/0', 'shield use' => '8/0',
+      'combat maneuvers' => '5/3', 'edged weapons' => '2/1', 'blunt weapons' => '3/1',
+      'two-handed weapons' => '5/2', 'ranged weapons' => '4/1', 'thrown weapons' => '2/1',
+      'polearm weapons' => '6/2', 'brawling' => '2/1', 'ambush' => '3/2',
+      'multi opponent combat' => '5/2', 'physical fitness' => '2/0', 'dodging' => '1/1',
+      'arcane symbols' => '0/6', 'magic item use' => '0/7', 'spell aiming' => '3/4',
+      'harness power' => '0/6', 'elemental mana control' => '0/15', 'mental mana control' => '0/8',
+      'spirit mana control' => '0/8', 'spell research' => '0/38', 'elemental lore' => '0/40',
+      'spiritual lore' => '0/12', 'sorcerous lore' => '0/35', 'mental lore' => '0/12',
+      'survival' => '2/2', 'disarming traps' => '3/4', 'picking locks' => '3/3',
+      'stalking and hiding' => '3/2', 'perception' => '0/2', 'climbing' => '1/0',
+      'swimming' => '2/0', 'first aid' => '1/2', 'trading' => '0/3', 'pickpocketing' => '2/2'
+    },
+    'Wizard' => {
+      'two weapon combat' => '12/12', 'armor use' => '14/0', 'shield use' => '13/0',
+      'combat maneuvers' => '12/8', 'edged weapons' => '6/1', 'blunt weapons' => '6/1',
+      'two-handed weapons' => '14/3', 'ranged weapons' => '14/3', 'thrown weapons' => '8/2',
+      'polearm weapons' => '14/3', 'brawling' => '10/2', 'ambush' => '15/10',
+      'multi opponent combat' => '15/10', 'physical fitness' => '8/0', 'dodging' => '20/20',
+      'arcane symbols' => '0/2', 'magic item use' => '0/1', 'spell aiming' => '2/1',
+      'harness power' => '0/4', 'elemental mana control' => '0/3', 'mental mana control' => '0/12',
+      'spirit mana control' => '0/12', 'spell research' => '0/8', 'elemental lore' => '0/6',
+      'spiritual lore' => '0/20', 'sorcerous lore' => '0/10', 'mental lore' => '0/20',
+      'survival' => '3/2', 'disarming traps' => '2/6', 'picking locks' => '2/4',
+      'stalking and hiding' => '5/4', 'perception' => '0/3', 'climbing' => '4/0',
+      'swimming' => '3/0', 'first aid' => '2/1', 'trading' => '0/3', 'pickpocketing' => '3/3'
+    },
+    'Sorcerer' => {
+      'two weapon combat' => '12/12', 'armor use' => '15/0', 'shield use' => '13/0',
+      'combat maneuvers' => '12/8', 'edged weapons' => '6/2', 'blunt weapons' => '6/2',
+      'two-handed weapons' => '14/3', 'ranged weapons' => '14/3', 'thrown weapons' => '9/3',
+      'polearm weapons' => '14/3', 'brawling' => '10/2', 'ambush' => '15/14',
+      'multi opponent combat' => '15/10', 'physical fitness' => '8/0', 'dodging' => '20/20',
+      'arcane symbols' => '0/1', 'magic item use' => '0/2', 'spell aiming' => '3/1',
+      'harness power' => '0/4', 'elemental mana control' => '0/3', 'mental mana control' => '0/12',
+      'spirit mana control' => '0/3', 'spell research' => '0/8', 'elemental lore' => '0/6',
+      'spiritual lore' => '0/6', 'sorcerous lore' => '0/6', 'mental lore' => '0/20',
+      'survival' => '3/2', 'disarming traps' => '2/6', 'picking locks' => '2/4',
+      'stalking and hiding' => '5/4', 'perception' => '0/3', 'climbing' => '4/0',
+      'swimming' => '3/0', 'first aid' => '2/1', 'trading' => '0/3', 'pickpocketing' => '3/3'
+    },
+    'Cleric' => {
+      'two weapon combat' => '9/9', 'armor use' => '8/0', 'shield use' => '13/0',
+      'combat maneuvers' => '10/8', 'edged weapons' => '6/1', 'blunt weapons' => '6/1',
+      'two-handed weapons' => '10/3', 'ranged weapons' => '9/3', 'thrown weapons' => '9/3',
+      'polearm weapons' => '11/3', 'brawling' => '6/1', 'ambush' => '12/12',
+      'multi opponent combat' => '15/8', 'physical fitness' => '8/0', 'dodging' => '20/20',
+      'arcane symbols' => '0/2', 'magic item use' => '0/2', 'spell aiming' => '3/1',
+      'harness power' => '0/4', 'elemental mana control' => '0/12', 'mental mana control' => '0/12',
+      'spirit mana control' => '0/3', 'spell research' => '0/8', 'elemental lore' => '0/20',
+      'spiritual lore' => '0/6', 'sorcerous lore' => '0/10', 'mental lore' => '0/20',
+      'survival' => '3/2', 'disarming traps' => '2/6', 'picking locks' => '2/4',
+      'stalking and hiding' => '5/4', 'perception' => '0/3', 'climbing' => '4/0',
+      'swimming' => '3/0', 'first aid' => '1/1', 'trading' => '0/3', 'pickpocketing' => '3/3'
+    },
+    'Empath' => {
+      'two weapon combat' => '12/12', 'armor use' => '15/0', 'shield use' => '13/0',
+      'combat maneuvers' => '12/8', 'edged weapons' => '6/2', 'blunt weapons' => '6/2',
+      'two-handed weapons' => '13/3', 'ranged weapons' => '14/3', 'thrown weapons' => '9/3',
+      'polearm weapons' => '14/3', 'brawling' => '10/2', 'ambush' => '15/15',
+      'multi opponent combat' => '15/10', 'physical fitness' => '2/0', 'dodging' => '20/20',
+      'arcane symbols' => '0/2', 'magic item use' => '0/2', 'spell aiming' => '3/1',
+      'harness power' => '0/4', 'elemental mana control' => '0/12', 'mental mana control' => '0/3',
+      'spirit mana control' => '0/3', 'spell research' => '0/8', 'elemental lore' => '0/20',
+      'spiritual lore' => '0/6', 'sorcerous lore' => '0/12', 'mental lore' => '0/6',
+      'survival' => '3/2', 'disarming traps' => '2/6', 'picking locks' => '2/4',
+      'stalking and hiding' => '5/4', 'perception' => '0/3', 'climbing' => '4/0',
+      'swimming' => '3/0', 'first aid' => '1/0', 'trading' => '0/3', 'pickpocketing' => '3/3'
+    },
+    'Ranger' => {
+      'two weapon combat' => '3/2', 'armor use' => '5/0', 'shield use' => '5/0',
+      'combat maneuvers' => '6/4', 'edged weapons' => '3/1', 'blunt weapons' => '4/1',
+      'two-handed weapons' => '6/2', 'ranged weapons' => '3/1', 'thrown weapons' => '3/1',
+      'polearm weapons' => '7/2', 'brawling' => '4/1', 'ambush' => '3/3',
+      'multi opponent combat' => '10/4', 'physical fitness' => '4/0', 'dodging' => '7/5',
+      'arcane symbols' => '0/5', 'magic item use' => '0/5', 'spell aiming' => '4/1',
+      'harness power' => '0/5', 'elemental mana control' => '0/15', 'mental mana control' => '0/15',
+      'spirit mana control' => '0/5', 'spell research' => '0/17', 'elemental lore' => '0/20',
+      'spiritual lore' => '0/10', 'sorcerous lore' => '0/18', 'mental lore' => '0/20',
+      'survival' => '1/1', 'disarming traps' => '2/4', 'picking locks' => '2/3',
+      'stalking and hiding' => '2/1', 'perception' => '0/2', 'climbing' => '2/0',
+      'swimming' => '2/0', 'first aid' => '2/1', 'trading' => '0/3', 'pickpocketing' => '2/3'
+    },
+    'Bard' => {
+      'two weapon combat' => '3/2', 'armor use' => '5/0', 'shield use' => '5/0',
+      'combat maneuvers' => '8/4', 'edged weapons' => '3/1', 'blunt weapons' => '4/1',
+      'two-handed weapons' => '7/2', 'ranged weapons' => '4/2', 'thrown weapons' => '5/1',
+      'polearm weapons' => '6/1', 'brawling' => '3/1', 'ambush' => '4/4',
+      'multi opponent combat' => '7/3', 'physical fitness' => '4/0', 'dodging' => '6/6',
+      'arcane symbols' => '0/4', 'magic item use' => '0/4', 'spell aiming' => '4/1',
+      'harness power' => '0/5', 'elemental mana control' => '0/5', 'mental mana control' => '0/5',
+      'spirit mana control' => '0/15', 'spell research' => '0/17', 'elemental lore' => '0/8',
+      'spiritual lore' => '0/20', 'sorcerous lore' => '0/18', 'mental lore' => '0/8',
+      'survival' => '2/2', 'disarming traps' => '2/3', 'picking locks' => '2/1',
+      'stalking and hiding' => '3/2', 'perception' => '0/3', 'climbing' => '3/0',
+      'swimming' => '3/0', 'first aid' => '2/1', 'trading' => '0/2', 'pickpocketing' => '2/1'
+    },
+    'Paladin' => {
+      'two weapon combat' => '3/3', 'armor use' => '3/0', 'shield use' => '2/0',
+      'combat maneuvers' => '5/4', 'edged weapons' => '3/1', 'blunt weapons' => '3/1',
+      'two-handed weapons' => '4/2', 'ranged weapons' => '6/2', 'thrown weapons' => '3/1',
+      'polearm weapons' => '5/2', 'brawling' => '4/1', 'ambush' => '4/5',
+      'multi opponent combat' => '5/2', 'physical fitness' => '3/0', 'dodging' => '5/3',
+      'arcane symbols' => '0/5', 'magic item use' => '0/5', 'spell aiming' => '4/2',
+      'harness power' => '0/5', 'elemental mana control' => '0/15', 'mental mana control' => '0/15',
+      'spirit mana control' => '0/5', 'spell research' => '0/17', 'elemental lore' => '0/20',
+      'spiritual lore' => '0/10', 'sorcerous lore' => '0/18', 'mental lore' => '0/20',
+      'survival' => '2/2', 'disarming traps' => '2/5', 'picking locks' => '2/4',
+      'stalking and hiding' => '4/4', 'perception' => '0/3', 'climbing' => '3/0',
+      'swimming' => '2/0', 'first aid' => '1/1', 'trading' => '0/3', 'pickpocketing' => '4/4'
+    }
+  }.freeze
+
+  # Maximum trainable ranks by profession
+  # Source: ~/maxranks.csv
+  SKILL_MAX_RANKS = {
+    'Warrior' => {
+      'two weapon combat' => 202, 'armor use' => 303, 'shield use' => 303,
+      'combat maneuvers' => 202, 'edged weapons' => 202, 'blunt weapons' => 202,
+      'two-handed weapons' => 202, 'ranged weapons' => 202, 'thrown weapons' => 202,
+      'polearm weapons' => 202, 'brawling' => 202, 'ambush' => 202,
+      'multi opponent combat' => 202, 'physical fitness' => 303, 'dodging' => 303,
+      'arcane symbols' => 101, 'magic item use' => 101, 'spell aiming' => 101,
+      'harness power' => 101, 'elemental mana control' => 101, 'mental mana control' => 101,
+      'spirit mana control' => 101, 'spell research' => 101, 'elemental lore' => 101,
+      'spiritual lore' => 101, 'sorcerous lore' => 101, 'mental lore' => 101,
+      'survival' => 202, 'disarming traps' => 202, 'picking locks' => 202,
+      'stalking and hiding' => 202, 'perception' => 202, 'climbing' => 202,
+      'swimming' => 202, 'first aid' => 202, 'trading' => 202, 'pickpocketing' => 101
+    },
+    'Rogue' => {
+      'two weapon combat' => 202, 'armor use' => 202, 'shield use' => 202,
+      'combat maneuvers' => 202, 'edged weapons' => 202, 'blunt weapons' => 202,
+      'two-handed weapons' => 202, 'ranged weapons' => 202, 'thrown weapons' => 202,
+      'polearm weapons' => 202, 'brawling' => 202, 'ambush' => 202,
+      'multi opponent combat' => 101, 'physical fitness' => 202, 'dodging' => 303,
+      'arcane symbols' => 101, 'magic item use' => 101, 'spell aiming' => 101,
+      'harness power' => 101, 'elemental mana control' => 101, 'mental mana control' => 101,
+      'spirit mana control' => 101, 'spell research' => 101, 'elemental lore' => 101,
+      'spiritual lore' => 101, 'sorcerous lore' => 101, 'mental lore' => 101,
+      'survival' => 202, 'disarming traps' => 303, 'picking locks' => 303,
+      'stalking and hiding' => 303, 'perception' => 303, 'climbing' => 202,
+      'swimming' => 202, 'first aid' => 202, 'trading' => 202, 'pickpocketing' => 202
+    },
+    'Monk' => {
+      'two weapon combat' => 202, 'armor use' => 202, 'shield use' => 202,
+      'combat maneuvers' => 202, 'edged weapons' => 202, 'blunt weapons' => 202,
+      'two-handed weapons' => 202, 'ranged weapons' => 202, 'thrown weapons' => 202,
+      'polearm weapons' => 202, 'brawling' => 202, 'ambush' => 202,
+      'multi opponent combat' => 202, 'physical fitness' => 303, 'dodging' => 303,
+      'arcane symbols' => 101, 'magic item use' => 101, 'spell aiming' => 101,
+      'harness power' => 101, 'elemental mana control' => 101, 'mental mana control' => 101,
+      'spirit mana control' => 101, 'spell research' => 101, 'elemental lore' => 101,
+      'spiritual lore' => 101, 'sorcerous lore' => 101, 'mental lore' => 101,
+      'survival' => 202, 'disarming traps' => 202, 'picking locks' => 202,
+      'stalking and hiding' => 202, 'perception' => 202, 'climbing' => 202,
+      'swimming' => 202, 'first aid' => 202, 'trading' => 202, 'pickpocketing' => 202
+    },
+    'Wizard' => {
+      'two weapon combat' => 101, 'armor use' => 101, 'shield use' => 101,
+      'combat maneuvers' => 101, 'edged weapons' => 101, 'blunt weapons' => 101,
+      'two-handed weapons' => 101, 'ranged weapons' => 101, 'thrown weapons' => 101,
+      'polearm weapons' => 101, 'brawling' => 101, 'ambush' => 101,
+      'multi opponent combat' => 101, 'physical fitness' => 101, 'dodging' => 101,
+      'arcane symbols' => 202, 'magic item use' => 202, 'spell aiming' => 202,
+      'harness power' => 303, 'elemental mana control' => 303, 'mental mana control' => 101,
+      'spirit mana control' => 101, 'spell research' => 303, 'elemental lore' => 202,
+      'spiritual lore' => 101, 'sorcerous lore' => 101, 'mental lore' => 101,
+      'survival' => 202, 'disarming traps' => 101, 'picking locks' => 202,
+      'stalking and hiding' => 101, 'perception' => 202, 'climbing' => 101,
+      'swimming' => 101, 'first aid' => 202, 'trading' => 202, 'pickpocketing' => 101
+    },
+    'Sorcerer' => {
+      'two weapon combat' => 101, 'armor use' => 101, 'shield use' => 101,
+      'combat maneuvers' => 101, 'edged weapons' => 101, 'blunt weapons' => 101,
+      'two-handed weapons' => 101, 'ranged weapons' => 101, 'thrown weapons' => 101,
+      'polearm weapons' => 101, 'brawling' => 101, 'ambush' => 101,
+      'multi opponent combat' => 101, 'physical fitness' => 101, 'dodging' => 101,
+      'arcane symbols' => 202, 'magic item use' => 202, 'spell aiming' => 202,
+      'harness power' => 303, 'elemental mana control' => 202, 'mental mana control' => 101,
+      'spirit mana control' => 202, 'spell research' => 303, 'elemental lore' => 202,
+      'spiritual lore' => 202, 'sorcerous lore' => 202, 'mental lore' => 101,
+      'survival' => 202, 'disarming traps' => 101, 'picking locks' => 202,
+      'stalking and hiding' => 101, 'perception' => 202, 'climbing' => 101,
+      'swimming' => 101, 'first aid' => 202, 'trading' => 202, 'pickpocketing' => 101
+    },
+    'Cleric' => {
+      'two weapon combat' => 101, 'armor use' => 101, 'shield use' => 101,
+      'combat maneuvers' => 101, 'edged weapons' => 101, 'blunt weapons' => 101,
+      'two-handed weapons' => 101, 'ranged weapons' => 101, 'thrown weapons' => 101,
+      'polearm weapons' => 101, 'brawling' => 101, 'ambush' => 101,
+      'multi opponent combat' => 101, 'physical fitness' => 101, 'dodging' => 101,
+      'arcane symbols' => 202, 'magic item use' => 202, 'spell aiming' => 202,
+      'harness power' => 303, 'elemental mana control' => 101, 'mental mana control' => 101,
+      'spirit mana control' => 303, 'spell research' => 303, 'elemental lore' => 101,
+      'spiritual lore' => 202, 'sorcerous lore' => 101, 'mental lore' => 101,
+      'survival' => 202, 'disarming traps' => 101, 'picking locks' => 202,
+      'stalking and hiding' => 101, 'perception' => 202, 'climbing' => 101,
+      'swimming' => 101, 'first aid' => 202, 'trading' => 202, 'pickpocketing' => 101
+    },
+    'Empath' => {
+      'two weapon combat' => 101, 'armor use' => 101, 'shield use' => 101,
+      'combat maneuvers' => 101, 'edged weapons' => 101, 'blunt weapons' => 101,
+      'two-handed weapons' => 101, 'ranged weapons' => 101, 'thrown weapons' => 101,
+      'polearm weapons' => 101, 'brawling' => 101, 'ambush' => 101,
+      'multi opponent combat' => 101, 'physical fitness' => 303, 'dodging' => 101,
+      'arcane symbols' => 202, 'magic item use' => 202, 'spell aiming' => 202,
+      'harness power' => 303, 'elemental mana control' => 101, 'mental mana control' => 202,
+      'spirit mana control' => 202, 'spell research' => 303, 'elemental lore' => 101,
+      'spiritual lore' => 202, 'sorcerous lore' => 101, 'mental lore' => 202,
+      'survival' => 202, 'disarming traps' => 101, 'picking locks' => 202,
+      'stalking and hiding' => 101, 'perception' => 202, 'climbing' => 101,
+      'swimming' => 101, 'first aid' => 303, 'trading' => 202, 'pickpocketing' => 101
+    },
+    'Ranger' => {
+      'two weapon combat' => 202, 'armor use' => 202, 'shield use' => 202,
+      'combat maneuvers' => 202, 'edged weapons' => 202, 'blunt weapons' => 202,
+      'two-handed weapons' => 202, 'ranged weapons' => 202, 'thrown weapons' => 202,
+      'polearm weapons' => 202, 'brawling' => 202, 'ambush' => 202,
+      'multi opponent combat' => 101, 'physical fitness' => 202, 'dodging' => 202,
+      'arcane symbols' => 101, 'magic item use' => 101, 'spell aiming' => 202,
+      'harness power' => 202, 'elemental mana control' => 101, 'mental mana control' => 101,
+      'spirit mana control' => 101, 'spell research' => 202, 'elemental lore' => 101,
+      'spiritual lore' => 101, 'sorcerous lore' => 101, 'mental lore' => 101,
+      'survival' => 303, 'disarming traps' => 202, 'picking locks' => 202,
+      'stalking and hiding' => 202, 'perception' => 202, 'climbing' => 202,
+      'swimming' => 202, 'first aid' => 202, 'trading' => 202, 'pickpocketing' => 101
+    },
+    'Bard' => {
+      'two weapon combat' => 202, 'armor use' => 202, 'shield use' => 202,
+      'combat maneuvers' => 202, 'edged weapons' => 202, 'blunt weapons' => 202,
+      'two-handed weapons' => 202, 'ranged weapons' => 202, 'thrown weapons' => 202,
+      'polearm weapons' => 202, 'brawling' => 202, 'ambush' => 101,
+      'multi opponent combat' => 101, 'physical fitness' => 202, 'dodging' => 202,
+      'arcane symbols' => 202, 'magic item use' => 202, 'spell aiming' => 202,
+      'harness power' => 202, 'elemental mana control' => 101, 'mental mana control' => 101,
+      'spirit mana control' => 101, 'spell research' => 202, 'elemental lore' => 101,
+      'spiritual lore' => 101, 'sorcerous lore' => 101, 'mental lore' => 101,
+      'survival' => 202, 'disarming traps' => 202, 'picking locks' => 202,
+      'stalking and hiding' => 202, 'perception' => 202, 'climbing' => 202,
+      'swimming' => 202, 'first aid' => 202, 'trading' => 202, 'pickpocketing' => 202
+    },
+    'Paladin' => {
+      'two weapon combat' => 202, 'armor use' => 303, 'shield use' => 303,
+      'combat maneuvers' => 202, 'edged weapons' => 202, 'blunt weapons' => 202,
+      'two-handed weapons' => 202, 'ranged weapons' => 202, 'thrown weapons' => 202,
+      'polearm weapons' => 202, 'brawling' => 202, 'ambush' => 101,
+      'multi opponent combat' => 101, 'physical fitness' => 202, 'dodging' => 202,
+      'arcane symbols' => 101, 'magic item use' => 101, 'spell aiming' => 202,
+      'harness power' => 202, 'elemental mana control' => 101, 'mental mana control' => 101,
+      'spirit mana control' => 101, 'spell research' => 202, 'elemental lore' => 101,
+      'spiritual lore' => 202, 'sorcerous lore' => 101, 'mental lore' => 101,
+      'survival' => 202, 'disarming traps' => 101, 'picking locks' => 202,
+      'stalking and hiding' => 101, 'perception' => 202, 'climbing' => 202,
+      'swimming' => 202, 'first aid' => 202, 'trading' => 202, 'pickpocketing' => 101
+    }
+  }.freeze
+
+  # Ascension skills with their metadata
+  # Source: asc list command output
+  ASCENSION_SKILLS = {
+    'acid resistance' => { max: 40, subcategory: 'Resist' },
+    'agility' => { max: 40, subcategory: 'Stat' },
+    'ambush' => { max: 50, subcategory: 'Skill' },
+    'arcane symbols' => { max: 50, subcategory: 'Skill' },
+    'armor use' => { max: 50, subcategory: 'Skill' },
+    'aura' => { max: 40, subcategory: 'Stat' },
+    'blunt weapons' => { max: 50, subcategory: 'Skill' },
+    'brawling' => { max: 50, subcategory: 'Skill' },
+    'climbing' => { max: 50, subcategory: 'Skill' },
+    'cold resistance' => { max: 40, subcategory: 'Resist' },
+    'combat maneuvers' => { max: 50, subcategory: 'Skill' },
+    'constitution' => { max: 40, subcategory: 'Stat' },
+    'crush resistance' => { max: 40, subcategory: 'Resist' },
+    'dexterity' => { max: 40, subcategory: 'Stat' },
+    'disarming traps' => { max: 50, subcategory: 'Skill' },
+    'discipline' => { max: 40, subcategory: 'Stat' },
+    'disintegration resistance' => { max: 40, subcategory: 'Resist' },
+    'disruption resistance' => { max: 40, subcategory: 'Resist' },
+    'dodging' => { max: 50, subcategory: 'Skill' },
+    'edged weapons' => { max: 50, subcategory: 'Skill' },
+    'electric resistance' => { max: 40, subcategory: 'Resist' },
+    'elemental lore - air' => { max: 50, subcategory: 'Skill' },
+    'elemental lore - earth' => { max: 50, subcategory: 'Skill' },
+    'elemental lore - fire' => { max: 50, subcategory: 'Skill' },
+    'elemental lore - water' => { max: 50, subcategory: 'Skill' },
+    'elemental mana control' => { max: 50, subcategory: 'Skill' },
+    'first aid' => { max: 50, subcategory: 'Skill' },
+    'grapple resistance' => { max: 40, subcategory: 'Resist' },
+    'harness power' => { max: 50, subcategory: 'Skill' },
+    'health regeneration' => { max: 50, subcategory: 'Regen' },
+    'heat resistance' => { max: 40, subcategory: 'Resist' },
+    'impact resistance' => { max: 40, subcategory: 'Resist' },
+    'influence' => { max: 40, subcategory: 'Stat' },
+    'intuition' => { max: 40, subcategory: 'Stat' },
+    'logic' => { max: 40, subcategory: 'Stat' },
+    'magic item use' => { max: 50, subcategory: 'Skill' },
+    'mana regeneration' => { max: 50, subcategory: 'Regen' },
+    'mental lore - divination' => { max: 50, subcategory: 'Skill' },
+    'mental lore - manipulation' => { max: 50, subcategory: 'Skill' },
+    'mental lore - telepathy' => { max: 50, subcategory: 'Skill' },
+    'mental lore - transference' => { max: 50, subcategory: 'Skill' },
+    'mental lore - transformation' => { max: 50, subcategory: 'Skill' },
+    'mental mana control' => { max: 50, subcategory: 'Skill' },
+    'multi opponent combat' => { max: 50, subcategory: 'Skill' },
+    'perception' => { max: 50, subcategory: 'Skill' },
+    'physical fitness' => { max: 50, subcategory: 'Skill' },
+    'picking locks' => { max: 50, subcategory: 'Skill' },
+    'picking pockets' => { max: 50, subcategory: 'Skill' },
+    'plasma resistance' => { max: 40, subcategory: 'Resist' },
+    'polearm weapons' => { max: 50, subcategory: 'Skill' },
+    'porter' => { max: 50, subcategory: 'Other' },
+    'puncture resistance' => { max: 40, subcategory: 'Resist' },
+    'ranged weapons' => { max: 50, subcategory: 'Skill' },
+    'shield use' => { max: 50, subcategory: 'Skill' },
+    'slash resistance' => { max: 40, subcategory: 'Resist' },
+    'sorcerous lore - demonology' => { max: 50, subcategory: 'Skill' },
+    'sorcerous lore - necromancy' => { max: 50, subcategory: 'Skill' },
+    'spell aiming' => { max: 50, subcategory: 'Skill' },
+    'spirit mana control' => { max: 50, subcategory: 'Skill' },
+    'spiritual lore - blessings' => { max: 50, subcategory: 'Skill' },
+    'spiritual lore - religion' => { max: 50, subcategory: 'Skill' },
+    'spiritual lore - summoning' => { max: 50, subcategory: 'Skill' },
+    'stalking and hiding' => { max: 50, subcategory: 'Skill' },
+    'stamina regeneration' => { max: 50, subcategory: 'Regen' },
+    'steam resistance' => { max: 40, subcategory: 'Resist' },
+    'strength' => { max: 40, subcategory: 'Stat' },
+    'survival' => { max: 50, subcategory: 'Skill' },
+    'swimming' => { max: 50, subcategory: 'Skill' },
+    'thrown weapons' => { max: 50, subcategory: 'Skill' },
+    'trading' => { max: 50, subcategory: 'Skill' },
+    'transcend destiny' => { max: 10, subcategory: 'Other', elite: true },
+    'two weapon combat' => { max: 50, subcategory: 'Skill' },
+    'two-handed weapons' => { max: 50, subcategory: 'Skill' },
+    'unbalance resistance' => { max: 40, subcategory: 'Resist' },
+    'vacuum resistance' => { max: 40, subcategory: 'Resist' },
+    'wisdom' => { max: 40, subcategory: 'Stat' }
+  }.freeze
+
+  # Spell circles available by profession (share cost/max with 'spell research')
+  # Source: ~/spellcircle.csv
+  SPELL_CIRCLES = {
+    'Warrior' => ['minor spiritual', 'minor elemental'],
+    'Rogue' => ['minor spiritual', 'minor elemental'],
+    'Monk' => ['minor mental', 'minor spiritual'],
+    'Wizard' => ['minor elemental', 'major elemental', 'wizard base'],
+    'Sorcerer' => ['minor spiritual', 'minor elemental', 'sorcerer base'],
+    'Cleric' => ['minor spiritual', 'major spiritual', 'cleric base'],
+    'Empath' => ['minor spiritual', 'major spiritual', 'empath base'],
+    'Ranger' => ['minor spiritual', 'ranger base'],
+    'Bard' => ['minor elemental', 'bard base'],
+    'Paladin' => ['minor spiritual', 'paladin base']
+  }.freeze
+
+  # Sublores for each parent lore (share cost/max with parent)
+  # Source: ~/lores.txt
+  LORE_SUBLORES = {
+    'elemental lore' => ['elemental lore - air lore', 'elemental lore - earth lore', 'elemental lore - fire lore', 'elemental lore - water lore'],
+    'spiritual lore' => ['spiritual lore - blessing lore', 'spiritual lore - religion lore', 'spiritual lore - summoning lore'],
+    'sorcerous lore' => ['sorcerous lore - demonology lore', 'sorcerous lore - necromancy lore'],
+    'mental lore' => ['mental lore - divination lore', 'mental lore - manipulation lore', 'mental lore - telepathy lore', 'mental lore - transference lore', 'mental lore - transformation lore']
+  }.freeze
+
+  # Parent skills that are never trained directly (only their subcategories are)
+  PARENT_SKILLS = ['spell research', 'elemental lore', 'spiritual lore',
+                   'sorcerous lore', 'mental lore'].freeze
+
+  # Normalize skill names to match SKILL_COSTS keys
+  SKILL_ALIASES = {
+    'two handed' => 'two-handed weapons',
+    'twc' => 'two weapon combat',
+    'cm' => 'combat maneuvers',
+    'moc' => 'multi opponent combat',
+    'edged' => 'edged weapons',
+    'blunt' => 'blunt weapons',
+    'ranged' => 'ranged weapons',
+    'thrown' => 'thrown weapons',
+    'polearm' => 'polearm weapons',
+    'pf' => 'physical fitness',
+    'as' => 'arcane symbols',
+    'miu' => 'magic item use',
+    'hp' => 'harness power',
+    'emc' => 'elemental mana control',
+    'mmc' => 'mental mana control',
+    'smc' => 'spirit mana control',
+    'spiritual mana control' => 'spirit mana control',
+    'sah' => 'stalking and hiding',
+    'hiding' => 'stalking and hiding',
+    'locks' => 'picking locks',
+    'traps' => 'disarming traps',
+    'fa' => 'first aid'
+  }.freeze
+
+  ASCENSION_SUBCATEGORIES = ['All', 'Skill', 'Stat', 'Resist', 'Regen', 'Other'].freeze
+end
+
+# =============================================================================
+# MAIN SCRIPT LOGIC
+# =============================================================================
+
+include Goals::SkillHelpers
+
+goals_data = Goals.load_goals
+force_update = script.vars[1]&.downcase == 'update'
+
+# Fetch and save profession if not set or forced
+needs_save = false
+if force_update || goals_data['profession'].nil? || goals_data['profession'].to_s.empty?
+  profession = Goals.get_profession_from_game
+  if profession && profession != goals_data['profession']
+    goals_data['profession'] = profession
+    needs_save = true
+    respond "Saved profession: #{profession}"
+  elsif force_update && profession == goals_data['profession']
+    respond "Profession unchanged: #{profession}"
+  end
+end
+
+# Fetch and save MATP if not set or forced
+if force_update || goals_data['matp'].nil? || goals_data['matp'] == 0
+  matp_count = Goals.get_matp_from_game
+  if matp_count > 0 && matp_count != goals_data['matp']
+    goals_data['matp'] = matp_count
+    needs_save = true
+    respond "Saved MATP: #{matp_count}"
+  elsif force_update && matp_count == goals_data['matp']
+    respond "MATP unchanged: #{matp_count}"
+  end
+end
+
+Goals.save_goals(goals_data) if needs_save
+
+if force_update
+  respond ''
+  exit
+end
+
+profession = goals_data['profession']
+skills = goals_data['skills'] || {}
+ascension_skills = goals_data['ascension_skills'] || {}
+
+# Check for completed skill goals
+completed_goals = []
+skills.each do |name, data|
+  current = get_skill_rank(name)
+  target = data['target']
+  if current >= target
+    respond "Congratulations! You've reached your goal of #{target} ranks in #{name}!"
+    completed_goals << name
+  end
+end
+
+# Check for completed ascension goals
+asc_current_ranks = Goals.get_ascension_ranks
+completed_asc_goals = []
+ascension_skills.each do |name, data|
+  current = asc_current_ranks[name] || 0
+  target = data['target']
+  if current >= target
+    respond "Congratulations! You've reached your ascension goal of #{target} ranks in #{name}!"
+    completed_asc_goals << name
+  end
+end
+
+if completed_goals.any? || completed_asc_goals.any?
+  completed_goals.each { |name| skills.delete(name) }
+  completed_asc_goals.each { |name| ascension_skills.delete(name) }
+  goals_data['skills'] = skills
+  goals_data['ascension_skills'] = ascension_skills
+  Goals.save_goals(goals_data)
+  total_completed = completed_goals.size + completed_asc_goals.size
+  respond "Removed #{total_completed} completed goal(s)."
+  respond ''
+end
+
+unless profession
+  respond 'Profession not set. Run ;goalstracker update to detect it.'
+  exit
+end
+
+unless Goals::SKILL_COSTS[profession]
+  respond "Unknown profession: #{profession}"
+  exit
+end
+
+if script.vars[1]&.downcase == 'help'
+  respond ''
+  respond 'Goals Tracker - Track skill and ascension training goals'
+  respond ''
+  respond 'Usage:'
+  respond '  ;goalstracker        - Show priority goals with EXP needed'
+  respond '  ;goalstracker full   - Show all goals (including non-priority)'
+  respond '  ;goalstracker next   - Show next goal with trainable ranks info'
+  respond '  ;goalstracker edit   - Open GTK editor to manage goals'
+  respond '  ;goalstracker update - Re-detect profession and MATP from game'
+  respond '  ;goalstracker help   - Show this help message'
+  respond ''
+  respond 'Goals file: ' + GOALS_FILE
+  respond ''
+  exit
+end
+
+if script.vars[1]&.downcase == 'edit'
+  Goals::GoalsEditor.new(goals_data).run
+  exit
+end
+
+if script.vars[1]&.downcase == 'next'
+  asc_exp_info = Goals.get_asc_exp_info
+  absorption_rate = asc_exp_info[:absorption_rate]
+  available_atps = asc_exp_info[:available_atps]
+  total_atps = asc_exp_info[:total_atps]
+  current_asc_exp = asc_exp_info[:current_exp]
+  # Progress towards next ATP (1 ATP = 50,000 exp)
+  asc_exp_progress = current_asc_exp % EXP_PER_ATP
+  training_points = Goals.get_available_training_points
+  transcend_threshold = goals_data['transcend_ignore_threshold'] || 150
+
+  # Get next skill goal (first priority, or first if none have priority)
+  priority_skills = skills.select { |_, data| data['priority'] }
+  next_skill = priority_skills.first || skills.first
+
+  # Get next ascension goal (first priority, or first if none have priority)
+  priority_asc = ascension_skills.select { |_, data| data['priority'] }
+  next_asc = priority_asc.first || ascension_skills.first
+
+  if next_skill.nil? && next_asc.nil?
+    respond 'No goals defined.'
+    exit
+  end
+
+  # Show skill goal if absorption rate < 100%
+  if absorption_rate < 100 && next_skill
+    name, data = next_skill
+    current = get_skill_rank(name)
+    target = data['target']
+    ranks_left = target - current
+
+    if ranks_left > 0
+      cost = get_skill_cost(profession, name)
+      trainable = Goals.calculate_trainable_skill_ranks(name, current, target, cost, training_points[:ptp], training_points[:mtp])
+      remaining_after_train = ranks_left - trainable
+
+      # Calculate effective PTPs needed for remaining ranks after training what we can
+      if trainable > 0
+        # Calculate effective PTPs used for trainable ranks
+        effective_ptp_used = Goals.calculate_ptp(current, current + trainable, cost)
+        remaining_effective_ptp = [training_points[:effective_ptp] - effective_ptp_used, 0].max
+        effective_ptp_needed = Goals.calculate_ptp(current + trainable, target, cost)
+      else
+        remaining_effective_ptp = training_points[:effective_ptp]
+        effective_ptp_needed = Goals.calculate_ptp(current, target, cost)
+      end
+
+      # Subtract remaining effective PTPs we have after training
+      effective_ptp_shortfall = [effective_ptp_needed - remaining_effective_ptp, 0].max
+
+      # Exp needed: 3 effective PTPs per 2.5k exp
+      exp = (effective_ptp_shortfall / 3.0 * EXP_PER_3_PTP).ceil
+
+      output = "Next Skill Goal: #{name} - #{current}/#{target} (#{ranks_left} left)"
+      if trainable > 0
+        output += ", can train #{trainable} now"
+        output += ", #{exp / 1000}k exp" if remaining_after_train > 0
+      else
+        output += ", #{exp / 1000}k exp"
+      end
+      respond output
+    else
+      respond "Next Skill Goal: #{name} - Complete!"
+    end
+  end
+
+  # Show ascension goal if absorption rate > 0%
+  if absorption_rate > 0 && next_asc
+    name, data = next_asc
+    target = data['target']
+
+    # Special handling for Transcend Destiny
+    if name == 'transcend destiny'
+      td_progress = Goals.calculate_td_effective_progress(asc_current_ranks, total_atps, transcend_threshold)
+      current = td_progress[:effective_current_rank]
+      effective_free = td_progress[:effective_free]
+
+      ranks_left = target - current
+      if ranks_left > 0
+        # Calculate how many ranks can be trained with effective free points
+        trainable = Goals.calculate_trainable_asc_ranks(name, current, target, effective_free)
+
+        # Calculate ATP cost for next rank after any trainable ranks
+        next_rank_start = current + trainable
+        next_rank_cost = Goals.asc_skill_cost(name, next_rank_start, next_rank_start + 1)
+
+        # Calculate remaining ATPs after training what we can
+        remaining_free = effective_free
+        current.upto(next_rank_start - 1) do |rank|
+          remaining_free -= [(rank + 1) * 10, 50].min
+        end
+        remaining_free = [remaining_free, 0].max
+
+        # Exp needed = ATPs still needed for next rank * 50k, minus progress towards next ATP
+        atps_needed = [next_rank_cost - remaining_free, 0].max
+        asc_exp_total = Goals.atp_to_exp(atps_needed)
+        asc_exp = [asc_exp_total - asc_exp_progress, 0].max
+
+        output = "Next Ascension Goal: #{name} - #{current}/#{target} (#{ranks_left} left)"
+        if trainable > 0
+          remaining_after_train = ranks_left - trainable
+          output += ", can train #{trainable} now"
+          output += ", #{asc_exp / 1000}k exp" if remaining_after_train > 0
+        else
+          output += ", #{asc_exp / 1000}k exp"
+        end
+        respond output
+      else
+        respond "Next Ascension Goal: #{name} - Complete!"
+      end
+    else
+      # Regular ascension skill
+      current = asc_current_ranks[name] || 0
+      ranks_left = target - current
+
+      if ranks_left > 0
+        trainable = Goals.calculate_trainable_asc_ranks(name, current, target, available_atps)
+
+        # Calculate ATP cost for next rank after any trainable ranks
+        next_rank_start = current + trainable
+        next_rank_cost = Goals.asc_skill_cost(name, next_rank_start, next_rank_start + 1)
+
+        # Calculate remaining ATPs after training what we can
+        remaining_atps = available_atps
+        current.upto(next_rank_start - 1) do |rank|
+          remaining_atps -= (rank / 5) + 1
+        end
+        remaining_atps = [remaining_atps, 0].max
+
+        # Exp needed = ATPs still needed for next rank * 50k, minus progress towards next ATP
+        atps_needed = [next_rank_cost - remaining_atps, 0].max
+        asc_exp_total = Goals.atp_to_exp(atps_needed)
+        asc_exp = [asc_exp_total - asc_exp_progress, 0].max
+
+        output = "Next Ascension Goal: #{name} - #{current}/#{target} (#{ranks_left} left)"
+        if trainable > 0
+          remaining_after_train = ranks_left - trainable
+          output += ", can train #{trainable} now"
+          output += ", #{asc_exp / 1000}k exp" if remaining_after_train > 0
+        else
+          output += ", #{asc_exp / 1000}k exp"
+        end
+        respond output
+      else
+        respond "Next Ascension Goal: #{name} - Complete!"
+      end
+    end
+  end
+
+  exit
+end
+
+show_full = script.vars[1]&.downcase == 'full'
+
+# Fetch training points and ascension info for smart calculations
+training_points = Goals.get_available_training_points
+asc_exp_info = Goals.get_asc_exp_info
+available_atps = asc_exp_info[:available_atps]
+total_atps = asc_exp_info[:total_atps]
+asc_exp_progress = asc_exp_info[:current_exp] % EXP_PER_ATP
+transcend_threshold = goals_data['transcend_ignore_threshold'] || 150
+
+# Filter skills based on priority flag
+filtered_skills = if show_full
+                    skills
+                  else
+                    skills.select { |_, data| data['priority'] }
+                  end
+
+# Filter ascension skills based on priority flag
+filtered_asc_skills = if show_full
+                         ascension_skills
+                       else
+                         ascension_skills.select { |_, data| data['priority'] }
+                       end
+
+if filtered_skills.empty? && filtered_asc_skills.empty?
+  respond "No goals defined. Run ;goalstracker edit to add your goals."
+  exit
+end
+
+# Build skill goals table
+rows = []
+total_exp = 0
+total_ptp = 0
+total_goal = 0
+total_left = 0
+first_skill_processed = false
+
+filtered_skills.each do |name, data|
+  current = get_skill_rank(name)
+  target = data['target']
+  cost = get_skill_cost(profession, name)
+
+  unless cost
+    respond "Warning: Unknown skill '#{name}' for #{profession}"
+    next
+  end
+
+  next unless target > current
+
+  ranks_needed = target - current
+
+  if !first_skill_processed
+    # First row: smart calculation accounting for trainable ranks
+    trainable = Goals.calculate_trainable_skill_ranks(name, current, target, cost, training_points[:ptp], training_points[:mtp])
+    left = ranks_needed - trainable
+
+    if trainable > 0
+      # Calculate effective PTPs used for trainable ranks
+      effective_ptp_used = Goals.calculate_ptp(current, current + trainable, cost)
+      remaining_effective_ptp = [training_points[:effective_ptp] - effective_ptp_used, 0].max
+      effective_ptp_needed = Goals.calculate_ptp(current + trainable, target, cost)
+    else
+      remaining_effective_ptp = training_points[:effective_ptp]
+      effective_ptp_needed = Goals.calculate_ptp(current, target, cost)
+    end
+
+    # Subtract remaining effective PTPs we have after training
+    effective_ptp_shortfall = [effective_ptp_needed - remaining_effective_ptp, 0].max
+    ptp = effective_ptp_shortfall
+    exp = (effective_ptp_shortfall / 3.0 * EXP_PER_3_PTP).ceil
+
+    first_skill_processed = true
+  else
+    # Subsequent rows: full cost (no adjustment)
+    left = ranks_needed
+    ptp = Goals.calculate_ptp(current, target, cost)
+    exp = (ptp / 3).ceil * EXP_PER_3_PTP
+  end
+
+  total_goal += target
+  total_left += left
+  total_exp += exp
+  total_ptp += ptp
+  rows << [name, target, left, ptp.to_s, "#{exp / 1000}k"]
+end
+
+if rows.any?
+  t = Terminal::Table.new headings: %w[Skill Goal Left pTPs EXP], rows: rows
+  t.add_separator
+  t.add_row ['total', total_goal, total_left, total_ptp.to_s, "#{total_exp / 1000}k"]
+  t.align_column(1, :right)
+  t.align_column(2, :right)
+  t.align_column(3, :right)
+  t.align_column(4, :right)
+  respond t
+end
+
+# Build ascension skill goals table
+asc_rows = []
+total_atp = 0
+total_asc_exp = 0
+total_asc_goal = 0
+total_asc_left = 0
+first_asc_processed = false
+
+filtered_asc_skills.each do |name, data|
+  target = data['target']
+
+  if !first_asc_processed
+    # First row: smart calculation accounting for trainable ranks and exp progress
+    if name == 'transcend destiny'
+      # Special handling for Transcend Destiny
+      td_progress = Goals.calculate_td_effective_progress(asc_current_ranks, total_atps, transcend_threshold)
+      current = td_progress[:effective_current_rank]
+      effective_free = td_progress[:effective_free]
+
+      ranks_needed = target - current
+      next unless ranks_needed > 0
+
+      trainable = Goals.calculate_trainable_asc_ranks(name, current, target, effective_free)
+      left = ranks_needed - trainable
+
+      # Calculate ATP cost for remaining ranks after trainable
+      next_rank_start = current + trainable
+      if left > 0
+        next_rank_cost = Goals.asc_skill_cost(name, next_rank_start, next_rank_start + 1)
+
+        # Calculate remaining ATPs after training what we can
+        remaining_free = effective_free
+        current.upto(next_rank_start - 1) do |rank|
+          remaining_free -= [(rank + 1) * 10, 50].min
+        end
+        remaining_free = [remaining_free, 0].max
+
+        atps_needed = [next_rank_cost - remaining_free, 0].max
+        asc_exp_total = Goals.atp_to_exp(atps_needed)
+        asc_exp = [asc_exp_total - asc_exp_progress, 0].max
+      else
+        atps_needed = 0
+        asc_exp = 0
+      end
+
+      atp_cost = atps_needed
+    else
+      # Regular ascension skill
+      current = asc_current_ranks[name] || 0
+      ranks_needed = target - current
+      next unless ranks_needed > 0
+
+      trainable = Goals.calculate_trainable_asc_ranks(name, current, target, available_atps)
+      left = ranks_needed - trainable
+
+      # Calculate ATP cost for remaining ranks after trainable
+      next_rank_start = current + trainable
+      if left > 0
+        next_rank_cost = Goals.asc_skill_cost(name, next_rank_start, next_rank_start + 1)
+
+        # Calculate remaining ATPs after training what we can
+        remaining_atps = available_atps
+        current.upto(next_rank_start - 1) do |rank|
+          remaining_atps -= (rank / 5) + 1
+        end
+        remaining_atps = [remaining_atps, 0].max
+
+        atps_needed = [next_rank_cost - remaining_atps, 0].max
+        asc_exp_total = Goals.atp_to_exp(atps_needed)
+        asc_exp = [asc_exp_total - asc_exp_progress, 0].max
+      else
+        atps_needed = 0
+        asc_exp = 0
+      end
+
+      atp_cost = atps_needed
+    end
+
+    first_asc_processed = true
+  else
+    # Subsequent rows: full cost (no adjustment)
+    current = asc_current_ranks[name] || 0
+    ranks_needed = target - current
+    next unless ranks_needed > 0
+
+    left = ranks_needed
+    atp_cost = Goals.asc_skill_cost(name, current, target)
+    asc_exp = Goals.atp_to_exp(atp_cost)
+  end
+
+  total_asc_goal += target
+  total_asc_left += left
+  total_atp += atp_cost
+  total_asc_exp += asc_exp
+  asc_rows << [name, target, left, atp_cost, "#{asc_exp / 1000}k"]
+end
+
+if asc_rows.any?
+  respond '' if rows.any?
+  ta = Terminal::Table.new headings: %w[Ascension Goal Left ATP EXP], rows: asc_rows
+  ta.add_separator
+  ta.add_row ['total', total_asc_goal, total_asc_left, total_atp, "#{total_asc_exp / 1000}k"]
+  ta.align_column(1, :right)
+  ta.align_column(2, :right)
+  ta.align_column(3, :right)
+  ta.align_column(4, :right)
+  respond ta
+end
+
+unless show_full
+  non_priority_skills = skills.select { |_, data| !data['priority'] }
+  non_priority_asc = ascension_skills.select { |_, data| !data['priority'] }
+  total_hidden = non_priority_skills.size + non_priority_asc.size
+  if total_hidden > 0
+    respond ''
+    respond "Run ;goalstracker full to see #{total_hidden} more goal(s)"
+  end
+end
