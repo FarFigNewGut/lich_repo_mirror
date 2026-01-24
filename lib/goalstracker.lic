@@ -6,7 +6,7 @@
   experience needed based on current training points and profession costs.
 
   Usage:
-    ;goalstracker        - Show priority goals with EXP needed
+    ;goalstracker        - Show priority goals (or all if none marked)
     ;goalstracker full   - Show all goals
     ;goalstracker next   - Show next goal with trainable ranks
     ;goalstracker edit   - Open GTK editor to manage goals
@@ -15,8 +15,15 @@
    author: Morvik
      game: Gemstone
      tags: training, skills, ascension, goals
-  version: 0.1.0
+  version: 0.4.0
 
+  Changelog:
+    0.4.0 - Required Training Points now show as physical/mental in Skill Table
+            instead of converting everything to physical training points
+    0.3.0 - ATP/EXP columns account for available ATPs and exp progress (first goal only)
+    0.2.0 - Fix: Left/ATP columns now show total remaining, not partial values
+          - EXP column accounts for progress toward next ATP (first goal only)
+          - Show all goals when no priority goals are marked
 =end
 
 require 'yaml'
@@ -153,24 +160,24 @@ module Goals
 
   module_function
 
+  # ATP cost for a single ascension rank
+  # Common skills: (rank / 5) + 1 (ranks 0-4: 1pt, 5-9: 2pts, etc.)
+  # Elite skills (Transcend Destiny): min((rank + 1) * 10, 50)
+  def asc_single_rank_cost(rank, is_elite)
+    is_elite ? [(rank + 1) * 10, 50].min : (rank / 5) + 1
+  end
+
   # Calculate ATP cost for common ascension skills (all except Transcend Destiny)
-  # Each rank costs: (current_rank / 5).floor + 1 points
-  # Ranks 0-4: 1 pt each, 5-9: 2 pts each, 10-14: 3 pts each, etc.
   def asc_common_cost(from_rank, to_rank)
     total = 0
-    from_rank.upto(to_rank - 1) do |rank|
-      total += (rank / 5) + 1
-    end
+    from_rank.upto(to_rank - 1) { |rank| total += asc_single_rank_cost(rank, false) }
     total
   end
 
   # Calculate ATP cost for elite ascension skills (Transcend Destiny)
-  # Costs: 10, 20, 30, 40, 50, 50, 50, 50, 50, 50 for ranks 1-10
   def asc_elite_cost(from_rank, to_rank)
     total = 0
-    from_rank.upto(to_rank - 1) do |rank|
-      total += [(rank + 1) * 10, 50].min
-    end
+    from_rank.upto(to_rank - 1) { |rank| total += asc_single_rank_cost(rank, true) }
     total
   end
 
@@ -189,6 +196,17 @@ module Goals
   # Convert ATP to ascension experience (1 ATP = 50,000 exp)
   def atp_to_exp(atps)
     atps * EXP_PER_ATP
+  end
+
+  # Get cost multiplier for a given rank (1x for 0-99, 2x for 100-200, 4x for 201-303)
+  def rank_cost_multiplier(rank)
+    if rank < RANK_TIER_1_MAX
+      1
+    elsif rank < RANK_TIER_2_MAX
+      2
+    else
+      4
+    end
   end
 
   def load_goals
@@ -237,7 +255,7 @@ module Goals
         transcend_ignore_threshold: 150
       YAML
       respond "Created empty goals file: #{GOALS_FILE}"
-      respond "Edit this file to add your goals, then run ;goalstracker again."
+      respond "Run ;goalstracker edit to configure your goals"
       exit
     end
 
@@ -324,10 +342,7 @@ module Goals
     remaining_mtp = available_mtp
 
     current_rank.upto(target_rank - 1) do |i|
-      multiplier = if i < RANK_TIER_1_MAX then 1
-                   elsif i < RANK_TIER_2_MAX then 2
-                   else 4
-                   end
+      multiplier = rank_cost_multiplier(i)
       cost_ptp = rank_ptp * multiplier
       cost_mtp = rank_mtp * multiplier
 
@@ -354,11 +369,7 @@ module Goals
     remaining_atps = available_atps
 
     current_rank.upto(target_rank - 1) do |rank|
-      cost = if skill_data[:elite]
-               [(rank + 1) * 10, 50].min
-             else
-               (rank / 5) + 1
-             end
+      cost = asc_single_rank_cost(rank, skill_data[:elite])
       break if remaining_atps < cost
 
       remaining_atps -= cost
@@ -399,20 +410,55 @@ module Goals
     ptp = 0
 
     current_rank.upto(target_rank - 1) do |i|
-      multiplier = if i < RANK_TIER_1_MAX
-                     1
-                   elsif i < RANK_TIER_2_MAX
-                     2
-                   elsif i <= 303
-                     4
-                   else
-                     echo 'BAD CALCULATION: rank > 303'
-                     exit 1
-                   end
-      ptp += (rank_ptp + (rank_mtp * 2)) * multiplier
+      ptp += (rank_ptp + (rank_mtp * 2)) * rank_cost_multiplier(i)
     end
 
     ptp
+  end
+
+  # Calculate separate PTP and MTP totals for a rank range
+  def calculate_separate_tps(current_rank, target_rank, cost_str)
+    rank_ptp, rank_mtp = cost_str.split('/').map(&:to_i)
+    total_ptp = 0
+    total_mtp = 0
+
+    current_rank.upto(target_rank - 1) do |i|
+      multiplier = rank_cost_multiplier(i)
+      total_ptp += rank_ptp * multiplier
+      total_mtp += rank_mtp * multiplier
+    end
+
+    { ptp: total_ptp, mtp: total_mtp }
+  end
+
+  # Get TP conversion state from SKILL command
+  # Returns { converted: X, direction: :phy_to_mnt | :mnt_to_phy | :none }
+  def get_conversion_state
+    result = { converted: 0, direction: :none }
+    lines = Lich::Util.quiet_command_xml('skill', /current skill bonuses and ranks/)
+    lines.each do |line|
+      if (match = line.match(/\((\d+) Phy converted to Mnt\)/))
+        result[:converted] = match[1].to_i
+        result[:direction] = :phy_to_mnt
+      elsif (match = line.match(/\((\d+) Mnt converted to Phy\)/))
+        result[:converted] = match[1].to_i
+        result[:direction] = :mnt_to_phy
+      end
+    end
+    result
+  end
+
+  # Calculate EXP based on TPs and conversion state
+  def calculate_exp_from_tps(total_ptp, total_mtp, conversion_state)
+    effective_ptp = total_ptp + (2 * total_mtp)
+
+    if conversion_state[:converted] > 0
+      # Unwinding mode: standard formula
+      (effective_ptp / 3).ceil * EXP_PER_3_PTP
+    else
+      # Normal mode: max of pTP-limited or effective formula
+      [total_ptp, (effective_ptp / 3.0).ceil].max * EXP_PER_3_PTP
+    end
   end
 
   class GoalsEditor
@@ -1628,6 +1674,7 @@ if script.vars[1]&.downcase == 'next'
   asc_exp_progress = current_asc_exp % EXP_PER_ATP
   training_points = Goals.get_available_training_points
   transcend_threshold = goals_data['transcend_ignore_threshold'] || 150
+  conversion_state = Goals.get_conversion_state
 
   # Get next skill goal (first priority, or first if none have priority)
   priority_skills = skills.select { |_, data| data['priority'] }
@@ -1654,22 +1701,25 @@ if script.vars[1]&.downcase == 'next'
       trainable = Goals.calculate_trainable_skill_ranks(name, current, target, cost, training_points[:ptp], training_points[:mtp])
       remaining_after_train = ranks_left - trainable
 
-      # Calculate effective PTPs needed for remaining ranks after training what we can
+      # Calculate separate TPs needed for remaining ranks after training what we can
       if trainable > 0
-        # Calculate effective PTPs used for trainable ranks
-        effective_ptp_used = Goals.calculate_ptp(current, current + trainable, cost)
-        remaining_effective_ptp = [training_points[:effective_ptp] - effective_ptp_used, 0].max
-        effective_ptp_needed = Goals.calculate_ptp(current + trainable, target, cost)
+        # Calculate TPs used for trainable ranks
+        trained_tps = Goals.calculate_separate_tps(current, current + trainable, cost)
+        remaining_ptp = [training_points[:ptp] - trained_tps[:ptp], 0].max
+        remaining_mtp = [training_points[:mtp] - trained_tps[:mtp], 0].max
+        needed_tps = Goals.calculate_separate_tps(current + trainable, target, cost)
       else
-        remaining_effective_ptp = training_points[:effective_ptp]
-        effective_ptp_needed = Goals.calculate_ptp(current, target, cost)
+        remaining_ptp = training_points[:ptp]
+        remaining_mtp = training_points[:mtp]
+        needed_tps = Goals.calculate_separate_tps(current, target, cost)
       end
 
-      # Subtract remaining effective PTPs we have after training
-      effective_ptp_shortfall = [effective_ptp_needed - remaining_effective_ptp, 0].max
+      # Subtract remaining TPs we have after training
+      ptp_shortfall = [needed_tps[:ptp] - remaining_ptp, 0].max
+      mtp_shortfall = [needed_tps[:mtp] - remaining_mtp, 0].max
 
-      # Exp needed: 3 effective PTPs per 2.5k exp
-      exp = (effective_ptp_shortfall / 3.0 * EXP_PER_3_PTP).ceil
+      # Calculate EXP based on shortfall TPs and conversion state
+      exp = Goals.calculate_exp_from_tps(ptp_shortfall, mtp_shortfall, conversion_state)
 
       output = "Next Skill Goal: #{name} - #{current}/#{target} (#{ranks_left} left)"
       if trainable > 0
@@ -1689,81 +1739,47 @@ if script.vars[1]&.downcase == 'next'
     name, data = next_asc
     target = data['target']
 
-    # Special handling for Transcend Destiny
+    # Determine current rank and available points based on skill type
     if name == 'transcend destiny'
       td_progress = Goals.calculate_td_effective_progress(asc_current_ranks, total_atps, transcend_threshold)
       current = td_progress[:effective_current_rank]
-      effective_free = td_progress[:effective_free]
-
-      ranks_left = target - current
-      if ranks_left > 0
-        # Calculate how many ranks can be trained with effective free points
-        trainable = Goals.calculate_trainable_asc_ranks(name, current, target, effective_free)
-
-        # Calculate ATP cost for next rank after any trainable ranks
-        next_rank_start = current + trainable
-        next_rank_cost = Goals.asc_skill_cost(name, next_rank_start, next_rank_start + 1)
-
-        # Calculate remaining ATPs after training what we can
-        remaining_free = effective_free
-        current.upto(next_rank_start - 1) do |rank|
-          remaining_free -= [(rank + 1) * 10, 50].min
-        end
-        remaining_free = [remaining_free, 0].max
-
-        # Exp needed = ATPs still needed for next rank * 50k, minus progress towards next ATP
-        atps_needed = [next_rank_cost - remaining_free, 0].max
-        asc_exp_total = Goals.atp_to_exp(atps_needed)
-        asc_exp = [asc_exp_total - asc_exp_progress, 0].max
-
-        output = "Next Ascension Goal: #{name} - #{current}/#{target} (#{ranks_left} left)"
-        if trainable > 0
-          remaining_after_train = ranks_left - trainable
-          output += ", can train #{trainable} now"
-          output += ", #{asc_exp / 1000}k exp" if remaining_after_train > 0
-        else
-          output += ", #{asc_exp / 1000}k exp"
-        end
-        respond output
-      else
-        respond "Next Ascension Goal: #{name} - Complete!"
-      end
+      available_points = td_progress[:effective_free]
+      is_elite = true
     else
-      # Regular ascension skill
       current = asc_current_ranks[name] || 0
-      ranks_left = target - current
+      available_points = available_atps
+      is_elite = false
+    end
 
-      if ranks_left > 0
-        trainable = Goals.calculate_trainable_asc_ranks(name, current, target, available_atps)
+    ranks_left = target - current
+    if ranks_left > 0
+      trainable = Goals.calculate_trainable_asc_ranks(name, current, target, available_points)
+      next_rank_start = current + trainable
+      next_rank_cost = Goals.asc_skill_cost(name, next_rank_start, next_rank_start + 1)
 
-        # Calculate ATP cost for next rank after any trainable ranks
-        next_rank_start = current + trainable
-        next_rank_cost = Goals.asc_skill_cost(name, next_rank_start, next_rank_start + 1)
-
-        # Calculate remaining ATPs after training what we can
-        remaining_atps = available_atps
-        current.upto(next_rank_start - 1) do |rank|
-          remaining_atps -= (rank / 5) + 1
-        end
-        remaining_atps = [remaining_atps, 0].max
-
-        # Exp needed = ATPs still needed for next rank * 50k, minus progress towards next ATP
-        atps_needed = [next_rank_cost - remaining_atps, 0].max
-        asc_exp_total = Goals.atp_to_exp(atps_needed)
-        asc_exp = [asc_exp_total - asc_exp_progress, 0].max
-
-        output = "Next Ascension Goal: #{name} - #{current}/#{target} (#{ranks_left} left)"
-        if trainable > 0
-          remaining_after_train = ranks_left - trainable
-          output += ", can train #{trainable} now"
-          output += ", #{asc_exp / 1000}k exp" if remaining_after_train > 0
-        else
-          output += ", #{asc_exp / 1000}k exp"
-        end
-        respond output
-      else
-        respond "Next Ascension Goal: #{name} - Complete!"
+      # Calculate remaining points after training what we can
+      remaining_points = available_points
+      current.upto(next_rank_start - 1) do |rank|
+        remaining_points -= Goals.asc_single_rank_cost(rank, is_elite)
       end
+      remaining_points = [remaining_points, 0].max
+
+      # Exp needed = ATPs still needed for next rank * 50k, minus progress towards next ATP
+      atps_needed = [next_rank_cost - remaining_points, 0].max
+      asc_exp_total = Goals.atp_to_exp(atps_needed)
+      asc_exp = [asc_exp_total - asc_exp_progress, 0].max
+
+      output = "Next Ascension Goal: #{name} - #{current}/#{target} (#{ranks_left} left)"
+      if trainable > 0
+        remaining_after_train = ranks_left - trainable
+        output += ", can train #{trainable} now"
+        output += ", #{asc_exp / 1000}k exp" if remaining_after_train > 0
+      else
+        output += ", #{asc_exp / 1000}k exp"
+      end
+      respond output
+    else
+      respond "Next Ascension Goal: #{name} - Complete!"
     end
   end
 
@@ -1772,8 +1788,14 @@ end
 
 show_full = script.vars[1]&.downcase == 'full'
 
-# Fetch training points and ascension info for smart calculations
-training_points = Goals.get_available_training_points
+# If no priority goals exist, show all goals automatically
+unless show_full
+  has_priority_skills = skills.any? { |_, data| data['priority'] }
+  has_priority_asc = ascension_skills.any? { |_, data| data['priority'] }
+  show_full = true unless has_priority_skills || has_priority_asc
+end
+
+# Fetch ascension info for calculations
 asc_exp_info = Goals.get_asc_exp_info
 available_atps = asc_exp_info[:available_atps]
 total_atps = asc_exp_info[:total_atps]
@@ -1803,9 +1825,10 @@ end
 rows = []
 total_exp = 0
 total_ptp = 0
+total_mtp = 0
 total_goal = 0
 total_left = 0
-first_skill_processed = false
+conversion_state = Goals.get_conversion_state
 
 filtered_skills.each do |name, data|
   current = get_skill_rank(name)
@@ -1817,49 +1840,24 @@ filtered_skills.each do |name, data|
     next
   end
 
-  next unless target > current
+  left = target - current
+  next unless left > 0
 
-  ranks_needed = target - current
-
-  if !first_skill_processed
-    # First row: smart calculation accounting for trainable ranks
-    trainable = Goals.calculate_trainable_skill_ranks(name, current, target, cost, training_points[:ptp], training_points[:mtp])
-    left = ranks_needed - trainable
-
-    if trainable > 0
-      # Calculate effective PTPs used for trainable ranks
-      effective_ptp_used = Goals.calculate_ptp(current, current + trainable, cost)
-      remaining_effective_ptp = [training_points[:effective_ptp] - effective_ptp_used, 0].max
-      effective_ptp_needed = Goals.calculate_ptp(current + trainable, target, cost)
-    else
-      remaining_effective_ptp = training_points[:effective_ptp]
-      effective_ptp_needed = Goals.calculate_ptp(current, target, cost)
-    end
-
-    # Subtract remaining effective PTPs we have after training
-    effective_ptp_shortfall = [effective_ptp_needed - remaining_effective_ptp, 0].max
-    ptp = effective_ptp_shortfall
-    exp = (effective_ptp_shortfall / 3.0 * EXP_PER_3_PTP).ceil
-
-    first_skill_processed = true
-  else
-    # Subsequent rows: full cost (no adjustment)
-    left = ranks_needed
-    ptp = Goals.calculate_ptp(current, target, cost)
-    exp = (ptp / 3).ceil * EXP_PER_3_PTP
-  end
+  tps = Goals.calculate_separate_tps(current, target, cost)
+  exp = Goals.calculate_exp_from_tps(tps[:ptp], tps[:mtp], conversion_state)
 
   total_goal += target
   total_left += left
   total_exp += exp
-  total_ptp += ptp
-  rows << [name, target, left, ptp.to_s, "#{exp / 1000}k"]
+  total_ptp += tps[:ptp]
+  total_mtp += tps[:mtp]
+  rows << [name, target, left, "#{tps[:ptp]}/#{tps[:mtp]}", "#{exp / 1000}k"]
 end
 
 if rows.any?
-  t = Terminal::Table.new headings: %w[Skill Goal Left pTPs EXP], rows: rows
+  t = Terminal::Table.new headings: %w[Skill Goal Left TPs EXP], rows: rows
   t.add_separator
-  t.add_row ['total', total_goal, total_left, total_ptp.to_s, "#{total_exp / 1000}k"]
+  t.add_row ['total', total_goal, total_left, "#{total_ptp}/#{total_mtp}", "#{total_exp / 1000}k"]
   t.align_column(1, :right)
   t.align_column(2, :right)
   t.align_column(3, :right)
@@ -1873,87 +1871,33 @@ total_atp = 0
 total_asc_exp = 0
 total_asc_goal = 0
 total_asc_left = 0
-first_asc_processed = false
+first_asc_goal = true
 
 filtered_asc_skills.each do |name, data|
   target = data['target']
 
-  if !first_asc_processed
-    # First row: smart calculation accounting for trainable ranks and exp progress
-    if name == 'transcend destiny'
-      # Special handling for Transcend Destiny
-      td_progress = Goals.calculate_td_effective_progress(asc_current_ranks, total_atps, transcend_threshold)
-      current = td_progress[:effective_current_rank]
-      effective_free = td_progress[:effective_free]
-
-      ranks_needed = target - current
-      next unless ranks_needed > 0
-
-      trainable = Goals.calculate_trainable_asc_ranks(name, current, target, effective_free)
-      left = ranks_needed - trainable
-
-      # Calculate ATP cost for remaining ranks after trainable
-      next_rank_start = current + trainable
-      if left > 0
-        next_rank_cost = Goals.asc_skill_cost(name, next_rank_start, next_rank_start + 1)
-
-        # Calculate remaining ATPs after training what we can
-        remaining_free = effective_free
-        current.upto(next_rank_start - 1) do |rank|
-          remaining_free -= [(rank + 1) * 10, 50].min
-        end
-        remaining_free = [remaining_free, 0].max
-
-        atps_needed = [next_rank_cost - remaining_free, 0].max
-        asc_exp_total = Goals.atp_to_exp(atps_needed)
-        asc_exp = [asc_exp_total - asc_exp_progress, 0].max
-      else
-        atps_needed = 0
-        asc_exp = 0
-      end
-
-      atp_cost = atps_needed
-    else
-      # Regular ascension skill
-      current = asc_current_ranks[name] || 0
-      ranks_needed = target - current
-      next unless ranks_needed > 0
-
-      trainable = Goals.calculate_trainable_asc_ranks(name, current, target, available_atps)
-      left = ranks_needed - trainable
-
-      # Calculate ATP cost for remaining ranks after trainable
-      next_rank_start = current + trainable
-      if left > 0
-        next_rank_cost = Goals.asc_skill_cost(name, next_rank_start, next_rank_start + 1)
-
-        # Calculate remaining ATPs after training what we can
-        remaining_atps = available_atps
-        current.upto(next_rank_start - 1) do |rank|
-          remaining_atps -= (rank / 5) + 1
-        end
-        remaining_atps = [remaining_atps, 0].max
-
-        atps_needed = [next_rank_cost - remaining_atps, 0].max
-        asc_exp_total = Goals.atp_to_exp(atps_needed)
-        asc_exp = [asc_exp_total - asc_exp_progress, 0].max
-      else
-        atps_needed = 0
-        asc_exp = 0
-      end
-
-      atp_cost = atps_needed
-    end
-
-    first_asc_processed = true
+  # Determine current rank and available points based on skill type
+  if name == 'transcend destiny'
+    td_progress = Goals.calculate_td_effective_progress(asc_current_ranks, total_atps, transcend_threshold)
+    current = td_progress[:effective_current_rank]
+    skill_available_atps = td_progress[:effective_free]
   else
-    # Subsequent rows: full cost (no adjustment)
     current = asc_current_ranks[name] || 0
-    ranks_needed = target - current
-    next unless ranks_needed > 0
+    skill_available_atps = available_atps
+  end
 
-    left = ranks_needed
-    atp_cost = Goals.asc_skill_cost(name, current, target)
+  left = target - current
+  next unless left > 0
+
+  atp_cost = Goals.asc_skill_cost(name, current, target)
+
+  # First goal: account for available ATPs and exp progress
+  if first_asc_goal
+    atp_shortfall = [atp_cost - skill_available_atps, 0].max
+    asc_exp = [Goals.atp_to_exp(atp_shortfall) - asc_exp_progress, 0].max
+    atp_cost = atp_shortfall
+    first_asc_goal = false
+  else
     asc_exp = Goals.atp_to_exp(atp_cost)
   end
 
