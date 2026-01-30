@@ -2,7 +2,7 @@
 
 =begin
 
-Loresang.lic is a new script written to fully loresing a bard's right hand item, or completely sing one container into another.
+Loresang.lic is a new script written to fully loresing a bard's right hand item, or completely sing one container into another. Has various options for notifying a value threshold, announcements to the room, custom songs, mana checks and chirps, filters and error corrections.
 
 The following inputs are available:
 	;loresang setup         - open configuration window
@@ -14,7 +14,7 @@ The following inputs are available:
 			game: Gemstone
 			tags: utility, economy, bard, loresong, loresing 
 			required: Lich >= 5.12.9
-			version: 1.0.3
+			version: 1.0.9
 		 
 			\Version\\
 			1.0.0 1/22/2026 - initial release
@@ -22,808 +22,864 @@ The following inputs are available:
 			1.0.2 1/22/2026 - fixed and improved low mana callout function
 			1.0.3 1/22/2026 - Widescale changes to setup GUI. It still isn't even close to pretty, but I'm much further from caring.
 			1.0.4 1/23/2026 - Impossibly minor tweaks you wouldn't know nothing about, don't even worry about it.
+			1.0.5 1/30/2026 - Encapsulated in module namespace to avoid polluting global Lich namespace
+			1.0.6 1/30/2026 - Consolidated UserVars into single hash, replaced custom messaging with Lich::Messaging
+			1.0.7 1/30/2026 - Changed all put commands to fput because obviously
+			1.0.8 1/30/2026 - Fixed value threshold detection: added migration for old settings, changed > to >=, added debug output
+			1.0.9 1/30/2026 - Removed debug output
 		 
 =end
 
 require 'gtk3' rescue nil
 
-def respond_yellow(msg)
-  _respond "<pushBold/>#{msg}<popBold/>"
-end
-
-def respond_green(msg)
-  _respond "<pushBold/><output class=\"mono\"/><preset id='thought'>#{msg}</preset><output class=\"\"/><popBold/>"
-end
-
-def parse_item_value(recall_text)
-  if recall_text =~ /estimated to be worth about ([\d,]+) silvers/i
-    value_str = $1.gsub(',', '')
-    return value_str.to_i
-  end
-  0
-end
-
-def show_progress(items_remaining)
-  respond_yellow "[Loresang] Progress: Sing Container Items Left: #{items_remaining}"
-end
-
-def wait_for_mana
-  return unless checkmana < 5
-  
-  respond_yellow "[Loresang] Mana is below 5. Pausing until mana reaches 20..."
-  last_feedback = Time.now
-  
-  while checkmana < 20
-    current_time = Time.now
-    if (current_time - last_feedback) >= 120
-      respond_yellow "[Loresang] Still waiting for mana... Current mana: #{checkmana}/20"
-      last_feedback = current_time
+module Loresang
+  class Runner
+    def initialize(mode)
+      @mode = mode
+      @high_value_items = []
+      # Initialize settings hash if it doesn't exist
+      UserVars.loresang ||= {}
+      migrate_old_settings
+      load_settings
     end
-    pause 5
-  end
-  
-  respond_yellow "[Loresang] Mana restored to #{checkmana}. Resuming..."
-end
 
-def setup_window
-  return unless defined?(Gtk) && Gtk.respond_to?(:queue)
+    def run
+      if @mode == :hand
+        run_hand_mode
+      else
+        run_container_mode
+      end
+    end
 
-  Thread.new do
-    Gtk.queue do
-      window = Gtk::Window.new
-      window.title = "Loresang Setup"
-      window.set_default_size(800, 680)
-      window.set_window_position(:center)
+    private
 
-      vbox = Gtk::Box.new(:vertical, 10)
-      window.add(vbox)
+    def migrate_old_settings
+      # Call the class method to do the actual migration
+      Loresang.migrate_old_settings
+    end
 
-      header = Gtk::Label.new
-      header.markup = "<b>Loresang Configuration</b>\nSettings for container mode mostly; some apply to hand mode too."
-      vbox.pack_start(header, :expand => false, :fill => false, :padding => 10)
+    def load_settings
+      settings = UserVars.loresang
+      @use_guildspeak = settings[:use_guildspeak] || false
+      @announce_successes = settings[:announce_successes] || false
+      @max_cycles = settings[:max_cycles] || 10
+      @verse1_default = "that I hold in my hand; Tell your secrets and don't be bland;Share your power and make it grand; I seek the knowledge lost in the sand"
+      @verse2_default = "of power that I hold;Speak of secrets left untold; Show me now for I am bold;Spare no detail don't leave me cold"
+      @verse1 = (settings[:verse1] || "").strip.empty? ? @verse1_default : settings[:verse1]
+      @verse2 = (settings[:verse2] || "").strip.empty? ? @verse2_default : settings[:verse2]
+      @low_mana_enabled = settings[:low_mana_enabled] || false
+      @low_mana_text = settings[:low_mana_text] || ""
+      @low_mana_pct = (settings[:low_mana_pct] || 15).to_i
+      @rt_skew_enabled = settings[:rt_skew_enabled] || false
+      @rt_skew = @rt_skew_enabled ? (settings[:rt_skew] || "0").to_f : 0.0
+      @value_alert_enabled = settings[:value_alert_enabled] || false
+      value_threshold_text = settings[:value_threshold].to_s.strip
+      @value_threshold = (@value_alert_enabled && !value_threshold_text.empty?) ? value_threshold_text.gsub(',', '').to_i : nil
+      @sing_container_name = settings[:sing_container].to_s.strip
+      @sung_container_name = settings[:sung_container].to_s.strip
+    end
 
-      grid = Gtk::Grid.new
-      grid.row_spacing = 12
-      grid.column_spacing = 10
-      grid.margin = 15
-      vbox.pack_start(grid, :expand => true, :fill => true)
+    def parse_item_value(recall_text)
+      if recall_text =~ /estimated to be worth about ([\d,]+) silvers/i
+        value_str = $1.gsub(',', '')
+        return value_str.to_i
+      end
+      0
+    end
 
-      row = 0
+    def show_progress(items_remaining)
+      Lich::Messaging.msg("yellow", "[Loresang] Progress: Sing Container Items Left: #{items_remaining}")
+    end
 
-      guildspeak_check = Gtk::CheckButton.new("Use guildspeak to loresing?")
-      guildspeak_check.active = (UserVars.loresang_use_guildspeak || false)
-      guildspeak_check.set_tooltip_text("Uses speak bard for singing, speak common after each item/finish. Applies to both hand and container modes.")
-      grid.attach(guildspeak_check, 0, row, 5, 1)
-      row += 1
+    def wait_for_mana
+      return unless checkmana < 5
+      
+      Lich::Messaging.msg("yellow", "[Loresang] Mana is below 5. Pausing until mana reaches 20...")
+      last_feedback = Time.now
+      
+      while checkmana < 20
+        current_time = Time.now
+        if (current_time - last_feedback) >= 120
+          Lich::Messaging.msg("yellow", "[Loresang] Still waiting for mana... Current mana: #{checkmana}/20")
+          last_feedback = current_time
+        end
+        pause 5
+      end
+      
+      Lich::Messaging.msg("yellow", "[Loresang] Mana restored to #{checkmana}. Resuming...")
+    end
 
-      low_mana_check = Gtk::CheckButton.new("Say something when mana drops below %:")
-      low_mana_check.active = (UserVars.loresang_low_mana_enabled || false)
-      grid.attach(low_mana_check, 0, row, 1, 1)
+    def already_unlocked?(recall_text)
+      text = recall_text.downcase
+      
+      return false if text.include?("must reveal the entire loresong")
+      return false if text.include?("you have not yet unlocked")
+      return false if text.include?("needs to be unlocked")
+      
+      text.include?("permanently unlocked") ||
+      text.include?("has a permanently unlocked loresong") ||
+      text.include?("harmonies reveal nothing") ||
+      text.include?("the loresong is complete") ||
+      text.include?("nothing more to learn") ||
+      text.include?("already learned") ||
+      text.include?("fully unlocked")
+    end
 
-      low_mana_pct_entry = Gtk::Entry.new
-      low_mana_pct_entry.text = (UserVars.loresang_low_mana_pct || "15").to_s
-      low_mana_pct_entry.max_length = 3
-      low_mana_pct_entry.width_chars = 2
-      low_mana_pct_entry.xalign = 0.0
-      low_mana_pct_entry.set_alignment(0.0)
-      low_mana_pct_entry.halign = :start
-      low_mana_pct_entry.set_tooltip_text("Mana percentage threshold (e.g., 15 for 15%)")
-      grid.attach(low_mana_pct_entry, 1, row, 1, 1)
+    def matches_filter(item)
+      settings = UserVars.loresang
+      enabled_tags = {
+        clothing:   settings[:tag_clothing]   || false,
+        weapons:    settings[:tag_weapons]    || false,
+        armor:      settings[:tag_armor]      || false,
+        jewelry:    settings[:tag_jewelry]    || false,
+        containers: settings[:tag_containers] || false,
+        magic:      settings[:tag_magic]      || false
+      }
+      should_sing = false
+      should_sing ||= enabled_tags[:clothing]   && item.type =~ /clothing/i
+      should_sing ||= enabled_tags[:weapons]    && item.type =~ /weapon/i
+      should_sing ||= enabled_tags[:armor]      && item.type =~ /armor/i
+      should_sing ||= enabled_tags[:jewelry]    && item.type =~ /jewelry/i
+      should_sing ||= enabled_tags[:containers] && item.type =~ /container/i
+      should_sing ||= enabled_tags[:magic]      && item.type =~ /magic/i
+      should_sing
+    end
 
-      low_mana_entry = Gtk::Entry.new
-      low_mana_entry.text = UserVars.loresang_low_mana_text || ""
-      low_mana_entry.hexpand = true
-      low_mana_entry.halign = :fill
-      low_mana_entry.margin_start = 40
-      low_mana_entry.set_tooltip_text("What to say when mana drops below threshold. Script will speak common, say this, then speak bard.")
-      grid.attach(low_mana_entry, 1, row, 4, 1)
-      row += 1
+    def sing_item(item_name, noun, items_remaining)
+      Lich::Messaging.msg("yellow", "[Loresang] Starting loresong for #{noun}...")
 
-      value_alert_check = Gtk::CheckButton.new("Alert for value threshold?")
-      value_alert_check.active = (UserVars.loresang_value_alert_enabled || false)
-      grid.attach(value_alert_check, 0, row, 1, 1)
-
-      value_alert_entry = Gtk::Entry.new
-      value_alert_entry.text = UserVars.loresang_value_threshold || ""
-      value_alert_entry.width_request = 100
-      value_alert_entry.hexpand = false
-      value_alert_entry.set_tooltip_text("If Loresong indicates item is worth more than this silver value, send an alert. Applies to both hand and container modes.")
-      grid.attach(value_alert_entry, 1, row, 1, 1)
-      row += 1
-
-      announce_box = Gtk::Box.new(:horizontal, 5)
-      elbow_label = Gtk::Label.new
-      elbow_label.markup = "<tt>   └─ </tt>"
-      announce_box.pack_start(elbow_label, :expand => false, :fill => false)
-
-      announce_check = Gtk::CheckButton.new("Announce valuable items to room?")
-      announce_check.active = (UserVars.loresang_announce_successes || false)
-      announce_check.set_tooltip_text("If checked (and value alert is enabled), verbally announce to the room each time a high-value item is found, plus a final summary.")
-      announce_check.sensitive = value_alert_check.active?
-      announce_box.pack_start(announce_check, :expand => true, :fill => true)
-
-      grid.attach(announce_box, 0, row, 5, 1)
-      row += 1
-
-      value_alert_check.signal_connect('toggled') do
-        announce_check.sensitive = value_alert_check.active?
-        if !value_alert_check.active?
-          announce_check.active = false
+      if @low_mana_enabled && !@low_mana_text.to_s.empty?
+        current_mana_pct = (checkmana.to_f / maxmana.to_f * 100).round(1)
+        if current_mana_pct < @low_mana_pct
+          fput "speak common"
+          pause 0.5
+          fput "say #{@low_mana_text}"
+          pause 0.5
+          fput "speak bard" if @use_guildspeak
+          pause 0.5
+          Lich::Messaging.msg("yellow", "[Loresang] Low mana alert triggered (#{current_mana_pct}% < #{@low_mana_pct}%).")
         end
       end
 
-      # Roundtime skew - moved here, below alert/announce
-      rt_skew_check = Gtk::CheckButton.new("Roundtime skew")
-      rt_skew_check.active = (UserVars.loresang_rt_skew_enabled || false)
-      grid.attach(rt_skew_check, 0, row, 1, 1)
+      fput "speak bard" if @use_guildspeak
+      pause 1 if @use_guildspeak
 
-      rt_skew_entry = Gtk::Entry.new
-      rt_skew_entry.text = UserVars.loresang_rt_skew || ""
-      rt_skew_entry.max_length = 6
-      rt_skew_entry.width_chars = 5
-      rt_skew_entry.xalign = 0.0
-      rt_skew_entry.set_alignment(0.0)
-      rt_skew_entry.halign = :start
-      rt_skew_entry.set_tooltip_text("Use -xx.x to shave seconds, +xx.x to add (.5 increments).")
-      grid.attach(rt_skew_entry, 1, row, 1, 1)
-      row += 1
+      cycle_count = 0
+      completed = false
 
-      # Max cycles - now below roundtime skew
-      max_label = Gtk::Label.new("Max cycles before abort:")
-      max_label.halign = :start
-      grid.attach(max_label, 0, row, 1, 1)
-
-      max_entry = Gtk::Entry.new
-      max_entry.text = (UserVars.loresang_max_cycles || 10).to_s
-      max_entry.max_length = 3
-      max_entry.width_chars = 5
-      max_entry.xalign = 0.0
-      max_entry.set_alignment(0.0)
-      max_entry.halign = :start
-      max_entry.set_tooltip_text("How many attempts per item before giving up?")
-      grid.attach(max_entry, 1, row, 1, 1)
-      row += 1
-
-      sing_label = Gtk::Label.new("Sing Container=")
-      sing_label.halign = :start
-      grid.attach(sing_label, 0, row, 1, 1)
-      sing_entry = Gtk::Entry.new
-      sing_entry.text = UserVars.loresang_sing_container || ""
-      sing_entry.hexpand = true
-      sing_entry.set_tooltip_text("Enter your WORN container with items to sing to here.")
-      grid.attach(sing_entry, 1, row, 4, 1)
-      row += 1
-
-      sung_label = Gtk::Label.new("Sung Container=")
-      sung_label.halign = :start
-      grid.attach(sung_label, 0, row, 1, 1)
-      sung_entry = Gtk::Entry.new
-      sung_entry.text = UserVars.loresang_sung_container || ""
-      sung_entry.hexpand = true
-      sung_entry.set_tooltip_text("Enter your worn container to place unlocked Lore Song items in")
-      grid.attach(sung_entry, 1, row, 4, 1)
-      row += 1
-
-      v1_label = Gtk::Label.new("Custom first verse (blank = default):")
-      v1_label.halign = :start
-      grid.attach(v1_label, 0, row, 1, 1)
-
-      v1_buffer = Gtk::TextBuffer.new
-      v1_buffer.text = UserVars.loresang_verse1 || ""
-      v1_view = Gtk::TextView.new(v1_buffer)
-      v1_view.wrap_mode = :word
-      v1_view.set_tooltip_text("Use \#{item.noun} for the item noun.")
-
-      v1_frame = Gtk::Frame.new
-      v1_frame.shadow_type = :in
-      v1_frame.add(v1_view)
-
-      v1_sw = Gtk::ScrolledWindow.new(nil, nil)
-      v1_sw.hexpand = true
-      v1_sw.add(v1_frame)
-      v1_sw.height_request = 30
-      grid.attach(v1_sw, 1, row, 3, 1)
-
-      placeholder1 = Gtk::Entry.new
-      placeholder1.text = "\#{item.noun}"
-      placeholder1.editable = false
-      placeholder1.width_request = 100
-      placeholder_box1 = Gtk::Box.new(:horizontal, 5)
-      placeholder_box1.pack_start(Gtk::Label.new("Copy Me"), :expand => false)
-      placeholder_box1.pack_start(Gtk::Label.new(" ==>"), :expand => false)
-      placeholder_box1.pack_start(placeholder1, :expand => false)
-      placeholder_box1.halign = :end
-      grid.attach(placeholder_box1, 4, row, 1, 1)
-      row += 1
-
-      v2_label = Gtk::Label.new("Custom second verse (blank = default):")
-      v2_label.halign = :start
-      grid.attach(v2_label, 0, row, 1, 1)
-
-      v2_buffer = Gtk::TextBuffer.new
-      v2_buffer.text = UserVars.loresang_verse2 || ""
-      v2_view = Gtk::TextView.new(v2_buffer)
-      v2_view.wrap_mode = :word
-      v2_view.set_tooltip_text("Use \#{item.noun} for the item noun.")
-
-      v2_frame = Gtk::Frame.new
-      v2_frame.shadow_type = :in
-      v2_frame.add(v2_view)
-
-      v2_sw = Gtk::ScrolledWindow.new(nil, nil)
-      v2_sw.hexpand = true
-      v2_sw.add(v2_frame)
-      v2_sw.height_request = 30
-      grid.attach(v2_sw, 1, row, 3, 1)
-
-      placeholder2 = Gtk::Entry.new
-      placeholder2.text = "\#{item.noun}"
-      placeholder2.editable = false
-      placeholder2.width_request = 100
-      placeholder_box2 = Gtk::Box.new(:horizontal, 5)
-      placeholder_box2.pack_start(Gtk::Label.new("Copy Me"), :expand => false)
-      placeholder_box2.pack_start(Gtk::Label.new(" ==>"), :expand => false)
-      placeholder_box2.pack_start(placeholder2, :expand => false)
-      placeholder_box2.halign = :end
-      grid.attach(placeholder_box2, 4, row, 1, 1)
-      row += 1
-
-      types_header = Gtk::Label.new
-      types_header.markup = "<b>Item Types to Sing:</b>"
-      types_header.halign = :start
-      types_header.margin_start = 130
-      grid.attach(types_header, 0, row, 3, 1)
-      row += 1
-
-      types_subgrid = Gtk::Grid.new
-      types_subgrid.column_homogeneous = false
-      types_subgrid.row_spacing = 8
-      types_subgrid.column_spacing = 10
-
-      clothing_check = Gtk::CheckButton.new("Clothing")
-      clothing_check.active = (UserVars.loresang_tag_clothing || false)
-      clothing_check.width_request = 120
-      types_subgrid.attach(clothing_check, 0, 0, 1, 1)
-
-      weapons_check = Gtk::CheckButton.new("Weapons")
-      weapons_check.active = (UserVars.loresang_tag_weapons || false)
-      weapons_check.width_request = 120
-      types_subgrid.attach(weapons_check, 1, 0, 1, 1)
-
-      armor_check = Gtk::CheckButton.new("Armor")
-      armor_check.active = (UserVars.loresang_tag_armor || false)
-      armor_check.width_request = 120
-      types_subgrid.attach(armor_check, 2, 0, 1, 1)
-
-      jewelry_check = Gtk::CheckButton.new("Jewelry")
-      jewelry_check.active = (UserVars.loresang_tag_jewelry || false)
-      jewelry_check.width_request = 120
-      types_subgrid.attach(jewelry_check, 0, 1, 1, 1)
-
-      containers_check = Gtk::CheckButton.new("Containers")
-      containers_check.active = (UserVars.loresang_tag_containers || false)
-      containers_check.width_request = 120
-      types_subgrid.attach(containers_check, 1, 1, 1, 1)
-
-      magic_check = Gtk::CheckButton.new("Magic")
-      magic_check.active = (UserVars.loresang_tag_magic || false)
-      magic_check.width_request = 120
-      types_subgrid.attach(magic_check, 2, 1, 1, 1)
-
-      grid.attach(types_subgrid, 0, row, 5, 1)
-      row += 1
-
-      btn_box = Gtk::ButtonBox.new(:horizontal)
-      btn_box.layout = :end
-      btn_box.spacing = 10
-      vbox.pack_end(btn_box, :expand => false, :fill => false, :padding => 10)
-
-      save_btn = Gtk::Button.new(label: "Save & Close")
-      save_btn.signal_connect('clicked') do
-        UserVars.loresang_sing_container = sing_entry.text.strip.empty? ? nil : sing_entry.text.strip
-        UserVars.loresang_sung_container = sung_entry.text.strip.empty? ? nil : sung_entry.text.strip
-        UserVars.loresang_use_guildspeak = guildspeak_check.active?
-        UserVars.loresang_announce_successes = announce_check.active? && value_alert_check.active?
-
-        if max_entry.text =~ /^\d+$/
-          UserVars.loresang_max_cycles = max_entry.text.to_i
-        end
-
-        verse1_text = v1_buffer.text.strip
-        UserVars.loresang_verse1 = verse1_text.empty? ? nil : verse1_text
-
-        verse2_text = v2_buffer.text.strip
-        UserVars.loresang_verse2 = verse2_text.empty? ? nil : verse2_text
-
-        UserVars.loresang_low_mana_enabled = low_mana_check.active?
-        UserVars.loresang_low_mana_text = low_mana_entry.text.strip.empty? ? nil : low_mana_entry.text.strip
+      loop do
+        wait_for_mana
         
-        pct_text = low_mana_pct_entry.text.strip
-        if pct_text =~ /^\d+$/
-          pct_val = pct_text.to_i
-          if pct_val > 100
-            UserVars.loresang_low_mana_pct = 100
-            respond_yellow "[Loresang] Mana percentage clamped to 100%."
-          elsif pct_val < 1
-            UserVars.loresang_low_mana_pct = 1
-            respond_yellow "[Loresang] Mana percentage must be at least 1%."
-          else
-            UserVars.loresang_low_mana_pct = pct_val
-          end
+        cycle_count += 1
+        Lich::Messaging.msg("yellow", "[Loresang] Cycle #{cycle_count}/#{@max_cycles} - singing...")
+        show_progress(items_remaining) if items_remaining
+
+        if cycle_count > @max_cycles
+          Lich::Messaging.msg("yellow", "[Loresang] Max cycles reached - putting item back.")
+          break
+        end
+
+        if GameObj.right_hand.nil? || GameObj.right_hand.name == "Empty"
+          Lich::Messaging.msg("yellow", "[Loresang] Item no longer in right hand - aborting this item.")
+          break
+        end
+
+        actual_verse1 = @verse1.gsub('#{item.noun}', noun)
+        fput "loresing #{noun} #{actual_verse1}"
+        pause 1
+
+        response = reget(12, /Roundtime|permanently unlocked|more to share|falters and fades|reached the end|nothing new|learn nothing new|resonates|previously learned/) || []
+
+        if response.empty?
+          Lich::Messaging.msg("yellow", "[Loresang] No immediate response after verse 1 - waiting...")
+        end
+
+        line = response.join(" ").downcase
+
+        if line =~ /permanently unlocked|reached the end of .* song|learn nothing new|nothing new about/
+          completed = true
+          rt_match = line.match(/roundtime: (\d+)/)
+          rt_sec = rt_match ? rt_match[1].to_i : 5
+          pause rt_sec + 1 + @rt_skew
+          check_item_value(noun, item_name, items_remaining)
+          Lich::Messaging.msg("yellow", "[Loresang] Loresong Completed, #{noun} fully identified.")
+          show_progress(items_remaining) if items_remaining
+          break
+        elsif line =~ /roundtime: (\d+)/
+          rt = $1.to_i
+          Lich::Messaging.msg("yellow", "[Loresang] Waiting #{(rt + 1 + @rt_skew).to_i} seconds...")
+          pause [rt + 1 + @rt_skew, 0].max
+        elsif line =~ /falters and fades/
+          Lich::Messaging.msg("yellow", "[Loresang] Song faltered - no loresong or fully identified.")
+          break
         else
-          UserVars.loresang_low_mana_pct = 15
+          Lich::Messaging.msg("yellow", "[Loresang] Verse 1 resonated with no new info - trying verse 2...")
+          pause 3
         end
 
-        skew_text = rt_skew_entry.text.strip
-        UserVars.loresang_rt_skew = skew_text
+        actual_verse2 = @verse2.gsub('#{item.noun}', noun)
+        fput "loresing #{noun} #{actual_verse2}"
+        pause 1
 
-        UserVars.loresang_rt_skew_enabled = rt_skew_check.active?
-        if rt_skew_check.active? && skew_text =~ /^-?\d+(\.[05])?$/
-          skew_val = skew_text.to_f
-          if skew_val.abs > 60
-            respond_yellow "[Loresang] Roundtime skew clamped to +/-60 seconds."
-            UserVars.loresang_rt_skew = skew_val.positive? ? "60" : "-60"
-          end
-        elsif rt_skew_check.active?
-          respond_yellow "[Loresang] Invalid roundtime skew format. Disabled."
-          UserVars.loresang_rt_skew_enabled = false
+        response = reget(12, /Roundtime|permanently unlocked|more to share|falters and fades|reached the end|nothing new|learn nothing new|resonates|previously learned/) || []
+
+        if response.empty?
+          Lich::Messaging.msg("yellow", "[Loresang] No immediate response after verse 2 - continuing...")
         end
 
-        UserVars.loresang_tag_clothing   = clothing_check.active?
-        UserVars.loresang_tag_weapons    = weapons_check.active?
-        UserVars.loresang_tag_armor      = armor_check.active?
-        UserVars.loresang_tag_jewelry    = jewelry_check.active?
-        UserVars.loresang_tag_containers = containers_check.active?
-        UserVars.loresang_tag_magic      = magic_check.active?
+        line = response.join(" ").downcase
 
-        UserVars.loresang_value_alert_enabled = value_alert_check.active?
-        value_threshold_text = value_alert_entry.text.strip
-        UserVars.loresang_value_threshold = value_threshold_text.empty? ? nil : value_threshold_text
-
-        respond_yellow "[Loresang] Settings saved."
-        window.destroy
+        if line =~ /permanently unlocked|reached the end of .* song|learn nothing new|nothing new about/
+          completed = true
+          rt_match = line.match(/roundtime: (\d+)/)
+          rt_sec = rt_match ? rt_match[1].to_i : 5
+          pause rt_sec + 1 + @rt_skew
+          check_item_value(noun, item_name, items_remaining)
+          Lich::Messaging.msg("yellow", "[Loresang] Loresong Completed, #{noun} fully identified.")
+          show_progress(items_remaining) if items_remaining
+          break
+        elsif line =~ /roundtime: (\d+)/
+          rt = $1.to_i
+          Lich::Messaging.msg("yellow", "[Loresang] Waiting #{(rt + 1 + @rt_skew).to_i} seconds...")
+          pause [rt + 1 + @rt_skew, 0].max
+        elsif line =~ /falters and fades/
+          Lich::Messaging.msg("yellow", "[Loresang] Song faltered - no loresong or fully identified.")
+          break
+        else
+          Lich::Messaging.msg("yellow", "[Loresang] Verse 2 resonated with no new info - cycling back...")
+          pause 3
+        end
       end
-      btn_box.add(save_btn)
 
-      cancel_btn = Gtk::Button.new(label: "Cancel")
-      cancel_btn.signal_connect('clicked') { window.destroy }
-      btn_box.add(cancel_btn)
+      fput "speak common" if @use_guildspeak
+      pause 0.5 if @use_guildspeak
 
-      window.show_all
+      if !completed && cycle_count <= @max_cycles
+        Lich::Messaging.msg("yellow", "[Loresang] No clear identification after verses - item may be fully unlocked or non-loresing.")
+      end
+
+      completed
+    end
+
+    def check_item_value(noun, item_name, items_remaining)
+      fput "recall #{noun}"
+      waitrt?
+      pause 0.8
+      recall_lines = reget(35, /.*/) || []
+      start_index = recall_lines.rindex { |line| line =~ /As you recall your song/ }
+      if start_index
+        recall_lines = recall_lines[start_index..-1]
+      end
+      if recall_lines.any?
+        recall_text = recall_lines.join(" ")
+
+        if @value_threshold
+          item_value = parse_item_value(recall_text)
+          
+          if item_value >= @value_threshold
+            formatted = item_value.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
+            message = "Your item was found to be worth #{formatted} silvers. This is over your value threshold! Congrats!"
+            message += " #{items_remaining} items to go!" if items_remaining
+            Lich::Messaging.msg("thought", message)
+            
+            if @announce_successes
+              fput "speak common"
+              pause 0.5
+              fput "say #{message}"
+              pause 0.5
+            end
+            
+            @high_value_items << { name: item_name, value: item_value }
+          end
+        end
+      end
+    end
+
+    def run_hand_mode
+      item = GameObj.right_hand
+      if item && item.name != "Empty"
+        item_name = item.name
+        noun = item.noun
+        Lich::Messaging.msg("yellow", "[Loresang] Starting loresinging on #{noun}...")
+
+        begin
+          completed = sing_item(item_name, noun, nil)
+        ensure
+          fput "speak common" if @use_guildspeak
+          pause 0.5 if @use_guildspeak
+        end
+
+        Lich::Messaging.msg("yellow", "[Loresang] #{completed ? 'Finished' : 'Did not complete'}.")
+
+        announce_high_value_summary if @high_value_items.any?
+      else
+        Lich::Messaging.msg("yellow", "[Loresang] Nothing in right hand!")
+      end
+    end
+
+    def run_container_mode
+      if @sing_container_name.empty? || @sung_container_name.empty?
+        Lich::Messaging.msg("yellow", "[Loresang] Container mode requires both Sing Container and Sung Container to be set in setup!")
+        Lich::Messaging.msg("yellow", "[Loresang] Run ;loresang setup and enter valid worn container names.")
+        return
+      end
+
+      sing_container = GameObj.inv.find { |o| o.name =~ /#{@sing_container_name}/i }
+      sung_container = GameObj.inv.find { |o| o.name =~ /#{@sung_container_name}/i }
+
+      unless sing_container
+        Lich::Messaging.msg("yellow", "[Loresang] Sing container '#{@sing_container_name}' not found (must be worn).")
+        return
+      end
+
+      unless sung_container
+        Lich::Messaging.msg("yellow", "[Loresang] Sung container '#{@sung_container_name}' not found (must be worn).")
+        return
+      end
+
+      clear_hands
+      open_containers(sing_container, sung_container)
+
+      items_to_sing = sing_container.contents.select { |i| matches_filter(i) }
+
+      if items_to_sing.empty?
+        Lich::Messaging.msg("yellow", "[Loresang] No matching items found in #{@sing_container_name}.")
+        return
+      end
+
+      failed_items = []
+      items_remaining = items_to_sing.length
+      successfully_unlocked = 0
+      already_unlocked_count = 0
+
+      begin
+        items_to_sing.each do |item|
+          fput "get ##{item.id} from ##{sing_container.id}"
+          pause 0.8
+          
+          if (GameObj.right_hand.nil? || GameObj.right_hand.name == "Empty") && GameObj.left_hand && GameObj.left_hand.id == item.id
+            fput "swap"
+            pause 0.5
+          end
+          
+          next unless GameObj.right_hand && GameObj.right_hand.id == item.id
+
+          item_name = item.name
+          noun = item.noun
+
+          fput "recall #{noun}"
+          waitrt?
+          pause 0.8
+          recall_lines = reget(35, /.*/) || []
+          start_index = recall_lines.rindex { |line| line =~ /As you recall your song/ }
+          if start_index
+            recall_lines = recall_lines[start_index..-1]
+          end
+          recall_text = recall_lines.join(" ")
+
+          if already_unlocked?(recall_text)
+            if @value_threshold
+              item_value = parse_item_value(recall_text)
+              
+              if item_value >= @value_threshold
+                formatted = item_value.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
+                message = "Your item was found to be worth #{formatted} silvers. This is over your value threshold! Congrats! #{items_remaining} items to go!"
+                Lich::Messaging.msg("thought", message)
+                
+                if @announce_successes
+                  fput "speak common"
+                  pause 0.5
+                  fput "say #{message}"
+                  pause 0.5
+                end
+                
+                @high_value_items << { name: item_name, value: item_value }
+              end
+            end
+
+            Lich::Messaging.msg("yellow", "[Loresang] #{noun} already fully unlocked - moving to sung container.")
+            fput "put ##{item.id} in ##{sung_container.id}"
+            pause 0.6
+            items_remaining -= 1
+            already_unlocked_count += 1
+            show_progress(items_remaining)
+            next
+          end
+
+          completed = sing_item(item_name, noun, items_remaining)
+
+          if completed
+            fput "put ##{item.id} in ##{sung_container.id}"
+            items_remaining -= 1
+            successfully_unlocked += 1
+          else
+            fput "put ##{item.id} in ##{sing_container.id}"
+            failed_items << item.name
+          end
+          pause 0.6
+        end
+      ensure
+        fput "speak common" if @use_guildspeak
+        pause 0.5 if @use_guildspeak
+      end
+
+      if failed_items.any?
+        Lich::Messaging.msg("yellow", "[Loresang] Failed items (returned to #{@sing_container_name}):")
+        failed_items.each { |n| Lich::Messaging.msg("yellow", "  - #{n}") }
+      end
+
+      Lich::Messaging.msg("yellow", "[Loresang] Batch loresinging complete! #{successfully_unlocked} items successfully unlocked and #{already_unlocked_count} items already found unlocked. All moved to #{@sung_container_name}!")
+
+      announce_high_value_summary if @high_value_items.any?
+
+      fput "speak common" if @use_guildspeak
+      pause 0.3 if @use_guildspeak
+
+      Lich::Messaging.msg("yellow", "[Loresang] Script finished.")
+    end
+
+    def clear_hands
+      if GameObj.right_hand && GameObj.right_hand.name != "Empty"
+        if GameObj.right_hand.type =~ /shield/i
+          fput "store shield"
+        elsif GameObj.right_hand.type =~ /weapon/i
+          fput "store weapon"
+        else
+          fput "stow right"
+        end
+        pause 0.5
+      end
+
+      if GameObj.left_hand && GameObj.left_hand.name != "Empty"
+        if GameObj.left_hand.type =~ /shield/i
+          fput "store shield"
+        elsif GameObj.left_hand.type =~ /weapon/i
+          fput "store weapon"
+        else
+          fput "stow left"
+        end
+        pause 0.5
+      end
+    end
+
+    def open_containers(sing_container, sung_container)
+      [sing_container, sung_container].each do |cont|
+        fput "look in ##{cont.id}"
+        pause 0.6
+        if reget(5, /closed/)
+          fput "open ##{cont.id}"
+          pause 0.8
+          fput "look in ##{cont.id}"
+          pause 0.6
+        end
+      end
+    end
+
+    def announce_high_value_summary
+      item_list = @high_value_items.map { |i| "#{i[:name]}(#{i[:value].to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse})" }.join(", ")
+      summary_message = "#{@high_value_items.length} valuable items found! The following deserve attention: #{item_list}"
+      Lich::Messaging.msg("thought", summary_message)
+      
+      if @announce_successes
+        fput "speak common"
+        pause 0.5
+        fput "say #{summary_message}"
+        pause 0.5
+      end
+    end
+  end
+
+  # Class method for migrating old settings format to new hash format
+  def self.migrate_old_settings
+    settings = UserVars.loresang
+    migrated_count = 0
+    
+    old_to_new = {
+      'loresang_use_guildspeak' => :use_guildspeak,
+      'loresang_announce_successes' => :announce_successes,
+      'loresang_max_cycles' => :max_cycles,
+      'loresang_verse1' => :verse1,
+      'loresang_verse2' => :verse2,
+      'loresang_low_mana_enabled' => :low_mana_enabled,
+      'loresang_low_mana_text' => :low_mana_text,
+      'loresang_low_mana_pct' => :low_mana_pct,
+      'loresang_rt_skew_enabled' => :rt_skew_enabled,
+      'loresang_rt_skew' => :rt_skew,
+      'loresang_value_alert_enabled' => :value_alert_enabled,
+      'loresang_value_threshold' => :value_threshold,
+      'loresang_sing_container' => :sing_container,
+      'loresang_sung_container' => :sung_container,
+      'loresang_tag_clothing' => :tag_clothing,
+      'loresang_tag_weapons' => :tag_weapons,
+      'loresang_tag_armor' => :tag_armor,
+      'loresang_tag_jewelry' => :tag_jewelry,
+      'loresang_tag_containers' => :tag_containers,
+      'loresang_tag_magic' => :tag_magic
+    }
+    
+    old_to_new.each do |old_var, new_key|
+      old_value = UserVars.send(old_var.to_sym)
+      if old_value && !settings.key?(new_key)
+        settings[new_key] = old_value
+        migrated_count += 1
+      end
+    end
+    
+    if migrated_count > 0
+      Lich::Messaging.msg("yellow", "[Loresang] Migrated #{migrated_count} settings from old format to new format.")
+    end
+    
+    migrated_count
+  end
+
+  # Setup window as a class method since it doesn't need Runner state
+  def self.show_setup_window
+    return unless defined?(Gtk) && Gtk.respond_to?(:queue)
+
+    Thread.new do
+      Gtk.queue do
+        # Initialize settings hash if it doesn't exist
+        UserVars.loresang ||= {}
+        Loresang.migrate_old_settings
+        settings = UserVars.loresang
+        
+        window = Gtk::Window.new
+        window.title = "Loresang Setup"
+        window.set_default_size(800, 680)
+        window.set_window_position(:center)
+
+        vbox = Gtk::Box.new(:vertical, 10)
+        window.add(vbox)
+
+        header = Gtk::Label.new
+        header.markup = "<b>Loresang Configuration</b>\nSettings for container mode mostly; some apply to hand mode too."
+        vbox.pack_start(header, :expand => false, :fill => false, :padding => 10)
+
+        grid = Gtk::Grid.new
+        grid.row_spacing = 12
+        grid.column_spacing = 10
+        grid.margin = 15
+        vbox.pack_start(grid, :expand => true, :fill => true)
+
+        row = 0
+
+        guildspeak_check = Gtk::CheckButton.new("Use guildspeak to loresing?")
+        guildspeak_check.active = (settings[:use_guildspeak] || false)
+        guildspeak_check.set_tooltip_text("Uses speak bard for singing, speak common after each item/finish. Applies to both hand and container modes.")
+        grid.attach(guildspeak_check, 0, row, 5, 1)
+        row += 1
+
+        low_mana_check = Gtk::CheckButton.new("Say something when mana drops below %:")
+        low_mana_check.active = (settings[:low_mana_enabled] || false)
+        grid.attach(low_mana_check, 0, row, 1, 1)
+
+        low_mana_pct_entry = Gtk::Entry.new
+        low_mana_pct_entry.text = (settings[:low_mana_pct] || "15").to_s
+        low_mana_pct_entry.max_length = 3
+        low_mana_pct_entry.width_chars = 2
+        low_mana_pct_entry.xalign = 0.0
+        low_mana_pct_entry.set_alignment(0.0)
+        low_mana_pct_entry.halign = :start
+        low_mana_pct_entry.set_tooltip_text("Mana percentage threshold (e.g., 15 for 15%)")
+        grid.attach(low_mana_pct_entry, 1, row, 1, 1)
+
+        low_mana_entry = Gtk::Entry.new
+        low_mana_entry.text = settings[:low_mana_text] || ""
+        low_mana_entry.hexpand = true
+        low_mana_entry.halign = :fill
+        low_mana_entry.margin_start = 40
+        low_mana_entry.set_tooltip_text("What to say when mana drops below threshold. Script will speak common, say this, then speak bard.")
+        grid.attach(low_mana_entry, 1, row, 4, 1)
+        row += 1
+
+        value_alert_check = Gtk::CheckButton.new("Alert for value threshold?")
+        value_alert_check.active = (settings[:value_alert_enabled] || false)
+        grid.attach(value_alert_check, 0, row, 1, 1)
+
+        value_alert_entry = Gtk::Entry.new
+        value_alert_entry.text = settings[:value_threshold] || ""
+        value_alert_entry.width_request = 100
+        value_alert_entry.hexpand = false
+        value_alert_entry.set_tooltip_text("If Loresong indicates item is worth more than this silver value, send an alert. Applies to both hand and container modes.")
+        grid.attach(value_alert_entry, 1, row, 1, 1)
+        row += 1
+
+        announce_box = Gtk::Box.new(:horizontal, 5)
+        elbow_label = Gtk::Label.new
+        elbow_label.markup = "<tt>   └─ </tt>"
+        announce_box.pack_start(elbow_label, :expand => false, :fill => false)
+
+        announce_check = Gtk::CheckButton.new("Announce valuable items to room?")
+        announce_check.active = (settings[:announce_successes] || false)
+        announce_check.set_tooltip_text("If checked (and value alert is enabled), verbally announce to the room each time a high-value item is found, plus a final summary.")
+        announce_check.sensitive = value_alert_check.active?
+        announce_box.pack_start(announce_check, :expand => true, :fill => true)
+
+        grid.attach(announce_box, 0, row, 5, 1)
+        row += 1
+
+        value_alert_check.signal_connect('toggled') do
+          announce_check.sensitive = value_alert_check.active?
+          if !value_alert_check.active?
+            announce_check.active = false
+          end
+        end
+
+        # Roundtime skew - moved here, below alert/announce
+        rt_skew_check = Gtk::CheckButton.new("Roundtime skew")
+        rt_skew_check.active = (settings[:rt_skew_enabled] || false)
+        grid.attach(rt_skew_check, 0, row, 1, 1)
+
+        rt_skew_entry = Gtk::Entry.new
+        rt_skew_entry.text = settings[:rt_skew] || ""
+        rt_skew_entry.max_length = 6
+        rt_skew_entry.width_chars = 5
+        rt_skew_entry.xalign = 0.0
+        rt_skew_entry.set_alignment(0.0)
+        rt_skew_entry.halign = :start
+        rt_skew_entry.set_tooltip_text("Use -xx.x to shave seconds, +xx.x to add (.5 increments).")
+        grid.attach(rt_skew_entry, 1, row, 1, 1)
+        row += 1
+
+        # Max cycles - now below roundtime skew
+        max_label = Gtk::Label.new("Max cycles before abort:")
+        max_label.halign = :start
+        grid.attach(max_label, 0, row, 1, 1)
+
+        max_entry = Gtk::Entry.new
+        max_entry.text = (settings[:max_cycles] || 10).to_s
+        max_entry.max_length = 3
+        max_entry.width_chars = 5
+        max_entry.xalign = 0.0
+        max_entry.set_alignment(0.0)
+        max_entry.halign = :start
+        max_entry.set_tooltip_text("How many attempts per item before giving up?")
+        grid.attach(max_entry, 1, row, 1, 1)
+        row += 1
+
+        sing_label = Gtk::Label.new("Sing Container=")
+        sing_label.halign = :start
+        grid.attach(sing_label, 0, row, 1, 1)
+        sing_entry = Gtk::Entry.new
+        sing_entry.text = settings[:sing_container] || ""
+        sing_entry.hexpand = true
+        sing_entry.set_tooltip_text("Enter your WORN container with items to sing to here.")
+        grid.attach(sing_entry, 1, row, 4, 1)
+        row += 1
+
+        sung_label = Gtk::Label.new("Sung Container=")
+        sung_label.halign = :start
+        grid.attach(sung_label, 0, row, 1, 1)
+        sung_entry = Gtk::Entry.new
+        sung_entry.text = settings[:sung_container] || ""
+        sung_entry.hexpand = true
+        sung_entry.set_tooltip_text("Enter your worn container to place unlocked Lore Song items in")
+        grid.attach(sung_entry, 1, row, 4, 1)
+        row += 1
+
+        v1_label = Gtk::Label.new("Custom first verse (blank = default):")
+        v1_label.halign = :start
+        grid.attach(v1_label, 0, row, 1, 1)
+
+        v1_buffer = Gtk::TextBuffer.new
+        v1_buffer.text = settings[:verse1] || ""
+        v1_view = Gtk::TextView.new(v1_buffer)
+        v1_view.wrap_mode = :word
+        v1_view.set_tooltip_text("Use \#{item.noun} for the item noun.")
+
+        v1_frame = Gtk::Frame.new
+        v1_frame.shadow_type = :in
+        v1_frame.add(v1_view)
+
+        v1_sw = Gtk::ScrolledWindow.new(nil, nil)
+        v1_sw.hexpand = true
+        v1_sw.add(v1_frame)
+        v1_sw.height_request = 30
+        grid.attach(v1_sw, 1, row, 3, 1)
+
+        placeholder1 = Gtk::Entry.new
+        placeholder1.text = "\#{item.noun}"
+        placeholder1.editable = false
+        placeholder1.width_request = 100
+        placeholder_box1 = Gtk::Box.new(:horizontal, 5)
+        placeholder_box1.pack_start(Gtk::Label.new("Copy Me"), :expand => false)
+        placeholder_box1.pack_start(Gtk::Label.new(" ==>"), :expand => false)
+        placeholder_box1.pack_start(placeholder1, :expand => false)
+        placeholder_box1.halign = :end
+        grid.attach(placeholder_box1, 4, row, 1, 1)
+        row += 1
+
+        v2_label = Gtk::Label.new("Custom second verse (blank = default):")
+        v2_label.halign = :start
+        grid.attach(v2_label, 0, row, 1, 1)
+
+        v2_buffer = Gtk::TextBuffer.new
+        v2_buffer.text = settings[:verse2] || ""
+        v2_view = Gtk::TextView.new(v2_buffer)
+        v2_view.wrap_mode = :word
+        v2_view.set_tooltip_text("Use \#{item.noun} for the item noun.")
+
+        v2_frame = Gtk::Frame.new
+        v2_frame.shadow_type = :in
+        v2_frame.add(v2_view)
+
+        v2_sw = Gtk::ScrolledWindow.new(nil, nil)
+        v2_sw.hexpand = true
+        v2_sw.add(v2_frame)
+        v2_sw.height_request = 30
+        grid.attach(v2_sw, 1, row, 3, 1)
+
+        placeholder2 = Gtk::Entry.new
+        placeholder2.text = "\#{item.noun}"
+        placeholder2.editable = false
+        placeholder2.width_request = 100
+        placeholder_box2 = Gtk::Box.new(:horizontal, 5)
+        placeholder_box2.pack_start(Gtk::Label.new("Copy Me"), :expand => false)
+        placeholder_box2.pack_start(Gtk::Label.new(" ==>"), :expand => false)
+        placeholder_box2.pack_start(placeholder2, :expand => false)
+        placeholder_box2.halign = :end
+        grid.attach(placeholder_box2, 4, row, 1, 1)
+        row += 1
+
+        types_header = Gtk::Label.new
+        types_header.markup = "<b>Item Types to Sing:</b>"
+        types_header.halign = :start
+        types_header.margin_start = 130
+        grid.attach(types_header, 0, row, 3, 1)
+        row += 1
+
+        types_subgrid = Gtk::Grid.new
+        types_subgrid.column_homogeneous = false
+        types_subgrid.row_spacing = 8
+        types_subgrid.column_spacing = 10
+
+        clothing_check = Gtk::CheckButton.new("Clothing")
+        clothing_check.active = (settings[:tag_clothing] || false)
+        clothing_check.width_request = 120
+        types_subgrid.attach(clothing_check, 0, 0, 1, 1)
+
+        weapons_check = Gtk::CheckButton.new("Weapons")
+        weapons_check.active = (settings[:tag_weapons] || false)
+        weapons_check.width_request = 120
+        types_subgrid.attach(weapons_check, 1, 0, 1, 1)
+
+        armor_check = Gtk::CheckButton.new("Armor")
+        armor_check.active = (settings[:tag_armor] || false)
+        armor_check.width_request = 120
+        types_subgrid.attach(armor_check, 2, 0, 1, 1)
+
+        jewelry_check = Gtk::CheckButton.new("Jewelry")
+        jewelry_check.active = (settings[:tag_jewelry] || false)
+        jewelry_check.width_request = 120
+        types_subgrid.attach(jewelry_check, 0, 1, 1, 1)
+
+        containers_check = Gtk::CheckButton.new("Containers")
+        containers_check.active = (settings[:tag_containers] || false)
+        containers_check.width_request = 120
+        types_subgrid.attach(containers_check, 1, 1, 1, 1)
+
+        magic_check = Gtk::CheckButton.new("Magic")
+        magic_check.active = (settings[:tag_magic] || false)
+        magic_check.width_request = 120
+        types_subgrid.attach(magic_check, 2, 1, 1, 1)
+
+        grid.attach(types_subgrid, 0, row, 5, 1)
+        row += 1
+
+        btn_box = Gtk::ButtonBox.new(:horizontal)
+        btn_box.layout = :end
+        btn_box.spacing = 10
+        vbox.pack_end(btn_box, :expand => false, :fill => false, :padding => 10)
+
+        save_btn = Gtk::Button.new(label: "Save & Close")
+        save_btn.signal_connect('clicked') do
+          settings = UserVars.loresang
+          settings[:sing_container] = sing_entry.text.strip.empty? ? nil : sing_entry.text.strip
+          settings[:sung_container] = sung_entry.text.strip.empty? ? nil : sung_entry.text.strip
+          settings[:use_guildspeak] = guildspeak_check.active?
+          settings[:announce_successes] = announce_check.active? && value_alert_check.active?
+
+          if max_entry.text =~ /^\d+$/
+            settings[:max_cycles] = max_entry.text.to_i
+          end
+
+          verse1_text = v1_buffer.text.strip
+          settings[:verse1] = verse1_text.empty? ? nil : verse1_text
+
+          verse2_text = v2_buffer.text.strip
+          settings[:verse2] = verse2_text.empty? ? nil : verse2_text
+
+          settings[:low_mana_enabled] = low_mana_check.active?
+          settings[:low_mana_text] = low_mana_entry.text.strip.empty? ? nil : low_mana_entry.text.strip
+          
+          pct_text = low_mana_pct_entry.text.strip
+          if pct_text =~ /^\d+$/
+            pct_val = pct_text.to_i
+            if pct_val > 100
+              settings[:low_mana_pct] = 100
+              Lich::Messaging.msg("yellow", "[Loresang] Mana percentage clamped to 100%.")
+            elsif pct_val < 1
+              settings[:low_mana_pct] = 1
+              Lich::Messaging.msg("yellow", "[Loresang] Mana percentage must be at least 1%.")
+            else
+              settings[:low_mana_pct] = pct_val
+            end
+          else
+            settings[:low_mana_pct] = 15
+          end
+
+          skew_text = rt_skew_entry.text.strip
+          settings[:rt_skew] = skew_text
+
+          settings[:rt_skew_enabled] = rt_skew_check.active?
+          if rt_skew_check.active? && skew_text =~ /^-?\d+(\.[05])?$/
+            skew_val = skew_text.to_f
+            if skew_val.abs > 60
+              Lich::Messaging.msg("yellow", "[Loresang] Roundtime skew clamped to +/-60 seconds.")
+              settings[:rt_skew] = skew_val.positive? ? "60" : "-60"
+            end
+          elsif rt_skew_check.active?
+            Lich::Messaging.msg("yellow", "[Loresang] Invalid roundtime skew format. Disabled.")
+            settings[:rt_skew_enabled] = false
+          end
+
+          settings[:tag_clothing]   = clothing_check.active?
+          settings[:tag_weapons]    = weapons_check.active?
+          settings[:tag_armor]      = armor_check.active?
+          settings[:tag_jewelry]    = jewelry_check.active?
+          settings[:tag_containers] = containers_check.active?
+          settings[:tag_magic]      = magic_check.active?
+
+          settings[:value_alert_enabled] = value_alert_check.active?
+          value_threshold_text = value_alert_entry.text.strip
+          settings[:value_threshold] = value_threshold_text.empty? ? nil : value_threshold_text
+
+          Lich::Messaging.msg("yellow", "[Loresang] Settings saved.")
+          window.destroy
+        end
+        btn_box.add(save_btn)
+
+        cancel_btn = Gtk::Button.new(label: "Cancel")
+        cancel_btn.signal_connect('clicked') { window.destroy }
+        btn_box.add(cancel_btn)
+
+        window.show_all
+      end
     end
   end
 end
 
+# Main script execution
 arg = script.vars[1].to_s.downcase.strip rescue ''
 
 if arg == 'setup'
   if defined?(Gtk) && Gtk.respond_to?(:queue)
-    setup_window()
+    Loresang.show_setup_window
   else
-    respond_yellow "*** GTK3 not loaded - cannot open GUI. Use ;setvariable for manual edits. ***"
+    Lich::Messaging.msg("yellow", "*** GTK3 not loaded - cannot open GUI. Use ;setvariable for manual edits. ***")
   end
   exit
 end
 
 mode = arg == 'hand' ? :hand : :container
-
-use_guildspeak = UserVars.loresang_use_guildspeak || false
-announce_successes = UserVars.loresang_announce_successes || false
-max_cycles = UserVars.loresang_max_cycles || 10
-verse1_default = "that I hold in my hand; Tell your secrets and don't be bland;Share your power and make it grand; I seek the knowledge lost in the sand"
-verse2_default = "of power that I hold;Speak of secrets left untold; Show me now for I am bold;Spare no detail don't leave me cold"
-verse1 = (UserVars.loresang_verse1 || "").strip.empty? ? verse1_default : UserVars.loresang_verse1
-verse2 = (UserVars.loresang_verse2 || "").strip.empty? ? verse2_default : UserVars.loresang_verse2
-low_mana_enabled = UserVars.loresang_low_mana_enabled || false
-low_mana_text = UserVars.loresang_low_mana_text || ""
-low_mana_pct = (UserVars.loresang_low_mana_pct || 15).to_i
-rt_skew_enabled = UserVars.loresang_rt_skew_enabled || false
-rt_skew = rt_skew_enabled ? (UserVars.loresang_rt_skew || "0").to_f : 0.0
-value_alert_enabled = UserVars.loresang_value_alert_enabled || false
-value_threshold_text = UserVars.loresang_value_threshold.to_s.strip
-value_threshold = (value_alert_enabled && !value_threshold_text.empty?) ? value_threshold_text.gsub(',', '').to_i : nil
-sing_container_name = UserVars.loresang_sing_container.to_s.strip
-sung_container_name = UserVars.loresang_sung_container.to_s.strip
-
-def already_unlocked?(recall_text)
-  text = recall_text.downcase
-  
-  return false if text.include?("must reveal the entire loresong")
-  return false if text.include?("you have not yet unlocked")
-  return false if text.include?("needs to be unlocked")
-  
-  text.include?("permanently unlocked") ||
-  text.include?("has a permanently unlocked loresong") ||
-  text.include?("harmonies reveal nothing") ||
-  text.include?("the loresong is complete") ||
-  text.include?("nothing more to learn") ||
-  text.include?("already learned") ||
-  text.include?("fully unlocked")
-end
-
-def matches_filter(item)
-  enabled_tags = {
-    clothing:   UserVars.loresang_tag_clothing   || false,
-    weapons:    UserVars.loresang_tag_weapons    || false,
-    armor:      UserVars.loresang_tag_armor      || false,
-    jewelry:    UserVars.loresang_tag_jewelry    || false,
-    containers: UserVars.loresang_tag_containers || false,
-    magic:      UserVars.loresang_tag_magic      || false
-  }
-  should_sing = false
-  should_sing ||= enabled_tags[:clothing]   && item.type =~ /clothing/i
-  should_sing ||= enabled_tags[:weapons]    && item.type =~ /weapon/i
-  should_sing ||= enabled_tags[:armor]      && item.type =~ /armor/i
-  should_sing ||= enabled_tags[:jewelry]    && item.type =~ /jewelry/i
-  should_sing ||= enabled_tags[:containers] && item.type =~ /container/i
-  should_sing ||= enabled_tags[:magic]      && item.type =~ /magic/i
-  should_sing
-end
-
-def sing_item(item_name, noun, verse1, verse2, use_guildspeak, announce_successes, max_cycles, low_mana_enabled, low_mana_text, low_mana_pct, rt_skew, items_remaining, value_threshold)
-  respond_yellow "[Loresang] Starting loresong for #{noun}..."
-
-  if low_mana_enabled && !low_mana_text.to_s.empty?
-    current_mana_pct = (checkmana.to_f / maxmana.to_f * 100).round(1)
-    if current_mana_pct < low_mana_pct
-      put "speak common"
-      pause 0.5
-      put "say #{low_mana_text}"
-      pause 0.5
-      put "speak bard" if use_guildspeak
-      pause 0.5
-      respond_yellow "[Loresang] Low mana alert triggered (#{current_mana_pct}% < #{low_mana_pct}%)."
-    end
-  end
-
-  put "speak bard" if use_guildspeak
-  pause 1 if use_guildspeak
-
-  cycle_count = 0
-  completed = false
-
-  loop do
-    wait_for_mana
-    
-    cycle_count += 1
-    respond_yellow "[Loresang] Cycle #{cycle_count}/#{max_cycles} - singing..."
-    show_progress(items_remaining) if items_remaining
-
-    if cycle_count > max_cycles
-      respond_yellow "[Loresang] Max cycles reached - putting item back."
-      break
-    end
-
-    if GameObj.right_hand.nil? || GameObj.right_hand.name == "Empty"
-      respond_yellow "[Loresang] Item no longer in right hand - aborting this item."
-      break
-    end
-
-    actual_verse1 = verse1.gsub('#{item.noun}', noun)
-    put "loresing #{noun} #{actual_verse1}"
-    pause 1
-
-    response = reget(12, /Roundtime|permanently unlocked|more to share|falters and fades|reached the end|nothing new|learn nothing new|resonates|previously learned/) || []
-
-    if response.empty?
-      respond_yellow "[Loresang] No immediate response after verse 1 - waiting..."
-    end
-
-    line = response.join(" ").downcase
-
-    if line =~ /permanently unlocked|reached the end of .* song|learn nothing new|nothing new about/
-      completed = true
-      rt_match = line.match(/roundtime: (\d+)/)
-      rt_sec = rt_match ? rt_match[1].to_i : 5
-      pause rt_sec + 1 + rt_skew
-      put "recall #{noun}"
-      waitrt?
-      pause 0.8
-      recall_lines = reget(35, /.*/) || []
-      start_index = recall_lines.rindex { |line| line =~ /As you recall your song/ }
-      if start_index
-        recall_lines = recall_lines[start_index..-1]
-      end
-      if recall_lines.any?
-        recall_text = recall_lines.join(" ")
-
-        if value_threshold
-          item_value = parse_item_value(recall_text)
-          if item_value > value_threshold
-            formatted = item_value.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
-            message = "Your item was found to be worth #{formatted} silvers. This is over your value threshold! Congrats!"
-            message += " #{items_remaining} items to go!" if items_remaining
-            respond_green message
-            
-            if announce_successes
-              put "speak common"
-              pause 0.5
-              put "say #{message}"
-              pause 0.5
-            end
-            
-            @high_value_items ||= []
-            @high_value_items << { name: item_name, value: item_value }
-          end
-        end
-      end
-      respond_yellow "[Loresang] Loresong Completed, #{noun} fully identified."
-      show_progress(items_remaining) if items_remaining
-      break
-    elsif line =~ /roundtime: (\d+)/
-      rt = $1.to_i
-      respond_yellow "[Loresang] Waiting #{(rt + 1 + rt_skew).to_i} seconds..."
-      pause [rt + 1 + rt_skew, 0].max
-    elsif line =~ /falters and fades/
-      respond_yellow "[Loresang] Song faltered - no loresong or fully identified."
-      break
-    else
-      respond_yellow "[Loresang] Verse 1 resonated with no new info - trying verse 2..."
-      pause 3
-    end
-
-    actual_verse2 = verse2.gsub('#{item.noun}', noun)
-    put "loresing #{noun} #{actual_verse2}"
-    pause 1
-
-    response = reget(12, /Roundtime|permanently unlocked|more to share|falters and fades|reached the end|nothing new|learn nothing new|resonates|previously learned/) || []
-
-    if response.empty?
-      respond_yellow "[Loresang] No immediate response after verse 2 - continuing..."
-    end
-
-    line = response.join(" ").downcase
-
-    if line =~ /permanently unlocked|reached the end of .* song|learn nothing new|nothing new about/
-      completed = true
-      rt_match = line.match(/roundtime: (\d+)/)
-      rt_sec = rt_match ? rt_match[1].to_i : 5
-      pause rt_sec + 1 + rt_skew
-      put "recall #{noun}"
-      waitrt?
-      pause 0.8
-      recall_lines = reget(35, /.*/) || []
-      start_index = recall_lines.rindex { |line| line =~ /As you recall your song/ }
-      if start_index
-        recall_lines = recall_lines[start_index..-1]
-      end
-      if recall_lines.any?
-        recall_text = recall_lines.join(" ")
-
-        if value_threshold
-          item_value = parse_item_value(recall_text)
-          if item_value > value_threshold
-            formatted = item_value.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
-            message = "Your item was found to be worth #{formatted} silvers. This is over your value threshold! Congrats!"
-            message += " #{items_remaining} items to go!" if items_remaining
-            respond_green message
-            
-            if announce_successes
-              put "speak common"
-              pause 0.5
-              put "say #{message}"
-              pause 0.5
-            end
-            
-            @high_value_items ||= []
-            @high_value_items << { name: item_name, value: item_value }
-          end
-        end
-      end
-      respond_yellow "[Loresang] Loresong Completed, #{noun} fully identified."
-      show_progress(items_remaining) if items_remaining
-      break
-    elsif line =~ /roundtime: (\d+)/
-      rt = $1.to_i
-      respond_yellow "[Loresang] Waiting #{(rt + 1 + rt_skew).to_i} seconds..."
-      pause [rt + 1 + rt_skew, 0].max
-    elsif line =~ /falters and fades/
-      respond_yellow "[Loresang] Song faltered - no loresong or fully identified."
-      break
-    else
-      respond_yellow "[Loresang] Verse 2 resonated with no new info - cycling back..."
-      pause 3
-    end
-  end
-
-  put "speak common" if use_guildspeak
-  pause 0.5 if use_guildspeak
-
-  if !completed && cycle_count <= max_cycles
-    respond_yellow "[Loresang] No clear identification after verses - item may be fully unlocked or non-loresing."
-  end
-
-  completed
-end
-
-if mode == :hand
-  item = GameObj.right_hand
-  if item && item.name != "Empty"
-    item_name = item.name
-    noun = item.noun
-    respond_yellow "[Loresang] Starting loresinging on #{noun}..."
-    @high_value_items = []
-
-    begin
-      completed = sing_item(item_name, noun, verse1, verse2, use_guildspeak, announce_successes, max_cycles, low_mana_enabled, low_mana_text, low_mana_pct, rt_skew, nil, value_threshold)
-    ensure
-      put "speak common" if use_guildspeak
-      pause 0.5 if use_guildspeak
-    end
-
-    respond_yellow "[Loresang] #{completed ? 'Finished' : 'Did not complete'}."
-
-    if @high_value_items.any?
-      item_list = @high_value_items.map { |i| "#{i[:name]}(#{i[:value].to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse})" }.join(", ")
-      summary_message = "#{@high_value_items.length} valuable items found! The following deserve attention: #{item_list}"
-      respond_green summary_message
-      
-      if announce_successes
-        put "speak common"
-        pause 0.5
-        put "say #{summary_message}"
-        pause 0.5
-      end
-    end
-  else
-    respond_yellow "[Loresang] Nothing in right hand!"
-  end
-else
-  if sing_container_name.empty? || sung_container_name.empty?
-    respond_yellow "[Loresang] Container mode requires both Sing Container and Sung Container to be set in setup!"
-    respond_yellow "[Loresang] Run ;loresang setup and enter valid worn container names."
-    exit
-  end
-
-  sing_container = GameObj.inv.find { |o| o.name =~ /#{sing_container_name}/i }
-  sung_container = GameObj.inv.find { |o| o.name =~ /#{sung_container_name}/i }
-
-  unless sing_container
-    respond_yellow "[Loresang] Sing container '#{sing_container_name}' not found (must be worn)."
-    exit
-  end
-
-  unless sung_container
-    respond_yellow "[Loresang] Sung container '#{sung_container_name}' not found (must be worn)."
-    exit
-  end
-
-  if GameObj.right_hand && GameObj.right_hand.name != "Empty"
-    if GameObj.right_hand.type =~ /shield/i
-      fput "store shield"
-    elsif GameObj.right_hand.type =~ /weapon/i
-      fput "store weapon"
-    else
-      fput "stow right"
-    end
-    pause 0.5
-  end
-
-  if GameObj.left_hand && GameObj.left_hand.name != "Empty"
-    if GameObj.left_hand.type =~ /shield/i
-      fput "store shield"
-    elsif GameObj.left_hand.type =~ /weapon/i
-      fput "store weapon"
-    else
-      fput "stow left"
-    end
-    pause 0.5
-  end
-
-  [sing_container, sung_container].each do |cont|
-    fput "look in ##{cont.id}"
-    pause 0.6
-    if reget(5, /closed/)
-      fput "open ##{cont.id}"
-      pause 0.8
-      fput "look in ##{cont.id}"
-      pause 0.6
-    end
-  end
-
-  items_to_sing = sing_container.contents.select { |i| matches_filter(i) }
-
-  if items_to_sing.empty?
-    respond_yellow "[Loresang] No matching items found in #{sing_container_name}."
-    exit
-  end
-
-  failed_items = []
-  items_remaining = items_to_sing.length
-  successfully_unlocked = 0
-  already_unlocked_count = 0
-  @high_value_items = []
-
-  begin
-    items_to_sing.each do |item|
-      fput "get ##{item.id} from ##{sing_container.id}"
-      pause 0.8
-      
-      if (GameObj.right_hand.nil? || GameObj.right_hand.name == "Empty") && GameObj.left_hand && GameObj.left_hand.id == item.id
-        fput "swap"
-        pause 0.5
-      end
-      
-      next unless GameObj.right_hand && GameObj.right_hand.id == item.id
-
-      item_name = item.name
-      noun = item.noun
-
-      put "recall #{noun}"
-      waitrt?
-      pause 0.8
-      recall_lines = reget(35, /.*/) || []
-      start_index = recall_lines.rindex { |line| line =~ /As you recall your song/ }
-      if start_index
-        recall_lines = recall_lines[start_index..-1]
-      end
-      recall_text = recall_lines.join(" ")
-
-      if already_unlocked?(recall_text)
-        if value_threshold && parse_item_value(recall_text) > value_threshold
-          item_value = parse_item_value(recall_text)
-          formatted = item_value.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
-          message = "Your item was found to be worth #{formatted} silvers. This is over your value threshold! Congrats! #{items_remaining} items to go!"
-          respond_green message
-          
-          if announce_successes
-            put "speak common"
-            pause 0.5
-            put "say #{message}"
-            pause 0.5
-          end
-          
-          @high_value_items << { name: item_name, value: item_value }
-        end
-
-        respond_yellow "[Loresang] #{noun} already fully unlocked - moving to sung container."
-        fput "put ##{item.id} in ##{sung_container.id}"
-        pause 0.6
-        items_remaining -= 1
-        already_unlocked_count += 1
-        show_progress(items_remaining)
-        next
-      end
-
-      completed = sing_item(item_name, noun, verse1, verse2, use_guildspeak, announce_successes, max_cycles, low_mana_enabled, low_mana_text, low_mana_pct, rt_skew, items_remaining, value_threshold)
-
-      if completed
-        fput "put ##{item.id} in ##{sung_container.id}"
-        items_remaining -= 1
-        successfully_unlocked += 1
-      else
-        fput "put ##{item.id} in ##{sing_container.id}"
-        failed_items << item.name
-      end
-      pause 0.6
-    end
-  ensure
-    put "speak common" if use_guildspeak
-    pause 0.5 if use_guildspeak
-  end
-
-  if failed_items.any?
-    respond_yellow "[Loresang] Failed items (returned to #{sing_container_name}):"
-    failed_items.each { |n| respond_yellow "  - #{n}" }
-  end
-
-  respond_yellow "[Loresang] Batch loresinging complete! #{successfully_unlocked} items successfully unlocked and #{already_unlocked_count} items already found unlocked. All moved to #{sung_container_name}!"
-
-  if @high_value_items.any?
-    item_list = @high_value_items.map { |i| "#{i[:name]}(#{i[:value].to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse})" }.join(", ")
-    summary_message = "#{@high_value_items.length} valuable items found! The following deserve attention: #{item_list}"
-    respond_green summary_message
-    
-    if announce_successes
-      put "speak common"
-      pause 0.5
-      put "say #{summary_message}"
-      pause 0.5
-    end
-  end
-
-  put "speak common" if use_guildspeak
-  pause 0.3 if use_guildspeak
-
-  respond_yellow "[Loresang] Script finished."
-end
+Loresang::Runner.new(mode).run
