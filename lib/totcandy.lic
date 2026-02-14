@@ -1,0 +1,670 @@
+=begin
+  Unified ToT candy helper for the brown trick-or-treat bag.
+
+  Commands:
+    ;totcandy unwrap [count] [bag name]
+    ;totcandy bundle [focus text|current] [bundle_count]
+    ;totcandy all [unwrap_count] [bag name]
+    ;totcandy rewards
+
+  Examples:
+    ;totcandy unwrap 100
+    ;totcandy bundle "a caramel square" 5
+    ;totcandy bundle current 10
+    ;totcandy all 250
+
+  Changelog:
+    3.0.4 (2026-02-13)
+      - Improved focus navigation to use exact shortest-path movement from current focus.
+      - Focus targeting now prefers `push` automatically when backward movement is faster.
+    3.0.3 (2026-02-13)
+      - Removed expensive full-bag rescan after target bundling.
+      - Final target totals now use tracked bundle operations to avoid extra turn/push cycling.
+    3.0.2 (2026-02-13)
+      - Fixed target bundle count handling: `;totcandy bundle <target> N` now attempts exactly N target candies.
+      - Added explicit "max makeable" feedback when requested target quantity cannot be reached.
+    3.0.1 (2026-02-13)
+      - Reverted rewards/planning count reads back to focus traversal (turn/push) for FE compatibility.
+    3.0.0 (2026-02-13)
+      - Made script fully self-contained (no external helper file required).
+      - Wrapped all logic in TotCandy::Helpers and TotCandy::App to avoid global collisions.
+    2.4.1 (2026-02-13)
+      - Rewards now reads counts from a single LOOK IN bag response (no turn/push cycling).
+    2.4.0 (2026-02-13)
+      - Updated rewards output to grouped live bag view.
+      - Rewards now show current count plus makeable quantity per tier.
+    2.3.0 (2026-02-13)
+      - Bundle commands now LOOK in the bag first and choose TURN vs PUSH by shortest path.
+      - Improved focus acquisition to reduce unnecessary full bag rotations.
+    2.2.0 (2026-02-13)
+      - Added tier-progression bundling to selected target candy.
+      - Bundle command now scans bag counts and auto-bundles lower tiers into target tier.
+      - Added projection output for reachable target count.
+=end
+
+module TotCandy
+  module Helpers
+    FOCUS_PATTERN = /labeled,\s*"([^"]+)"/i
+    OPEN_FOCUS_PATTERN = /compartment labeled,\s*"([^"]+)",\s*is currently (?:wide )?open/i
+    COUNT_PATTERN = /There (?:is|are) (\d+) treats? inside/i
+    LOOK_COUNT_LINE_PATTERN = /^\s*\((\d+)\)\s+(.+?)\s*$/
+    PULL_PATTERN = /remove one piece|come up empty handed|no treats inside|need a free hand/i
+    BUNDLE_PATTERN = /do not have anything to bundle|now has 2 bites|now has 3 bites|combined 3 bites|morphed into one bite|cannot bundle candy that is not of the same tier|need a free hand/i
+    TWIST_PATTERN = /small treat is exposed|already unwrapped|You twist|Pulling on the outer ends/i
+
+    module_function
+
+    def normalize_label(label)
+      text = label.to_s.strip
+      text = text.sub(/\.\z/, "")
+      text.gsub(/\s+/, " ")
+    end
+
+    def parse_focus_state(text)
+      line = text.to_s
+      label = normalize_label(line[FOCUS_PATTERN, 1])
+      count_text = line[COUNT_PATTERN, 1]
+      count = count_text ? count_text.to_i : 0
+      { label: label, count: count, raw: line }
+    end
+
+    def cycle_focus(bag_name:, direction: "turn")
+      response = dothistimeout("#{direction} my #{bag_name}", 3, /labeled|turn|push|What were you referring|can't|cannot/i)
+      parse_focus_state(response)
+    end
+
+    def current_focus_from_look(bag_name:)
+      response = dothistimeout("look in my #{bag_name}", 6, OPEN_FOCUS_PATTERN)
+      match = response.to_s.match(OPEN_FOCUS_PATTERN)
+      return nil unless match
+
+      normalize_label(match[1])
+    end
+
+    def navigation_plan(current_label:, target_label:, cycle_order:)
+      return nil if cycle_order.nil? || cycle_order.empty?
+
+      normalized_order = cycle_order.map { |label| normalize_label(label) }
+      current_idx = normalized_order.index(normalize_label(current_label))
+      target_idx = normalized_order.index(normalize_label(target_label))
+      return nil if current_idx.nil? || target_idx.nil?
+
+      size = normalized_order.length
+      forward_steps = (target_idx - current_idx) % size
+      backward_steps = (current_idx - target_idx) % size
+
+      if forward_steps <= backward_steps
+        { direction: "turn", steps: forward_steps }
+      else
+        { direction: "push", steps: backward_steps }
+      end
+    end
+
+    def focus_on_label(bag_name:, target_text:, max_steps: 80, cycle_order: nil, current_label: nil)
+      if current_label && cycle_order
+        plan = navigation_plan(
+          current_label: current_label,
+          target_label: target_text,
+          cycle_order: cycle_order
+        )
+
+        if plan
+          return { label: normalize_label(current_label), count: nil, raw: "" } if plan[:steps].zero?
+
+          state = nil
+          plan[:steps].times do
+            state = cycle_focus(bag_name: bag_name, direction: plan[:direction])
+          end
+          return state if state
+        end
+      end
+
+      steps = 0
+      while steps < max_steps
+        state = cycle_focus(bag_name: bag_name, direction: "turn")
+        return state if state[:label]&.downcase&.include?(target_text.downcase)
+
+        steps += 1
+      end
+      nil
+    end
+
+    def clear_hands_to_bag(bag_name:)
+      right = GameObj.right_hand
+      left = GameObj.left_hand
+      fput("put ##{right.id} in my #{bag_name}") if right && right.respond_to?(:id) && right.id
+      fput("put ##{left.id} in my #{bag_name}") if left && left.respond_to?(:id) && left.id
+    end
+
+    def pull_piece(bag_name:)
+      dothistimeout("pull my #{bag_name}", 4, PULL_PATTERN)
+    end
+
+    def twist_held_candy
+      candy = GameObj.right_hand || GameObj.left_hand
+      return nil unless candy
+
+      dothistimeout("twist ##{candy.id}", 4, TWIST_PATTERN)
+    end
+
+    def bundle_held_candy
+      dothistimeout("bundle", 4, BUNDLE_PATTERN)
+    end
+
+    def bundle_from_current_focus(bag_name:, bundle_goal: nil)
+      clear_hands_to_bag(bag_name: bag_name)
+      bundled = 0
+
+      loop do
+        break if bundle_goal && bundled >= bundle_goal
+
+        pull_result = pull_piece(bag_name: bag_name).to_s
+        break if pull_result =~ /come up empty handed|no treats inside/i
+
+        if pull_result =~ /need a free hand/i
+          clear_hands_to_bag(bag_name: bag_name)
+          next
+        end
+
+        bundle_result = bundle_held_candy.to_s
+        case bundle_result
+        when /combined 3 bites|morphed into one bite/i
+          bundled += 1
+          clear_hands_to_bag(bag_name: bag_name)
+        when /cannot bundle candy that is not of the same tier|need a free hand/i
+          clear_hands_to_bag(bag_name: bag_name)
+        else
+          # Keep current held candy state for next pull/bundle pass.
+        end
+      end
+
+      clear_hands_to_bag(bag_name: bag_name)
+      bundled
+    end
+
+    def unwrap_from_wrapped_focus(bag_name:, unwrap_limit: nil)
+      focus = focus_on_label(bag_name: bag_name, target_text: "wrapped piece of candy")
+      return nil unless focus
+
+      unwrapped = 0
+      loop do
+        break if unwrap_limit && unwrapped >= unwrap_limit
+
+        pull_result = pull_piece(bag_name: bag_name).to_s
+        break if pull_result =~ /come up empty handed|no treats inside/i
+
+        if pull_result =~ /need a free hand/i
+          clear_hands_to_bag(bag_name: bag_name)
+          next
+        end
+
+        twist_held_candy
+        clear_hands_to_bag(bag_name: bag_name)
+        unwrapped += 1
+      end
+
+      { unwrapped: unwrapped, start_label: focus[:label] }
+    end
+
+    def full_cycle_bundle(bag_name:, unwrap_limit: nil)
+      unwrap_result = unwrap_from_wrapped_focus(bag_name: bag_name, unwrap_limit: unwrap_limit)
+      return nil unless unwrap_result
+
+      bundles_done = 0
+      start_label = unwrap_result[:start_label]
+      visited_labels = {}
+
+      loop do
+        state = cycle_focus(bag_name: bag_name, direction: "turn")
+        label = state[:label]
+
+        break if label.nil?
+        break if label == start_label && visited_labels[label]
+
+        visited_labels[label] = true
+        next if label =~ /wrapped piece of candy/i
+        next if state[:count] < 3
+
+        planned_bundles = state[:count] / 3
+        bundles_done += bundle_from_current_focus(
+          bag_name: bag_name,
+          bundle_goal: planned_bundles
+        )
+      end
+
+      { unwrapped: unwrap_result[:unwrapped], bundled: bundles_done }
+    end
+
+    def scan_focus_counts(bag_name:, max_steps: 120)
+      counts = {}
+      first_state = cycle_focus(bag_name: bag_name, direction: "turn")
+      first_label = first_state[:label]
+      return counts if first_label.nil?
+
+      counts[first_label] = first_state[:count]
+      steps = 0
+
+      while steps < max_steps
+        state = cycle_focus(bag_name: bag_name, direction: "turn")
+        label = state[:label]
+        break if label.nil?
+        break if label == first_label
+
+        counts[label] = state[:count]
+        steps += 1
+      end
+
+      counts
+    end
+
+    def scan_focus_counts_from_look(bag_name:)
+      response = dothistimeout(
+        "look in my #{bag_name}",
+        8,
+        /currently wide open|WRAPPED CANDY|GROUP 1|compartment labeled/i
+      ).to_s
+
+      counts = parse_counts_from_text(response)
+      return counts unless counts.empty?
+
+      # Some front-ends only return the final line from dothistimeout.
+      # Fallback: collect the full LOOK output block from the stream.
+      full_response = collect_look_output_block(bag_name: bag_name)
+      parse_counts_from_text(full_response)
+    end
+
+    def parse_counts_from_text(text)
+      counts = {}
+      text.to_s.each_line do |line|
+        next unless (match = line.match(LOOK_COUNT_LINE_PATTERN))
+
+        counts[normalize_label(match[2])] = match[1].to_i
+      end
+
+      counts
+    end
+
+    def collect_look_output_block(bag_name:, max_lines: 80)
+      lines = []
+      fput("look in my #{bag_name}")
+
+      max_lines.times do
+        line = get.to_s
+        lines << line
+        break if line.match?(OPEN_FOCUS_PATTERN)
+      end
+
+      lines.join
+    rescue StandardError
+      lines.join
+    end
+  end
+
+  class App
+    DEFAULT_BAG_NAME = "brown bag".freeze
+
+    CANDY_REWARD_ROWS = [
+      ["some dried fruit", "N/A (Tier 1)"],
+      ["some sugar-dusted dried fruit", "a blue feather-shaped charm (6 charges)"],
+      ["some sugar-dusted dried fruit dipped in chocolate", "an enruned gold ring (60 charges)"],
+      ["a chocolate-laced fruit coated in nonpareils", "a swirling nexus orb (1 entry)"],
+      ["a nonpareils-coated chocolate filled with fruit syrup", "a warmly glowing orb (30 entries)"],
+      ["a green candy", "N/A (Tier 1)"],
+      ["a swirled green candy", "an urchin guide bond (60 days)"],
+      ["a swirled green candy drizzled with caramel", "a locker runner contract (60 items)"],
+      ["a chocolate-dipped green candy topped with apple bits", "a silvery blue potion (1 sip)"],
+      ["a caramel-filled apple candy covered in milk chocolate", "a locker expansion contract (10 items)"],
+      ["a chocolate drop", "N/A (Tier 1)"],
+      ["a powdered chocolate drop", "a birth certificate parchment (1)"],
+      ["a powdered chocolate drop with lemon rind sprinkles", "a squat pale grey crystal bottle (10 pills)"],
+      ["a lemon-infused dark chocolate drop", "a thick stability contract (20 uses)"],
+      ["a lemon-infused dark chocolate truffle", "a shimmering blue orb (1)"],
+      ["a caramel square", "N/A (Tier 1)"],
+      ["a caramel and cream square", "a muscular arm token (100 uses)"],
+      ["a caramel and cream square with chocolate corners", "a bulging muscular arm token (90 days)"],
+      ["an orange cream caramel square with chocolate corners", "a swirling yellow-green potion (3 charges, 30 days each)"],
+      ["a creamy orange caramel square dipped in chocolate", "a potent yellow-green potion (4 charges, 1 month each)"],
+      ["a candy stick", "N/A (Tier 1)"],
+      ["a cherry candy stick", "an Elanthian Guilds voucher pack (10 uses)"],
+      ["a cherry and vanilla candy stick", "an Adventurer's Guild voucher pack (40 uses)"],
+      ["a swirled cherry-vanilla stick with chocolate tips", "an Adventurer's Guild task waiver (60 days)"],
+      ["a chocolate-tipped cherry-vanilla stick with peppermint crumbles", "a Guild Night form (3.5 hours)"]
+    ].freeze
+
+    CANDY_GROUPS = [
+      [
+        "some dried fruit",
+        "some sugar-dusted dried fruit",
+        "some sugar-dusted dried fruit dipped in chocolate",
+        "a chocolate-laced fruit coated in nonpareils",
+        "a nonpareils-coated chocolate filled with fruit syrup"
+      ],
+      [
+        "a green candy",
+        "a swirled green candy",
+        "a swirled green candy drizzled with caramel",
+        "a chocolate-dipped green candy topped with apple bits",
+        "a caramel-filled apple candy covered in milk chocolate"
+      ],
+      [
+        "a small chocolate drop",
+        "a powdered chocolate drop",
+        "a powdered chocolate drop with lemon rind sprinkles",
+        "a lemon-infused dark chocolate drop",
+        "a lemon-infused dark chocolate truffle"
+      ],
+      [
+        "a caramel square",
+        "a caramel and cream square",
+        "a caramel and cream square with chocolate corners",
+        "an orange cream caramel square with chocolate corners",
+        "a creamy orange caramel square dipped in chocolate"
+      ],
+      [
+        "a candy stick",
+        "a cherry candy stick",
+        "a cherry and vanilla candy stick",
+        "a swirled cherry-vanilla stick with chocolate tips",
+        "a chocolate-tipped cherry-vanilla stick with peppermint crumbles"
+      ]
+    ].freeze
+
+    CANDY_CYCLE_ORDER = ["a wrapped piece of candy"] + CANDY_GROUPS.flatten
+
+    def run
+      args = script_args
+      command = args.first&.downcase
+
+      case command
+      when "unwrap", "u"
+        args.shift
+        run_unwrap(args)
+      when "bundle", "b", "focus", "f"
+        args.shift
+        run_bundle(args)
+      when "all", "auto", "full"
+        args.shift
+        run_all(args)
+      when "rewards", "reward", "table", "list"
+        run_rewards
+      when "help", "-h", "--help"
+        show_usage
+      else
+        run_bundle(args)
+      end
+    end
+
+    private
+
+    def parse_optional_count(args)
+      return nil if args.empty?
+      return nil unless args.first.match?(/^\d+$/)
+
+      args.shift.to_i
+    end
+
+    def run_unwrap(args)
+      unwrap_limit = parse_optional_count(args)
+      bag_name = args.empty? ? DEFAULT_BAG_NAME : args.join(" ")
+
+      result = Helpers.unwrap_from_wrapped_focus(
+        bag_name: bag_name,
+        unwrap_limit: unwrap_limit
+      )
+
+      unless result
+        echo "totcandy: could not focus wrapped candy in my #{bag_name}."
+        return
+      end
+
+      echo "totcandy: unwrapped #{result[:unwrapped]} candy."
+    end
+
+    def run_bundle(args)
+      bundle_goal = args.last&.match?(/^\d+$/) ? args.pop.to_i : nil
+      focus_text = args.join(" ").strip
+      bag_name = DEFAULT_BAG_NAME
+
+      if !focus_text.empty? && focus_text.downcase != "current"
+        resolved_target = resolve_target_label(focus_text)
+        if resolved_target
+          run_bundle_to_target(
+            bag_name: bag_name,
+            target_label: resolved_target,
+            target_count: bundle_goal
+          )
+          return
+        end
+
+        current_focus = Helpers.current_focus_from_look(bag_name: bag_name)
+        focus = Helpers.focus_on_label(
+          bag_name: bag_name,
+          target_text: focus_text,
+          cycle_order: CANDY_CYCLE_ORDER,
+          current_label: current_focus
+        )
+        unless focus
+          echo "totcandy: could not focus on '#{focus_text}' in my #{bag_name}."
+          return
+        end
+      end
+
+      bundled = Helpers.bundle_from_current_focus(
+        bag_name: bag_name,
+        bundle_goal: bundle_goal
+      )
+      echo "totcandy: completed #{bundled} bundles."
+    end
+
+    def run_all(args)
+      unwrap_limit = parse_optional_count(args)
+      bag_name = args.empty? ? DEFAULT_BAG_NAME : args.join(" ")
+
+      result = Helpers.full_cycle_bundle(
+        bag_name: bag_name,
+        unwrap_limit: unwrap_limit
+      )
+
+      unless result
+        echo "totcandy: could not focus wrapped candy in my #{bag_name}."
+        return
+      end
+
+      echo "totcandy: unwrapped #{result[:unwrapped]}, completed #{result[:bundled]} bundles."
+    end
+
+    def run_rewards
+      bag_name = DEFAULT_BAG_NAME
+      counts = Helpers.scan_focus_counts(bag_name: bag_name)
+
+      if counts.empty?
+        echo "totcandy: unable to parse counts from 'look in my #{bag_name}'."
+        return
+      end
+
+      reward_map = CANDY_REWARD_ROWS.to_h
+      wrapped_label = "a wrapped piece of candy"
+      wrapped_count = counts.fetch(Helpers.normalize_label(wrapped_label), 0)
+
+      echo "WRAPPED CANDY"
+      echo "(#{wrapped_count}) #{wrapped_label}"
+      echo ""
+
+      CANDY_GROUPS.each_with_index do |group, group_index|
+        echo "GROUP #{group_index + 1}"
+
+        group.each_with_index do |label, tier_index|
+          normalized_label = Helpers.normalize_label(label)
+          current_count = counts.fetch(normalized_label, 0)
+          projected_count = compute_bundle_plan(group, counts, tier_index)[:projected_target]
+          reward = reward_map.fetch(label, "N/A")
+
+          echo "(#{current_count}) #{label}"
+          echo "  reward: #{reward}"
+          echo "  makeable now: #{projected_count}"
+        end
+
+        echo ""
+      end
+    end
+
+    def show_usage
+      echo "usage: ;totcandy unwrap [count] [bag name]"
+      echo "usage: ;totcandy bundle [focus text|current] [bundle_count]"
+      echo "usage: ;totcandy all [unwrap_count] [bag name]"
+      echo "usage: ;totcandy rewards"
+    end
+
+    def resolve_target_label(input_text)
+      needle = Helpers.normalize_label(input_text).downcase
+      return nil if needle.empty?
+
+      CANDY_GROUPS.flatten.find { |label| Helpers.normalize_label(label).downcase.include?(needle) }
+    end
+
+    def find_group_for_label(target_label)
+      normalized_target = Helpers.normalize_label(target_label)
+      CANDY_GROUPS.find { |group| group.any? { |label| Helpers.normalize_label(label).casecmp(normalized_target).zero? } }
+    end
+
+    def compute_bundle_plan(group_labels, counts_by_label, target_index)
+      working = group_labels.map { |label| counts_by_label.fetch(Helpers.normalize_label(label), 0).to_i }
+      operations = Array.new(group_labels.length, 0)
+
+      0.upto(target_index - 1) do |idx|
+        operations[idx] = working[idx] / 3
+        working[idx] %= 3
+        working[idx + 1] += operations[idx]
+      end
+
+      {
+        operations: operations,
+        projected_target: working[target_index],
+        projected_counts: working
+      }
+    end
+
+    def compute_exact_target_plan(group_labels, counts_by_label, target_index, target_count)
+      working = group_labels.map { |label| counts_by_label.fetch(Helpers.normalize_label(label), 0).to_i }
+      operations = Array.new(group_labels.length, 0)
+      required = Array.new(group_labels.length, 0)
+      required[target_index] = target_count
+
+      (target_index - 1).downto(0) do |idx|
+        needed = required[idx + 1] * 3
+        available = working[idx]
+        consumed = [available, needed].min
+        working[idx] = available - consumed
+        required[idx] = needed - consumed
+        operations[idx] = required[idx + 1]
+      end
+
+      {
+        feasible: required[0].zero?,
+        operations: operations
+      }
+    end
+
+    def run_bundle_to_target(bag_name:, target_label:, target_count: nil)
+      normalized_target = Helpers.normalize_label(target_label)
+      group = find_group_for_label(target_label)
+      unless group
+        echo "totcandy: could not match target group for '#{target_label}'."
+        return
+      end
+
+      target_index = group.index { |label| Helpers.normalize_label(label).casecmp(normalized_target).zero? }
+      if target_index.nil?
+        echo "totcandy: could not find target index for '#{target_label}'."
+        return
+      end
+
+      counts = Helpers.scan_focus_counts(bag_name: bag_name)
+      plan = compute_bundle_plan(group, counts, target_index)
+      operations = plan[:operations]
+      initial_target_count = counts.fetch(normalized_target, 0).to_i
+
+      if target_count
+        if target_count <= 0
+          echo "totcandy: bundle count must be greater than 0."
+          return
+        end
+
+        if target_index.zero?
+          echo "totcandy: '#{target_label}' is a base tier and cannot be created by bundling."
+          return
+        end
+
+        exact_plan = compute_exact_target_plan(group, counts, target_index, target_count)
+        unless exact_plan[:feasible]
+          max_makeable = [plan[:projected_target] - initial_target_count, 0].max
+          echo "totcandy: not enough candy to make #{target_count} '#{target_label}' (max makeable #{max_makeable})."
+          return
+        end
+
+        operations = exact_plan[:operations]
+      end
+
+      total_bundles = 0
+      produced_by_tier = Array.new(group.length, 0)
+      0.upto(target_index - 1) do |idx|
+        bundles_needed = operations[idx]
+        next if bundles_needed <= 0
+
+        current_focus = Helpers.current_focus_from_look(bag_name: bag_name)
+        focus = Helpers.focus_on_label(
+          bag_name: bag_name,
+          target_text: group[idx],
+          cycle_order: CANDY_CYCLE_ORDER,
+          current_label: current_focus
+        )
+        unless focus
+          echo "totcandy: failed to focus '#{group[idx]}'. stopping early."
+          break
+        end
+
+        completed = Helpers.bundle_from_current_focus(
+          bag_name: bag_name,
+          bundle_goal: bundles_needed
+        )
+        total_bundles += completed
+        produced_by_tier[idx + 1] += completed
+      end
+
+      made = produced_by_tier[target_index]
+      final_target_count = initial_target_count + made
+
+      if target_count
+        echo "totcandy: target '#{target_label}' requested #{target_count}, made #{made}, now #{final_target_count}. bundles run: #{total_bundles}."
+      else
+        echo "totcandy: target '#{target_label}' projected #{plan[:projected_target]}, now #{final_target_count}. bundles run: #{total_bundles}."
+      end
+    end
+
+    def script_args
+      vars = if defined?(Script) && Script.current && Script.current.respond_to?(:vars)
+               Script.current.vars.dup
+             else
+               []
+             end
+
+      vars = vars.compact.map(&:to_s)
+      parsed =
+        if vars.length > 1
+          vars[1..]
+        elsif vars.length == 1
+          vars[0].strip.split(/\s+/)
+        else
+          ARGV.dup
+        end
+
+      if defined?(Script) && Script.current && parsed.first&.downcase == Script.current.name.downcase
+        parsed.shift
+      end
+
+      parsed
+    end
+  end
+end
+
+TotCandy::App.new.run
