@@ -1,5 +1,80 @@
 # frozen_string_literal: true
 require 'yaml'
+require 'socket'
+
+# Returns [offset_seconds, rtt_seconds] or nil on failure
+def sntp_sample(host: 'pool.ntp.org', port: 123, timeout: 1.5)
+  s = UDPSocket.new
+  s.connect(host, port)
+
+  # NTP packet: 48 bytes. First byte = LI(0) VN(4) Mode(3) => 0x23
+  pkt = "\x23" + ("\x00" * 47)
+
+  t0 = Time.now.to_f
+  s.send(pkt, 0)
+
+  r = IO.select([s], nil, nil, timeout)
+  return nil unless r
+
+  data = s.recv(48)
+  t3 = Time.now.to_f
+  return nil unless data && data.bytesize >= 48
+
+  # Transmit Timestamp (server time) starts at byte 40: 64-bit (seconds, fraction)
+  sec, frac = data[40, 8].unpack("N2")
+  ntp_time = (sec - 2_208_988_800) + (frac / 2.0**32) # convert NTP epoch->Unix epoch
+
+  # Simple SNTP offset estimate using midpoint:
+  # offset = ((t1 - t0) + (t2 - t3)) / 2 ; but we only have server transmit ~t2.
+  # Approximate server time at midpoint of our request/response:
+  local_mid = (t0 + t3) / 2.0
+  offset = local_mid - ntp_time     # + = local clock ahead, - = behind
+  rtt = t3 - t0
+
+  [offset, rtt]
+ensure
+  s.close rescue nil
+end
+
+def clock_drift_tenths(samples: 3)
+  offsets = []
+
+  samples.times do
+    res = sntp_sample
+    next unless res
+    offset, rtt = res
+    # toss garbage / high-latency samples
+    next if rtt > 1.0
+    offsets << offset
+  end
+
+  raise "No successful samples" if offsets.empty?
+
+  offsets.sort!
+  drift = offsets[offsets.length / 2]      # median is stable under jitter
+  (drift * 10).round / 10.0
+end
+
+#DRIFT_SECONDS = clock_drift_tenths(samples: 9)
+#echo "Clock drift: #{DRIFT_SECONDS}s"
+
+def auto_detect_offset!(samples: 3, host: 'pool.ntp.org')
+  drift = clock_drift_tenths(samples: samples) # drift = local - server (seconds, tenths)
+
+  # temporal wants offset_sec such that: server = local + offset_sec
+  offset_sec = -drift
+
+  if offset_sec >= 0
+    seconds = offset_sec.abs
+    dir = "behind"
+  else
+    seconds = offset_sec.abs
+    dir = "ahead"
+  end
+
+  [seconds, dir, offset_sec, drift]
+end
+
 
 module ConfigManager
   def self.load_config(config_name, defaults = {})
@@ -14,8 +89,7 @@ module ConfigManager
                     {}
                   end
 
-    config_data = defaults.merge(config_data)
-    config_data
+    defaults.merge(config_data)
   end
 
   def self.save_config(config_name, data)
@@ -25,7 +99,7 @@ module ConfigManager
 
     begin
       File.open(config_file_path, "w") { |file| file.write(data.to_yaml) }
-      echo("Preferences successfully saved to #{config_file_path}.")
+      #echo("Preferences successfully saved to #{config_file_path}.")
     rescue StandardError => e
       echo("Failed to save preferences: #{e.message}")
     end
@@ -43,25 +117,18 @@ module ConfigGUI
 
     begin
       Gtk.queue {
-        # Create a window
         window = Gtk::Window.new("Configure #{config_name}")
         window.set_default_size(600, 600)
 
-        # Create a notebook to organize tabs
         notebook = Gtk::Notebook.new
-
-        # Create a hash to store the entries
         entries = {}
 
-        # Group settings by display_tab
         grouped_settings = config.keys.group_by { |key| display_params.dig(key, :display_tab) || "General Settings" }
 
-        # Create tabs for each group
         grouped_settings.each do |tab_name, keys|
           scrolled_window = Gtk::ScrolledWindow.new
           scrolled_window.set_policy(:automatic, :automatic)
 
-          # Create a grid to organize the widgets in two columns
           grid = Gtk::Grid.new
           grid.column_spacing = 10
           grid.row_spacing = 10
@@ -95,14 +162,11 @@ module ConfigGUI
             grid.attach(widget, index % 2 * 2 + 1, index / 2, 1, 1)
           end
 
-          # Add the grid to the notebook tab
           notebook.append_page(scrolled_window, Gtk::Label.new(tab_name))
         end
 
-        # Add a save button
         save_button = Gtk::Button.new(label: "Save")
         save_button.signal_connect("clicked") do
-          # Save the changes back to config
           entries.each do |key, widget|
             value = case widget
                     when Gtk::CheckButton
@@ -119,38 +183,30 @@ module ConfigGUI
           window_closed = true
         end
 
-        # Add a close event that does NOT save
         window.signal_connect("destroy") do
           window_closed = true
         end
 
-        # Add the notebook and save button to the layout
         main_box = Gtk::Box.new(:vertical, 10)
         main_box.pack_start(notebook, expand: true, fill: true, padding: 10)
         main_box.pack_start(save_button, expand: false, fill: false, padding: 10)
 
-        # Add main box to window
         window.add(main_box)
-
-        # Show the window
         window.show_all
       }
 
-      # Wait until the window is closed
       wait_while { !window_closed }
     rescue StandardError => e
       echo("An error occurred: #{e.message}")
-      puts e.backtrace # Optional: Print the stack trace for debugging
+      puts e.backtrace
       exit(1)
     end
   end
 
-  # Format key to Title Case for display
   def self.format_key(key)
     key.split('_').map(&:capitalize).join(' ')
   end
 
-  # Parse entry value to appropriate type
   def self.parse_entry_value(value)
     if value =~ /^\d+$/
       value.to_i
@@ -165,40 +221,63 @@ module ConfigGUI
 end
 
 AUTHOR  = "Nick S"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 USAGE_TEXT = <<~TXT
   # temporal.lic (v#{VERSION}) — #{AUTHOR}
   #
-  # Quick start (GUI):
+  # Setup (auto-populates offset):
   #   ;temporal setup
-  #     - Choose flare type + enchant (and optional action/hand)
-  #     - Save your time.is offset (seconds + behind/ahead)
+  #     - Attempts to auto-detect your time offset (SNTP) and pre-fills the Timing fields
+  #     - Configure flare/enchant/action/hand and Save
+  #     - Flare Type supports "Next" (computed at runtime)
   #
-  # Run using saved config (one-liner):
+  # Run with saved config:
   #   ;temporal
-  #     - Uses saved flare/enchant/action/hand + saved time offset
   #
-  # Override ONLY the time offset (still uses GUI target):
+  # Auto-detect offset and run with saved config:
+  #   ;temporal auto
+  #
+  # Auto-detect offset and run with CLI overrides:
+  #   ;temporal auto <flare> <enchant> [clench|break] [right|left]
+  #     - Example: ;temporal auto fire 67 clench
+  #     - Valid regular flare types are:
+  #         "fire"
+  #         "ice" 
+  #         "lightning"      
+  #         "earth"          
+  #         "acid"           
+  #         "void"           
+  #         "disruption"     
+  #         "plasma"         
+  #         "steam"          
+  #         "disintegration" 
+  #
+  # Auto-detect offset and set Death flares:
+  #   ;temporal auto 66death
+  #   ;temporal auto 100death
+  #
+  # Next flare type (requires enchant):
+  #   ;temporal next <enchant> [clench|break] [right|left]
+  #   ;temporal auto next <enchant> [clench|break] [right|left]
+  #     - Sets Flare Type = "Next" (based on the hundreds digit of server Unix time)
+  #     - Prints what the next flare will be + ETA until it becomes active
+  #
+  # Manual offset override (time.is style):
   #   ;temporal <seconds> <behind|ahead>
-  #     - Example: ;temporal 3.2 behind
-  #     - Overwrites & saves offset_seconds/offset_direction
-  #     - Uses saved flare/enchant/action/hand to compute the tail
+  #     - Saves the offset, then runs using saved flare/enchant/action/hand
   #
-  # Full CLI mode (explicit tail):
-  #   ;temporal <seconds> <behind|ahead> <tail> [action=clench] [hand=right|left]
-  #     - Example: ;temporal 3.2 behind 400 break
-  #     - Tail may be 1..6 digits (e.g. 6, 100, 400, 41234, 666100)
+  # Full manual mode (explicit tail):
+  #   ;temporal <seconds> <behind|ahead> <tail> [clench|break] [right|left]
   #
   # Notes:
-  #   - time.is tells you if you are AHEAD or BEHIND (in seconds).
   #   - behind X => server = local + X
   #   - ahead  X => server = local - X
+  #   - If Flare Type is saved as "Next", it is re-computed on EVERY run of ;temporal
   #
   # Help:
   #   ;temporal help
 TXT
-
 
 MAX_DIGITS  = 6
 CONFIG_NAME = "temporal"
@@ -219,13 +298,21 @@ FLARE_DIGIT = {
   "+100 Death"     => "666100"
 }.freeze
 
+# Inverse map for NORMAL flares only (0-9), used for "Next"
+DIGIT_TO_FLARE = FLARE_DIGIT
+  .select { |_k, v| v =~ /\A\d\z/ }
+  .invert
+  .freeze
+
 DEFAULTS = {
   flare_type:       "Earth",
   enchant:          100,
   action:           "clench",
   hand:             "right",
   offset_seconds:   0.0,
-  offset_direction: "behind"
+  offset_direction: "behind",
+  offset_source:    "",
+  offset_note:      ""
 }.freeze
 
 DISPLAY_PARAMS = {
@@ -233,8 +320,8 @@ DISPLAY_PARAMS = {
     display_name: "Flare type",
     display_tab:  "Temporal",
     datatype:     :dropdown,
-    options:      FLARE_DIGIT.keys,
-    tooltip:      "Select the flare appearance/type for the daily set."
+    options:      (FLARE_DIGIT.keys + ["Next"]),
+    tooltip:      "Select the flare appearance/type for the daily set. 'Next' is computed at runtime from server time."
   },
   enchant: {
     display_name: "Enchant",
@@ -266,9 +353,13 @@ DISPLAY_PARAMS = {
     datatype:     :dropdown,
     options:      %w[behind ahead],
     tooltip:      "behind: your clock is behind server; ahead: your clock is ahead."
+  },
+  offset_note: {
+    display_name: "Offset note",
+    display_tab:  "Timing",
+    tooltip:      "Status from auto-detection / failures."
   }
 }.freeze
-
 
 def usage
   echo USAGE_TEXT
@@ -297,6 +388,22 @@ def perform_action(action, hand)
   fput "#{action} my #{noun}"
 end
 
+def parse_flare_token(token)
+  t = token.to_s.strip
+  return nil if t.empty?
+
+  down = t.downcase
+
+  return "+66 Death"  if down == "66death"
+  return "+100 Death" if down == "100death"
+
+  FLARE_DIGIT.keys.each do |k|
+    return k if k.downcase == down
+  end
+
+  nil
+end
+
 def build_tail(flare_type, enchant)
   flare = flare_type.to_s
   digit = FLARE_DIGIT.fetch(flare)
@@ -305,15 +412,9 @@ def build_tail(flare_type, enchant)
   ench = 0 if ench < 0
   ench = 100 if ench > 100
 
-  if flare == "+100 Death"
-    return "666100"
-  end
+  return "666100" if flare == "+100 Death"
+  return "666"    if flare == "+66 Death"
 
-  if flare == "+66 Death"
-    return "666"
-  end
-
-  # Normal flares: one-digit flare + last-two digits of enchant (00 => +100)
   ench2 = format("%02d", ench % 100) # 100 => "00"
   "#{digit}#{ench2}"
 end
@@ -328,6 +429,29 @@ def offset_from(seconds, dir)
   end
 end
 
+def next_flare_info(offset_sec)
+  server_sec = (Time.now.to_f + offset_sec).to_i
+
+  current_digit = (server_sec / 100) % 10
+  next_digit    = ((server_sec / 100) + 1) % 10
+
+  next_boundary = ((server_sec / 100) + 1) * 100
+  eta = next_boundary - server_sec
+
+  current_flare = DIGIT_TO_FLARE[current_digit.to_s]
+  next_flare    = DIGIT_TO_FLARE[next_digit.to_s]
+
+  [current_flare, current_digit, next_flare, next_digit, eta]
+end
+
+def resolve_flare_type(flare_type, offset_sec)
+  return [flare_type, nil] unless flare_type.to_s.downcase == "next"
+
+  current_flare, current_digit, next_flare, next_digit, eta = next_flare_info(offset_sec)
+  note = "[temporal] Next flare computed from server time: now=#{current_flare}(#{current_digit}), next=#{next_flare}(#{next_digit}) in ~#{eta}s"
+  [next_flare, note]
+end
+
 def wait_for_server_tail(tail, offset_sec:, fire_at: 0.5)
   tail_s = tail.to_s.strip
   unless tail_s =~ /\A\d+\z/ && (1..MAX_DIGITS).include?(tail_s.length)
@@ -337,27 +461,51 @@ def wait_for_server_tail(tail, offset_sec:, fire_at: 0.5)
   mod    = 10 ** tail_s.length
   tail_i = tail_s.to_i
 
+  # --- ETA (best-effort, printed once) ---
+  server_now = Time.now.to_f + offset_sec
+  sec  = server_now.to_i
+  frac = server_now - sec
+
+  rem = (tail_i - (sec % mod)) % mod
+
+  eta =
+    if rem == 0
+      # we're in the target second already; wait until fire_at within it
+      [fire_at - frac, 0.0].max
+    else
+      # wait rem seconds to reach target second, then wait to fire_at
+      (rem - frac) + fire_at
+    end
+
+  if eta <= 0.5
+    echo "[temporal] Trigger imminent..."
+  else
+    echo "[temporal] Estimated time until fire: ~#{eta.round(2)}s"
+  end
+  # --- end ETA ---
+
+  # Poll until:
+  #   1) server seconds match tail
+  #   2) we're at/after fire_at inside that second
+  #
+  # This avoids the bug where we enter the right second AFTER fire_at and return immediately (late).
+  poll_sleep = 0.01
+
   loop do
     server_now = Time.now.to_f + offset_sec
     sec  = server_now.to_i
     frac = server_now - sec
 
     if (sec % mod) == tail_i
+      return if frac >= fire_at
+
+      # We're in the correct second but before fire_at; sleep just enough to land near fire_at.
       sleep_time = fire_at - frac
       sleep(sleep_time) if sleep_time > 0
       return
     end
 
-    remaining = (tail_i - (sec % mod)) % mod
-
-    sleep_time =
-      if remaining <= 2
-        0.05
-      else
-        [1.0 - frac, 0.5].min
-      end
-
-    sleep(sleep_time) if sleep_time > 0
+    sleep(poll_sleep)
   end
 end
 
@@ -370,16 +518,26 @@ def save_cfg(cfg)
 end
 
 def run_setup_gui
+  cfg = load_cfg
+  begin
+    seconds, dir, offset_sec, drift = auto_detect_offset!
+    cfg[:offset_seconds]   = seconds
+    cfg[:offset_direction] = dir
+    cfg[:offset_source]    = 'auto'
+    cfg[:offset_note]      = "Auto-detected during setup via SNTP: drift=#{drift}s => offset=#{offset_sec}s"
+    puts "*** temporal setup auto-detected offset: #{seconds} #{dir} (offset=#{offset_sec})"
+  rescue => e
+    cfg[:offset_note] = "Auto-detect during setup failed: #{e.class}: #{e.message}"
+    echo "temporal: #{cfg[:offset_note]}"
+  end
+  save_cfg(cfg)
+
   ConfigGUI.run(CONFIG_NAME, DEFAULTS, DISPLAY_PARAMS)
 end
 
 def run_from_config(cfg, offset_override: nil)
-  flare  = cfg[:flare_type]
-  ench   = cfg[:enchant]
   action = (cfg[:action] || "clench").to_s.downcase.strip
   hand   = normalize_hand(cfg[:hand])
-
-  tail = build_tail(flare, ench)
 
   offset_sec =
     if offset_override
@@ -388,11 +546,18 @@ def run_from_config(cfg, offset_override: nil)
       offset_from(cfg[:offset_seconds], cfg[:offset_direction])
     end
 
-  # Loud notice when using saved timing (requested)
+  flare  = cfg[:flare_type]
+  ench   = cfg[:enchant]
+
+  resolved_flare, next_note = resolve_flare_type(flare, offset_sec)
+  echo next_note if next_note
+
+  tail = build_tail(resolved_flare, ench)
+
   if offset_override.nil?
     puts "************************************************************"
     puts "*** temporal using SAVED offset: #{cfg[:offset_seconds]} #{cfg[:offset_direction]} (offset=#{offset_sec})"
-    puts "*** target tail=#{tail} (flare=#{flare}, enchant=#{ench}), action=#{action}, hand=#{hand}"
+    puts "*** target tail=#{tail} (flare=#{resolved_flare}, enchant=#{ench}), action=#{action}, hand=#{hand}"
     puts "************************************************************"
   end
 
@@ -403,12 +568,15 @@ end
 # ----------------------------
 # Entry (Lich variable[] args)
 # ----------------------------
-echo "DEBUG: FILE=#{__FILE__}"
+args = []
+i = 1
+while (v = variable[i])
+  s = v.to_s.strip
+  args << s unless s.empty?
+  i += 1
+end
 
-cmd1 = (variable[1] || "").to_s.strip
-
-if cmd1.empty?
-  # ;temporal  => run using saved config
+if args.empty?
   begin
     cfg = load_cfg
     run_from_config(cfg)
@@ -419,12 +587,20 @@ if cmd1.empty?
   exit
 end
 
-if cmd1.downcase == "help"
+auto_mode = false
+if args.first.downcase == "auto"
+  auto_mode = true
+  args.shift
+end
+
+cmd = (args.first || "").downcase
+
+if cmd == "help"
   usage
   exit
 end
 
-if cmd1.downcase == "setup"
+if cmd == "setup"
   begin
     run_setup_gui
   rescue => e
@@ -433,13 +609,127 @@ if cmd1.downcase == "setup"
   exit
 end
 
-# If params and not setup/help:
-# - If ONLY "<seconds> <behind|ahead>" are provided: run using config-derived tail/action/hand, and overwrite saved offset.
-# - Otherwise: command line behavior: "<seconds> <behind|ahead> <tail> [action] [hand]"
+cfg = load_cfg
 
-seconds_str = cmd1
-dir         = (variable[2] || "").to_s.downcase.strip
-tail_arg    = (variable[3] || "").to_s.strip
+auto_offset_sec = nil
+if auto_mode
+  begin
+    seconds, dir, offset_sec, drift = auto_detect_offset!
+    cfg[:offset_seconds]   = seconds
+    cfg[:offset_direction] = dir
+    cfg[:offset_source]    = 'auto'
+    cfg[:offset_note]      = "Auto-detected via SNTP: drift=#{drift}s => offset=#{offset_sec}s"
+    save_cfg(cfg)
+    auto_offset_sec = offset_sec
+    puts "*** temporal auto-detected offset: #{seconds} #{dir} (offset=#{offset_sec})"
+  rescue => e
+    cfg[:offset_note] = "Auto-detect failed: #{e.class}: #{e.message}"
+    save_cfg(cfg)
+    echo "temporal: #{cfg[:offset_note]}"
+  end
+end
+
+# ';temporal auto' (with no further args)
+if auto_mode && args.empty?
+  begin
+    if auto_offset_sec
+      run_from_config(cfg, offset_override: auto_offset_sec)
+    else
+      run_from_config(cfg)
+    end
+  rescue => e
+    echo "temporal: ERROR: #{e.class}: #{e.message}"
+    echo "temporal: run ';temporal setup' first."
+  end
+  exit
+end
+
+# consume command token
+args.shift
+
+# Next flare type (requires enchant): ;temporal [auto] next <enchant> [clench|break] [right|left]
+if cmd == "next"
+  ench_arg = (args[0] || "").to_s.strip
+  unless ench_arg =~ /\A\d+\z/
+    echo "temporal: 'next' requires an enchant integer (0-100)."
+    usage
+    exit
+  end
+
+  action = (args[1] || cfg[:action] || "clench").to_s.downcase.strip
+  hand   = normalize_hand(args[2] || cfg[:hand])
+
+  begin
+    cfg[:flare_type] = "Next"
+    cfg[:enchant]    = ench_arg.to_i
+    cfg[:action]     = action
+    cfg[:hand]       = hand
+    save_cfg(cfg)
+
+    if auto_offset_sec
+      run_from_config(cfg, offset_override: auto_offset_sec)
+    else
+      run_from_config(cfg)
+    end
+  rescue => e
+    echo "temporal: ERROR: #{e.class}: #{e.message}"
+    echo "temporal: run ';temporal setup' first."
+  end
+
+  exit
+end
+
+flare_token = parse_flare_token(cmd)
+
+if flare_token
+  begin
+    cfg[:flare_type] = flare_token
+
+    if flare_token == "+66 Death" || flare_token == "+100 Death"
+      action = (args[0] || cfg[:action] || "clench").to_s.downcase.strip
+      hand   = normalize_hand(args[1] || cfg[:hand])
+      cfg[:action] = action
+      cfg[:hand]   = hand
+      save_cfg(cfg)
+
+      if auto_offset_sec
+        run_from_config(cfg, offset_override: auto_offset_sec)
+      else
+        run_from_config(cfg)
+      end
+      exit
+    end
+
+    ench_arg = (args[0] || "").to_s.strip
+    unless ench_arg =~ /\A\d+\z/
+      echo "temporal: expected enchant after flare (example: ;temporal#{auto_mode ? ' auto' : ''} fire 67 clench)."
+      usage
+      exit
+    end
+
+    action = (args[1] || cfg[:action] || "clench").to_s.downcase.strip
+    hand   = normalize_hand(args[2] || cfg[:hand])
+
+    cfg[:enchant] = ench_arg.to_i
+    cfg[:action]  = action
+    cfg[:hand]    = hand
+    save_cfg(cfg)
+
+    if auto_offset_sec
+      run_from_config(cfg, offset_override: auto_offset_sec)
+    else
+      run_from_config(cfg)
+    end
+  rescue => e
+    echo "temporal: ERROR: #{e.class}: #{e.message}"
+  end
+  exit
+end
+
+# Manual offset modes:
+seconds_str = cmd
+dir         = (args[0] || "").to_s.downcase.strip
+tail_arg    = (args[1] || "").to_s.strip
 
 unless seconds_str =~ /\A-?\d+(\.\d+)?\z/ && %w[behind ahead].include?(dir)
   usage
@@ -450,17 +740,14 @@ seconds = seconds_str.to_f.abs
 offset_sec = offset_from(seconds, dir)
 
 if tail_arg.empty?
-  # ;temporal 3.2 behind  => use GUI-configured target, but overwrite saved offset
   begin
-    cfg = load_cfg
-    cfg[:offset_seconds] = seconds
+    cfg[:offset_seconds]   = seconds
     cfg[:offset_direction] = dir
+    cfg[:offset_source]    = 'manual'
+    cfg[:offset_note]      = "Manual override provided on CLI."
     save_cfg(cfg)
 
-    puts "************************************************************"
     puts "*** temporal using PROVIDED offset (saved): #{seconds} #{dir} (offset=#{offset_sec})"
-    puts "************************************************************"
-
     run_from_config(cfg, offset_override: offset_sec)
   rescue => e
     echo "temporal: ERROR: #{e.class}: #{e.message}"
@@ -469,9 +756,8 @@ if tail_arg.empty?
   exit
 end
 
-# CLI mode (explicit tail/action/hand)
-action = (variable[4] || "clench").to_s.downcase.strip
-hand   = normalize_hand(variable[5])
+action = (args[2] || "clench").to_s.downcase.strip
+hand   = normalize_hand(args[3])
 
 begin
   echo "temporal: offset=#{offset_sec} (server = local + offset)"
