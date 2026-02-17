@@ -7,31 +7,33 @@
     - 88 different flare patterns added.
   1.1.0 (2024-09-8)
     - Added lots of new flares to track, mainly armor scripts.
-  - Separated non-damaging flares into a separate global constant.
+    - Separated non-damaging flares into a separate global constant.
   1.2.0 (2024-09-11)
-  - Added all custom fatal afflares messaging.
+    - Added all custom fatal afflares messaging.
   1.3.0 (2024-09-26)
-  - Excluded Symbol of Dreams conflict with Ensorcell_Spirit.
-  - Added Holy Water Flare tracking.
-  - Added lots of tracking for just about every spell with a native effect or spell with a lore benefit effect that functions similar to a flare.
+    - Excluded Symbol of Dreams conflict with Ensorcell_Spirit.
+    - Added Holy Water Flare tracking.
+    - Added lots of tracking for just about every spell with a native effect or spell with a lore benefit effect that functions similar to a flare.
   1.4.0 (2024-10-07)
-  - Added all custom flare messaging sold at the Ebon Gate Festival in the Quinton Manse.
+    - Added all custom flare messaging sold at the Ebon Gate Festival in the Quinton Manse.
   1.5.0 (2024-10-11)
-  - Added Mechanical Quiver and moved Fire Mage Armor to damage pattern.
-  - Added attack pattern match for channeling spells.
+    - Added Mechanical Quiver and moved Fire Mage Armor to damage pattern.
+    - Added attack pattern match for channeling spells.
     - Added Wildfire Oil available from the Hinterwilds Alchemist.
   1.6.0 (2024-10-28)
-  - Covert Arts Deadly Poisons added.
-  - Ball Spell Splash added.
+    - Covert Arts Deadly Poisons added.
+    - Ball Spell Splash added.
   1.7.0 (2025-2-11)
     - Updated for Duskruin Feb 2025.
   1.7.0 (2025-5-15)
     - Updated for Bloodstone Jewelry.  SanguineSacrifice and SanguineSacrifice_Overflow.
-	 1.7.1 (2025-9-13)
-		  - Updated for Rogue Feats Sidestep.
-
+  1.7.1 (2025-9-13)
+    - Updated for Rogue Feats Sidestep.
+  1.7.2 (2026-2-16)
+    - Updated for purified metals, Mirthbrand, and Greater Shadowdeath.
+	
 tags: tracking, item scripts, flares, data, abilities
-version: 1.7.0
+version: 1.7.2
 
 =end
 
@@ -57,7 +59,7 @@ NODMGFLARE_PATTERNS = {
   TotemFeral: /your vision briefly obscured with a bloody haze as a rush of strength surges into your limbs/,
   Tome_Spellwarden: /As you stare at the words, you feel the weight of tactical knowledge build in you, allowing you to better protect yourself/,
   TWard503_LoreBenefit: /The glowing specks of .*? surrounding you intensify/,
-  Terror_Flare: /Your .*? releases a distorted black shadow at|A wave of wicked power surges forth from your/,
+  Terror_Flare: /Your .*? releases a distorted black shadow|A wave of wicked power surges forth from your/,
   TReversion540: /Your surroundings melt away as the air around you shivers with a large flux of mana. Abruptly, time wrenches violently to give you a second chance. This time, you're better prepared/,
   TVerdict1603_Zealot: /Your surroundings take on a violet sheen as you burn with zealous fervor/,
   SteelSkin_Flare: /You exhale in pain as your skin rapidly hardens into a shimmering barrier/,
@@ -86,6 +88,7 @@ NODMGFLARE_PATTERNS = {
   NightshroudCloak_Hide: /a cyclone of shadows emerge from your .*?.  The shadows swirl around in an attempt to conceal you/,
   NTouch625_ArcaneReflex: /Vital energy infuses you, hastening your arcane reflexes/,
   NTouch625_PhysicalProwess: /The vitality of nature bestows you with a burst of strength/,
+  Mirthbrand_JoyfulHeart: /Hints of an old\, joyful battle song at the edges of your hearing uplift your heart\, lending you preternatural prowess\./,
   MinorFire906_Ignite: /Some of the flames from the stream of fire linger around .*?/,
   MechanizedArm_Block: /Just as .*? attacks, your arm suddenly swings out and intercepts it!/,
   ManaArmor_ManaShield: /latticework springs up from the surface of your .*? and shields you from some of the damage/,
@@ -249,6 +252,8 @@ DMGFLARE_PATTERNS = {
   MinorFire906_Burn: /The flames around .*? continue to burn/,
   MinorShock901_StunShock: /Tiny arcs of lightning briefly dance across .*? skin/,
   MinorWater903_Soak: /The water completely drenches .*?/,
+  Mirthbrand_BraveCompanions: /One of the spectral combatants rushes at/,
+  Mirthbrand_GlitterFlare: /A winking spray of glittering motes erupts from your .*?\, showering .*? in sparkling flecks of clinging radiance/,
   NebularWeapon: /Cold as the great void, the silvery power of starlight channels through your/,
   Necromancy_LoreFlare: /\*\* A sickly green aura radiates from/,
   Necromancy_LoreFlareDoT: /Small pieces of flesh rot off a/,
@@ -258,13 +263,27 @@ DMGFLARE_PATTERNS = {
   Plasma_Flare: /\*\* Your .*? pulse(s)? with a burst of plasma energy|Splashing magma everywhere, charred red ghosts rise out of your .*? and sail through the air, passing in and out of .*? before dissipating with a low moan/,
 		Phytomorphic_PutrescenceFlare: /\*\* Silvery vapor\-wreathed .*? lash out at .*? with a clinging mass of poisonous foliage\! \*\*/,
   Parasitic_BloodFlares: /You wince as .*? draws upon your blood as it strikes/,
+  Pure_Adamantine: /Your .*? meets .*? with unyielding force\!/,
+  Pure_Drakar: /\*\* A scorching blast of golden fire blazes forth from your .*?\, bathing .*? in flame\!/,
+  Pure_Drakar_2ndFlare: /\*\* Sparks swirl about .*?\, spiraling inward to ignite the air in a roaring firestorm\!/,
+  Pure_Eonake: /Your .*? bursts with radiant silver light\, causing the .*? to recoil in agony/,
+  Pure_Faewood: /\*\* Crackling like autumn leaves\, a conflagration of red\-gold flame leaps from your .*? to engulf the .*?\!/,
+  Pure_Gornar: /\*\* Your .*? thrums\, pulsing a pounding rhythm and battering .*? with caliginous waves of pressure\!/,
+  Pure_Gornar_2ndFlare: /\*\* Reverberating\, the thrum intensifies to an ominous rumble as .*? is rocked by repercussive force\!/,
+  Pure_Rhimar: /\*\* An arctic blast from your .*? in freezing fog\!/,
+  Pure_Rhimar_2ndFlare: /\*\* With a crystalline peal\, the frigid fog enveloping the .*? flash\-freezes into spiky rime ice\!/,
+  Pure_Zorchar: /\*\* Frayed forks of blue\-white lightning leap from your .*? to ground themselves through the .*?\!/,
+  Pure_Zorchar_2ndFlare: /\*\* With an echoing thunderclap\, an eye\-searing arc of electricity leaps upward\, jolting through .*? again in its ascent\!/,
+  Purified_Sephwir: /\*\* With a crepitant snap\, the .*? splinters on impact\!/,
   Religion_LoreFlare: /Divine flames kindle around .*? leaping forth to engulf/,
   Religion_LoreFlareDoT: /The sacred inferno surrounding .*? ignites anew/,
   SanguineSacrifice: /suffers an additional .*? damage!/,
 		SanguineSacrifice_Overflow: /Sanguine brilliance strikes .*? a rupturing blow!/,
   ShieldCape_BroochFlare: /attached to the left shoulder of your .*? suddenly explodes with a brilliant flash/,
   ShadowDeathWeapon: /Ravenous tendrils of shadow burst forth from .*?, draining the very life from .*?/,
-  SigilStaff_Dispel: /Tendrils of .*? energy lash out from your .*? toward .*? and cage/,
+  Greater_SD_Darkrasp: /\*\* Ravenous tendrils of tangible shadow rip free from .*?\, rasping hungrily at .*?\!/,
+  Greater_SD_Apex: //,
+  SigilStaff_Dispel: /Tendrils of .*?? energy lash out from your .*?? toward .*?? and cage/,
   Smite302_Infusion: /With a sudden burst of divine insight, you're able to amplify the power of your/,
   Smite302_InstantDeath: /A minuscule blue-white star slowly ascends from the floor directly under the|A triad of ebony orbs conjoined by crackling ribbons of violet energy suddenly appear out of nowhere/,
   SolarWeapon: /Searing hot, the golden power of the sun is channeled through your/,
@@ -324,6 +343,7 @@ DMGFLARE_PATTERNS = {
 		ThornsImpact_GS: /\*\* The air around .*? pulses rapidly with violent oscillations\! \*\*/,
 		ThornsPlasma_GS: /\*\* Plasmatic tendrils of blinding light radiate from your vicinity\, lashing toward .*?\! \*\*/,
 		Trueshot_GS: /place holder/,
+		Arcane_Sidearm: /^You .*? with a vapor\-haloed .*? at/,
 }
 
 # Define ATTACK_PATTERNS as a constant to be used globally

@@ -1,0 +1,3706 @@
+=begin
+  Combatical - Combat Ability Manager for Gemstone IV
+
+  A comprehensive GTK3-based UI for managing all combat abilities, spells, and utilities. Wiki enabled. Use it to take inventory of your capabilities.
+    Features:
+      Click to execute ability - tracks roundtimes as well as cooldowns
+      Add scripted items and custom verbs - can track uses per day
+      Add notes to every ability - what it does and when to use it
+      Change number of windows and their labels
+      Track health, stamina, mana, and targetting information built in.
+      Right click to open wiki for each ability
+
+  WARNING: Be careful when dragging and dropping abilities. Perform actions deliberate and avoid spammy drags. There's some stability issues if you blast it.
+
+  Author: Kyrandos
+  Version: 1.0.0
+  Game: Gemstone IV
+  Other Mods: Loresang
+  tags: utility, abilities, manager, list, organization
+  Required: Lich > 5.0
+
+  			\\Version\\
+			1.0.0 2/15/2026 - initial release
+      1.0.1 2/15/2026 - Minor tweaks to language and ability pool layout + slider bars
+      1.0.5 2/15/2026 - major revisions to ability status tracking, added ability to reorder abilities.
+      1.1.0 2/16/2026 - major revisions across the board. Added notification for locked items, added gameobj id method for scripted items, debugging, and improved stability
+      1.1.1 2/16/2026 - fix reset not clearing scripted items, fix box_labels sizing, add tooltips to verbs tab, add [verb] bracket notation for remove-first item actions, add GoS sigils, scan versioning
+      1.1.1 2/16/2026 - fix reset not clearing scripted items, fix box_labels array size mismatch when adding boxes, fix CSS provider and widget accumulation causing hang after 
+                        repeated DnD, add GoS sigils to society scanner, add scan versioning for auto-rescan.
+      1.1.2 2/16/2026 - Added some clarifying tooltips, added [] remove item function to scripted items
+
+  NOTES - PLEASE READ: Drag and drop abilities has some stability issues. Just perform actions deliberately and do not spam. Closing it will save. 
+          Please ensure all your spell circles and ability categories appear in the unfiltered pool, I have only tested on Paladin, Wizard, and Bard.
+          Pay attention to rountime tracking in particular.
+          Report any issues to EducatedBarbarian@proton.me
+
+=end
+
+require 'gtk3'
+
+module Combatical
+  SCAN_VERSION = 2  # Bump to force rescan when scanner logic changes
+
+  @debug = false
+
+  def self.debug?;  @debug; end
+  def self.debug=(v); @debug = !!v; end
+
+# ============================================================================
+# ABILITY DATA STRUCTURE
+# ============================================================================
+
+# Represents a single combat ability, spell, or utility
+class Ability
+  attr_accessor :name, :command, :type, :resource_type, :cost, :roundtime,
+                :wiki_url, :category, :passive,
+                :frequency_seconds, :max_charges, :remaining_charges,
+                :max_upd, :remaining_upd, :upd_last_reset,
+                :item_cooldown_end, :remove_first, :item_target
+
+  def initialize(data = {})
+    @name = data[:name] || ""
+    @command = data[:command] || ""
+    @type = data[:type] || :unknown  # :spell, :cman, :shield, :weapon, :armor, :feat, :warcry, :society, :item, :verb
+    @resource_type = data[:resource_type] || :none  # :mana, :stamina, :health, :spirit, :none
+    @cost = data[:cost] || 0
+    @roundtime = data[:roundtime] || 0  # in seconds
+    @wiki_url = data[:wiki_url] || ""
+    @category = data[:category] || "Uncategorized"
+    @passive = data[:passive] || false
+    # Item frequency/charges tracking
+    @frequency_seconds = data[:frequency_seconds]  # nil = no frequency, >0 = seconds between uses
+    @max_charges = data[:max_charges]              # nil = not charge-based, >0 = max charges
+    @remaining_charges = data[:remaining_charges]  # runtime: current charge count
+    @max_upd = data[:max_upd]                      # nil = not UPD-based, >0 = uses per day
+    @remaining_upd = data[:remaining_upd]          # runtime: remaining uses today
+    @upd_last_reset = data[:upd_last_reset]        # runtime: date string of last reset (EST)
+    @item_cooldown_end = nil                       # runtime: Time when frequency cooldown expires
+    @remove_first = data[:remove_first] || false   # true = remove item before verb, then wear again
+    @item_target = data[:item_target]              # runtime: target string for remove/wear (e.g. "my neckchain" or "#25667483")
+  end
+
+  def to_h
+    h = {
+      name: @name,
+      command: @command,
+      type: @type,
+      resource_type: @resource_type,
+      cost: @cost,
+      roundtime: @roundtime,
+      wiki_url: @wiki_url,
+      category: @category,
+      passive: @passive
+    }
+    h[:frequency_seconds] = @frequency_seconds if @frequency_seconds
+    h[:max_charges] = @max_charges if @max_charges
+    h[:max_upd] = @max_upd if @max_upd
+    h[:remove_first] = true if @remove_first
+    h
+  end
+
+  def self.from_h(hash)
+    # Normalize keys to symbols (CharSettings may serialize keys as strings)
+    normalized = {}
+    hash.each do |k, v|
+      normalized[k.to_sym] = v
+    end
+    # Ensure type and resource_type are symbols
+    normalized[:type] = normalized[:type].to_s.to_sym if normalized[:type]
+    normalized[:resource_type] = normalized[:resource_type].to_s.to_sym if normalized[:resource_type]
+    new(normalized)
+  end
+
+  # Check if ability is currently available (not in cooldown)
+  # NOTE: Lich::Util.normalize_lookup only checks key EXISTENCE, not expiry.
+  # We must check the actual expiry timestamp to correctly detect expired cooldowns.
+  def available?
+    return false if @passive
+    # Items with frequency: check item-specific cooldown
+    if @type == :item
+      return false if @item_cooldown_end && @item_cooldown_end > Time.now
+      return false if @max_charges && @remaining_charges && @remaining_charges <= 0
+      if @max_upd
+        check_upd_reset!
+        return false if @remaining_upd && @remaining_upd <= 0
+      end
+      return true
+    end
+    return true if @type == :spell || @type == :society || @type == :verb
+    begin
+      normalized_name = @name.downcase
+      Effects::Cooldowns.to_h.each do |key, expiry|
+        next unless key.to_s.downcase == normalized_name
+        return false if expiry.is_a?(Time) && expiry > Time.now
+      end
+    rescue
+      # Cooldown lookup failed — assume available
+    end
+    true
+  end
+
+  # Record that this item ability was just used (for frequency/charges tracking)
+  def record_item_use!
+    if @frequency_seconds && @frequency_seconds > 0
+      @item_cooldown_end = Time.now + @frequency_seconds
+      respond "--- Combatical: [ITEM] #{@name}: cooldown set to #{@frequency_seconds}s" if Combatical.debug?
+    end
+    if @max_charges && @remaining_charges && @remaining_charges > 0
+      @remaining_charges -= 1
+      respond "--- Combatical: [ITEM] #{@name}: charges #{@remaining_charges}/#{@max_charges}" if Combatical.debug?
+    end
+    if @max_upd
+      check_upd_reset!
+      if @remaining_upd && @remaining_upd > 0
+        @remaining_upd -= 1
+        respond "--- Combatical: [ITEM] #{@name}: UPD #{@remaining_upd}/#{@max_upd}" if Combatical.debug?
+      end
+    end
+  end
+
+  # Reset UPD counter if a new day has started (midnight Eastern Standard Time)
+  def check_upd_reset!
+    return unless @max_upd
+    est_now = Time.now.getlocal('-05:00')
+    est_today = est_now.strftime('%Y-%m-%d')
+    if @upd_last_reset.nil? || @upd_last_reset != est_today
+      respond "--- Combatical: [UPD] #{@name}: daily reset (#{@upd_last_reset || 'first use'} -> #{est_today}), refilled to #{@max_upd}" if Combatical.debug?
+      @remaining_upd = @max_upd
+      @upd_last_reset = est_today
+    end
+  end
+
+  # Remaining seconds on item cooldown (0 if not on cooldown)
+  def item_cooldown_remaining
+    return 0 unless @item_cooldown_end
+    [0, @item_cooldown_end.to_f - Time.now.to_f].max
+  end
+
+  # Format a duration in seconds to human-readable (e.g., "12:04:32", "4:32", "3s")
+  def self.format_duration(seconds)
+    seconds = seconds.ceil
+    if seconds >= 3600
+      h = seconds / 3600
+      m = (seconds % 3600) / 60
+      s = seconds % 60
+      "%d:%02d:%02d" % [h, m, s]
+    elsif seconds >= 60
+      m = seconds / 60
+      s = seconds % 60
+      "%d:%02d" % [m, s]
+    else
+      "#{seconds}s"
+    end
+  end
+
+  # Get formatted roundtime display
+  def roundtime_display
+    return "" if @roundtime == 0
+
+    if @roundtime < 60
+      "#{@roundtime}s"
+    elsif @roundtime < 3600
+      minutes = @roundtime / 60
+      seconds = @roundtime % 60
+      "#{minutes}m #{seconds}s"
+    else
+      hours = @roundtime / 3600
+      minutes = (@roundtime % 3600) / 60
+      "#{hours}h #{minutes}m"
+    end
+  end
+
+end
+
+# ============================================================================
+# SCANNER MODULE
+# ============================================================================
+
+module Scanner
+  extend self
+
+  # Abilities excluded from display (DragonRealms-only or unwanted)
+  EXCLUDED_ABILITIES = %w[perceive glance].freeze
+
+  # Parse a frequency/uses string into a structured result.
+  # Accepts:
+  #   "12h4m32s", "4m", "30s", "24h", "1h30m" → { type: :frequency, value: <seconds> }
+  #   "50 charges", "50charges", "12 charge"   → { type: :charges, value: <count> }
+  #   "3UPD", "3 upd", "3upd"                  → { type: :upd, value: <count> }
+  #   ""  or invalid                           → nil
+  def parse_frequency(str)
+    str = str.to_s.strip.downcase
+    return nil if str.empty?
+
+    # Check for UPD format: "3UPD", "3 upd"
+    if str =~ /^(\d+)\s*upd$/
+      return { type: :upd, value: $1.to_i }
+    end
+
+    # Check for charges format: "50 charges" or "50charges"
+    if str =~ /^(\d+)\s*charges?$/
+      return { type: :charges, value: $1.to_i }
+    end
+
+    # Parse time format: 12h4m32s, 4m30s, 24h, etc.
+    total_seconds = 0
+    matched = false
+    if str =~ /(\d+)\s*h/
+      total_seconds += $1.to_i * 3600
+      matched = true
+    end
+    if str =~ /(\d+)\s*m/
+      total_seconds += $1.to_i * 60
+      matched = true
+    end
+    if str =~ /(\d+)\s*s/
+      total_seconds += $1.to_i
+      matched = true
+    end
+
+    return nil unless matched && total_seconds > 0
+    { type: :frequency, value: total_seconds }
+  end
+
+  # Main scan method - collects all abilities for current character
+  def scan_all_abilities
+    respond "--- Combatical: Scanning abilities for #{XMLData.name}..." if Combatical.debug?
+
+    abilities = []
+
+    # Scan each source
+    abilities.concat(scan_spells)
+    abilities.concat(scan_cmans)
+    abilities.concat(scan_shields)
+    abilities.concat(scan_weapons)
+    abilities.concat(scan_armor)
+    abilities.concat(scan_feats)
+    abilities.concat(scan_warcries)
+    abilities.concat(scan_society)
+    abilities.concat(scan_common_verbs)
+    abilities.concat(scan_native_buffs)
+
+    # Add any saved item scripts
+    if CharSettings['combatical'] && CharSettings['combatical']['scripted_items']
+      abilities.concat(load_scripted_items)
+    end
+
+    # Add user-defined custom verbs
+    if CharSettings['combatical'] && CharSettings['combatical']['custom_verbs']
+      CharSettings['combatical']['custom_verbs'].each do |verb_name|
+        name = verb_name.to_s
+        abilities << Ability.new(
+          name: name.capitalize,
+          command: name.downcase,
+          type: :verb,
+          resource_type: :none,
+          cost: 0,
+          roundtime: 3,
+          wiki_url: "",
+          category: "Verbs",
+          passive: false
+        )
+      end
+    end
+
+    # Filter out excluded abilities
+    abilities.reject! { |a| EXCLUDED_ABILITIES.include?(a.name.downcase) }
+
+    respond "--- Combatical: Found #{abilities.length} total abilities" if Combatical.debug?
+    abilities
+  end
+
+  # Scan all known spells
+  def scan_spells
+    abilities = []
+
+    begin
+      # Load spell data if not already loaded
+      Spell.load unless defined?(Spell) && Spell.list.length > 0
+
+      # Scan all known spells - ONLY ones the character actually knows
+      Spell.list.each do |spell|
+        next unless spell.known?
+
+        circle_name = Lich::Gemstone::Spells.get_circle_name(spell.circle)
+
+        # Skip society spells - handled by scan_society
+        if circle_name == "Order of Voln" || circle_name == "Council of Light" || circle_name == "Guardians of Sunfist"
+          respond "--- Combatical: [SPELL DEBUG] Skipping society spell #{spell.name} (circle: #{circle_name})" if Combatical.debug?
+          next
+        end
+
+        # Determine resource type (almost all spells use mana)
+        resource_type = :mana
+        cost = spell.mana_cost || 0
+
+        ability = Ability.new(
+          name: spell.name,
+          command: spell.num.to_s =~ /^\d+$/ ? "incant #{spell.num}" : "incant #{spell.name.downcase}",
+          type: :spell,
+          resource_type: resource_type,
+          cost: cost,
+          roundtime: 3,  # Default roundtime for spells
+          wiki_url: build_wiki_url(spell.name),
+          category: "Spells - #{circle_name}",
+          passive: false
+        )
+
+        abilities << ability
+      end
+
+      respond "--- Combatical: Found #{abilities.length} KNOWN spells (filtered from #{Spell.list.length} total)" if Combatical.debug?
+    rescue => e
+      respond "--- Combatical: Error scanning spells: #{e.message}" if Combatical.debug?
+    end
+
+    abilities
+  end
+
+  # Scan Combat Maneuvers
+  def scan_cmans
+    abilities = []
+
+    begin
+      total_cmans = 0
+      known_cmans = 0
+
+      Lich::Gemstone::CMan.cman_lookups.each do |cman|
+        total_cmans += 1
+        rank = Lich::Gemstone::CMan[cman[:short_name]]
+
+        # CRITICAL: Only include CMANs the character has actually learned (rank > 0)
+        next if rank == 0 || rank.nil?
+        known_cmans += 1
+
+        cman_data = Lich::Gemstone::CMan.send(:class_variable_get, :@@combat_mans)[cman[:long_name]]
+        next if cman_data[:type] == :passive  # Skip passives (will be filtered by user preference)
+
+        ability = Ability.new(
+          name: cman[:long_name].split('_').map(&:capitalize).join(' '),
+          command: "cman #{cman_data[:usage] || cman[:short_name]}",
+          type: :cman,
+          resource_type: :stamina,
+          cost: cman_data[:cost][:stamina] || 0,
+          roundtime: 3,  # Default, varies by maneuver
+          wiki_url: build_wiki_url(cman[:long_name]),
+          category: "Combat Maneuvers",
+          passive: cman_data[:type] == :passive
+        )
+
+        abilities << ability
+      end
+
+      respond "--- Combatical: Found #{abilities.length} KNOWN Combat Maneuvers (#{known_cmans} known of #{total_cmans} total)" if Combatical.debug?
+    rescue => e
+      respond "--- Combatical: Error scanning CMANs: #{e.message}" if Combatical.debug?
+    end
+
+    abilities
+  end
+
+  # Scan Shield Specializations
+  def scan_shields
+    abilities = []
+
+    begin
+      # Check if Shield module has data loaded
+      unless Lich::Gemstone::Shield.respond_to?(:shield_lookups)
+        respond "--- Combatical: [SHIELD DEBUG] Shield module does not respond to :shield_lookups" if Combatical.debug?
+        return abilities
+      end
+
+      total_shields = 0
+      known_shields = 0
+
+      Lich::Gemstone::Shield.shield_lookups.each do |shield|
+        total_shields += 1
+        rank = Lich::Gemstone::Shield[shield[:short_name]]
+
+        respond "--- Combatical: [SHIELD DEBUG] #{shield[:long_name]}: rank=#{rank.inspect}" if Combatical.debug? && total_shields <= 5
+
+        # CRITICAL: Only include shields the character has actually learned (rank > 0)
+        next if rank == 0 || rank.nil?
+        known_shields += 1
+
+        # Safely get shield data
+        shields_data = Lich::Gemstone::Shield.send(:class_variable_get, :@@shield_techniques) rescue {}
+        shield_data = shields_data[shield[:long_name]]
+        next unless shield_data
+        next if shield_data[:type] == :passive  # Skip passives
+
+        ability = Ability.new(
+          name: shield[:long_name].split('_').map(&:capitalize).join(' '),
+          command: "shield #{shield_data[:usage] || shield[:short_name]}",
+          type: :shield,
+          resource_type: :stamina,
+          cost: shield_data[:cost][:stamina] || 0,
+          roundtime: 3,
+          wiki_url: build_wiki_url(shield[:long_name]),
+          category: "Shield Specializations",
+          passive: shield_data[:type] == :passive
+        )
+
+        abilities << ability
+      end
+
+      respond "--- Combatical: Found #{abilities.length} KNOWN Shield specializations (#{known_shields} known of #{total_shields} total)" if Combatical.debug?
+    rescue => e
+      respond "--- Combatical: Error scanning Shields: #{e.message}" if Combatical.debug?
+    end
+
+    abilities
+  end
+
+  # Scan Weapon Techniques
+  def scan_weapons
+    abilities = []
+
+    begin
+      # Check if Weapon module has data loaded
+      unless Lich::Gemstone::Weapon.respond_to?(:weapon_lookups)
+        respond "--- Combatical: [WEAPON DEBUG] Weapon module does not respond to :weapon_lookups" if Combatical.debug?
+        return abilities
+      end
+
+      total_weapons = 0
+      known_weapons = 0
+
+      Lich::Gemstone::Weapon.weapon_lookups.each do |weapon|
+        total_weapons += 1
+        rank = Lich::Gemstone::Weapon[weapon[:short_name]]
+
+        respond "--- Combatical: [WEAPON DEBUG] #{weapon[:long_name]}: rank=#{rank.inspect}" if Combatical.debug? && total_weapons <= 5
+
+        # CRITICAL: Only include weapons the character has actually learned (rank > 0)
+        next if rank == 0 || rank.nil?
+        known_weapons += 1
+
+        # Safely get weapon data
+        weapons_data = Lich::Gemstone::Weapon.send(:class_variable_get, :@@weapon_techniques) rescue {}
+        weapon_data = weapons_data[weapon[:long_name]]
+        next unless weapon_data
+        next if weapon_data[:type] == :passive  # Skip passives
+
+        ability = Ability.new(
+          name: weapon[:long_name].split('_').map(&:capitalize).join(' '),
+          command: "weapon #{weapon_data[:usage] || weapon[:short_name]}",
+          type: :weapon,
+          resource_type: :stamina,
+          cost: weapon_data[:cost][:stamina] || 0,
+          roundtime: 3,
+          wiki_url: build_wiki_url(weapon[:long_name]),
+          category: "Weapon Techniques",
+          passive: weapon_data[:type] == :passive
+        )
+
+        abilities << ability
+      end
+
+      respond "--- Combatical: Found #{abilities.length} KNOWN Weapon techniques (#{known_weapons} known of #{total_weapons} total)" if Combatical.debug?
+    rescue => e
+      respond "--- Combatical: Error scanning Weapons: #{e.message}" if Combatical.debug?
+    end
+
+    abilities
+  end
+
+  # Scan Armor Specializations
+  def scan_armor
+    abilities = []
+
+    begin
+      # Check if Armor module has data loaded
+      unless Lich::Gemstone::Armor.respond_to?(:armor_lookups)
+        respond "--- Combatical: [ARMOR DEBUG] Armor module does not respond to :armor_lookups" if Combatical.debug?
+        return abilities
+      end
+
+      total_armor = 0
+      known_armor = 0
+
+      Lich::Gemstone::Armor.armor_lookups.each do |armor|
+        total_armor += 1
+        rank = Lich::Gemstone::Armor[armor[:short_name]]
+
+        respond "--- Combatical: [ARMOR DEBUG] #{armor[:long_name]}: rank=#{rank.inspect}" if Combatical.debug? && total_armor <= 5
+
+        # CRITICAL: Only include armor the character has actually learned (rank > 0)
+        next if rank == 0 || rank.nil?
+        known_armor += 1
+
+        # Safely get armor data from @@armor_techniques
+        armors_data = Lich::Gemstone::Armor.send(:class_variable_get, :@@armor_techniques) rescue {}
+        armor_data = armors_data[armor[:long_name]]
+        next unless armor_data
+        next if armor_data[:type] == :passive  # Skip passives
+
+        ability = Ability.new(
+          name: armor[:long_name].split('_').map(&:capitalize).join(' '),
+          command: "armor #{armor_data[:usage] || armor[:short_name]}",
+          type: :armor,
+          resource_type: :stamina,
+          cost: armor_data[:cost][:stamina] || 0,
+          roundtime: 3,
+          wiki_url: build_wiki_url(armor[:long_name]),
+          category: "Armor Specializations",
+          passive: armor_data[:type] == :passive
+        )
+
+        abilities << ability
+      end
+
+      respond "--- Combatical: Found #{abilities.length} KNOWN Armor specializations (#{known_armor} known of #{total_armor} total)" if Combatical.debug?
+    rescue => e
+      respond "--- Combatical: Error scanning Armor: #{e.message}" if Combatical.debug?
+    end
+
+    abilities
+  end
+
+  # Scan Feats
+  def scan_feats
+    abilities = []
+
+    begin
+      total_feats = 0
+      known_feats = 0
+
+      Lich::Gemstone::Feat.feat_lookups.each do |feat|
+        total_feats += 1
+        rank = Lich::Gemstone::Feat[feat[:short_name]]
+
+        # CRITICAL: Only include feats the character has actually learned (rank > 0)
+        next if rank == 0 || rank.nil?
+        known_feats += 1
+
+        feat_data = Lich::Gemstone::Feat.send(:class_variable_get, :@@feats)[feat[:long_name]]
+        next if feat_data[:type] == :passive  # Skip passives
+
+        # Filter out specific unwanted abilities
+        next if feat[:long_name] =~ /kais_strike/i  # Kai's Strike (Voln passive)
+
+        ability = Ability.new(
+          name: feat[:long_name].split('_').map(&:capitalize).join(' '),
+          command: "feat #{feat_data[:usage] || feat[:short_name]}",
+          type: :feat,
+          resource_type: :stamina,
+          cost: feat_data[:cost][:stamina] || 0,
+          roundtime: 3,
+          wiki_url: build_wiki_url(feat[:long_name]),
+          category: "Feats",
+          passive: feat_data[:type] == :passive
+        )
+
+        abilities << ability
+      end
+
+      respond "--- Combatical: Found #{abilities.length} KNOWN Feats (#{known_feats} known of #{total_feats} total)" if Combatical.debug?
+    rescue => e
+      respond "--- Combatical: Error scanning Feats: #{e.message}" if Combatical.debug?
+    end
+
+    abilities
+  end
+
+  # Scan Warcries
+  def scan_warcries
+    abilities = []
+
+    begin
+      # Check profession - only Warriors and Berserkers can use warcries
+      profession = Lich::Gemstone::Stats.profession
+      unless profession =~ /^(Warrior|Berserker)$/i
+        respond "--- Combatical: [WARCRY DEBUG] Skipping warcries - profession '#{profession}' cannot use warcries" if Combatical.debug?
+        return abilities
+      end
+
+      total_warcries = 0
+      known_warcries = 0
+
+      Lich::Gemstone::Warcry.warcry_lookups.each do |warcry|
+        total_warcries += 1
+        rank = Lich::Gemstone::Warcry[warcry[:short_name]]
+
+        # CRITICAL: Only include warcries the character has actually learned (rank > 0)
+        # Note: rank might be false/nil for classes that can't learn warcries
+        respond "--- Combatical: [WARCRY DEBUG] #{warcry[:long_name]}: rank=#{rank.inspect}" if Combatical.debug?
+        next if rank.nil? || rank == false || rank == 0
+        known_warcries += 1
+
+        warcry_data = Lich::Gemstone::Warcry.send(:class_variable_get, :@@warcries)[warcry[:long_name]]
+        next unless warcry_data  # Skip if data not found
+        next if warcry_data[:type] == :passive  # Skip passives
+
+        ability = Ability.new(
+          name: warcry[:long_name].split('_').map(&:capitalize).join(' '),
+          command: "warcry #{warcry_data[:usage] || warcry[:short_name]}",
+          type: :warcry,
+          resource_type: :stamina,
+          cost: warcry_data[:cost][:stamina] || 0,
+          roundtime: 3,
+          wiki_url: build_wiki_url(warcry[:long_name]),
+          category: "Warcries",
+          passive: warcry_data[:type] == :passive
+        )
+
+        abilities << ability
+      end
+
+      respond "--- Combatical: Found #{abilities.length} KNOWN Warcries (#{known_warcries} known of #{total_warcries} total)" if Combatical.debug?
+    rescue => e
+      respond "--- Combatical: Error scanning Warcries: #{e.message}" if Combatical.debug?
+    end
+
+    abilities
+  end
+
+  # Scan Society abilities
+  def scan_society
+    abilities = []
+
+    begin
+      # Check for Voln abilities (only for actual Voln members)
+      if Society.status == 'Order of Voln'
+        # Voln symbols from https://gswiki.play.net/Order_of_Voln (excluding Kai's Strike passive)
+        voln_symbols = [
+          { name: "Symbol of Recognition", command: "symbol of recognition", rank: 1 },
+          { name: "Symbol of Retribution", command: "symbol of retribution", rank: 2 },
+          { name: "Symbol of Blessing", command: "symbol of blessing", rank: 3 },
+          { name: "Symbol of Diminishment", command: "symbol of diminishment", rank: 4 },
+          { name: "Symbol of Mana", command: "symbol of mana", rank: 5 },
+          { name: "Symbol of Turning", command: "symbol of turning", rank: 6 },
+          { name: "Symbol of Protection", command: "symbol of protection", rank: 7 },
+          { name: "Symbol of Supremacy", command: "symbol of supremacy", rank: 8 },
+          { name: "Symbol of Sight", command: "symbol of sight", rank: 9 },
+          { name: "Symbol of Dreams", command: "symbol of dreams", rank: 11 },
+          { name: "Symbol of Restoration", command: "symbol of restoration", rank: 12 },
+          { name: "Symbol of Holiness", command: "symbol of holiness", rank: 13 },
+          { name: "Symbol of Return", command: "symbol of return", rank: 14 },
+          { name: "Symbol of Courage", command: "symbol of courage", rank: 15 },
+          { name: "Symbol of Disruption", command: "symbol of disruption", rank: 16 },
+          { name: "Symbol of Submission", command: "symbol of submission", rank: 17 },
+          { name: "Symbol of Sleep", command: "symbol of sleep", rank: 18 },
+          { name: "Symbol of Recall", command: "symbol of recall", rank: 19 },
+          { name: "Symbol of Thought", command: "symbol of thought", rank: 21 },
+          { name: "Symbol of Renewal", command: "symbol of renewal", rank: 23 },
+          { name: "Symbol of Need", command: "symbol of need", rank: 24 },
+          { name: "Symbol of Transcendence", command: "symbol of transcendence", rank: 26 },
+        ]
+
+        voln_symbols.each do |symbol|
+          next if Society.rank < symbol[:rank]
+
+          ability = Ability.new(
+            name: symbol[:name],
+            command: symbol[:command],
+            type: :society,
+            resource_type: :spirit,
+            cost: 1,
+            roundtime: 3,
+            wiki_url: build_wiki_url(symbol[:name]),
+            category: "Society - Voln",
+            passive: false
+          )
+          abilities << ability
+        end
+      end
+
+      # Check for Guardians of Sunfist abilities (only for actual GoS members)
+      if Society.status == 'Guardians of Sunfist'
+        # GoS sigils from https://gswiki.play.net/Guardians_of_Sunfist
+        gos_sigils = [
+          { name: "Sigil of Recognition", command: "sigil of recognition", rank: 1 },
+          { name: "Sigil of Location", command: "sigil of location", rank: 2 },
+          { name: "Sigil of Contact", command: "sigil of contact", rank: 3 },
+          { name: "Sigil of Resolve", command: "sigil of resolve", rank: 4 },
+          { name: "Sigil of Minor Bane", command: "sigil of minor bane", rank: 5 },
+          { name: "Sigil of Bandages", command: "sigil of bandages", rank: 6 },
+          { name: "Sigil of Defense", command: "sigil of defense", rank: 7 },
+          { name: "Sigil of Offense", command: "sigil of offense", rank: 8 },
+          { name: "Sigil of Distraction", command: "sigil of distraction", rank: 9 },
+          { name: "Sigil of Minor Protection", command: "sigil of minor protection", rank: 10 },
+          { name: "Sigil of Focus", command: "sigil of focus", rank: 11 },
+          { name: "Sigil of Intimidation", command: "sigil of intimidation", rank: 12 },
+          { name: "Sigil of Mending", command: "sigil of mending", rank: 13 },
+          { name: "Sigil of Concentration", command: "sigil of concentration", rank: 14 },
+          { name: "Sigil of Major Bane", command: "sigil of major bane", rank: 15 },
+          { name: "Sigil of Determination", command: "sigil of determination", rank: 16 },
+          { name: "Sigil of Health", command: "sigil of health", rank: 17 },
+          { name: "Sigil of Power", command: "sigil of power", rank: 18 },
+          { name: "Sigil of Major Protection", command: "sigil of major protection", rank: 19 },
+          { name: "Sigil of Escape", command: "sigil of escape", rank: 20 },
+        ]
+
+        gos_sigils.each do |sigil|
+          next if Society.rank < sigil[:rank]
+
+          ability = Ability.new(
+            name: sigil[:name],
+            command: sigil[:command],
+            type: :society,
+            resource_type: :stamina,
+            cost: 1,
+            roundtime: 3,
+            wiki_url: build_wiki_url(sigil[:name]),
+            category: "Society - Guardians of Sunfist",
+            passive: false
+          )
+          abilities << ability
+        end
+      end
+
+      # TODO: Add Council of Light abilities when their ability data is available
+
+      respond "--- Combatical: Found #{abilities.length} Society abilities" if Combatical.debug?
+    rescue => e
+      respond "--- Combatical: Error scanning Society: #{e.message}" if Combatical.debug?
+    end
+
+    abilities
+  end
+
+  # Scan common stamina/mana verbs
+  def scan_common_verbs
+    abilities = []
+
+    # Common verbs that use resources
+    common_verbs = [
+      { name: "Hide", command: "hide", resource: :stamina, cost: 10, rt: 3 },
+      { name: "Search", command: "search", resource: :stamina, cost: 5, rt: 3 },
+    ]
+
+    common_verbs.each do |verb|
+      ability = Ability.new(
+        name: verb[:name],
+        command: verb[:command],
+        type: :verb,
+        resource_type: verb[:resource],
+        cost: verb[:cost],
+        roundtime: verb[:rt],
+        wiki_url: build_wiki_url(verb[:name]),
+        category: "Verbs",
+        passive: false
+      )
+      abilities << ability
+    end
+
+    respond "--- Combatical: Found #{abilities.length} common verbs" if Combatical.debug?
+    abilities
+  end
+
+  # Scan native resource buff abilities
+  def scan_native_buffs
+    abilities = []
+
+    native_buffs = [
+      { name: "Stamina Burst",      command: "stamina burst",      resource: :stamina, cost: 0, rt: 0 },
+      { name: "Stamina Second Wind", command: "stamina second wind", resource: :stamina, cost: 0, rt: 0 },
+      { name: "Mana Spellup",       command: "mana spellup",       resource: :mana,    cost: 0, rt: 0 },
+      { name: "Mana Pulse",         command: "mana pulse",         resource: :mana,    cost: 0, rt: 0 },
+    ]
+
+    native_buffs.each do |buff|
+      abilities << Ability.new(
+        name: buff[:name],
+        command: buff[:command],
+        type: :feat,
+        resource_type: buff[:resource],
+        cost: buff[:cost],
+        roundtime: buff[:rt],
+        wiki_url: "",
+        category: "Native Buffs",
+        passive: false
+      )
+    end
+
+    respond "--- Combatical: Found #{abilities.length} native buffs" if Combatical.debug?
+    abilities
+  end
+
+  # Load saved scripted items from CharSettings
+  def load_scripted_items
+    abilities = []
+
+    raw_items = []
+    proxy_items = CharSettings['combatical']['scripted_items'] || []
+    # Extract raw data to avoid SettingsProxy iteration issues
+    proxy_items.each do |item|
+      verb_list = []
+      (item['verbs'] || []).each { |v| verb_list << v.to_s }
+      entry = {
+        'name'   => item['name'].to_s,
+        'verbs'  => verb_list,
+        'status' => item['status'].to_s
+      }
+      # Extract verb_meta if present (frequency/charges per verb)
+      raw_meta = item['verb_meta']
+      if raw_meta
+        vm = {}
+        raw_meta.each do |verb_key, meta_val|
+          m = {}
+          meta_val.each { |mk, mv| m[mk.to_s] = mv.to_s } if meta_val
+          vm[verb_key.to_s] = m
+        end
+        entry['verb_meta'] = vm
+      end
+      raw_items << entry
+    end
+
+    # De-duplicate by name (clean up any prior corruption)
+    seen_names = {}
+    unique_items = []
+    raw_items.each do |item|
+      key = item['name'].downcase
+      unless seen_names[key]
+        seen_names[key] = true
+        unique_items << item
+      end
+    end
+
+    # If duplicates were found, clean up CharSettings
+    if unique_items.length < raw_items.length
+      respond "--- Combatical: Cleaned up #{raw_items.length - unique_items.length} duplicate item(s)" if Combatical.debug?
+      CharSettings['combatical']['scripted_items'] = unique_items
+    end
+
+    respond "--- Combatical: [LOAD] Found #{unique_items.length} unique scripted items" if Combatical.debug?
+
+    unique_items.each do |item|
+      next unless item['status'] == 'verified'
+
+      verb_meta = item['verb_meta'] || {}
+      verbs = item['verbs'] || []
+      verbs.each do |verb|
+        meta = verb_meta[verb.to_s] || {}
+        freq_str = meta['freq_str'].to_s
+        parsed = freq_str.empty? ? nil : parse_frequency(freq_str)
+
+        # Detect [verb] bracket notation: remove item first, verb, then wear again
+        raw_verb = verb.to_s
+        remove_first = false
+        if raw_verb =~ /^\[(.+)\]$/
+          bare_verb = $1
+          remove_first = true
+        else
+          bare_verb = raw_verb
+        end
+
+        item_target = item['gameobj_id'] ? "##{item['gameobj_id']}" : "my #{item['name']}"
+        item_cmd = "#{bare_verb} #{item_target}"
+        ability_data = {
+          name: "#{item['name']} - #{raw_verb}",
+          command: item_cmd,
+          type: :item,
+          resource_type: :none,
+          cost: 0,
+          roundtime: 3,
+          wiki_url: "",
+          category: "Item Scripts",
+          passive: false,
+          remove_first: remove_first,
+          item_target: item_target
+        }
+        if parsed
+          if parsed[:type] == :frequency
+            ability_data[:frequency_seconds] = parsed[:value]
+          elsif parsed[:type] == :charges
+            ability_data[:max_charges] = parsed[:value]
+            ability_data[:remaining_charges] = parsed[:value]
+          elsif parsed[:type] == :upd
+            ability_data[:max_upd] = parsed[:value]
+            ability_data[:remaining_upd] = parsed[:value]
+          end
+        end
+        abilities << Ability.new(ability_data)
+      end
+    end
+
+    respond "--- Combatical: Loaded #{abilities.length} item script abilities" if Combatical.debug?
+    abilities
+  end
+
+  # Build wiki URL for ability
+  def build_wiki_url(name)
+    base_url = "https://gswiki.play.net/"
+    formatted_name = name.to_s.split('_').map(&:capitalize).join('_')
+    "#{base_url}#{formatted_name}"
+  end
+end
+
+# ============================================================================
+# SETTINGS MANAGEMENT
+# ============================================================================
+
+module Settings
+  extend self
+
+  # Initialize default settings for character
+  def init_defaults
+    CharSettings['combatical'] ||= {}
+    CharSettings['combatical']['abilities'] ||= []
+    CharSettings['combatical']['boxes'] ||= create_default_boxes
+    CharSettings['combatical']['num_boxes'] ||= 6
+    CharSettings['combatical']['bg_color'] ||= [0.2, 0.2, 0.2]  # Dark gray background
+    CharSettings['combatical']['title_color'] ||= [0.5, 0.5, 0.5]  # Medium gray titles
+    CharSettings['combatical']['wiki_confirm'] = true if CharSettings['combatical']['wiki_confirm'].nil?
+    CharSettings['combatical']['scripted_items'] ||= []
+    CharSettings['combatical']['last_scan'] ||= 0
+    CharSettings['combatical']['always_on_top'] ||= false
+    CharSettings['combatical']['custom_verbs'] ||= []
+    CharSettings['combatical']['ability_notes'] ||= {}
+    CharSettings['combatical']['observed_rt'] ||= {}
+  end
+
+  # Create default box layout
+  def create_default_boxes
+    [
+      { 'name' => 'Box 1', 'abilities' => [] },
+      { 'name' => 'Box 2', 'abilities' => [] },
+      { 'name' => 'Box 3', 'abilities' => [] },
+      { 'name' => 'Box 4', 'abilities' => [] },
+      { 'name' => 'Box 5', 'abilities' => [] },
+      { 'name' => 'Box 6', 'abilities' => [] }
+    ]
+  end
+
+  # Save abilities to CharSettings
+  def save_abilities(abilities)
+    CharSettings['combatical']['abilities'] = abilities.map(&:to_h)
+    CharSettings['combatical']['last_scan'] = Time.now.to_i
+    CharSettings['combatical']['scan_version'] = Combatical::SCAN_VERSION
+  end
+
+  # Load abilities from CharSettings
+  def load_abilities
+    return [] unless CharSettings['combatical']['abilities']
+    return [] unless CharSettings['combatical']['abilities'].is_a?(Array)
+
+    # Load and validate abilities, filtering out blacklisted ones
+    abilities = []
+    CharSettings['combatical']['abilities'].each do |h|
+      begin
+        if h.is_a?(Hash)
+          ab = Ability.from_h(h)
+          abilities << ab unless Scanner::EXCLUDED_ABILITIES.include?(ab.name.downcase)
+        end
+      rescue => e
+        respond "--- Combatical: Warning - skipped invalid ability data: #{e.message}" if Combatical.debug?
+      end
+    end
+    abilities
+  end
+
+  # Check if we need to rescan (first time, user requested, or scanner version changed)
+  def needs_scan?
+    return true if CharSettings['combatical']['abilities'].nil?
+    return true if CharSettings['combatical']['abilities'].empty?
+    cached_version = CharSettings['combatical']['scan_version'].to_i
+    return true if cached_version < Combatical::SCAN_VERSION
+    false
+  end
+end
+
+end # module Combatical
+
+# ============================================================================
+# MAIN SCRIPT INITIALIZATION
+# ============================================================================
+
+# Check for debug mode (can be toggled at runtime via settings)
+# NOTE: `script` is a local variable from Lich's eval binding, not accessible inside module defs
+Combatical.debug = script.vars[1].to_s.downcase == 'debug'
+
+# Wait for character to be logged in
+unless XMLData.name && !XMLData.name.empty?
+  respond "--- Combatical: Waiting for character login..." if Combatical.debug?
+  wait_while { XMLData.name.nil? || XMLData.name.empty? }
+end
+
+respond "--- Combatical: Starting for character: #{XMLData.name}"
+respond "--- Combatical: Debug mode #{Combatical.debug? ? 'ENABLED' : 'disabled'}" if Combatical.debug?
+
+# Initialize settings
+Combatical::Settings.init_defaults
+
+# Check if we need to scan abilities
+if Combatical::Settings.needs_scan?
+  respond "--- Combatical: First time use - scanning all abilities..." if Combatical.debug?
+  abilities = Combatical::Scanner.scan_all_abilities
+  Combatical::Settings.save_abilities(abilities)
+  respond "--- Combatical: Scan complete - found #{abilities.length} abilities" if Combatical.debug?
+else
+  respond "--- Combatical: Loading cached abilities..." if Combatical.debug?
+  abilities = Combatical::Settings.load_abilities
+  respond "--- Combatical: Loaded #{abilities.length} abilities from cache" if Combatical.debug?
+end
+
+# ============================================================================
+# GTK3 WINDOW AND UI COMPONENTS
+# ============================================================================
+
+module Combatical
+class Window
+  attr_accessor :window, :abilities, :boxes_container, :pool_container
+
+  # Drag and drop target entry
+  TARGET_ENTRY = Gtk::TargetEntry.new('text/plain', :same_app, 0)
+
+  def initialize(abilities)
+    @abilities = abilities
+    @boxes = CharSettings['combatical']['boxes']
+    @num_boxes = CharSettings['combatical']['num_boxes']
+    @wiki_confirm = CharSettings['combatical']['wiki_confirm']
+    @box_labels = CharSettings['combatical']['box_labels'] || Array.new(@num_boxes, "(empty)")
+    @box_vboxes = []  # Track box containers for drag-drop
+    @box_header_labels = []  # Track box header labels for text updates
+    @current_target = nil  # Current selected target
+    @current_target_type = nil  # :enemy or :player
+    @current_enemies = []  # Current enemy list
+    @current_players = []  # Current player list
+    @tracked_buttons = []      # [{button:, ability:}] for RT display updates
+    @tracked_pool_labels = []  # [{label:, ability:, rgb:}] for RT display updates
+    @resource_bars = {}        # {health:, mana:, stamina:, spirit:} DrawingArea widgets
+    @last_cast_ability = nil   # Name of the last ability used (for targeted RT display)
+    @cast_seen_rt = false      # Whether we've seen RT start after casting
+    @last_cast_time = nil      # Timestamp when @last_cast_ability was set (for stale timeout)
+    @rt_end_snapshot = 0       # Snapshot of roundtime_end when command was recorded
+    @cast_rt_end_snapshot = 0  # Snapshot of cast_roundtime_end when command was recorded
+    @prepped_spell = nil       # Name of prepped spell (for prep/cast detection)
+    @prev_last_upstream = $_LASTUPSTREAM_.to_s  # Track $_LASTUPSTREAM_ changes (init to current to skip stale cmds)
+    @locked = CharSettings['combatical']['locked'] || false  # Lock prevents editing labels/drag-drop
+    @always_on_top = CharSettings['combatical']['always_on_top'] || false
+    @custom_verbs = []
+    raw_cv = CharSettings['combatical']['custom_verbs']
+    if raw_cv
+      raw_cv.each { |v| @custom_verbs << v.to_s }
+    end
+    @scripted_items_cache = deep_copy_items(CharSettings['combatical']['scripted_items'])
+    # Item frequency/charges runtime tracking (restored from CharSettings)
+    @item_charges_tracking = {}
+    raw_charges = CharSettings['combatical']['item_charges_tracking']
+    if raw_charges
+      raw_charges.each { |k, v| @item_charges_tracking[k.to_s] = v.to_i }
+    end
+    @item_cooldown_tracking = {}
+    raw_cooldowns = CharSettings['combatical']['item_cooldown_tracking']
+    if raw_cooldowns
+      raw_cooldowns.each { |k, v| @item_cooldown_tracking[k.to_s] = v.to_f }
+    end
+    @item_upd_tracking = {}
+    raw_upd = CharSettings['combatical']['item_upd_tracking']
+    if raw_upd
+      raw_upd.each { |k, v| @item_upd_tracking[k.to_s] = v }
+    end
+    raw_notes = CharSettings['combatical']['ability_notes']
+    @ability_notes = {}
+    if raw_notes
+      raw_notes.each { |k, v| @ability_notes[k.to_s] = v.to_s }
+    end
+    raw_rt = CharSettings['combatical']['observed_rt']
+    @observed_rt = {}
+    if raw_rt
+      raw_rt.each { |k, v| @observed_rt[k.to_s] = v.to_i }
+    end
+    @needs_rebuild = false  # Flag for deferred UI rebuild after drag-drop
+    @drop_indicator_child = nil  # Currently highlighted drop target widget
+    @dragged_ability_name = nil  # Ability name being dragged (bypasses GTK data transfer)
+
+    # Restore item runtime tracking state (charges/cooldowns) to loaded abilities
+    @abilities.each do |a|
+      next unless a.type == :item
+      if a.max_charges
+        saved_charges = @item_charges_tracking[a.name]
+        a.remaining_charges = saved_charges unless saved_charges.nil?
+      end
+      if a.max_upd
+        saved = @item_upd_tracking[a.name]
+        if saved
+          a.remaining_upd = saved['remaining']
+          a.upd_last_reset = saved['last_reset']
+        end
+        a.check_upd_reset!
+      end
+      if a.frequency_seconds
+        saved_cd = @item_cooldown_tracking[a.name]
+        if saved_cd && saved_cd > Time.now.to_f
+          a.item_cooldown_end = Time.at(saved_cd)
+        end
+      end
+    end
+
+    if Combatical.debug?
+      item_count = @abilities.count { |a| a.type == :item }
+      charge_count = @abilities.count { |a| a.max_charges }
+      upd_count = @abilities.count { |a| a.max_upd }
+      cd_count = @abilities.count { |a| a.frequency_seconds }
+      respond "--- Combatical: [INIT] #{@abilities.length} abilities loaded (#{item_count} items, #{charge_count} charge-tracked, #{upd_count} UPD-tracked, #{cd_count} cooldown-tracked)"
+      respond "--- Combatical: [INIT] #{@num_boxes} boxes, #{@scripted_items_cache.length} scripted items, locked=#{@locked}"
+    end
+
+    create_main_window
+    create_toolbar
+
+    # Apply global color CSS before creating UI elements
+    Gtk.queue do
+      apply_global_colors
+    end
+
+    # Wrap UI creation in Gtk.queue for initialization
+    Gtk.queue do
+      create_boxes_grid
+      create_unassigned_pool
+    end
+
+    # Show the complete window
+    show_window
+
+    # Start roundtime tracker
+    start_roundtime_tracker
+  end
+
+  # Start periodic roundtime status updates and target list updates
+  def start_roundtime_tracker
+    @last_rebuild_time = Time.now.to_f
+    @rebuilding = false
+    @last_click_time = Time.now.to_f
+    @drag_in_progress = false
+    @drop_completed_at = nil
+    @timer_stopped = false
+
+    # Simple repeating timer on the GTK main thread.
+    # Do NOT wrap in Gtk.queue — GLib::Timeout callbacks already run on the
+    # main thread, and Gtk.queue creates nested one-shot timers that accumulate.
+    @update_timer = GLib::Timeout.add(250) {
+      begin
+        unless @timer_stopped
+          update_target_lists
+          update_ability_displays
+          update_resource_bars
+
+          # Safety valve: on Windows, drag-end never fires with manual drop
+          # handling. Wait one event-loop cycle (~100ms) after the drop for
+          # GTK to finish its DnD cleanup, then release the rebuild lock.
+          if @drag_in_progress && @drop_completed_at
+            if (Time.now.to_f - @drop_completed_at) > 0.1
+              respond "--- Combatical: Safety valve — resetting stuck drag state" if Combatical.debug?
+              @drag_in_progress = false
+              @drop_completed_at = nil
+            end
+          end
+
+          # Deferred rebuild after drag-and-drop (safe — outside drag signal stack)
+          # Skip if a drag is in progress (rebuilding destroys drag source widgets)
+          if @needs_rebuild && !@rebuilding && !@drag_in_progress
+            now = Time.now.to_f
+            if (now - @last_rebuild_time) >= 0.4
+              @needs_rebuild = false
+              @rebuilding = true
+              @last_rebuild_time = now
+              begin
+                rebuild_ui
+              ensure
+                @rebuilding = false
+              end
+            end
+          end
+        end
+      rescue => e
+        respond "--- Combatical: Timer error: #{e.message}"
+        respond "--- Combatical:   #{e.backtrace.first}" if e.backtrace
+        @rebuilding = false
+        @drag_in_progress = false
+      end
+      !@timer_stopped  # true = keep running, false = stop
+    }
+    respond "--- Combatical: Roundtime tracker started" if Combatical.debug?
+  end
+
+  # Stop roundtime tracker
+  def stop_roundtime_tracker
+    @timer_stopped = true
+    GLib::Source.remove(@update_timer) if @update_timer
+  end
+
+  # Toggle lock state
+  def toggle_lock
+    @locked = !@locked
+    update_lock_icon
+    update_lock_tooltip
+    respond "--- Combatical: #{@locked ? 'Locked' : 'Unlocked'}" if Combatical.debug?
+  end
+
+  # Update lock icon with greyscale coloring
+  def update_lock_icon
+    if @locked
+      @lock_label.set_markup("<span foreground='#999999'>🔒</span>")
+    else
+      @lock_label.set_markup("<span foreground='#CCCCCC'>🔓</span>")
+    end
+  end
+
+  # Update lock button tooltip based on current state
+  def update_lock_tooltip
+    if @locked
+      @lock_button.set_tooltip_text("Ability box titles are locked, no abilities may move, and defaults are locked in")
+    else
+      @lock_button.set_tooltip_text("Ability box titles may be edited, abilities added and removed from pools, and defaults set")
+    end
+  end
+
+  # Flash the lock button red to alert user that the action is blocked
+  def flash_lock_warning
+    return unless @locked && @lock_button && !@lock_button.destroyed?
+    respond "--- Combatical: [LOCK] Action blocked — flashing lock warning" if Combatical.debug?
+    @lock_button.style_context.add_class('combatical-lock-flash')
+    # Also briefly show the locked emoji in red
+    @lock_label.set_markup("<span foreground='#FF2222' font_desc='Sans 14'>\u{1F512}</span>")
+    GLib::Timeout.add(700) {
+      if @lock_button && !@lock_button.destroyed?
+        @lock_button.style_context.remove_class('combatical-lock-flash')
+        update_lock_icon
+      end
+      false  # Don't repeat
+    }
+  end
+
+  # Create a single resource bar DrawingArea (no text — text goes in external label)
+  def create_resource_bar(width, height, label, fill_rgb, bg_rgb)
+    area = Gtk::DrawingArea.new
+    area.set_size_request(width, height)
+
+    # External label widget for "HP 85/100" text
+    text_label = Gtk::Label.new
+    text_label.set_markup("<span font_desc='Sans 8' foreground='white'>#{label} 0/0</span>")
+
+    bar_data = { area: area, label: label, fill_rgb: fill_rgb, bg_rgb: bg_rgb,
+                 current: 0, max: 0, text_label: text_label }
+
+    area.signal_connect('draw') do |widget, cr|
+      w = widget.allocated_width.to_f
+      h = widget.allocated_height.to_f
+      cur = bar_data[:current].to_f
+      mx = bar_data[:max].to_f
+      fraction = mx > 0 ? (cur / mx).clamp(0.0, 1.0) : 0.0
+
+      # Background (dark)
+      cr.set_source_rgb(*bar_data[:bg_rgb])
+      cr.rectangle(0, 0, w, h)
+      cr.fill
+
+      # Filled portion
+      if fraction > 0
+        cr.set_source_rgb(*bar_data[:fill_rgb])
+        cr.rectangle(0, 0, w * fraction, h)
+        cr.fill
+      end
+
+      # Border
+      cr.set_source_rgb(0.5, 0.5, 0.5)
+      cr.rectangle(0, 0, w, h)
+      cr.set_line_width(1)
+      cr.stroke
+
+      false
+    end
+
+    bar_data
+  end
+
+  # Update resource bars with current XMLData values
+  def update_resource_bars
+    { health: [:health, :max_health],
+      mana:   [:mana, :max_mana],
+      stamina: [:stamina, :max_stamina],
+      spirit: [:spirit, :max_spirit]
+    }.each do |key, (cur_method, max_method)|
+      bar = @resource_bars[key]
+      next unless bar && bar[:area] && !bar[:area].destroyed?
+      cur = XMLData.send(cur_method).to_i
+      mx = XMLData.send(max_method).to_i
+      if bar[:current] != cur || bar[:max] != mx
+        bar[:current] = cur
+        bar[:max] = mx
+        bar[:area].queue_draw
+        bar[:text_label].set_markup("<span font_desc='Sans 8' foreground='white'>#{bar[:label]} #{cur}/#{mx}</span>")
+      end
+    end
+  end
+
+  # Update all tracked ability widgets with current RT countdown
+  def update_ability_displays
+    # Calculate remaining roundtime (max of regular RT and cast RT)
+    rt = [0, XMLData.roundtime_end.to_f - Time.now.to_f + XMLData.server_time_offset.to_f].max
+    cast_rt = [0, XMLData.cast_roundtime_end.to_f - Time.now.to_f + XMLData.server_time_offset.to_f].max
+    remaining = [rt, cast_rt].max.ceil
+
+    # State machine: detect NEW RT by comparing RT end times to the snapshot
+    # taken when the command was recorded. If roundtime_end increased, a new RT
+    # started (game accepted the command). Old RT still counting down won't
+    # be attributed to the new command.
+    if @last_cast_ability
+      current_rt_end = XMLData.roundtime_end.to_f
+      current_cast_rt_end = XMLData.cast_roundtime_end.to_f
+
+      if !@cast_seen_rt
+        # Check if the game set a NEW RT (end time increased since our snapshot)
+        if current_rt_end > (@rt_end_snapshot || 0) + 0.5 ||
+           current_cast_rt_end > (@cast_rt_end_snapshot || 0) + 0.5
+          @cast_seen_rt = true
+          initial_rt = remaining
+          prev = @observed_rt[@last_cast_ability]
+          if prev.nil? || initial_rt < prev
+            @observed_rt[@last_cast_ability] = initial_rt
+            respond "--- Combatical: Observed RT for #{@last_cast_ability}: #{initial_rt}s (was #{prev || 'none'})" if Combatical.debug?
+          end
+        elsif @last_cast_time && (Time.now.to_f - @last_cast_time) > 8.0
+          # Stale timeout: no new RT detected within 8 seconds — command likely failed
+          respond "--- Combatical: Stale cast timeout for #{@last_cast_ability}, clearing" if Combatical.debug?
+          @last_cast_ability = nil
+          @cast_seen_rt = false
+          @last_cast_time = nil
+        end
+      elsif remaining <= 0
+        # RT was confirmed and has now ended — safe to clear
+        @last_cast_ability = nil
+        @cast_seen_rt = false
+        @last_cast_time = nil
+      end
+    end
+
+    # Update all tracked ability labels (boxes + pool use same format now)
+    all_tracked = @tracked_buttons + @tracked_pool_labels
+    all_tracked.each do |entry|
+      lbl = entry[:label]
+      ability = entry[:ability]
+      rgb = entry[:rgb]
+      next unless lbl && !lbl.destroyed?
+
+      # Use observed RT if available, otherwise fall back to ability default
+      observed = @observed_rt[ability.name]
+      base_rt = observed || ability.roundtime
+      rt_display = base_rt > 0 ? " (#{base_rt}s)" : ""
+
+      # Build charges/UPD suffix for item abilities
+      charges_suffix = ""
+      if ability.type == :item && ability.max_charges
+        rc = ability.remaining_charges || 0
+        if rc <= 0
+          charges_suffix = " <span foreground='#FFCC00'>[0]</span> <span foreground='#FF4444'>\u2620</span>"
+        else
+          charges_suffix = " <span foreground='#FFCC00'>[#{rc}]</span>"
+        end
+      end
+      if ability.type == :item && ability.max_upd
+        ability.check_upd_reset!
+        ru = ability.remaining_upd || 0
+        if ru <= 0
+          charges_suffix += " <span foreground='#CC88FF'>[0/#{ability.max_upd} UPD]</span> <span foreground='#FF4444'>\u2620</span>"
+        else
+          charges_suffix += " <span foreground='#CC88FF'>[#{ru}/#{ability.max_upd} UPD]</span>"
+        end
+      end
+
+      # Item frequency cooldown remaining (separate from game RT)
+      item_cd = (ability.type == :item) ? ability.item_cooldown_remaining : 0
+
+      if remaining > 0 && ability.name == @last_cast_ability && @cast_seen_rt
+        # This specific ability triggered a confirmed NEW RT — show strikethrough + countdown
+        lbl.set_markup("<span foreground='#%02x%02x%02x' strikethrough='true'>%s%s</span> <span foreground='#FF6600'>%ds</span>%s" %
+                       [rgb[0], rgb[1], rgb[2], ability.name, rt_display, remaining, charges_suffix])
+      elsif item_cd > 0
+        # Item on frequency cooldown (game RT done, but item cooldown still ticking)
+        cd_str = Ability.format_duration(item_cd)
+        lbl.set_markup("<span foreground='#%02x%02x%02x' strikethrough='true'>%s%s</span> <span foreground='#FF4444'>%s</span>%s" %
+                       [rgb[0], rgb[1], rgb[2], ability.name, rt_display, cd_str, charges_suffix])
+      elsif ability.available?
+        lbl.set_markup("<span foreground='#%02x%02x%02x'>%s%s</span> <span foreground='#00CC00'>✓</span>%s" %
+                       [rgb[0], rgb[1], rgb[2], ability.name, rt_display, charges_suffix])
+      else
+        lbl.set_markup("<span foreground='#%02x%02x%02x' strikethrough='true'>%s%s</span>%s" %
+                       [rgb[0], rgb[1], rgb[2], ability.name, rt_display, charges_suffix])
+      end
+    end
+  end
+
+  # Create the main GTK3 window
+  def create_main_window
+    # CRITICAL: Wrap ALL GTK operations in Gtk.queue for Lich integration
+    Gtk.queue do
+      respond "--- Combatical: Creating window..." if Combatical.debug?
+      @window = Gtk::Window.new
+      @window.set_title("Combatical - #{XMLData.name}")
+      @window.set_default_size(900, 700)
+      @window.set_border_width(10)
+      @window.set_keep_above(@always_on_top)
+
+      # Create main vertical box for layout
+      @main_vbox = Gtk::Box.new(:vertical, 5)
+      @window.add(@main_vbox)
+
+      respond "--- Combatical: Window created" if Combatical.debug?
+    end
+  end
+
+  # Show the complete window
+  def show_window
+    Gtk.queue do
+      @window.show_all
+      respond "--- Combatical: Window displayed" if Combatical.debug?
+    end
+  end
+
+  # Set close handler (called from main execution)
+  def set_close_handler(&block)
+    Gtk.queue do
+      @window.signal_connect('destroy') {
+        respond "--- Combatical: [TEST] Destroy signal triggered" if Combatical.debug?
+        stop_roundtime_tracker
+        save_all_settings
+        respond "--- Combatical: Window closed, all settings saved" if Combatical.debug?
+        block.call if block
+      }
+    end
+  end
+
+  # Save all current settings to CharSettings
+  def save_all_settings
+    CharSettings['combatical']['boxes'] = @boxes
+    CharSettings['combatical']['num_boxes'] = @num_boxes
+    CharSettings['combatical']['box_labels'] = @box_labels
+    CharSettings['combatical']['locked'] = @locked
+    CharSettings['combatical']['always_on_top'] = @always_on_top
+    CharSettings['combatical']['custom_verbs'] = @custom_verbs
+    CharSettings['combatical']['wiki_confirm'] = @wiki_confirm
+    CharSettings['combatical']['scripted_items'] = @scripted_items_cache || []
+    CharSettings['combatical']['ability_notes'] = @ability_notes || {}
+    CharSettings['combatical']['observed_rt'] = @observed_rt || {}
+    # Save item frequency/charges tracking state
+    charges = {}
+    cooldowns = {}
+    @abilities.each do |a|
+      next unless a.type == :item
+      charges[a.name] = a.remaining_charges if a.max_charges && a.remaining_charges
+      cooldowns[a.name] = a.item_cooldown_end.to_f if a.item_cooldown_end && a.item_cooldown_end > Time.now
+    end
+    CharSettings['combatical']['item_charges_tracking'] = charges unless charges.empty?
+    CharSettings['combatical']['item_cooldown_tracking'] = cooldowns unless cooldowns.empty?
+    upd_data = {}
+    @abilities.each do |a|
+      next unless a.type == :item && a.max_upd
+      upd_data[a.name] = { 'remaining' => a.remaining_upd, 'last_reset' => a.upd_last_reset }
+    end
+    CharSettings['combatical']['item_upd_tracking'] = upd_data unless upd_data.empty?
+    # Save abilities to ensure refresh changes are persisted
+    Settings.save_abilities(@abilities)
+    respond "--- Combatical: [SAVE] Settings saved (#{@abilities.length} abilities, #{charges.length} charge-tracked, #{cooldowns.length} cooldown-tracked, #{upd_data.length} UPD-tracked, #{@num_boxes} boxes)" if Combatical.debug?
+  end
+
+  # Create toolbar with targeting boxes and buttons
+  def create_toolbar
+    Gtk.queue do
+      # Top row: Title on left, buttons on right
+      button_row = Gtk::Box.new(:horizontal, 2)
+
+      # Title label (left-aligned, colosseum style)
+      title_label = Gtk::Label.new
+      title_label.set_markup(
+        "<span font_desc='18' weight='bold' foreground='#D4AF37'>" \
+        "⚔ </span>" \
+        "<span font_desc='22' weight='heavy' foreground='#D4AF37' letter_spacing='4096'>" \
+        "COMBATICAL</span>" \
+        "<span font_desc='18' weight='bold' foreground='#D4AF37'>" \
+        " ⚔</span>"
+      )
+      button_row.pack_start(title_label, expand: false, fill: false, padding: 5)
+
+      # Spacer to push bars and buttons to the right
+      button_row.pack_start(Gtk::Label.new(""), expand: true, fill: true, padding: 0)
+
+      # Resource bars: HP/Stamina column and Mana/Spirit column
+      # Layout per column: label above top bar, bar, bar, label below bottom bar
+      bar_width = 120
+      bar_height = 8
+
+      # Left column: HP label, health bar, stamina bar, ST label
+      left_col = Gtk::Box.new(:vertical, 0)
+      @resource_bars[:health] = create_resource_bar(bar_width, bar_height, "HP", [0.8, 0.0, 0.0], [0.3, 0.0, 0.0])
+      @resource_bars[:stamina] = create_resource_bar(bar_width, bar_height, "ST", [1.0, 0.84, 0.0], [0.4, 0.33, 0.0])
+      @resource_bars[:health][:text_label].set_halign(:center)
+      @resource_bars[:stamina][:text_label].set_halign(:center)
+      left_col.pack_start(@resource_bars[:health][:text_label], expand: false, fill: false, padding: 0)
+      left_col.pack_start(@resource_bars[:health][:area], expand: false, fill: false, padding: 0)
+      left_col.pack_start(@resource_bars[:stamina][:area], expand: false, fill: false, padding: 0)
+      left_col.pack_start(@resource_bars[:stamina][:text_label], expand: false, fill: false, padding: 0)
+      button_row.pack_start(left_col, expand: false, fill: false, padding: 4)
+
+      # Right column: MP label, mana bar, spirit bar, SP label
+      right_col = Gtk::Box.new(:vertical, 0)
+      @resource_bars[:mana] = create_resource_bar(bar_width, bar_height, "MP", [0.0, 0.4, 0.8], [0.0, 0.15, 0.3])
+      @resource_bars[:spirit] = create_resource_bar(bar_width, bar_height, "SP", [0.9, 0.9, 0.9], [0.35, 0.35, 0.35])
+      @resource_bars[:mana][:text_label].set_halign(:center)
+      @resource_bars[:spirit][:text_label].set_halign(:center)
+      right_col.pack_start(@resource_bars[:mana][:text_label], expand: false, fill: false, padding: 0)
+      right_col.pack_start(@resource_bars[:mana][:area], expand: false, fill: false, padding: 0)
+      right_col.pack_start(@resource_bars[:spirit][:area], expand: false, fill: false, padding: 0)
+      right_col.pack_start(@resource_bars[:spirit][:text_label], expand: false, fill: false, padding: 0)
+      button_row.pack_start(right_col, expand: false, fill: false, padding: 4)
+
+      @refresh_button = Gtk::Button.new
+      @refresh_button.set_size_request(20, 20)
+      refresh_label = Gtk::Label.new
+      refresh_label.set_markup("<span foreground='#66BB6A'>🔄</span>")
+      @refresh_button.add(refresh_label)
+      @refresh_button.set_tooltip_text("Refresh abilities")
+      @refresh_button.signal_connect('clicked') {
+        refresh_abilities
+      }
+      button_row.pack_start(@refresh_button, expand: false, fill: false, padding: 0)
+
+      # Lock/unlock toggle button
+      @lock_button = Gtk::Button.new
+      @lock_button.set_size_request(20, 20)
+      @lock_label = Gtk::Label.new
+      update_lock_icon
+      @lock_button.add(@lock_label)
+      update_lock_tooltip
+      @lock_button.signal_connect('clicked') {
+        toggle_lock
+      }
+      button_row.pack_start(@lock_button, expand: false, fill: false, padding: 0)
+
+      @settings_button = Gtk::Button.new
+      @settings_button.set_size_request(20, 20)
+      settings_label = Gtk::Label.new
+      settings_label.set_markup("<span foreground='#90CAF9'>⚙</span>")
+      @settings_button.add(settings_label)
+      @settings_button.set_tooltip_text("Settings")
+      @settings_button.signal_connect('clicked') {
+        open_settings_dialog
+      }
+      button_row.pack_start(@settings_button, expand: false, fill: false, padding: 0)
+
+      @main_vbox.pack_start(button_row, expand: false, fill: false, padding: 2)
+
+      # Bottom row: Targeting boxes only
+      toolbar_box = Gtk::Box.new(:horizontal, 2)
+
+      # Enemy targets box (wrapping FlowBox for multi-line display)
+      enemy_frame = Gtk::Frame.new("<small>Enemy targets</small>")
+      enemy_frame.label_widget.set_use_markup(true)
+      enemy_frame.label_widget.style_context.add_class('combatical-section-header')
+      enemy_scroll = Gtk::ScrolledWindow.new
+      enemy_scroll.set_policy(:never, :automatic)  # No horizontal scroll, vertical if needed
+      enemy_scroll.override_background_color(:normal, Gdk::RGBA.new(0, 0, 0, 1))
+      @enemy_box = Gtk::FlowBox.new
+      @enemy_box.set_selection_mode(:none)
+      @enemy_box.set_max_children_per_line(20)
+      @enemy_box.set_min_children_per_line(1)
+      @enemy_box.set_column_spacing(0)
+      @enemy_box.set_row_spacing(0)
+      @enemy_box.override_background_color(:normal, Gdk::RGBA.new(0, 0, 0, 1))
+      enemy_scroll.add(@enemy_box)
+      enemy_scroll.set_size_request(380, 65)
+      enemy_frame.add(enemy_scroll)
+      enemy_frame.set_size_request(380, 85)
+      toolbar_box.pack_start(enemy_frame, expand: false, fill: false, padding: 1)
+      # Player targets box (wrapping FlowBox for multi-line display)
+      player_frame = Gtk::Frame.new("<small>Player targets</small>")
+      player_frame.label_widget.set_use_markup(true)
+      player_frame.label_widget.style_context.add_class('combatical-section-header')
+      player_scroll = Gtk::ScrolledWindow.new
+      player_scroll.set_policy(:never, :automatic)  # No horizontal scroll, vertical if needed
+      player_scroll.override_background_color(:normal, Gdk::RGBA.new(0, 0, 0, 1))
+      @player_box = Gtk::FlowBox.new
+      @player_box.set_selection_mode(:none)
+      @player_box.set_max_children_per_line(20)
+      @player_box.set_min_children_per_line(1)
+      @player_box.set_column_spacing(0)
+      @player_box.set_row_spacing(0)
+      @player_box.override_background_color(:normal, Gdk::RGBA.new(0, 0, 0, 1))
+      player_scroll.add(@player_box)
+      player_scroll.set_size_request(380, 65)
+      player_frame.add(player_scroll)
+      player_frame.set_size_request(380, 85)
+      toolbar_box.pack_start(player_frame, expand: false, fill: false, padding: 1)
+
+      # Current target box with clear button (vertical)
+      target_vbox = Gtk::Box.new(:vertical, 2)
+      target_frame = Gtk::Frame.new("<small>Current Target</small>")
+      target_frame.label_widget.set_use_markup(true)
+      target_frame.label_widget.style_context.add_class('combatical-section-header')
+      target_eventbox = Gtk::EventBox.new
+      target_eventbox.override_background_color(:normal, Gdk::RGBA.new(0, 0, 0, 1))
+      @current_target_label = Gtk::Label.new("(none)")
+      @current_target_label.set_halign(:center)
+      @current_target_label.set_valign(:center)
+      target_eventbox.add(@current_target_label)
+      target_frame.add(target_eventbox)
+      target_frame.set_size_request(140, 33)
+      target_vbox.pack_start(target_frame, expand: false, fill: false, padding: 0)
+
+      @clear_target_button = Gtk::Button.new(label: "Clear")
+      @clear_target_button.set_size_request(100, 18)
+      @clear_target_button.signal_connect('clicked') {
+        clear_target
+      }
+      target_vbox.pack_start(@clear_target_button, expand: false, fill: false, padding: 0)
+      toolbar_box.pack_start(target_vbox, expand: false, fill: false, padding: 1)
+
+      @main_vbox.pack_start(toolbar_box, expand: false, fill: false, padding: 5)
+      respond "--- Combatical: Toolbar created" if Combatical.debug?
+    end
+  end
+
+  # Create grid of ability boxes
+  def create_boxes_grid
+    # Scrolled window for boxes (store as instance variable for removal)
+    @boxes_scroll = Gtk::ScrolledWindow.new
+    @boxes_scroll.set_policy(:never, :automatic)
+    @boxes_scroll.set_overlay_scrolling(false)
+    @boxes_scroll.set_vexpand(true)
+
+    # Grid container (3 boxes per row)
+    @boxes_container = Gtk::Grid.new
+    @boxes_container.set_row_spacing(5)
+    @boxes_container.set_column_spacing(5)
+    @boxes_container.set_column_homogeneous(true)
+    @boxes_container.set_row_homogeneous(true)
+
+    # Create boxes (2 columns for 4 boxes, 3 columns otherwise)
+    cols = (@num_boxes == 4) ? 2 : 3
+    @box_widgets = []
+    @num_boxes.times do |i|
+      box_widget = create_box_widget(i)
+      @box_widgets << box_widget
+
+      row = i / cols
+      col = i % cols
+      @boxes_container.attach(box_widget, col, row, 1, 1)
+    end
+
+    @boxes_scroll.add(@boxes_container)
+    @main_vbox.pack_start(@boxes_scroll, expand: true, fill: true, padding: 5)
+    respond "--- Combatical: Boxes grid created (#{@num_boxes} boxes)" if Combatical.debug?
+  end
+
+  # Create ability label widget (colored text matching pool style)
+  # Returns an EventBox containing: [ability_label] [note_text] [notepad_icon]
+  # pool: true  — tracks in @tracked_pool_labels, adds drag dest, simpler tooltip
+  # pool: false — tracks in @tracked_buttons, adds right-click wiki
+  def create_ability_button(ability, pool: false)
+    rgb = get_ability_color_rgb(ability)
+    observed = @observed_rt[ability.name]
+    base_rt = observed || ability.roundtime
+    rt_display = base_rt > 0 ? " (#{base_rt}s)" : ""
+    checkmark = ability.available? ? " <span foreground='#00CC00'>✓</span>" : ""
+
+    label = Gtk::Label.new
+    label.set_markup("<span foreground='#%02x%02x%02x'>%s%s</span>%s" %
+                    [rgb[0], rgb[1], rgb[2], ability.name, rt_display, checkmark])
+    label.set_halign(:start)
+
+    has_wiki = ability.wiki_url && !ability.wiki_url.empty?
+    if pool
+      label.set_tooltip_text("#{ability.command} (RT: #{ability.roundtime}s)")
+      @tracked_pool_labels << { label: label, ability: ability, rgb: rgb }
+    else
+      tip = "#{ability.name}\nCost: #{ability.cost} #{ability.resource_type}\nRT: #{ability.roundtime_display}\nClick to execute"
+      tip << "\nRight-click for wiki" if has_wiki
+      label.set_tooltip_text(tip)
+      @tracked_buttons << { label: label, ability: ability, rgb: rgb }
+    end
+
+    # Horizontal row: [ability_label] ... [note_text] [notepad_icon]
+    # Notepad icon is always flush-right; note butts up against it, expanding left.
+    hbox = Gtk::Box.new(:horizontal, 2)
+    hbox.pack_start(label, expand: false, fill: false, padding: 0)
+
+    # Notepad icon (always present, always flush-right — pack_end first)
+    note_icon = Gtk::Label.new
+    note_icon.set_markup("<span foreground='#888888' font_desc='Sans 8'>\u{1F4DD}</span>")
+    note_icon.set_tooltip_text(@locked ? "Unlock to edit notes" : "Click to add/edit note")
+    note_ebox = Gtk::EventBox.new
+    note_ebox.override_background_color(:normal, Gdk::RGBA.new(0, 0, 0, 1))
+    note_ebox.add(note_icon)
+    note_ebox.signal_connect('button-release-event') { |widget, event|
+      if event.button == 1
+        if @locked
+          flash_lock_warning
+        else
+          edit_ability_note(ability)
+        end
+      end
+      true  # Stop propagation so it doesn't trigger ability execution
+    }
+    hbox.pack_end(note_ebox, expand: false, fill: false, padding: 2)
+
+    # Note text (grey, right-justified, butts up against notepad icon)
+    note = @ability_notes[ability.name]
+    if note && !note.empty?
+      note_label = Gtk::Label.new
+      note_label.set_markup("<span foreground='#999999' font_desc='Sans 8'>#{note}</span>")
+      note_label.set_halign(:end)
+      hbox.pack_end(note_label, expand: false, fill: false, padding: 2)
+    end
+
+    # Wrap in EventBox for click and drag
+    event_box = Gtk::EventBox.new
+    event_box.override_background_color(:normal, Gdk::RGBA.new(0, 0, 0, 1))
+    event_box.add(hbox)
+
+    # Make draggable
+    setup_drag_source(event_box, ability)
+
+    # NOTE: Pool ability event_boxes are NOT drag destinations — the category
+    # containers (abilities_box) and pool-level containers handle drops.
+    # Registering 60+ individual drag dests caused GTK to hang after repeated rebuilds.
+
+    # Track drag state so click-to-execute doesn't fire after a drag
+    is_dragging = false
+    event_box.signal_connect('drag-begin') { |w, ctx|
+      begin
+        is_dragging = true
+        @drag_in_progress = true  # Block rebuilds while dragging
+        @drop_completed_at = nil  # Reset safety valve for new drag
+        @dragged_ability_name = ability.name  # Store for drop handler (bypasses GTK data transfer)
+        respond "--- Combatical: [DND] drag-begin: '#{ability.name}' (pool=#{pool ? 'yes' : 'no'})" if Combatical.debug?
+      rescue => e
+        respond "--- Combatical: [DND] drag-begin error: #{e.message}" if Combatical.debug?
+      end
+    }
+    event_box.signal_connect('drag-end') { |w, ctx|
+      begin
+        respond "--- Combatical: [DND] drag-end: '#{ability.name}' (drop_completed=#{@drop_completed_at ? 'yes' : 'no'})" if Combatical.debug?
+        is_dragging = false
+      ensure
+        # ALWAYS release the drag lock so rebuilds can proceed
+        @drag_in_progress = false
+        @drop_completed_at = nil
+        @dragged_ability_name = nil
+      end
+    }
+
+    # Execute on release (not press) so drag gets first chance
+    event_box.signal_connect('button-release-event') { |widget, event|
+      if event.button == 1 && !is_dragging
+        execute_ability(ability)
+      elsif !pool && event.button == 3 && ability.wiki_url && !ability.wiki_url.empty?
+        open_wiki_link(ability)
+      end
+      false
+    }
+
+    event_box
+  end
+
+  # Set up drag source on ability button
+  def setup_drag_source(button, ability)
+    button.drag_source_set(
+      Gdk::ModifierType::BUTTON1_MASK,
+      [TARGET_ENTRY],
+      Gdk::DragAction::MOVE
+    )
+
+    # Send ability name as drag data
+    button.signal_connect('drag-data-get') { |widget, context, selection_data, info, time|
+      selection_data.set_text(ability.name)
+    }
+  end
+
+  # Calculate the insert position from a y coordinate within a box container.
+  # Returns 0..N where 0 = before all children, N = after all children.
+  def find_drop_index(container, y)
+    children = container.children
+    return 0 if children.empty?
+    children.each_with_index do |child, i|
+      alloc = child.allocation
+      mid = alloc.y + alloc.height / 2.0
+      return i if y < mid
+    end
+    children.length
+  end
+
+  # Clear the drop indicator underline from whichever widget currently has it
+  def clear_drop_indicator
+    if @drop_indicator_child
+      begin
+        @drop_indicator_child.style_context.remove_class('combatical-drop-indicator') unless @drop_indicator_child.destroyed?
+      rescue
+      end
+      @drop_indicator_child = nil
+    end
+  end
+
+  # Set up drag destination on container.
+  # On Windows, GdkWin32DragContext doesn't support drag_finish, so we omit
+  # DestDefaults::DROP. We keep MOTION | HIGHLIGHT for acceptance and visual
+  # feedback, and handle the drop ourselves using @dragged_ability_name.
+  def setup_drag_dest(widget, box_index = nil)
+    widget.drag_dest_set(
+      Gtk::DestDefaults::MOTION | Gtk::DestDefaults::HIGHLIGHT,
+      [TARGET_ENTRY],
+      Gdk::DragAction::MOVE
+    )
+
+    # For box containers: add positional targeting with underline indicator
+    if box_index
+      widget.signal_connect('drag-motion') { |w, context, x, y, time|
+        begin
+          insert_pos = find_drop_index(w, y)
+          indicator_idx = insert_pos > 0 ? insert_pos - 1 : nil
+          children = w.children
+          new_child = (indicator_idx && indicator_idx < children.length) ? children[indicator_idx] : nil
+          if new_child != @drop_indicator_child
+            clear_drop_indicator
+            if new_child && !new_child.destroyed?
+              new_child.style_context.add_class('combatical-drop-indicator')
+              @drop_indicator_child = new_child
+            end
+          end
+        rescue => e
+          respond "--- Combatical: drag-motion error: #{e.message}" if Combatical.debug?
+        end
+        false  # Let default MOTION handling continue (drag acceptance)
+      }
+
+      widget.signal_connect('drag-leave') { |w, context, time|
+        clear_drop_indicator
+      }
+    end
+
+    # Handle drop using @dragged_ability_name (set in drag-begin).
+    # Also call drag_get_data to complete GTK's DnD protocol and prevent
+    # the state machine from getting stuck (which blocks future drags).
+    widget.signal_connect('drag-drop') { |w, context, x, y, time|
+      begin
+        clear_drop_indicator
+
+        # Complete GTK's DnD protocol (fire-and-forget)
+        begin
+          target = context.targets.first
+          w.drag_get_data(context, target, time) if target
+        rescue
+          # May fail for cross-container drops on Windows; not fatal
+        end
+
+        # Use stored ability name — reliable across all drag scenarios
+        ability_name = @dragged_ability_name
+        respond "--- Combatical: [DND] drag-drop fired, ability=#{ability_name.inspect}, box=#{box_index.inspect}" if Combatical.debug?
+        if ability_name && !ability_name.empty?
+          insert_at = box_index ? find_drop_index(w, y) : nil
+          handle_ability_drop(ability_name, box_index, insert_at)
+        end
+      rescue => e
+        respond "--- Combatical: drag-drop error: #{e.message}" if Combatical.debug?
+      end
+      true  # We handled the drop — do NOT let GTK call drag_finish
+    }
+
+    # No-op handler required to complete GTK's DnD protocol after drag_get_data.
+    # Actual drop logic is in the drag-drop handler via @dragged_ability_name.
+    widget.signal_connect('drag-data-received') { |w, context, x, y, selection_data, info, time|
+      respond "--- Combatical: [DND] drag-data-received (no-op, box=#{box_index.inspect})" if Combatical.debug?
+    }
+  end
+
+  # Handle ability being dropped into a box or pool (blocked when locked)
+  # insert_at: nil = append, integer = insert at specific position (for reordering)
+  def handle_ability_drop(ability_name, dest_box_index, insert_at = nil)
+    if @locked
+      flash_lock_warning
+      return
+    end
+    begin
+      old_location = "Unassigned Pool"
+      @boxes.each_with_index { |box, i| old_location = "Box #{i + 1}" if (box['abilities'] || []).include?(ability_name) }
+      dest_name = dest_box_index ? (@boxes[dest_box_index]['name'] rescue "Box #{dest_box_index + 1}") : "Unassigned Pool"
+      respond "--- Combatical: [DND] Drop '#{ability_name}': #{old_location} -> #{dest_name} at position #{insert_at.inspect}" if Combatical.debug?
+
+      # Find the ability's current position (for same-box reorder adjustment)
+      old_box_idx = nil
+      old_pos = nil
+      @boxes.each_with_index do |box, i|
+        box['abilities'] ||= []
+        pos = box['abilities'].index(ability_name)
+        if pos
+          old_box_idx = i
+          old_pos = pos
+        end
+      end
+
+      # Remove ability from all boxes
+      @boxes.each do |box|
+        box['abilities'] ||= []
+        box['abilities'].delete(ability_name)
+      end
+
+      # Add to destination box (nil = pool/unassigned)
+      if dest_box_index
+        @boxes[dest_box_index]['abilities'] ||= []
+        if insert_at
+          # Adjust for same-box reorder: if we removed an item above the target, shift down
+          if old_box_idx == dest_box_index && old_pos && old_pos < insert_at
+            insert_at -= 1
+          end
+          insert_at = [insert_at, @boxes[dest_box_index]['abilities'].length].min
+          @boxes[dest_box_index]['abilities'].insert(insert_at, ability_name)
+        else
+          @boxes[dest_box_index]['abilities'] << ability_name
+        end
+      end
+    ensure
+      # Do NOT reset @drag_in_progress here — GTK's DnD state machine still
+      # holds a reference to the drag source widget. Resetting here lets the
+      # timer rebuild (and destroy widgets) before drag-end fires, causing a
+      # segfault on Windows. Instead, let drag-end reset it. A safety valve
+      # in the timer auto-resets after 1.5s if drag-end never fires.
+      @drop_completed_at = Time.now.to_f
+      @needs_rebuild = true
+    end
+  end
+
+  # Apply global CSS for colors (like combat_tracker)
+  def apply_global_colors
+    # Get user-selected colors or defaults
+    bg_color = CharSettings['combatical']['bg_color'] || [0.2, 0.2, 0.2]  # Dark gray
+    title_color = CharSettings['combatical']['title_color'] || [0.5, 0.5, 0.5]  # Medium gray
+
+    bg_rgb = [(bg_color[0] * 255).to_i, (bg_color[1] * 255).to_i, (bg_color[2] * 255).to_i]
+    title_rgb = [(title_color[0] * 255).to_i, (title_color[1] * 255).to_i, (title_color[2] * 255).to_i]
+
+    # Remove previous CSS provider before adding new one (prevents accumulation on rebuild)
+    if @css_provider
+      begin
+        Gtk::StyleContext.remove_provider_for_screen(Gdk::Screen.default, @css_provider)
+      rescue
+      end
+    end
+
+    # Build CSS with fixed ability button colors and user-selected background/titles
+    @css_provider = Gtk::CssProvider.new
+    css_data = <<-CSS
+      window {
+        background-color: rgb(#{bg_rgb[0]}, #{bg_rgb[1]}, #{bg_rgb[2]});
+      }
+      .combatical-section-header {
+        background-color: rgb(#{title_rgb[0]}, #{title_rgb[1]}, #{title_rgb[2]});
+        color: white;
+        padding: 5px 10px;
+        font-weight: bold;
+        border-radius: 3px;
+      }
+      .combatical-box-frame {
+        border: 1px solid rgba(180, 180, 180, 0.4);
+        border-radius: 3px;
+      }
+      .combatical-drop-indicator {
+        border-bottom: 2px solid #4488FF;
+      }
+      .combatical-lock-flash {
+        border: 3px solid #FF2222;
+        margin: -3px;
+        background-color: rgba(255, 0, 0, 0.25);
+        border-radius: 4px;
+      }
+    CSS
+
+    @css_provider.load(data: css_data)
+
+    # Apply globally like combat_tracker does
+    Gtk::StyleContext.add_provider_for_screen(
+      Gdk::Screen.default,
+      @css_provider,
+      Gtk::StyleProvider::PRIORITY_APPLICATION
+    )
+  end
+
+  # Clear current target
+  def clear_target
+    @current_target = nil
+    @current_target_type = nil
+
+    Gtk.queue do
+      @current_target_label.set_text("(none)")
+      update_target_lists
+    end
+
+    respond "--- Combatical: Target cleared" if Combatical.debug?
+  end
+
+  # Update target lists with current NPCs and players
+  # Only recreates widgets when the data actually changes (fingerprint check)
+  def update_target_lists
+    # Filter out player pets/companions from NPCs
+    @current_enemies = GameObj.npcs.reject { |npc|
+      npc.type =~ /companion|familiar/i ||
+      npc.status =~ /companion|familiar/i ||
+      GameObj.pcs.any? { |pc| npc.noun =~ /#{pc.noun}/i }
+    }
+
+    @current_players = GameObj.pcs
+
+    # Build fingerprint: list of nouns + current target + target type
+    enemy_nouns = @current_enemies.map { |npc| npc.noun }
+    player_nouns = @current_players.map { |pc| pc.noun }
+    fingerprint = [enemy_nouns, player_nouns, @current_target, @current_target_type]
+
+    # Skip widget rebuild if nothing changed
+    if fingerprint == @target_list_fingerprint
+      return
+    end
+    @target_list_fingerprint = fingerprint
+
+    # --- Rebuild enemy widgets (FlowBox — wraps automatically) ---
+    @enemy_box.children.each { |child| @enemy_box.remove(child) }
+
+    @current_enemies.each do |npc|
+      label = Gtk::Label.new
+      if @current_target == npc.noun && @current_target_type == :enemy
+        label.set_markup("<span foreground='yellow' weight='bold' font_desc='Sans 10'>#{npc.noun}</span>")
+      else
+        label.set_markup("<span foreground='yellow' font_desc='Sans 10'>#{npc.noun}</span>")
+      end
+
+      event_box = Gtk::EventBox.new
+      event_box.override_background_color(:normal, Gdk::RGBA.new(0, 0, 0, 1))
+      event_box.add(label)
+      event_box.signal_connect('button-press-event') { |widget, event|
+        if event.button == 1
+          select_target(npc.noun, :enemy)
+        end
+      }
+      @enemy_box.add(event_box)
+    end
+
+    # --- Rebuild player widgets (FlowBox — wraps automatically) ---
+    @player_box.children.each { |child| @player_box.remove(child) }
+
+    @current_players.each do |pc|
+      label = Gtk::Label.new
+      if @current_target == pc.noun && @current_target_type == :player
+        label.set_markup("<span foreground='blue' weight='bold' font_desc='Sans 10'>#{pc.noun}</span>")
+      else
+        label.set_markup("<span foreground='blue' font_desc='Sans 10'>#{pc.noun}</span>")
+      end
+
+      event_box = Gtk::EventBox.new
+      event_box.override_background_color(:normal, Gdk::RGBA.new(0, 0, 0, 1))
+      event_box.add(label)
+      event_box.signal_connect('button-press-event') { |widget, event|
+        if event.button == 1
+          select_target(pc.noun, :player)
+        end
+      }
+      @player_box.add(event_box)
+    end
+
+    @enemy_box.show_all
+    @player_box.show_all
+
+    # Auto-clear target if it's no longer present in the room
+    if @current_target
+      target_gone = if @current_target_type == :enemy
+                      !@current_enemies.any? { |npc| npc.noun == @current_target }
+                    elsif @current_target_type == :player
+                      !@current_players.any? { |pc| pc.noun == @current_target }
+                    else
+                      false
+                    end
+      if target_gone
+        @current_target = nil
+        @current_target_type = nil
+        @current_target_label.set_text("(none)")
+        respond "--- Combatical: Target auto-cleared (no longer in room)" if Combatical.debug?
+      end
+    end
+  end
+
+  # Select a specific target by name
+  def select_target(target_name, target_type)
+    @current_target = target_name
+    @current_target_type = target_type
+
+    color = target_type == :enemy ? 'yellow' : 'blue'
+    markup = "<span foreground='#{color}' weight='bold' style='italic'>#{target_name}</span>"
+    @current_target_label.set_markup(markup)
+
+    update_target_lists
+    respond "--- Combatical: Target set to #{target_name} (#{target_type})" if Combatical.debug?
+  end
+
+  # Match a command string against known abilities.
+  # Returns the matched Ability or nil.
+  # Supports exact match, shorthand verbs, and abbreviated commands (min 3 chars).
+  def match_ability_command(cmd_str)
+    stripped = cmd_str.to_s.strip.downcase
+    return nil if stripped.empty?
+
+    typed_words = stripped.split(/\s+/, 3)
+    typed_first = typed_words[0] || ""
+
+    matched = @abilities.find { |a|
+      acmd = a.command.downcase
+      # Match full command or with target appended
+      next true if stripped == acmd || stripped.start_with?(acmd + " ")
+
+      parts = acmd.split(' ', 2)
+      if parts.length == 2
+        prefix = parts[0]
+        verb = parts[1]
+
+        # Match shorthand (verb portion only)
+        next true if stripped == verb || stripped.start_with?(verb + " ")
+
+        # Match abbreviated verb (min 3 chars)
+        if typed_first.length >= 3 && verb.start_with?(typed_first)
+          next true
+        end
+
+        # Match abbreviated with prefix: "cman sur" matches "cman surge"
+        if typed_first == prefix && typed_words.length >= 2
+          typed_verb = typed_words[1]
+          if typed_verb.length >= 3 && verb.start_with?(typed_verb)
+            next true
+          end
+        end
+      else
+        # Single-word commands: "hid" matches "hide"
+        if typed_first.length >= 3 && acmd.start_with?(typed_first)
+          next true
+        end
+      end
+      false
+    }
+
+    # Check prep/cast for spells
+    if !matched && stripped =~ /^prep(?:are)?\s+(\d+)/
+      spell_num = $1
+      matched = @abilities.find { |a|
+        a.type == :spell && a.command.downcase == "incant #{spell_num}"
+      }
+      @prepped_spell = matched.name if matched
+    end
+
+    if !matched && stripped =~ /^cast\b/
+      if @prepped_spell
+        matched = @abilities.find { |a| a.name == @prepped_spell }
+      end
+    end
+
+    matched
+  end
+
+  # Record that an ability was just used (sets RT tracking state).
+  # Snapshots current RT end times so the state machine can detect NEW RT
+  # (from this command) vs OLD RT (still counting down from a prior command).
+  def record_ability_cast(ability_name)
+    @last_cast_ability = ability_name
+    @cast_seen_rt = false
+    @last_cast_time = Time.now.to_f
+    # Snapshot current RT end times — if they increase later, a NEW RT started
+    @rt_end_snapshot = XMLData.roundtime_end.to_f
+    @cast_rt_end_snapshot = XMLData.cast_roundtime_end.to_f
+    respond "--- Combatical: [RT] Tracking cast: '#{ability_name}' rt_snap=#{@rt_end_snapshot.round(1)} cast_snap=#{@cast_rt_end_snapshot.round(1)}" if Combatical.debug?
+  end
+
+  # Execute ability in game (with optional target)
+  # Click throttle: ignore clicks within 300ms of the last one
+  def execute_ability(ability)
+    now = Time.now.to_f
+    return if (now - (@last_click_time || 0)) < 0.3
+    @last_click_time = now
+
+    # Don't execute if already in roundtime — game will reject it
+    game_rt = [0, XMLData.roundtime_end.to_f - Time.now.to_f + XMLData.server_time_offset.to_f].max
+    game_cast_rt = [0, XMLData.cast_roundtime_end.to_f - Time.now.to_f + XMLData.server_time_offset.to_f].max
+    if [game_rt, game_cast_rt].max > 0.5
+      respond "--- Combatical: Still in roundtime, command not sent" if Combatical.debug?
+      return
+    end
+
+    if ability.available?
+      command = ability.command
+      # Append target for spells (incant accepts target directly)
+      command += " #{@current_target}" if @current_target && ability.type == :spell
+
+      # Consume item charges/cooldown immediately (RT guard above ensures we're not in RT)
+      ability.record_item_use! if ability.type == :item
+      record_ability_cast(ability.name)
+
+      # Remove-first items: remove -> wait RT -> verb -> wait RT -> wear
+      if ability.remove_first && ability.item_target
+        respond "--- Combatical: [EXEC] #{ability.name} REMOVE-FIRST -> '#{command}' target=#{ability.item_target}" if Combatical.debug?
+        target = ability.item_target
+        verb_cmd = command
+        Thread.new {
+          begin
+            put "remove #{target}"
+            waitrt?
+            sleep 0.3
+            put verb_cmd
+            waitrt?
+            sleep 0.3
+            put "wear #{target}"
+          rescue => e
+            respond "--- Combatical: [EXEC] Remove-first error: #{e.message}" if Combatical.debug?
+          end
+        }
+      else
+        respond "--- Combatical: [EXEC] #{ability.name} (#{ability.type}) -> '#{command}' target=#{@current_target.inspect}" if Combatical.debug?
+        do_client(command)
+      end
+    else
+      cd_info = []
+      cd_info << "item_cd=#{ability.item_cooldown_remaining.round(1)}s" if ability.type == :item && ability.item_cooldown_end
+      cd_info << "charges=#{ability.remaining_charges}/#{ability.max_charges}" if ability.max_charges
+      cd_info << "upd=#{ability.remaining_upd}/#{ability.max_upd}" if ability.max_upd
+      cd_info << "passive" if ability.passive
+      respond "--- Combatical: [EXEC] #{ability.name} BLOCKED (#{cd_info.join(', ')})" if Combatical.debug?
+    end
+  end
+
+  # Open wiki link with confirmation
+  def open_wiki_link(ability)
+    Gtk.queue do
+      confirmed = true
+      if @wiki_confirm
+        dialog = Gtk::MessageDialog.new(
+          parent: @window,
+          flags: :modal,
+          type: :question,
+          buttons: :yes_no,
+          message: "Open wiki page for #{ability.name}?"
+        )
+        dialog.set_keep_above(true) if @always_on_top
+
+        response = dialog.run
+        dialog.destroy
+
+        confirmed = (response == Gtk::ResponseType::YES)
+      end
+
+      if confirmed
+        # Open in system browser (spawn is non-blocking, unlike system)
+        if RUBY_PLATFORM =~ /mingw|mswin/
+          spawn("start \"\" \"#{ability.wiki_url}\"")
+        elsif RUBY_PLATFORM =~ /darwin/
+          spawn("open", ability.wiki_url)
+        else
+          spawn("xdg-open", ability.wiki_url)
+        end
+
+        respond "--- Combatical: Opened wiki: #{ability.wiki_url}" if Combatical.debug?
+      end
+    end
+  end
+
+  # Open dialog to edit an ability's personal note
+  def edit_ability_note(ability)
+    if @locked
+      flash_lock_warning
+      return
+    end
+    Gtk.queue do
+      dialog = Gtk::Dialog.new(
+        title: "Edit Note",
+        parent: @window,
+        flags: :modal,
+        buttons: [
+          [Gtk::Stock::CANCEL, Gtk::ResponseType::CANCEL],
+          [Gtk::Stock::OK, Gtk::ResponseType::OK]
+        ]
+      )
+      dialog.set_keep_above(true) if @always_on_top
+
+      dialog.child.set_border_width(10)
+
+      header = Gtk::Label.new("Enter note for #{ability.name}:")
+      header.set_halign(:start)
+      dialog.child.pack_start(header, expand: false, fill: false, padding: 5)
+
+      entry = Gtk::Entry.new
+      entry.text = @ability_notes[ability.name] || ""
+      entry.max_length = 60
+      dialog.child.pack_start(entry, expand: false, fill: false, padding: 5)
+
+      dialog.show_all
+
+      response = dialog.run
+      if response == Gtk::ResponseType::OK
+        note_text = entry.text.strip
+        if note_text.empty?
+          @ability_notes.delete(ability.name)
+        else
+          @ability_notes[ability.name] = note_text
+        end
+        @needs_rebuild = true
+      end
+
+      dialog.destroy
+    end
+  end
+
+  # Create individual ability box widget
+  def create_box_widget(index)
+    label_text = @box_labels[index] || "(empty)"
+
+    # Frame wrapper for visible border
+    box_frame = Gtk::Frame.new
+    box_frame.style_context.add_class('combatical-box-frame')
+    box_frame.set_hexpand(true)
+    box_frame.set_vexpand(true)
+
+    # Outer vertical container inside frame
+    box_outer = Gtk::Box.new(:vertical, 0)
+
+    # Standalone section header label (same style as Enemy/Player targets)
+    header_label = Gtk::Label.new
+    header_label.set_markup("<small>#{label_text}</small>")
+    header_label.set_halign(:center)
+    header_label.style_context.add_class('combatical-section-header')
+    @box_header_labels << header_label
+
+    # Wrap in EventBox to make clickable for editing
+    header_eventbox = Gtk::EventBox.new
+    header_eventbox.add(header_label)
+    header_eventbox.set_tooltip_text("Click to edit label")
+    header_eventbox.signal_connect('button-press-event') { |widget, event|
+      if event.button == 1
+        edit_box_label(index)
+      end
+    }
+
+    box_outer.pack_start(header_eventbox, expand: false, fill: true, padding: 0)
+
+    # Scrolled window for box contents
+    box_scroll = Gtk::ScrolledWindow.new
+    box_scroll.set_policy(:never, :automatic)
+    box_scroll.set_overlay_scrolling(false)
+    box_scroll.override_background_color(:normal, Gdk::RGBA.new(0, 0, 0, 1))
+
+    # Vertical box for abilities
+    box_vbox = Gtk::Box.new(:vertical, 2)
+    box_vbox.set_border_width(5)
+    box_vbox.override_background_color(:normal, Gdk::RGBA.new(0, 0, 0, 1))
+    @box_vboxes[index] = box_vbox  # Store reference for drag-drop
+
+    # Set up as drop target
+    setup_drag_dest(box_vbox, index)
+
+    # Add abilities assigned to this box
+    box_abilities = @boxes[index]['abilities'] || []
+
+    # Filter and display abilities (passives always hidden)
+    displayed_count = 0
+    box_abilities.each do |ability_name|
+      ability = @abilities.find { |a| a.name == ability_name }
+      next unless ability
+      next if ability.passive
+
+      button = create_ability_button(ability)
+      box_vbox.pack_start(button, expand: false, fill: false, padding: 2)
+      displayed_count += 1
+    end
+
+    # Show placeholder if empty
+    if displayed_count == 0
+      placeholder_label = Gtk::Label.new("Drag abilities here")
+      placeholder_label.set_sensitive(false)
+      placeholder_label.override_color(:normal, Gdk::RGBA.new(0.5, 0.5, 0.5, 1))
+      box_vbox.pack_start(placeholder_label, expand: false, fill: false, padding: 5)
+    end
+
+    box_scroll.add(box_vbox)
+    box_outer.pack_start(box_scroll, expand: true, fill: true, padding: 0)
+
+    box_frame.add(box_outer)
+    box_frame
+  end
+
+  # Edit box label (blocked when locked)
+  def edit_box_label(box_index)
+    if @locked
+      flash_lock_warning
+      return
+    end
+    Gtk.queue do
+      dialog = Gtk::Dialog.new(
+        title: "Edit Box Label",
+        parent: @window,
+        flags: :modal,
+        buttons: [
+          [Gtk::Stock::CANCEL, Gtk::ResponseType::CANCEL],
+          [Gtk::Stock::OK, Gtk::ResponseType::OK]
+        ]
+      )
+      dialog.set_keep_above(true) if @always_on_top
+
+      dialog.child.set_border_width(10)
+
+      label = Gtk::Label.new("Enter box label (max 21 characters):")
+      dialog.child.pack_start(label, expand: false, fill: false, padding: 5)
+
+      entry = Gtk::Entry.new
+      entry.text = @box_labels[box_index]
+      entry.max_length = 21
+      dialog.child.pack_start(entry, expand: false, fill: false, padding: 5)
+
+      dialog.show_all
+
+      response = dialog.run
+      if response == Gtk::ResponseType::OK
+        new_label = entry.text.strip
+        new_label = "(empty)" if new_label.empty?
+        @box_labels[box_index] = new_label
+
+        # Update the standalone header label directly
+        @box_header_labels[box_index].set_markup("<small>#{new_label}</small>")
+
+        save_all_settings
+        respond "--- Combatical: Box #{box_index + 1} label updated to '#{new_label}'" if Combatical.debug?
+      end
+
+      dialog.destroy
+    end
+  end
+
+  # Map detailed categories to simplified names
+  def simplify_category(category)
+    return "Unknown" unless category
+
+    case category
+    when /^Spells - (.+)$/ then $1  # Keep spell circle name (Wizard, Paladin, Minor Spirit, etc.)
+    when "Combat Maneuvers" then "CMANs"
+    when "Shield Specializations" then "Shields"
+    when "Weapon Techniques" then "Weapons"
+    when "Armor Specializations" then "Armor"
+    when "Item Scripts" then "Gear"
+    when /^Society - (.+)$/ then $1  # Keep society name (Voln, Guardians of Sunfist, etc.)
+    else category  # Keep as-is for Feats, Warcries, etc.
+    end
+  end
+
+  # Get color RGB array for ability resource type
+  def get_ability_color_rgb(ability)
+    case ability.resource_type
+    when :mana then [0, 102, 204]      # Blue
+    when :stamina then [255, 214, 0]   # Yellow/Gold
+    when :health then [204, 0, 0]      # Red
+    when :spirit then [255, 255, 255]  # White (for spirit/favor)
+    else [135, 135, 135]               # Gray
+    end
+  end
+
+  # Toggle pool expanded/collapsed state
+  def toggle_pool_expanded
+    @pool_expanded = !@pool_expanded
+
+    # Update the standalone header label directly
+    arrow_symbol = @pool_expanded ? "▼" : "▲"
+    @pool_header_label.set_markup("<small>#{arrow_symbol} Unassigned Pool #{arrow_symbol}</small>")
+
+    @pool_revealer.set_reveal_child(@pool_expanded)
+
+    respond "--- Combatical: Pool #{@pool_expanded ? 'expanded' : 'collapsed'}" if Combatical.debug?
+  end
+
+  # Create unassigned abilities pool with 3-column layout
+  def create_unassigned_pool
+    # Initialize expanded state if not already set
+    @pool_expanded = true if @pool_expanded.nil?
+
+    # Outer frame for the entire pool section
+    pool_outer_frame = Gtk::Frame.new
+    pool_vbox = Gtk::Box.new(:vertical, 0)
+
+    # Standalone section header label (matching Enemy/Player targets style, centered)
+    arrow_symbol = @pool_expanded ? "▼" : "▲"
+    @pool_header_label = Gtk::Label.new
+    @pool_header_label.set_markup("<small>#{arrow_symbol} Unassigned Pool #{arrow_symbol}</small>")
+    @pool_header_label.set_halign(:center)
+    @pool_header_label.style_context.add_class('combatical-section-header')
+
+    # Wrap in EventBox to make clickable for collapse/expand
+    pool_header_eventbox = Gtk::EventBox.new
+    pool_header_eventbox.add(@pool_header_label)
+    pool_header_eventbox.set_tooltip_text("Click to collapse/expand")
+    pool_header_eventbox.signal_connect('button-press-event') { |widget, event|
+      if event.button == 1
+        toggle_pool_expanded
+      end
+      false
+    }
+
+    pool_vbox.pack_start(pool_header_eventbox, expand: false, fill: true, padding: 0)
+
+    # Separator line under header
+    separator = Gtk::Separator.new(:horizontal)
+    pool_vbox.pack_start(separator, expand: false, fill: false, padding: 0)
+
+    # Revealer for slide animation
+    @pool_revealer = Gtk::Revealer.new
+    @pool_revealer.set_transition_type(:slide_down)
+    @pool_revealer.set_transition_duration(250)
+    @pool_revealer.set_reveal_child(@pool_expanded)
+
+    # Scrolled window for pool content
+    pool_scroll = Gtk::ScrolledWindow.new
+    pool_scroll.set_policy(:never, :automatic)
+    pool_scroll.set_overlay_scrolling(false)
+    pool_scroll.set_size_request(-1, 250)
+    pool_scroll.override_background_color(:normal, Gdk::RGBA.new(0, 0, 0, 1))
+
+    # Main container (3-column grid)
+    @pool_container = Gtk::Grid.new
+    @pool_container.set_row_spacing(5)
+    @pool_container.set_column_spacing(15)
+    @pool_container.set_border_width(10)
+    @pool_container.set_column_homogeneous(true)  # Equal column widths
+    @pool_container.override_background_color(:normal, Gdk::RGBA.new(0, 0, 0, 1))
+
+    # Get list of assigned ability names
+    assigned_names = @boxes.flat_map { |box| box['abilities'] || [] }
+
+    # Add unassigned abilities to pool
+    unassigned = @abilities.reject { |ability| assigned_names.include?(ability.name) }
+
+    # Always filter out passives
+    unassigned = unassigned.reject { |ability| ability.passive }
+
+    if unassigned.empty?
+      placeholder_label = Gtk::Label.new("No unassigned abilities")
+      placeholder_label.set_sensitive(false)
+      @pool_container.attach(placeholder_label, 0, 0, 3, 1)  # Span all 3 columns
+    else
+      # Group by simplified category
+      categories = {}
+      unassigned.each do |ability|
+        simple_cat = simplify_category(ability.category)
+        categories[simple_cat] ||= []
+        categories[simple_cat] << ability
+      end
+
+      # Distribute categories across 3 columns
+      sorted_categories = categories.keys.sort
+      column = 0
+      row_in_column = [0, 0, 0]  # Track current row for each column
+
+      @pool_expanders = {}
+
+      sorted_categories.each do |category_name|
+        abilities_in_category = categories[category_name]
+
+        # Create category expander, restoring previous open/closed state
+        expander = Gtk::Expander.new("<b>#{category_name}</b> (#{abilities_in_category.length})")
+        expander.label_widget.set_use_markup(true)
+        @expanded_categories ||= {}
+        was_expanded = @expanded_categories[category_name]
+        expander.set_expanded(was_expanded || false)
+        @pool_expanders[category_name] = expander
+
+        # Container for abilities list
+        abilities_box = Gtk::Box.new(:vertical, 2)
+        abilities_box.set_border_width(5)
+
+        abilities_in_category.each do |ability|
+          event_box = create_ability_button(ability, pool: true)
+          abilities_box.pack_start(event_box, expand: false, fill: false, padding: 1)
+        end
+
+        # Accept drops on the category container too
+        setup_drag_dest(abilities_box, nil)
+
+        expander.add(abilities_box)
+
+        # Add to grid at current column position
+        @pool_container.attach(expander, column, row_in_column[column], 1, 1)
+        row_in_column[column] += 1
+
+        # Move to next column
+        column = (column + 1) % 3
+      end
+    end
+
+    # Make pool a drop target at multiple levels (box_index=nil means "return to unassigned")
+    # Grid, scroll window, and individual EventBoxes all accept drops
+    # so that wherever the user releases in the pool area, the drop is caught.
+    setup_drag_dest(@pool_container, nil)
+
+    pool_scroll.add(@pool_container)
+    setup_drag_dest(pool_scroll, nil)
+    @pool_revealer.add(pool_scroll)
+    pool_vbox.pack_start(@pool_revealer, expand: true, fill: true, padding: 0)
+    pool_outer_frame.add(pool_vbox)
+    # Don't let pool expand - give space to boxes instead
+    @main_vbox.pack_start(pool_outer_frame, expand: false, fill: true, padding: 5)
+
+    pool_outer_frame.show_all
+
+    # Store reference to pool frame for rebuild
+    @pool_frame = pool_outer_frame
+
+    respond "--- Combatical: Unassigned pool created (#{unassigned.length} abilities)" if Combatical.debug?
+  end
+
+  # Refresh all abilities (rescan character)
+  # Uses runtime data for custom verbs and scripted items (not stale CharSettings)
+  def refresh_abilities
+    respond "--- Combatical: Refreshing abilities..." if Combatical.debug?
+    Thread.new {
+      new_abilities = Scanner.scan_all_abilities
+
+      # The scanner loads items/verbs from CharSettings, which may be stale
+      # (changes this session haven't been saved yet). Replace with runtime data.
+      new_abilities.reject! { |a| a.category == "Item Scripts" }
+      new_abilities.reject! { |a| a.type == :verb && a.resource_type == :none && a.cost == 0 }
+
+      # Re-add items from the runtime cache (preserves charges/cooldown tracking)
+      capture_item_tracking_state
+      new_abilities.concat(build_item_abilities)
+
+      # Re-add custom verbs from runtime list
+      @custom_verbs.each do |verb_name|
+        new_abilities << Ability.new(
+          name: verb_name.capitalize,
+          command: verb_name.downcase,
+          type: :verb,
+          resource_type: :none,
+          cost: 0,
+          roundtime: 3,
+          wiki_url: "",
+          category: "Verbs",
+          passive: false
+        )
+      end
+
+      Settings.save_abilities(new_abilities)
+      @abilities = new_abilities
+
+      # Rebuild UI with new abilities (wrap in Gtk.queue since we're in a background thread)
+      Gtk.queue { rebuild_ui }
+      respond "--- Combatical: Refresh complete (#{@abilities.length} abilities)" if Combatical.debug?
+    }
+  end
+
+  # Save which category expanders are currently expanded
+  def save_expander_states
+    @expanded_categories ||= {}
+    return unless @pool_expanders
+    @pool_expanders.each do |cat_name, expander|
+      @expanded_categories[cat_name] = expander.expanded? rescue false
+    end
+  end
+
+  # Rebuild entire UI (after refresh or settings change)
+  # NOTE: This should be called from GTK context (callback/dialog) or wrapped in Gtk.queue if from background thread
+  def rebuild_ui
+    start_t = Time.now.to_f
+    respond "--- Combatical: rebuild_ui START" if Combatical.debug?
+
+    # Save expander open/closed states before destroying pool
+    save_expander_states
+
+    # Destroy old boxes scroll window (not just remove — frees signal handlers and drag registrations)
+    if @boxes_scroll
+      @main_vbox.remove(@boxes_scroll)
+      @boxes_scroll.destroy
+      @boxes_scroll = nil
+    end
+
+    # Destroy old pool frame
+    if @pool_frame
+      @main_vbox.remove(@pool_frame)
+      @pool_frame.destroy
+      @pool_frame = nil
+    end
+
+    # Clear box and tracking references
+    @box_vboxes = []
+    @box_header_labels = []
+    @tracked_buttons = []
+    @tracked_pool_labels = []
+    @target_list_fingerprint = nil  # Force target list rebuild on next tick
+
+    # Reapply global colors (in case palette changed)
+    apply_global_colors
+
+    # Recreate boxes and pool
+    create_boxes_grid
+    create_unassigned_pool
+
+    @window.show_all
+    elapsed = ((Time.now.to_f - start_t) * 1000).round(1)
+    respond "--- Combatical: rebuild_ui END (#{elapsed}ms)" if Combatical.debug?
+  end
+
+  # Open settings dialog
+  def open_settings_dialog
+    Gtk.queue do
+      @settings_dialog = Gtk::Dialog.new(
+        title: "Combatical Settings",
+        parent: @window,
+        flags: :modal,
+        buttons: [
+          [Gtk::Stock::CANCEL, Gtk::ResponseType::CANCEL],
+          [Gtk::Stock::OK, Gtk::ResponseType::OK]
+        ]
+      )
+
+      @settings_dialog.set_default_size(500, 400)
+      @settings_dialog.set_keep_above(true) if @always_on_top
+
+      # Create notebook (tabbed interface)
+      notebook = Gtk::Notebook.new
+      @settings_dialog.content_area.pack_start(notebook, expand: true, fill: true, padding: 10)
+
+      # Add tabs
+      create_appearance_tab(notebook)
+      create_verbs_tab(notebook)
+      create_about_tab(notebook)
+
+      @settings_dialog.show_all
+
+      # Handle response
+      loop do
+        response = @settings_dialog.run
+        break if response == Gtk::ResponseType::CANCEL || response == Gtk::ResponseType::DELETE_EVENT
+
+        # Apply settings
+        apply_settings_from_dialog(@settings_dialog)
+
+        break if response == Gtk::ResponseType::OK
+      end
+
+      @settings_dialog.destroy
+      @settings_dialog = nil
+    end
+  end
+
+  # Create Appearance settings tab
+  def create_appearance_tab(notebook)
+    vbox = Gtk::Box.new(:vertical, 10)
+    vbox.set_border_width(10)
+
+    # Number of boxes
+    boxes_label = Gtk::Label.new("Number of Ability Pool windows:")
+    boxes_label.set_halign(:start)
+    vbox.pack_start(boxes_label, expand: false, fill: false, padding: 10)
+
+    boxes_hbox = Gtk::Box.new(:horizontal, 5)
+    @boxes_spinner = Gtk::SpinButton.new(1, 20, 1)
+    # Read from instance variable instead of CharSettings (CharSettings not accessible inside Gtk.queue)
+    @boxes_spinner.set_value(@num_boxes || 6)
+    boxes_hbox.pack_start(@boxes_spinner, expand: false, fill: false, padding: 0)
+    vbox.pack_start(boxes_hbox, expand: false, fill: false, padding: 0)
+
+    # Wiki confirmation toggle
+    @wiki_confirm_check = Gtk::CheckButton.new("Confirm before opening wiki links")
+    # Read current value from instance variable or default
+    @wiki_confirm_check.set_active(@wiki_confirm.nil? ? true : @wiki_confirm)
+    vbox.pack_start(@wiki_confirm_check, expand: false, fill: false, padding: 5)
+
+    # Always on top toggle
+    @always_on_top_check = Gtk::CheckButton.new("Always on top")
+    @always_on_top_check.set_active(@always_on_top || false)
+    vbox.pack_start(@always_on_top_check, expand: false, fill: false, padding: 5)
+
+    notebook.append_page(vbox, Gtk::Label.new("Appearance"))
+  end
+
+  # Create Verbs settings tab
+  def create_verbs_tab(notebook)
+    vbox = Gtk::Box.new(:vertical, 10)
+    vbox.set_border_width(10)
+
+    # --- Add Verb section ---
+    verb_label = Gtk::Label.new("Add Verb:")
+    verb_label.set_halign(:start)
+    vbox.pack_start(verb_label, expand: false, fill: false, padding: 0)
+
+    verb_hbox = Gtk::Box.new(:horizontal, 5)
+    @verb_entry = Gtk::Entry.new
+    @verb_entry.set_placeholder_text("Enter verb name...")
+    @verb_entry.set_width_chars(20)
+    @verb_entry.set_tooltip_text("For adding basic inputs to the game")
+    verb_hbox.pack_start(@verb_entry, expand: true, fill: true, padding: 0)
+
+    add_verb_btn = Gtk::Button.new(label: "Add")
+    add_verb_btn.set_tooltip_text("For adding basic inputs to the game")
+    add_verb_btn.signal_connect('clicked') {
+      name = @verb_entry.text.strip
+      unless name.empty?
+        unless @custom_verbs.any? { |v| v.downcase == name.downcase }
+          @custom_verbs << name.downcase
+          populate_verb_list
+          @verb_entry.set_text("")
+        end
+      end
+    }
+    verb_hbox.pack_start(add_verb_btn, expand: false, fill: false, padding: 0)
+    vbox.pack_start(verb_hbox, expand: false, fill: false, padding: 0)
+
+    # List of custom verbs (4-column grid, compact)
+    @verbs_grid = Gtk::Grid.new
+    @verbs_grid.set_column_spacing(12)
+    @verbs_grid.set_row_spacing(1)
+    verbs_scroll = Gtk::ScrolledWindow.new
+    verbs_scroll.set_policy(:never, :automatic)
+    verbs_scroll.set_size_request(-1, 80)
+    verbs_scroll.add(@verbs_grid)
+    populate_verb_list
+    vbox.pack_start(verbs_scroll, expand: false, fill: false, padding: 0)
+
+    # Separator
+    vbox.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: true, padding: 5)
+
+    # --- Add Scripted Item section ---
+    add_label = Gtk::Label.new("Add Scripted Item:")
+    add_label.set_halign(:start)
+    vbox.pack_start(add_label, expand: false, fill: false, padding: 0)
+
+    add_hbox = Gtk::Box.new(:horizontal, 5)
+    @item_entry = Gtk::Entry.new
+    @item_entry.set_placeholder_text("Enter item name, Protip: include adjective or use GameObj id...")
+    @item_entry.set_width_chars(30)
+    @item_entry.set_tooltip_text("Add items here, it will ask for verbs next.\nUse 'Right Hand ID' to add the item by ID (preferred)")
+    add_hbox.pack_start(@item_entry, expand: true, fill: true, padding: 0)
+
+    @add_item_button = Gtk::Button.new(label: "Add")
+    @add_item_button.set_tooltip_text("Add items here, it will ask for verbs next.\nUse 'Right Hand ID' to add the item by ID (preferred)")
+    @add_item_button.signal_connect('clicked') {
+      add_scripted_item
+    }
+    add_hbox.pack_start(@add_item_button, expand: false, fill: false, padding: 0)
+
+    @rh_id_button = Gtk::Button.new(label: "Right Hand ID")
+    @rh_id_button.set_tooltip_text("Get the GameObj ID of the item in your right hand and fill it into the entry field")
+    @rh_id_button.signal_connect('clicked') { grab_right_hand_id }
+    add_hbox.pack_end(@rh_id_button, expand: false, fill: false, padding: 0)
+
+    vbox.pack_start(add_hbox, expand: false, fill: false, padding: 0)
+
+    # Status label
+    @item_status_label = Gtk::Label.new("")
+    vbox.pack_start(@item_status_label, expand: false, fill: false, padding: 5)
+
+    # List of added items
+    items_label = Gtk::Label.new("Added Items:")
+    items_label.set_halign(:start)
+    vbox.pack_start(items_label, expand: false, fill: false, padding: 0)
+
+    # Scrolled window for items list
+    items_scroll = Gtk::ScrolledWindow.new
+    items_scroll.set_policy(:never, :automatic)
+    items_scroll.set_size_request(-1, 150)
+
+    @items_box = Gtk::Box.new(:vertical, 1)
+    populate_items_list
+    items_scroll.add(@items_box)
+    vbox.pack_start(items_scroll, expand: true, fill: true, padding: 0)
+
+    notebook.append_page(vbox, Gtk::Label.new("Verbs"))
+  end
+
+  # Create About settings tab
+  def create_about_tab(notebook)
+    vbox = Gtk::Box.new(:vertical, 10)
+    vbox.set_border_width(10)
+
+    # Notes section
+    notes_text = "Notes:\n" \
+                 "  \u2022 The unassigned pool can be minimized and maximized by clicking its button.\n" \
+                 "  \u2022 Right clicking an ability will open its wiki page\n" \
+                 "  \u2022 Click the notepad to the right of an ability to add a personalized note\n" \
+                 "    (great for reminders on when and how to use it)\n" \
+                 "  \u2022 If you have scripted items you want to add, use the verbs tab.\n" \
+                 "    You should be able to add most anything."
+    notes_label = Gtk::Label.new(notes_text)
+    notes_label.set_line_wrap(true)
+    notes_label.set_justify(:left)
+    notes_label.set_halign(:start)
+    vbox.pack_start(notes_label, expand: false, fill: false, padding: 10)
+
+    # Attribution / contact message
+    about_text = "Any missing functions, broken features, bugs or suggestions report to EducatedBarbarian@proton.me\n\n" \
+                 "Check out my other scripts:\n" \
+                 "Loresang - For Real Bards, not robots. *Charming smile and a wink*\n" \
+                 "ChitterChatter - *Coming Soon*\n\n" \
+                 "Thanks for using my script, hope you find it useful, and if you do - spread the word!"
+    about_label = Gtk::Label.new(about_text)
+    about_label.set_line_wrap(true)
+    about_label.set_justify(:left)
+    about_label.set_halign(:start)
+    vbox.pack_start(about_label, expand: true, fill: false, padding: 20)
+
+    # Debug mode toggle
+    debug_check = Gtk::CheckButton.new("Debug Mode (shows diagnostic messages in game window)")
+    debug_check.set_active(Combatical.debug?)
+    debug_check.signal_connect('toggled') { |widget|
+      Combatical.debug = widget.active?
+      respond "--- Combatical: Debug mode #{Combatical.debug? ? 'ON' : 'OFF'}"
+    }
+    vbox.pack_start(debug_check, expand: false, fill: false, padding: 5)
+
+    # Reset button at the bottom
+    reset_button = Gtk::Button.new(label: "Reset to Defaults")
+    reset_button.signal_connect('clicked') {
+      confirm_reset_settings
+    }
+    vbox.pack_start(reset_button, expand: false, fill: false, padding: 10)
+
+    notebook.append_page(vbox, Gtk::Label.new("About"))
+  end
+
+  # Populate items list in settings (compact label + red x, no buttons)
+  def populate_items_list(items = nil)
+    @items_box.children.each { |child| @items_box.remove(child) }
+
+    # Use provided items or in-memory cache
+    items ||= @scripted_items_cache || []
+    if items.empty?
+      label = Gtk::Label.new("No items added yet")
+      label.set_sensitive(false)
+      label.set_halign(:start)
+      @items_box.pack_start(label, expand: false, fill: false, padding: 2)
+    else
+      items.each do |item|
+        name = item['name'].to_s
+        verbs_text = (item['verbs'] || []).map(&:to_s).join(', ')
+        gid = item['gameobj_id']
+
+        hbox = Gtk::Box.new(:horizontal, 0)
+        item_label = Gtk::Label.new
+        id_tag = gid ? " <span foreground='#88CCFF'>[ID]</span>" : ""
+        item_label.set_markup("#{name} <span foreground='#888888'>(#{verbs_text})</span>#{id_tag} ")
+        item_label.set_halign(:start)
+        hbox.pack_start(item_label, expand: false, fill: false, padding: 0)
+
+        x_label = Gtk::Label.new
+        x_label.set_markup("<span foreground='red'>x</span>")
+        x_ebox = Gtk::EventBox.new
+        x_ebox.add(x_label)
+        item_gid = gid  # capture for closure
+        item_name = name  # capture for closure
+        x_ebox.signal_connect('button-release-event') { |widget, event|
+          if event.button == 1
+            remove_scripted_item(item_name, item_gid)
+          end
+          false
+        }
+        hbox.pack_start(x_ebox, expand: false, fill: false, padding: 0)
+        @items_box.pack_start(hbox, expand: false, fill: false, padding: 1)
+      end
+    end
+
+    @items_box.show_all
+  end
+
+  # Populate custom verbs list in settings (4-column grid, compact label + red x)
+  def populate_verb_list
+    @verbs_grid.children.each { |child| @verbs_grid.remove(child) }
+
+    if @custom_verbs.empty?
+      label = Gtk::Label.new("No custom verbs added")
+      label.set_sensitive(false)
+      label.set_halign(:start)
+      @verbs_grid.attach(label, 0, 0, 4, 1)
+    else
+      @custom_verbs.each_with_index do |verb, i|
+        col = i % 4
+        row = i / 4
+
+        hbox = Gtk::Box.new(:horizontal, 0)
+        vlabel = Gtk::Label.new(verb)
+        vlabel.set_halign(:start)
+        hbox.pack_start(vlabel, expand: false, fill: false, padding: 0)
+
+        x_label = Gtk::Label.new
+        x_label.set_markup(" <span foreground='red'>x</span>")
+        x_ebox = Gtk::EventBox.new
+        x_ebox.add(x_label)
+        x_ebox.signal_connect('button-release-event') { |widget, event|
+          if event.button == 1
+            @custom_verbs.delete_if { |v| v.downcase == verb.downcase }
+            populate_verb_list
+          end
+          false
+        }
+        hbox.pack_start(x_ebox, expand: false, fill: false, padding: 0)
+        @verbs_grid.attach(hbox, col, row, 1, 1)
+      end
+    end
+
+    @verbs_grid.show_all
+  end
+
+  # Extract a plain Ruby array of hashes from CharSettings scripted_items
+  # This avoids SettingsProxy issues — .map on a proxy returns another proxy,
+  # so we use .each to build plain Ruby arrays and strings.
+  def deep_copy_items(proxy_or_array)
+    result = []
+    return result if proxy_or_array.nil?
+    proxy_or_array.each do |item|
+      verb_list = []
+      (item['verbs'] || []).each { |v| verb_list << v.to_s }
+      entry = {
+        'name'   => item['name'].to_s,
+        'verbs'  => verb_list,
+        'status' => item['status'].to_s
+      }
+      # Copy gameobj_id if present (for precise item targeting)
+      entry['gameobj_id'] = item['gameobj_id'].to_s if item['gameobj_id'] && !item['gameobj_id'].to_s.empty?
+      # Copy verb_meta if present (frequency/charges per verb)
+      raw_meta = item['verb_meta']
+      if raw_meta
+        vm = {}
+        raw_meta.each do |verb_key, meta_val|
+          m = {}
+          meta_val.each { |mk, mv| m[mk.to_s] = mv.to_s } if meta_val
+          vm[verb_key.to_s] = m
+        end
+        entry['verb_meta'] = vm
+      end
+      result << entry
+    end
+    result
+  end
+
+  # Add scripted item with ANALYZE
+  # Grab the GameObj ID of the item in the right hand
+  def grab_right_hand_id
+    rh = GameObj.right_hand
+    if rh.nil? || rh.id.nil? || rh.id.to_s.empty? || rh.noun.nil? || rh.noun.to_s.empty?
+      @item_status_label.set_markup("<span color='orange'>Nothing in right hand</span>")
+      return
+    end
+    gameobj_id = rh.id.to_s
+    display_name = rh.name.to_s
+    # Strip leading articles for cleaner display
+    display_name = display_name.sub(/^(?:a |an |some |the )/i, '')
+    @item_entry.set_text("##{gameobj_id}")
+    @pending_gameobj_display_name = display_name
+    respond "--- Combatical: Right hand: #{display_name} (GameObj ID: ##{gameobj_id})"
+    @item_status_label.set_markup("<span color='#88CCFF'>##{gameobj_id} = #{display_name}</span>")
+  end
+
+  # Open verb entry dialog for a new scripted item
+  def add_scripted_item
+    item_name = @item_entry.text.strip
+    return if item_name.empty?
+
+    # Detect GameObj ID format: #12345
+    gameobj_id = nil
+    display_name = item_name
+    if item_name =~ /^#(\d+)$/
+      gameobj_id = $1
+      # Use cached display name from "Right Hand ID" button, or look up live
+      if @pending_gameobj_display_name && !@pending_gameobj_display_name.empty?
+        display_name = @pending_gameobj_display_name
+      else
+        obj = GameObj[gameobj_id]
+        if obj
+          display_name = obj.name.to_s.sub(/^(?:a |an |some |the )/i, '')
+        else
+          @item_status_label.set_markup("<span color='orange'>GameObj ##{gameobj_id} not found — is the item in your inventory?</span>")
+          return
+        end
+      end
+      @pending_gameobj_display_name = nil
+    end
+
+    # Show dialog to manually add verbs for this item
+    show_item_verb_dialog(display_name, gameobj_id)
+  end
+
+  # Dialog for manually adding verbs to a scripted item
+  # gameobj_id: optional GameObj ID string for precise targeting
+  def show_item_verb_dialog(item_name, gameobj_id = nil)
+    dialog = Gtk::Dialog.new(
+      title: "Add Verbs for: #{item_name}",
+      parent: @window,
+      flags: :modal,
+      buttons: [
+        [Gtk::Stock::CANCEL, Gtk::ResponseType::CANCEL],
+        [Gtk::Stock::OK, Gtk::ResponseType::OK]
+      ]
+    )
+    dialog.set_keep_above(true) if @always_on_top
+    dialog.set_default_size(450, 350)
+
+    content = dialog.content_area
+    content.set_border_width(10)
+    content.set_spacing(8)
+
+    # Verb entry section
+    entry_label = Gtk::Label.new
+    entry_label.set_markup("<b>Add verbs for #{item_name}:</b>")
+    entry_label.set_halign(:start)
+    content.pack_start(entry_label, expand: false, fill: false, padding: 0)
+
+    # Column labels
+    labels_hbox = Gtk::Box.new(:horizontal, 5)
+    verb_lbl = Gtk::Label.new("Verb")
+    verb_lbl.set_halign(:start)
+    verb_lbl.set_size_request(150, -1)
+    labels_hbox.pack_start(verb_lbl, expand: false, fill: false, padding: 0)
+    freq_lbl = Gtk::Label.new("Frequency / Charges / Uses Per Day")
+    freq_lbl.set_halign(:start)
+    freq_lbl.set_size_request(150, -1)
+    labels_hbox.pack_start(freq_lbl, expand: false, fill: false, padding: 0)
+    content.pack_start(labels_hbox, expand: false, fill: false, padding: 0)
+
+    # Entry fields
+    entry_hbox = Gtk::Box.new(:horizontal, 5)
+    verb_entry = Gtk::Entry.new
+    verb_entry.set_placeholder_text("e.g. TURN, RUB, [TURN]...")
+    verb_entry.set_size_request(150, -1)
+    verb_entry.set_tooltip_text("Enter a verb to use on this item.\nWrap in brackets [TURN] to remove the item first,\nperform the verb, then wear it again.\nExample: [TURN] = remove ring, turn ring, wear ring")
+    entry_hbox.pack_start(verb_entry, expand: false, fill: false, padding: 0)
+
+    freq_entry = Gtk::Entry.new
+    freq_entry.set_placeholder_text("3h3m30s, 50 charges, 3UPD")
+    freq_entry.set_size_request(200, -1)
+    freq_entry.set_tooltip_text("Optional. Time between uses (e.g. 24h, 4m30s, 1h30m),\nnumber of charges (e.g. 50 charges),\nor uses per day that reset at midnight EST (e.g. 3UPD)")
+    entry_hbox.pack_start(freq_entry, expand: false, fill: false, padding: 0)
+
+    add_btn = Gtk::Button.new(label: "+ Add")
+    entry_hbox.pack_start(add_btn, expand: false, fill: false, padding: 0)
+    content.pack_start(entry_hbox, expand: false, fill: false, padding: 0)
+
+    # Scrollable list of added verbs with their frequency/charges info
+    # verbs_data: array of { 'verb' => "PULL", 'freq_str' => "12h4m32s" }
+    verbs_data = []
+    verbs_vbox = Gtk::Box.new(:vertical, 1)
+    verbs_scroll = Gtk::ScrolledWindow.new
+    verbs_scroll.set_policy(:never, :automatic)
+    verbs_scroll.set_size_request(-1, 140)
+    verbs_scroll.add(verbs_vbox)
+    content.pack_start(verbs_scroll, expand: true, fill: true, padding: 0)
+
+    # Pre-populate with existing verbs if re-editing
+    raw_items = deep_copy_items(@scripted_items_cache || [])
+    existing = if gameobj_id
+      raw_items.find { |i| i['gameobj_id'].to_s == gameobj_id }
+    else
+      raw_items.find { |i| i['name'].to_s.downcase == item_name.downcase }
+    end
+    if existing
+      existing_meta = existing['verb_meta'] || {}
+      (existing['verbs'] || []).each do |v|
+        meta = existing_meta[v.to_s] || {}
+        verbs_data << { 'verb' => v.to_s, 'freq_str' => (meta['freq_str'] || '').to_s }
+      end
+    end
+
+    # Rebuild verb list display
+    rebuild_verb_display = proc {
+      verbs_vbox.children.each { |c| verbs_vbox.remove(c) }
+      if verbs_data.empty?
+        lbl = Gtk::Label.new("No verbs added yet")
+        lbl.set_sensitive(false)
+        lbl.set_halign(:start)
+        verbs_vbox.pack_start(lbl, expand: false, fill: false, padding: 2)
+      else
+        verbs_data.each do |vd|
+          hbox = Gtk::Box.new(:horizontal, 4)
+          vlbl = Gtk::Label.new
+          freq_display = vd['freq_str'].to_s.empty? ? "" : "  <span foreground='#AAAAAA'>[#{vd['freq_str']}]</span>"
+          vlbl.set_markup("<b>#{vd['verb']}</b>#{freq_display}")
+          vlbl.set_halign(:start)
+          hbox.pack_start(vlbl, expand: true, fill: true, padding: 0)
+
+          x_lbl = Gtk::Label.new
+          x_lbl.set_markup("<span foreground='red'>x</span>")
+          x_ebox = Gtk::EventBox.new
+          x_ebox.add(x_lbl)
+          x_ebox.signal_connect('button-release-event') { |widget, event|
+            if event.button == 1
+              verbs_data.delete(vd)
+              rebuild_verb_display.call
+            end
+            false
+          }
+          hbox.pack_start(x_ebox, expand: false, fill: false, padding: 2)
+          verbs_vbox.pack_start(hbox, expand: false, fill: false, padding: 1)
+        end
+      end
+      verbs_vbox.show_all
+    }
+
+    # Add verb handler
+    add_verb = proc {
+      verb_text = verb_entry.text.strip.upcase
+      freq_text = freq_entry.text.strip
+      unless verb_text.empty? || verbs_data.any? { |vd| vd['verb'].upcase == verb_text }
+        # Validate frequency if provided
+        if !freq_text.empty?
+          parsed = Combatical::Scanner.parse_frequency(freq_text)
+          unless parsed
+            freq_entry.set_text("")
+            next
+          end
+        end
+        verbs_data << { 'verb' => verb_text, 'freq_str' => freq_text }
+        rebuild_verb_display.call
+        verb_entry.set_text("")
+        freq_entry.set_text("")
+      end
+      verb_entry.grab_focus
+    }
+
+    add_btn.signal_connect('clicked') { add_verb.call }
+    verb_entry.signal_connect('activate') { add_verb.call }
+    freq_entry.signal_connect('activate') { add_verb.call }
+
+    rebuild_verb_display.call
+    dialog.show_all
+
+    response = dialog.run
+
+    if response == Gtk::ResponseType::OK
+      dialog.destroy
+      if verbs_data.empty?
+        @item_status_label.set_markup("<span color='orange'>No verbs added — item not saved</span>")
+        return
+      end
+      save_scripted_item(item_name, verbs_data, gameobj_id)
+    else
+      dialog.destroy
+      @item_status_label.set_markup("<span color='orange'>Cancelled</span>")
+    end
+    @item_entry.set_text("")
+  end
+
+  # Save a scripted item with selected verbs (called after verb selection dialog)
+  # verbs_data: array of { 'verb' => "PULL", 'freq_str' => "12h4m32s" }
+  # gameobj_id: optional GameObj ID string for precise targeting
+  def save_scripted_item(item_name, verbs_data, gameobj_id = nil)
+    @scripted_items_cache ||= []
+
+    # Build verb list and metadata from the dialog data
+    verb_list = verbs_data.map { |vd| vd['verb'] }
+    verb_meta = {}
+    verbs_data.each do |vd|
+      unless vd['freq_str'].to_s.empty?
+        verb_meta[vd['verb']] = { 'freq_str' => vd['freq_str'] }
+      end
+    end
+
+    # Remove any existing entry for this item, then add with selected verbs
+    # Match by gameobj_id if present (more precise), otherwise by name
+    if gameobj_id
+      @scripted_items_cache.reject! { |i| i['gameobj_id'].to_s == gameobj_id }
+    else
+      @scripted_items_cache.reject! { |i| i['gameobj_id'].nil? && i['name'].to_s.downcase == item_name.downcase }
+    end
+    entry = {
+      'name' => item_name,
+      'verbs' => verb_list,
+      'status' => 'verified'
+    }
+    entry['gameobj_id'] = gameobj_id if gameobj_id
+    entry['verb_meta'] = verb_meta unless verb_meta.empty?
+    @scripted_items_cache << entry
+    respond "--- Combatical: Saved item #{item_name} with verbs: #{verb_list.join(', ')} (total items: #{@scripted_items_cache.length})" if Combatical.debug?
+
+    capture_item_tracking_state
+    new_item_abilities = build_item_abilities
+
+    @item_status_label.set_markup("<span color='green'>✓ Added #{item_name} (#{verb_list.join(', ')})</span>")
+    @item_entry.set_text("")
+    @add_item_button.set_sensitive(true)
+    populate_items_list(@scripted_items_cache)
+
+    # Remove old item abilities and add new ones
+    @abilities.reject! { |a| a.category == "Item Scripts" }
+    @abilities.concat(new_item_abilities)
+
+    rebuild_ui
+  end
+
+  # Capture current runtime tracking state from existing item abilities
+  # Call this before rebuild_item_abilities to preserve charges/cooldowns
+  def capture_item_tracking_state
+    @abilities.each do |a|
+      next unless a.type == :item
+      @item_charges_tracking[a.name] = a.remaining_charges if a.max_charges && a.remaining_charges
+      @item_cooldown_tracking[a.name] = a.item_cooldown_end.to_f if a.item_cooldown_end && a.item_cooldown_end > Time.now
+      if a.max_upd
+        @item_upd_tracking[a.name] = { 'remaining' => a.remaining_upd, 'last_reset' => a.upd_last_reset }
+      end
+    end
+  end
+
+  # Build Ability objects from the scripted items cache
+  def build_item_abilities
+    abilities = []
+    @scripted_items_cache.each do |item|
+      next unless item['status'] == 'verified'
+      verb_meta = item['verb_meta'] || {}
+      item['verbs'].each do |verb|
+        meta = verb_meta[verb.to_s] || {}
+        freq_str = meta['freq_str'].to_s
+        parsed = freq_str.empty? ? nil : Combatical::Scanner.parse_frequency(freq_str)
+
+        # Detect [verb] bracket notation: remove item first, verb, then wear again
+        raw_verb = verb.to_s
+        remove_first = false
+        if raw_verb =~ /^\[(.+)\]$/
+          bare_verb = $1
+          remove_first = true
+        else
+          bare_verb = raw_verb
+        end
+
+        item_target = item['gameobj_id'] ? "##{item['gameobj_id']}" : "my #{item['name']}"
+        item_cmd = "#{bare_verb} #{item_target}"
+        ability_data = {
+          name: "#{item['name']} - #{raw_verb}",
+          command: item_cmd,
+          type: :item,
+          resource_type: :none,
+          cost: 0,
+          roundtime: 3,
+          wiki_url: "",
+          category: "Item Scripts",
+          passive: false,
+          remove_first: remove_first,
+          item_target: item_target
+        }
+
+        if parsed
+          if parsed[:type] == :frequency
+            ability_data[:frequency_seconds] = parsed[:value]
+          elsif parsed[:type] == :charges
+            ability_data[:max_charges] = parsed[:value]
+          elsif parsed[:type] == :upd
+            ability_data[:max_upd] = parsed[:value]
+          end
+        end
+
+        a = Ability.new(ability_data)
+        # Restore runtime charge tracking from saved state
+        if a.max_charges
+          saved_charges = (@item_charges_tracking || {})[a.name]
+          a.remaining_charges = saved_charges.nil? ? a.max_charges : saved_charges
+        end
+        # Restore runtime UPD tracking from saved state
+        if a.max_upd
+          saved = (@item_upd_tracking || {})[a.name]
+          if saved
+            a.remaining_upd = saved['remaining']
+            a.upd_last_reset = saved['last_reset']
+          end
+          a.check_upd_reset!
+        end
+        # Restore runtime cooldown tracking from saved state
+        if a.frequency_seconds
+          saved_cd = (@item_cooldown_tracking || {})[a.name]
+          if saved_cd && saved_cd > Time.now.to_f
+            a.item_cooldown_end = Time.at(saved_cd)
+          end
+        end
+        abilities << a
+      end
+    end
+    abilities
+  end
+
+  # Remove scripted item by name (more robust than index-based removal)
+  def remove_scripted_item(item_name, gameobj_id = nil)
+    @scripted_items_cache ||= []
+    before_count = @scripted_items_cache.length
+
+    respond "--- Combatical: [ITEM DEBUG] Removing '#{item_name}' (gameobj_id=#{gameobj_id.inspect}) from #{@scripted_items_cache.length} items" if Combatical.debug?
+
+    # Prefer matching by gameobj_id for ID-targeted items, fall back to name
+    found_index = if gameobj_id
+                    @scripted_items_cache.index { |i| i['gameobj_id'].to_s == gameobj_id.to_s }
+                  else
+                    @scripted_items_cache.index { |i| i['name'].to_s.downcase == item_name.to_s.downcase }
+                  end
+    if found_index
+      @scripted_items_cache.delete_at(found_index)
+      respond "--- Combatical: Removed item '#{item_name}' (#{before_count} -> #{@scripted_items_cache.length} items)" if Combatical.debug?
+    else
+      respond "--- Combatical: Item '#{item_name}' not found for removal" if Combatical.debug?
+      return
+    end
+
+    capture_item_tracking_state
+    new_item_abilities = build_item_abilities
+
+    populate_items_list(@scripted_items_cache)
+
+    # Remove old item abilities and add new ones
+    @abilities.reject! { |a| a.category == "Item Scripts" }
+    @abilities.concat(new_item_abilities)
+
+    rebuild_ui
+  end
+
+  # Apply settings from dialog
+  def apply_settings_from_dialog(dialog)
+    # Apply number of boxes (use instance variables, not CharSettings — GTK thread)
+    new_num_boxes = @boxes_spinner.value.to_i
+    old_num_boxes = @num_boxes || 6
+
+    respond "--- Combatical: [SETTINGS DEBUG] Box count change: #{old_num_boxes} -> #{new_num_boxes}" if Combatical.debug?
+
+    if new_num_boxes != old_num_boxes
+      if new_num_boxes > old_num_boxes
+        (old_num_boxes...new_num_boxes).each do |i|
+          @boxes << { 'name' => "Box #{i + 1}", 'abilities' => [] }
+        end
+        # Grow box_labels to match new box count
+        while @box_labels.length < new_num_boxes
+          @box_labels << "(empty)"
+        end
+        respond "--- Combatical: [SETTINGS DEBUG] Added #{new_num_boxes - old_num_boxes} boxes" if Combatical.debug?
+      elsif new_num_boxes < old_num_boxes
+        # Clear abilities from removed boxes (they return to unassigned pool)
+        (new_num_boxes...old_num_boxes).each do |i|
+          @boxes[i]['abilities'] = [] if @boxes[i]
+        end
+        @boxes = @boxes[0...new_num_boxes]
+        respond "--- Combatical: [SETTINGS DEBUG] Removed #{old_num_boxes - new_num_boxes} boxes" if Combatical.debug?
+      end
+      @num_boxes = new_num_boxes
+    end
+
+    # Apply wiki confirm
+    @wiki_confirm = @wiki_confirm_check.active?
+
+    # Apply always on top
+    @always_on_top = @always_on_top_check.active?
+    @window.set_keep_above(@always_on_top)
+
+    # Sync custom verb abilities into the abilities list
+    sync_custom_verb_abilities
+
+    respond "--- Combatical: Settings applied" if Combatical.debug?
+    rebuild_ui
+  end
+
+  # Update @abilities to reflect current @custom_verbs (in-memory only;
+  # persistence handled by save_all_settings from the script thread)
+  def sync_custom_verb_abilities
+    # Remove old custom verb abilities (type :verb with zero cost and no resource)
+    @abilities.reject! { |a| a.type == :verb && a.resource_type == :none && a.cost == 0 }
+    # Add current custom verbs
+    @custom_verbs.each do |verb_name|
+      @abilities << Ability.new(
+        name: verb_name.capitalize,
+        command: verb_name.downcase,
+        type: :verb,
+        resource_type: :none,
+        cost: 0,
+        roundtime: 3,
+        wiki_url: "",
+        category: "Verbs",
+        passive: false
+      )
+    end
+  end
+
+  # Confirm reset settings
+  def confirm_reset_settings
+    Gtk.queue do
+      dialog = Gtk::MessageDialog.new(
+        parent: @window,
+        flags: :modal,
+        type: :warning,
+        buttons: :yes_no,
+        message: "Reset all settings to defaults?\n\nThis will clear your box configurations, custom verbs, and scripted items."
+      )
+      dialog.set_keep_above(true) if @always_on_top
+
+      response = dialog.run
+      dialog.destroy
+
+      if response == Gtk::ResponseType::YES
+        # Reset all instance variables to defaults (avoid CharSettings in GTK thread)
+        @boxes = Settings.create_default_boxes
+        @num_boxes = 6
+        @box_labels = Array.new(6, "(empty)")
+        @locked = false
+        @wiki_confirm = true
+        @always_on_top = false
+        @custom_verbs = []
+        @scripted_items_cache = []
+        @ability_notes = {}
+        @observed_rt = {}
+
+        # Remove custom verb abilities from the abilities list
+        @abilities.reject! { |a| a.type == :verb && a.resource_type == :none && a.cost == 0 }
+
+        # Remove scripted item abilities
+        @abilities.reject! { |a| a.type == :item }
+
+        # Clear all box assignments (move everything to unassigned pool)
+        @boxes.each { |box| box['abilities'] = [] }
+
+        # Apply always_on_top immediately
+        @window.set_keep_above(@always_on_top)
+
+        # Close the settings dialog so stale widgets aren't shown
+        if @settings_dialog
+          @settings_dialog.response(Gtk::ResponseType::DELETE_EVENT)
+        end
+
+        respond "--- Combatical: Settings reset to defaults" if Combatical.debug?
+        rebuild_ui
+      end
+    end
+  end
+end
+end # module Combatical
+
+# ============================================================================
+# MAIN SCRIPT EXECUTION
+# ============================================================================
+
+# Verify GTK3 is available
+unless defined?(Gtk)
+  respond "--- Combatical: ERROR - GTK3 not available. Install gtk3 gem."
+  respond "--- Combatical: Run: gem install gtk3"
+  exit
+end
+
+# Create GTK window using Lich's Gtk.queue pattern
+respond "--- Combatical: Creating GTK window..." if Combatical.debug?
+
+# Track if window is open
+window_open = true
+
+begin
+  window = Combatical::Window.new(abilities)
+  respond "--- Combatical: Window initialization complete" if Combatical.debug?
+
+  # Wait for GTK to finish initialization
+  pause 0.5
+
+  # Set up close handler
+  window.set_close_handler {
+    respond "--- Combatical: Window closed by user" if Combatical.debug?
+    window_open = false
+  }
+
+  # Handle cleanup on script exit
+  before_dying {
+    respond "--- Combatical: Shutting down" if Combatical.debug?
+    UpstreamHook.remove('combatical_cmd_monitor')
+    window.save_all_settings if window
+    Gtk.queue { window.window.destroy if window && window.window && !window.window.destroyed? }
+    window_open = false
+  }
+
+  # Install upstream hook to detect abilities typed directly in the game client.
+  # Note: Commands sent by other scripts via put() bypass UpstreamHook entirely —
+  # those are detected separately via $_LASTUPSTREAM_ monitoring in the get loop.
+  UpstreamHook.add('combatical_cmd_monitor', proc { |cmd|
+    begin
+      stripped = cmd.to_s.strip.sub(/^<c>/i, '').strip.downcase
+      unless stripped.empty?
+        respond "--- Combatical: [HOOK] Input: '#{stripped}'" if Combatical.debug?
+        # Skip if this ability is already being tracked (e.g., from execute_ability → do_client)
+        matched = window.match_ability_command(stripped)
+        if matched
+          unless window.instance_variable_get(:@last_cast_ability) == matched.name
+            respond "--- Combatical: [HOOK] Matched: #{matched.name} (type: #{matched.type})" if Combatical.debug?
+            matched.record_item_use! if matched.type == :item
+            window.record_ability_cast(matched.name)
+          end
+        else
+          # Unrecognized command (e.g., "kill") — clear any stale ability tracking
+          # so its RT countdown doesn't persist through unrelated commands
+          if window.instance_variable_get(:@last_cast_ability) && window.instance_variable_get(:@cast_seen_rt)
+            respond "--- Combatical: [HOOK] Unmatched cmd '#{stripped}' — clearing stale RT for '#{window.instance_variable_get(:@last_cast_ability)}'" if Combatical.debug?
+            window.instance_variable_set(:@last_cast_ability, nil)
+            window.instance_variable_set(:@cast_seen_rt, false)
+            window.instance_variable_set(:@last_cast_time, nil)
+          end
+        end
+      end
+    rescue => e
+      respond "--- Combatical: [HOOK ERROR] #{e.message}" if Combatical.debug?
+    end
+    cmd  # Always pass command through unchanged
+  })
+
+  respond "--- Combatical: Window is open - close the window to exit script"
+
+  # Use 'get' loop to yield to Lich's I/O properly
+  # This allows game data to flow while GTK window stays responsive
+  loop do
+    line = get  # This yields to Lich's main loop, keeping game I/O alive!
+
+    # ---- Detect commands sent by other scripts (e.g., bigshot) ----
+    # Scripts using put() bypass UpstreamHook, but Game.puts sets $_LASTUPSTREAM_.
+    # Format: "[scriptname]>command" — we extract the command portion and match it.
+    begin
+      last_up = $_LASTUPSTREAM_.to_s
+      if last_up != window.instance_variable_get(:@prev_last_upstream)
+        window.instance_variable_set(:@prev_last_upstream, last_up)
+        # Extract command: strip "[scriptname]" prefix and separator character
+        cmd_part = last_up.sub(/^\[.*?\]./, '').strip
+        unless cmd_part.empty?
+          respond "--- Combatical: [UPSTREAM] Detected: '#{cmd_part}'" if Combatical.debug?
+          # Skip if this ability is already being tracked (e.g., from execute_ability)
+          matched = window.match_ability_command(cmd_part)
+          if matched
+            unless window.instance_variable_get(:@last_cast_ability) == matched.name
+              respond "--- Combatical: [UPSTREAM] Matched: #{matched.name} (type: #{matched.type})" if Combatical.debug?
+              matched.record_item_use! if matched.type == :item
+              window.record_ability_cast(matched.name)
+            end
+          else
+            # Unrecognized command — clear stale ability tracking
+            if window.instance_variable_get(:@last_cast_ability) && window.instance_variable_get(:@cast_seen_rt)
+              respond "--- Combatical: [UPSTREAM] Unmatched cmd '#{cmd_part}' — clearing stale RT for '#{window.instance_variable_get(:@last_cast_ability)}'" if Combatical.debug?
+              window.instance_variable_set(:@last_cast_ability, nil)
+              window.instance_variable_set(:@cast_seen_rt, false)
+              window.instance_variable_set(:@last_cast_time, nil)
+            end
+          end
+        end
+      end
+    rescue => e
+      respond "--- Combatical: [UPSTREAM ERROR] #{e.message}" if Combatical.debug?
+    end
+
+    # ---- Detect roundtime from game output ----
+    # Catches both regular RT and cast RT immediately from game text,
+    # ensuring the RT countdown starts promptly (faster than 250ms timer poll).
+    if line =~ /^Roundtime: (\d+) sec\.$/ || line =~ /^Cast Roundtime (\d+) Seconds?\./
+      rt_val = $1.to_i
+      ability_name = window.instance_variable_get(:@last_cast_ability)
+      seen_rt = window.instance_variable_get(:@cast_seen_rt)
+      if ability_name && !seen_rt
+        window.instance_variable_set(:@cast_seen_rt, true)
+        observed = window.instance_variable_get(:@observed_rt)
+        prev = observed[ability_name]
+        if prev.nil? || rt_val < prev
+          observed[ability_name] = rt_val
+        end
+        respond "--- Combatical: [GET] RT confirmed for #{ability_name}: #{rt_val}s" if Combatical.debug?
+      end
+    end
+
+    # ---- Detect cooldown expiry from game output ----
+    # Lines like "Chastise is ready for use." indicate cooldown has ended.
+    # This provides immediate feedback rather than waiting for the next available? poll.
+    if line =~ /^(\w[\w\s]+?) is ready for use\.$/
+      ready_name = $1.strip
+      respond "--- Combatical: [GET] Cooldown expired: '#{ready_name}'" if Combatical.debug?
+    end
+
+    break unless window_open
+  end
+
+  respond "--- Combatical: Script exiting cleanly" if Combatical.debug?
+rescue => e
+  respond "--- Combatical: ERROR: #{e.message}"
+  respond "--- Combatical: Backtrace: #{e.backtrace.first(5).join(' | ')}"
+end
