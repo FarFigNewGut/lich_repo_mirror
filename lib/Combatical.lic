@@ -28,6 +28,8 @@
       1.1.1 2/16/2026 - fix reset not clearing scripted items, fix box_labels array size mismatch when adding boxes, fix CSS provider and widget accumulation causing hang after 
                         repeated DnD, add GoS sigils to society scanner, add scan versioning for auto-rescan.
       1.1.2 2/16/2026 - Added some clarifying tooltips, added [] remove item function to scripted items
+      1.1.3 2/16/2026 - Added (verb) paren notation for get-from-container item actions, attack flash on enemy/player labels, COWARDS tracking for fled enemies
+      1.1.5 2/16/2026 - Extensive work on getting attacker flash correct, reworked NPC targeting, added status icons to targets
 
   NOTES - PLEASE READ: Drag and drop abilities has some stability issues. Just perform actions deliberately and do not spam. Closing it will save. 
           Please ensure all your spell circles and ability categories appear in the unfiltered pool, I have only tested on Paladin, Wizard, and Bard.
@@ -39,7 +41,7 @@
 require 'gtk3'
 
 module Combatical
-  SCAN_VERSION = 2  # Bump to force rescan when scanner logic changes
+  SCAN_VERSION = 2 unless defined?(SCAN_VERSION)  # Bump to force rescan when scanner logic changes
 
   @debug = false
 
@@ -56,7 +58,7 @@ class Ability
                 :wiki_url, :category, :passive,
                 :frequency_seconds, :max_charges, :remaining_charges,
                 :max_upd, :remaining_upd, :upd_last_reset,
-                :item_cooldown_end, :remove_first, :item_target
+                :item_cooldown_end, :remove_first, :get_first, :item_target
 
   def initialize(data = {})
     @name = data[:name] || ""
@@ -77,7 +79,8 @@ class Ability
     @upd_last_reset = data[:upd_last_reset]        # runtime: date string of last reset (EST)
     @item_cooldown_end = nil                       # runtime: Time when frequency cooldown expires
     @remove_first = data[:remove_first] || false   # true = remove item before verb, then wear again
-    @item_target = data[:item_target]              # runtime: target string for remove/wear (e.g. "my neckchain" or "#25667483")
+    @get_first = data[:get_first] || false         # true = get item from container before verb, then return it
+    @item_target = data[:item_target]              # runtime: target string for remove/wear/get (e.g. "my neckchain" or "#25667483")
   end
 
   def to_h
@@ -96,6 +99,7 @@ class Ability
     h[:max_charges] = @max_charges if @max_charges
     h[:max_upd] = @max_upd if @max_upd
     h[:remove_first] = true if @remove_first
+    h[:get_first] = true if @get_first
     h
   end
 
@@ -220,7 +224,7 @@ module Scanner
   extend self
 
   # Abilities excluded from display (DragonRealms-only or unwanted)
-  EXCLUDED_ABILITIES = %w[perceive glance].freeze
+  EXCLUDED_ABILITIES = %w[perceive glance].freeze unless defined?(EXCLUDED_ABILITIES)
 
   # Parse a frequency/uses string into a structured result.
   # Accepts:
@@ -877,11 +881,16 @@ module Scanner
         parsed = freq_str.empty? ? nil : parse_frequency(freq_str)
 
         # Detect [verb] bracket notation: remove item first, verb, then wear again
+        # Detect (verb) paren notation: get item from container, verb, then return it
         raw_verb = verb.to_s
         remove_first = false
+        get_first = false
         if raw_verb =~ /^\[(.+)\]$/
           bare_verb = $1
           remove_first = true
+        elsif raw_verb =~ /^\((.+)\)$/
+          bare_verb = $1
+          get_first = true
         else
           bare_verb = raw_verb
         end
@@ -899,6 +908,7 @@ module Scanner
           category: "Item Scripts",
           passive: false,
           remove_first: remove_first,
+          get_first: get_first,
           item_target: item_target
         }
         if parsed
@@ -1044,7 +1054,7 @@ class Window
   attr_accessor :window, :abilities, :boxes_container, :pool_container
 
   # Drag and drop target entry
-  TARGET_ENTRY = Gtk::TargetEntry.new('text/plain', :same_app, 0)
+  TARGET_ENTRY = Gtk::TargetEntry.new('text/plain', :same_app, 0) unless defined?(TARGET_ENTRY)
 
   def initialize(abilities)
     @abilities = abilities
@@ -1105,6 +1115,17 @@ class Window
     @needs_rebuild = false  # Flag for deferred UI rebuild after drag-drop
     @drop_indicator_child = nil  # Currently highlighted drop target widget
     @dragged_ability_name = nil  # Ability name being dragged (bypasses GTK data transfer)
+    # Attack flash tracking: { noun => { type: :enemy/:player, flash_count: N, timer_id: id } }
+    @flash_targets = {}
+    # Attack flash: attacker ID captured by DownstreamHook from XML
+    @last_attacker_id = nil
+    @last_attacker_time = nil
+    # COWARDS tracking: fled enemies after player engagement
+    @engaged_enemy_ids = {}       # { id_string => true } — all enemies present when player attacked
+    @fled_enemies = []            # [{ noun:, direction:, id: }]
+    @departure_cache = {}         # { creature_name => { direction:, time: } }
+    @prev_enemy_ids = {}          # { id_string => { noun:, name: } } — previous tick snapshot
+    @last_room_id = nil           # Track room changes to clear fled enemies
 
     # Restore item runtime tracking state (charges/cooldowns) to loaded abilities
     @abilities.each do |a|
@@ -2040,10 +2061,59 @@ class Window
 
     @current_players = GameObj.pcs
 
-    # Build fingerprint: list of nouns + current target + target type
-    enemy_nouns = @current_enemies.map { |npc| npc.noun }
-    player_nouns = @current_players.map { |pc| pc.noun }
-    fingerprint = [enemy_nouns, player_nouns, @current_target, @current_target_type]
+    # --- Room change detection: clear COWARDS and engagement on room move ---
+    current_room = (XMLData.room_id rescue nil)
+    if current_room && current_room != @last_room_id
+      @last_room_id = current_room
+      @fled_enemies.clear
+      @engaged_enemy_ids.clear
+      @departure_cache.clear
+      @prev_enemy_ids.clear
+    end
+
+    # --- Detect fled enemies: compare previous snapshot to current ---
+    current_enemy_ids = {}
+    @current_enemies.each { |npc| current_enemy_ids[npc.id.to_s] = { noun: npc.noun, name: npc.name } }
+
+    # Direction shortening map
+    dir_short = { 'north'=>'n', 'south'=>'s', 'east'=>'e', 'west'=>'w',
+                  'northeast'=>'ne', 'northwest'=>'nw', 'southeast'=>'se', 'southwest'=>'sw',
+                  'up'=>'up', 'down'=>'down' }
+
+    @prev_enemy_ids.each do |eid, info|
+      next if current_enemy_ids.key?(eid)
+      next unless @engaged_enemy_ids.key?(eid)
+      # This engaged enemy disappeared — only count as COWARD if we saw them leave
+      # (creatures that die, get looted, go invisible, or hide should NOT count)
+      dir = nil
+      @departure_cache.each do |cname, dinfo|
+        if info[:name] && info[:name].downcase.include?(cname.downcase)
+          raw_dir = dinfo[:direction]
+          dir = dir_short[raw_dir.downcase] || (raw_dir.length > 12 ? raw_dir[0..11] : raw_dir)
+          break
+        end
+      end
+      # Only add to COWARDS if we found a matching departure message
+      if dir
+        unless @fled_enemies.any? { |f| f[:id] == eid }
+          @fled_enemies << { noun: info[:noun], direction: dir, id: eid }
+          respond "--- Combatical: COWARD detected: #{info[:noun]} fled #{dir}" if Combatical.debug?
+        end
+      end
+    end
+
+    @prev_enemy_ids = current_enemy_ids
+
+    # Expire stale departure cache entries (>5 seconds old)
+    now = Time.now
+    @departure_cache.delete_if { |_, v| now - v[:time] > 5 }
+
+    # Build fingerprint: nouns + statuses + current target + flash state + fled enemies
+    enemy_data = @current_enemies.map { |npc| [npc.noun, npc.status.to_s] }
+    player_data = @current_players.map { |pc| [pc.noun, pc.status.to_s] }
+    flash_state = @flash_targets.map { |id, info| [id, info[:flash_count]] }
+    fled_nouns = @fled_enemies.map { |f| [f[:noun], f[:direction]] }
+    fingerprint = [enemy_data, player_data, @current_target, @current_target_type, flash_state, fled_nouns]
 
     # Skip widget rebuild if nothing changed
     if fingerprint == @target_list_fingerprint
@@ -2056,10 +2126,14 @@ class Window
 
     @current_enemies.each do |npc|
       label = Gtk::Label.new
-      if @current_target == npc.noun && @current_target_type == :enemy
-        label.set_markup("<span foreground='yellow' weight='bold' font_desc='Sans 10'>#{npc.noun}</span>")
+      icons = status_icons_for(npc)
+      if flashing?(npc.id)
+        # Attack flash: yellow -> red color pulse
+        label.set_markup("<span foreground='red' font_desc='Sans 10'>#{npc.noun}#{icons}</span>")
+      elsif @current_target == npc.noun && @current_target_type == :enemy
+        label.set_markup("<span foreground='yellow' weight='bold' font_desc='Sans 10'>#{npc.noun}#{icons}</span>")
       else
-        label.set_markup("<span foreground='yellow' font_desc='Sans 10'>#{npc.noun}</span>")
+        label.set_markup("<span foreground='yellow' font_desc='Sans 10'>#{npc.noun}#{icons}</span>")
       end
 
       event_box = Gtk::EventBox.new
@@ -2073,15 +2147,43 @@ class Window
       @enemy_box.add(event_box)
     end
 
+    # --- COWARDS: fled enemies grouped at bottom of enemy box ---
+    if !@fled_enemies.empty?
+      coward_header = Gtk::Label.new
+      coward_header.set_markup("<span foreground='red' weight='bold' font_desc='Sans 9'>COWARDS:</span>")
+      coward_header.set_halign(:end)
+      header_ebox = Gtk::EventBox.new
+      header_ebox.override_background_color(:normal, Gdk::RGBA.new(0, 0, 0, 1))
+      header_ebox.add(coward_header)
+      @enemy_box.add(header_ebox)
+
+      @fled_enemies.each do |fled|
+        label = Gtk::Label.new
+        dir_text = fled[:direction] ? "(#{fled[:direction]})" : ""
+        label.set_markup("<span foreground='red' font_desc='Sans 9'>#{fled[:noun]}#{dir_text}</span>")
+        ebox = Gtk::EventBox.new
+        ebox.override_background_color(:normal, Gdk::RGBA.new(0, 0, 0, 1))
+        ebox.add(label)
+        ebox.signal_connect('button-press-event') { |w, ev|
+          select_target(fled[:noun], :enemy) if ev.button == 1
+        }
+        @enemy_box.add(ebox)
+      end
+    end
+
     # --- Rebuild player widgets (FlowBox — wraps automatically) ---
     @player_box.children.each { |child| @player_box.remove(child) }
 
     @current_players.each do |pc|
       label = Gtk::Label.new
-      if @current_target == pc.noun && @current_target_type == :player
-        label.set_markup("<span foreground='blue' weight='bold' font_desc='Sans 10'>#{pc.noun}</span>")
+      icons = status_icons_for(pc)
+      if flashing?(pc.id)
+        # Attack flash: dark blue -> purple color pulse
+        label.set_markup("<span foreground='#9933FF' font_desc='Sans 10'>#{pc.noun}#{icons}</span>")
+      elsif @current_target == pc.noun && @current_target_type == :player
+        label.set_markup("<span foreground='blue' weight='bold' font_desc='Sans 10'>#{pc.noun}#{icons}</span>")
       else
-        label.set_markup("<span foreground='blue' font_desc='Sans 10'>#{pc.noun}</span>")
+        label.set_markup("<span foreground='blue' font_desc='Sans 10'>#{pc.noun}#{icons}</span>")
       end
 
       event_box = Gtk::EventBox.new
@@ -2127,6 +2229,80 @@ class Window
 
     update_target_lists
     respond "--- Combatical: Target set to #{target_name} (#{target_type})" if Combatical.debug?
+  end
+
+  # Flash a target's label to indicate they attacked. Tracked by GameObj ID.
+  def flash_target_label(target_id, target_type)
+    id_str = target_id.to_s
+    # Cancel existing flash timer for this ID
+    if @flash_targets[id_str] && @flash_targets[id_str][:timer_id]
+      GLib::Source.remove(@flash_targets[id_str][:timer_id]) rescue nil
+    end
+
+    # 10 transitions at 150ms = 1.5s, rapid color toggling
+    @flash_targets[id_str] = { type: target_type, flash_count: 10, timer_id: nil }
+
+    # Force immediate rebuild to show first flash
+    @target_list_fingerprint = nil
+    update_target_lists
+
+    timer_id = GLib::Timeout.add(150) {
+      entry = @flash_targets[id_str]
+      if entry.nil? || entry[:flash_count] <= 0
+        @flash_targets.delete(id_str)
+        @target_list_fingerprint = nil
+        update_target_lists
+        next false
+      end
+      entry[:flash_count] -= 1
+      @target_list_fingerprint = nil
+      update_target_lists
+      if entry[:flash_count] <= 0
+        @flash_targets.delete(id_str)
+        @target_list_fingerprint = nil
+        update_target_lists
+        next false
+      end
+      true
+    }
+    @flash_targets[id_str][:timer_id] = timer_id
+  end
+
+  # Check if a GameObj ID is currently in "flash on" state (even flash_count = lit up)
+  def flashing?(target_id)
+    entry = @flash_targets[target_id.to_s]
+    return false unless entry && entry[:flash_count] > 0
+    entry[:flash_count].even?  # 10=on, 9=off, 8=on, ...
+  end
+
+  # Status icon mapping for GameObj.status strings (from game XML)
+  # Status strings come from "that is/appears <status>" or "(<status>)" in room descriptions
+  unless defined?(STATUS_ICONS)
+    STATUS_ICONS = [
+      ['stunned',       "\u{1F31F}"],   # Glowing Star
+      ['lying down',    "\u{2B07}\u{FE0F}"],   # Down Arrow (emoji) — "that is lying down"
+      ['laying down',   "\u{2B07}\u{FE0F}"],   # Down Arrow (emoji) — alternate phrasing
+      ['dead',          "\u{1F480}"],   # Skull
+      ['kneeling',      "\u{1F9CE}"],   # Person Kneeling
+      ['sitting',       "\u{1F9D8}"],   # Person in Lotus Position
+      ['webbed',        "\u{1F578}"],   # Spider Web
+      ['held in place', "\u{1F578}"],   # Spider Web — held/rooted effect
+      ['frozen',        "\u{1F9CA}"],   # Ice Cube
+      ['paralyzed',     "\u{1F9CA}"],   # Ice Cube — can't move
+      ['bleeding',      "\u{1FA78}"],   # Drop of Blood
+      ['sleeping',      "\u{1F4A4}"],   # Zzz
+    ].freeze
+  end
+
+  # Build status icon string from a GameObj's status
+  def status_icons_for(gameobj)
+    status_str = gameobj.status.to_s.downcase
+    return '' if status_str.empty?
+    icons = []
+    STATUS_ICONS.each do |keyword, icon|
+      icons << icon if status_str.include?(keyword)
+    end
+    icons.empty? ? '' : " #{icons.join('')}"
   end
 
   # Match a command string against known abilities.
@@ -2228,6 +2404,9 @@ class Window
       ability.record_item_use! if ability.type == :item
       record_ability_cast(ability.name)
 
+      # Mark all current enemies as engaged (for COWARDS tracking)
+      @current_enemies.each { |npc| @engaged_enemy_ids[npc.id.to_s] = true }
+
       # Remove-first items: remove -> wait RT -> verb -> wait RT -> wear
       if ability.remove_first && ability.item_target
         respond "--- Combatical: [EXEC] #{ability.name} REMOVE-FIRST -> '#{command}' target=#{ability.item_target}" if Combatical.debug?
@@ -2244,6 +2423,47 @@ class Window
             put "wear #{target}"
           rescue => e
             respond "--- Combatical: [EXEC] Remove-first error: #{e.message}" if Combatical.debug?
+          end
+        }
+      # Get-first items: get from container -> verb -> return to container
+      elsif ability.get_first && ability.item_target
+        respond "--- Combatical: [EXEC] #{ability.name} GET-FIRST -> '#{command}' target=#{ability.item_target}" if Combatical.debug?
+        target = ability.item_target
+        verb_cmd = command
+        # Find which container holds this item
+        container_noun = nil
+        item_id_str = target.sub(/^#/, '')
+        begin
+          GameObj.containers.each do |cid, items|
+            if items && items.any? { |obj| obj.id.to_s == item_id_str }
+              container_obj = GameObj[cid]
+              container_noun = container_obj.noun if container_obj
+              break
+            end
+          end
+        rescue => e
+          respond "--- Combatical: [EXEC] Container lookup error: #{e.message}" if Combatical.debug?
+        end
+        respond "--- Combatical: [EXEC] Container for #{target}: #{container_noun || '(not found, will stow)'}" if Combatical.debug?
+        Thread.new {
+          begin
+            if container_noun
+              put "get #{target} from my #{container_noun}"
+            else
+              put "get #{target}"
+            end
+            waitrt?
+            sleep 0.3
+            put verb_cmd
+            waitrt?
+            sleep 0.3
+            if container_noun
+              put "put #{target} in my #{container_noun}"
+            else
+              put "stow #{target}"
+            end
+          rescue => e
+            respond "--- Combatical: [EXEC] Get-first error: #{e.message}" if Combatical.debug?
           end
         }
       else
@@ -3153,9 +3373,9 @@ class Window
     # Entry fields
     entry_hbox = Gtk::Box.new(:horizontal, 5)
     verb_entry = Gtk::Entry.new
-    verb_entry.set_placeholder_text("e.g. TURN, RUB, [TURN]...")
+    verb_entry.set_placeholder_text("e.g. TURN, RUB, [TURN], (RAISE)...")
     verb_entry.set_size_request(150, -1)
-    verb_entry.set_tooltip_text("Enter a verb to use on this item.\nWrap in brackets [TURN] to remove the item first,\nperform the verb, then wear it again.\nExample: [TURN] = remove ring, turn ring, wear ring")
+    verb_entry.set_tooltip_text("Enter a verb to use on this item.\nWrap in brackets [TURN] to remove the item first,\nperform the verb, then wear it again.\nExample: [TURN] = remove ring, turn ring, wear ring\n\nWrap in parens (RAISE) to get the item from its container,\nperform the verb, then return it to the container.\nExample: (RAISE) = get wand from pack, raise wand, put wand in pack")
     entry_hbox.pack_start(verb_entry, expand: false, fill: false, padding: 0)
 
     freq_entry = Gtk::Entry.new
@@ -3344,11 +3564,16 @@ class Window
         parsed = freq_str.empty? ? nil : Combatical::Scanner.parse_frequency(freq_str)
 
         # Detect [verb] bracket notation: remove item first, verb, then wear again
+        # Detect (verb) paren notation: get item from container, verb, then return it
         raw_verb = verb.to_s
         remove_first = false
+        get_first = false
         if raw_verb =~ /^\[(.+)\]$/
           bare_verb = $1
           remove_first = true
+        elsif raw_verb =~ /^\((.+)\)$/
+          bare_verb = $1
+          get_first = true
         else
           bare_verb = raw_verb
         end
@@ -3366,6 +3591,7 @@ class Window
           category: "Item Scripts",
           passive: false,
           remove_first: remove_first,
+          get_first: get_first,
           item_target: item_target
         }
 
@@ -3590,11 +3816,27 @@ begin
   # Handle cleanup on script exit
   before_dying {
     respond "--- Combatical: Shutting down" if Combatical.debug?
+    DownstreamHook.remove('combatical_attack_monitor')
     UpstreamHook.remove('combatical_cmd_monitor')
     window.save_all_settings if window
     Gtk.queue { window.window.destroy if window && window.window && !window.window.destroyed? }
     window_open = false
   }
+
+  # Install downstream hook to capture attacker IDs from XML before tags are stripped.
+  # XML attack lines look like: <pushBold/><a exist="12345" noun="worker">kiramon worker</a><popBold/> charges at you!
+  attack_verbs_pattern = /(?:swings|claws|bites|charges|hurls|lunges|thrusts|slashes|swipes|punches|kicks|fires|gestures|channels|casts|directs|throws|pounds|smashes|attacks|strikes) /i
+  DownstreamHook.add('combatical_attack_monitor', proc { |xml_line|
+    begin
+      if xml_line =~ /<a exist="(-?\d+)" noun="[^"]*">[^<]*<\/a>.*?#{attack_verbs_pattern}/
+        attacker_id = $1
+        window.instance_variable_set(:@last_attacker_id, attacker_id)
+        window.instance_variable_set(:@last_attacker_time, Time.now)
+      end
+    rescue
+    end
+    xml_line  # Always pass through unchanged
+  })
 
   # Install upstream hook to detect abilities typed directly in the game client.
   # Note: Commands sent by other scripts via put() bypass UpstreamHook entirely —
@@ -3611,6 +3853,8 @@ begin
             respond "--- Combatical: [HOOK] Matched: #{matched.name} (type: #{matched.type})" if Combatical.debug?
             matched.record_item_use! if matched.type == :item
             window.record_ability_cast(matched.name)
+            # Mark all current enemies as engaged (for COWARDS tracking)
+            (window.instance_variable_get(:@current_enemies) || []).each { |npc| window.instance_variable_get(:@engaged_enemy_ids)[npc.id.to_s] = true }
           end
         else
           # Unrecognized command (e.g., "kill") — clear any stale ability tracking
@@ -3654,6 +3898,8 @@ begin
               respond "--- Combatical: [UPSTREAM] Matched: #{matched.name} (type: #{matched.type})" if Combatical.debug?
               matched.record_item_use! if matched.type == :item
               window.record_ability_cast(matched.name)
+              # Mark all current enemies as engaged (for COWARDS tracking)
+              (window.instance_variable_get(:@current_enemies) || []).each { |npc| window.instance_variable_get(:@engaged_enemy_ids)[npc.id.to_s] = true }
             end
           else
             # Unrecognized command — clear stale ability tracking
@@ -3694,6 +3940,51 @@ begin
     if line =~ /^(\w[\w\s]+?) is ready for use\.$/
       ready_name = $1.strip
       respond "--- Combatical: [GET] Cooldown expired: '#{ready_name}'" if Combatical.debug?
+    end
+
+    # ---- Detect creature/player attacks for flash effect ----
+    # The DownstreamHook captures the attacker's GameObj ID from XML before tags
+    # are stripped. We use that ID here to flash the correct individual creature.
+    # Enemy attack patterns: "A/An/The <creature> <attack_verb> ..."
+    if line =~ /^(?:An?|The) (.+?) (?:swings|claws|bites|charges|hurls|lunges|thrusts|slashes|swipes|punches|kicks|fires|gestures|channels|casts|directs|throws|pounds|smashes|attacks|strikes) /i
+      attacker_name = $1.strip
+      enemies = window.instance_variable_get(:@current_enemies)
+      matches = (enemies || []).select { |npc| attacker_name.downcase.include?(npc.noun.downcase) }
+      if matches.length == 1
+        enemy = matches.first
+      elsif matches.length > 1
+        # Use the attacker ID captured by the DownstreamHook from the XML stream
+        hook_id = window.instance_variable_get(:@last_attacker_id)
+        hook_time = window.instance_variable_get(:@last_attacker_time)
+        if hook_id && hook_time && (Time.now - hook_time) < 1.0
+          enemy = matches.find { |npc| npc.id.to_s == hook_id.to_s } || matches.first
+        else
+          enemy = matches.first
+        end
+      end
+      if enemy
+        Gtk.queue { window.flash_target_label(enemy.id, :enemy) }
+        respond "--- Combatical: [FLASH] Enemy attack: #{enemy.noun} (id=#{enemy.id})" if Combatical.debug?
+      end
+    end
+    # Player attack patterns: "<Name> swings/gestures/casts/etc ..."
+    if line =~ /^([A-Z][a-z]+) (?:swings|gestures|casts|channels|thrusts|hurls|fires|lunges|slashes|punches|kicks|throws|strikes|attacks) /
+      player_name = $1.strip
+      players = window.instance_variable_get(:@current_players)
+      player = (players || []).find { |pc| pc.noun == player_name }
+      if player
+        Gtk.queue { window.flash_target_label(player.id, :player) }
+        respond "--- Combatical: [FLASH] Player attack: #{player.noun} (id=#{player.id})" if Combatical.debug?
+      end
+    end
+
+    # ---- Detect creature departures for COWARDS tracking ----
+    # "A/An/The <creature name> just went <direction>."
+    if line =~ /^(?:An?|The) (.+?) just went (.+?)\.$/
+      creature_name = $1.strip
+      direction = $2.strip
+      window.instance_variable_get(:@departure_cache)[creature_name] = { direction: direction, time: Time.now }
+      respond "--- Combatical: [DEPART] #{creature_name} -> #{direction}" if Combatical.debug?
     end
 
     break unless window_open
