@@ -26,52 +26,37 @@
 
   Author: Phocosoen, ChatGPT
   Tags: wrayth, frontend, mod, window, players, spam, filter, group, avalon, wizard, gtk3
-  Version: 1.8.7
+  Version: 1.8.21
 
   Changelog:
+  1.8.21 (2026-02-19)
+    - Added custom falloff filter for shattered constricting bands messaging.
+  1.8.20 (2026-02-19)
+    - Added spell-falloff filtering using built-in `Spell.downmsgs` data for non-self targets.
+  1.8.19 (2026-02-19)
+    - Added condensed death messaging (`NOUN DIES`) with centered output.
   1.8.7 (2026-02-18)
-    - Added toggleable combat filter (*pwcombat / *filtercombat).
-    - Added Wrayth and GTK controls for AS/CS/SMR line filtering.
+    - Added combat filter toggle (`*pwcombat` / `*filtercombat`).
+    - Added Wrayth and GTK controls for combat filtering.
   1.8.6 (2026-02-18)
-    - Added flare filter toggle (*pwflare / *filterflares) using flare_patterns.rb.
-    - Added persisted flare-filter setting and Wrayth/GTK controls.
+    - Added flare filter toggle (`*pwflare` / `*filterflares`) via `flare_patterns.rb`.
   1.8.5 (2026-02-13)
-    - Added GTK availability fallback and safe GTK startup handling.
-    - Switched window settings loading to YAML.safe_load with defaults merge.
-    - Improved group refresh by using Lich Group state snapshots and broken-group checks.
-    - Updated ASCII-only comment text for compatibility.
-  1.8.4 (2025-09-01)
-    - Update to grouping display.
-  1.8.3 (2025-08-21)
-    - Bugfix to ensure ASCII safe characters used in code for ASCII loaded Ruby/FEs.
-  1.8.2 (2025-07-08)
-    - Fixed movement filter also blocking players kneeling, lying down, sitting, and standing.
-  1.8.1 (2025-06-30)
-    - 2 second delay before showing player enter/leave with spam filter to cut drive-by spam.
+    - Added persistent settings improvements and safer GTK startup behavior.
   1.8.0 (2025-06-25)
     - GTK window now displays clickable statuses with context-sensitive actions.
-  1.7.1 (2025-06-25)
-    - Replaced light/dark mode toggle with GTK palette selector.
   1.7.0 (2025-06-22)
     - Added Wizard and Avalon FE compatibility via implementation of a GTK window.
   1.6.0 (2025-06-12)
     - Added *pwmove command to toggle player movement filtering.
   1.5.0 (2025-06-08)
     - Added GROUP display showing group members with leader denoted by *NAME*.
-  1.4.1 (2025-06-07)
-    - Column button removed. Command is *pwcol to swap between single and double column layouts.
   1.4.0 (2025-06-05)
     - Layout button added to toggle between one or two column format.
-    - Will save state between sessions for all commands.
-    - Spam filter now blocks locksmith pool actions (disarming, lockpicking).
-  1.3.1 (2025-06-04)
-    - Updated to allow familiar speech even with animal filter on.
+    - Added persistent state saving for commands.
   1.3.0 (2025-06-03)
     - Added Animal Filter to filter out companions, animates, familiars, pets, and spirits.
-  1.2.1 (2025-06-02)
-    - Spam filter now blocks consignment, gem shop, furrier, and pawn shop actions.
   1.2.0 (2025-05-31)
-    - Added Spam Filter to reduce clutter from spell casting, healing, urchins, FWI, etc.
+    - Added Spam Filter to reduce story window clutter.
   1.0.0 (2025-02-11)
     - Initial release.
 =end
@@ -80,120 +65,199 @@ no_kill_all
 
 require 'yaml'
 
-def load_flare_patterns_file
-  scripts_dir = "#{$script_dir}"
-  flare_patterns_filename = "flare_patterns.rb"
-  flare_patterns_path = File.join(scripts_dir, flare_patterns_filename)
+module PlayerWindow
+  extend self
+  include Lich::Common if defined?(Lich::Common)
 
-  return false unless File.exist?(flare_patterns_path)
+  class << self
+    attr_accessor :gtk_available,
+                  :use_gtk_playerwindow,
+                  :filter_spam,
+                  :filter_animals,
+                  :filter_flares,
+                  :filter_combat_math,
+                  :single_column,
+                  :show_movement,
+                  :debug_filter_enabled,
+                  :flare_patterns,
+                  :group_dirty,
+                  :group_display
+  end
 
-  load flare_patterns_path
-  true
-rescue Exception
-  false
+  PW_DEFAULT_WINDOW_SETTINGS = {
+    "playerwindow" => {
+      "single_column"        => false,
+      "filter_animals"       => false,
+      "filter_flares"        => false,
+      "filter_combat_math"   => false,
+      "filter_spam"          => true,
+      "show_movement"        => true,
+      "x"                    => 1860,
+      "y"                    => 1600,
+      "width"                => 420,
+      "height"               => 370,
+      "font_size"            => 17,
+      "use_gtk_playerwindow" => true,
+      "palette"              => "White on Black"
+    },
+  }.freeze
+
+  def load_flare_patterns_file
+    scripts_dir = "#{$script_dir}"
+    flare_patterns_filename = "flare_patterns.rb"
+    flare_patterns_path = File.join(scripts_dir, flare_patterns_filename)
+
+    return false unless File.exist?(flare_patterns_path)
+
+    load flare_patterns_path
+    true
+  rescue StandardError
+    false
+  end
+
+  def deep_merge_hash(base, override)
+    base.merge(override) do |_k, base_val, override_val|
+      if base_val.is_a?(Hash) && override_val.is_a?(Hash)
+        deep_merge_hash(base_val, override_val)
+      else
+        override_val
+      end
+    end
+  end
+
+  def load_flare_filter_patterns
+    patterns = []
+    patterns.concat(DMGFLARE_PATTERNS.values) if defined?(DMGFLARE_PATTERNS) && DMGFLARE_PATTERNS.is_a?(Hash)
+    patterns.concat(NODMGFLARE_PATTERNS.values) if defined?(NODMGFLARE_PATTERNS) && NODMGFLARE_PATTERNS.is_a?(Hash)
+    patterns.select { |pattern| pattern.is_a?(Regexp) }
+  end
+
+  def window_settings_path(name: Char.name)
+    # Use $data_dir and XMLData.game for Lich data structure
+    base_dir = "#{$data_dir}#{XMLData.game}/#{name}"
+    Dir.mkdir("#{$data_dir}#{XMLData.game}") unless File.exist?("#{$data_dir}#{XMLData.game}")
+    Dir.mkdir(base_dir) unless File.exist?(base_dir)
+    File.join(base_dir, "lichwindows.yaml")
+  end
+
+  def load_window_settings(name: Char.name)
+    filename = window_settings_path(name: name)
+    settings_hash = nil
+
+    if File.exist?(filename) && name == Char.name
+      raw = File.read(filename)
+      parsed = YAML.safe_load(
+        raw,
+        permitted_classes: [Hash, Array, String, Integer, Float, TrueClass, FalseClass, NilClass],
+        aliases: false
+      )
+      settings_hash = parsed.is_a?(Hash) ? parsed : {}
+      settings_hash = deep_merge_hash(PW_DEFAULT_WINDOW_SETTINGS, settings_hash)
+    elsif !File.exist?(filename) && name != Char.name
+      echo "Window settings: Attempt to load a profile (#{name}) that does not exist."
+      settings_hash = nil
+    elsif !File.exist?(filename) && name == Char.name
+      echo "Window settings: No current settings found. Loading defaults..."
+      settings_hash = deep_merge_hash(PW_DEFAULT_WINDOW_SETTINGS, {})
+      File.write(filename, settings_hash.to_yaml)
+    else
+      echo "Window settings: Unknown error loading profile (#{name})"
+      settings_hash = nil
+    end
+
+    settings_hash
+  rescue Psych::SyntaxError => e
+    echo "Window settings: YAML parse error (#{e.message}). Loading defaults..."
+    settings_hash = deep_merge_hash(PW_DEFAULT_WINDOW_SETTINGS, {})
+    File.write(filename, settings_hash.to_yaml) if name == Char.name
+    settings_hash
+  end
+
+  def save_window_settings(settings, name: Char.name)
+    filename = window_settings_path(name: name)
+    File.write(filename, settings.to_yaml)
+  end
+
+  def gtk_enabled?
+    gtk_available && PlayerWindow.use_gtk_playerwindow
+  end
+
+  def start_gtk_main_if_needed
+    return unless gtk_available
+
+    Gtk.main if Gtk.main_level.zero?
+  end
+
+  def center_text(text, width = 80)
+    trimmed = text.to_s.strip
+    return trimmed if trimmed.empty?
+
+    pad = [(width - trimmed.length) / 2, 0].max
+    (" " * pad) + trimmed
+  end
+
+  def line_is_self_status?(line)
+    plain = line.to_s.gsub(/<[^>]*>/, " ").strip
+    plain.match?(/\A(?:You|Your)\b/i)
+  end
+
+  def spell_falloff_patterns
+    return @spell_falloff_patterns if @spell_falloff_patterns
+
+    @spell_falloff_patterns = []
+    Array(Spell.downmsgs).each do |msg|
+      next if msg.nil? || msg.strip.empty?
+
+      source = msg.to_s
+      source = source.gsub(/\A\^/, "").gsub(/\$\z/, "")
+      begin
+        @spell_falloff_patterns << Regexp.new(source, Regexp::IGNORECASE)
+      rescue RegexpError
+        next
+      end
+    end
+    @spell_falloff_patterns
+  end
+
+  def spell_falloff_line?(line)
+    return false if line_is_self_status?(line)
+    return true if line =~ /The constricting bands surrounding .* shatter into nothingness\./i
+
+    spell_falloff_patterns.any? { |pattern| line =~ pattern }
+  end
+
+  def extract_noun_from_line(line)
+    xml_nouns = line.scan(/noun="([^"]+)"/i).flatten
+    return xml_nouns.last if xml_nouns.any?
+
+    plain = line.gsub(/<[^>]*>/, " ").strip
+    return Regexp.last_match(1).strip if plain =~ /\b(?:a|an|the|some)\s+([a-z][a-z' -]{2,40})\b/i
+
+    nil
+  end
+
 end
 
-unless load_flare_patterns_file
+unless PlayerWindow.load_flare_patterns_file
   echo "Playerwindow: flare patterns unavailable (could not load flare_patterns.rb from #{$script_dir}). Flare filtering disabled."
 end
 
-def deep_merge_hash(base, override)
-  base.merge(override) do |_k, base_val, override_val|
-    if base_val.is_a?(Hash) && override_val.is_a?(Hash)
-      deep_merge_hash(base_val, override_val)
-    else
-      override_val
-    end
-  end
-end
+# ... load WINDOW_SETTINGS_PATH, PlayerWindow.load_window_settings, etc ...
 
-PW_DEFAULT_WINDOW_SETTINGS = {
-  "playerwindow" => {
-    "single_column"        => false,
-    "filter_animals"       => false,
-    "filter_flares"        => false,
-    "filter_combat_math"   => false,
-    "filter_spam"          => true,
-    "show_movement"        => true,
-    "x"                    => 1860,
-    "y"                    => 1600,
-    "width"                => 420,
-    "height"               => 370,
-    "font_size"            => 17,
-    "use_gtk_playerwindow" => true,
-    "palette"              => "White on Black"
-  },
-} unless defined?(PW_DEFAULT_WINDOW_SETTINGS)
-
-def load_flare_filter_patterns
-  patterns = []
-  patterns.concat(DMGFLARE_PATTERNS.values) if defined?(DMGFLARE_PATTERNS) && DMGFLARE_PATTERNS.is_a?(Hash)
-  patterns.concat(NODMGFLARE_PATTERNS.values) if defined?(NODMGFLARE_PATTERNS) && NODMGFLARE_PATTERNS.is_a?(Hash)
-  patterns.select { |pattern| pattern.is_a?(Regexp) }
-end
-
-def window_settings_path(name: Char.name)
-  # Use $data_dir and XMLData.game for Lich data structure
-  base_dir = "#{$data_dir}#{XMLData.game}/#{name}"
-  Dir.mkdir("#{$data_dir}#{XMLData.game}") unless File.exist?("#{$data_dir}#{XMLData.game}")
-  Dir.mkdir(base_dir) unless File.exist?(base_dir)
-  File.join(base_dir, "lichwindows.yaml")
-end
-
-def load_window_settings(name: Char.name)
-  filename = window_settings_path(name: name)
-  settings_hash = nil
-
-  if File.exist?(filename) && name == Char.name
-    raw = File.read(filename)
-    parsed = YAML.safe_load(
-      raw,
-      permitted_classes: [Hash, Array, String, Integer, Float, TrueClass, FalseClass, NilClass],
-      aliases: false
-    )
-    settings_hash = parsed.is_a?(Hash) ? parsed : {}
-    settings_hash = deep_merge_hash(PW_DEFAULT_WINDOW_SETTINGS, settings_hash)
-  elsif !File.exist?(filename) && name != Char.name
-    echo "Window settings: Attempt to load a profile (#{name}) that does not exist."
-    settings_hash = nil
-  elsif !File.exist?(filename) && name == Char.name
-    echo "Window settings: No current settings found. Loading defaults..."
-    settings_hash = deep_merge_hash(PW_DEFAULT_WINDOW_SETTINGS, {})
-    File.write(filename, settings_hash.to_yaml)
-  else
-    echo "Window settings: Unknown error loading profile (#{name})"
-    settings_hash = nil
-  end
-
-  settings_hash
-rescue Psych::SyntaxError => e
-  echo "Window settings: YAML parse error (#{e.message}). Loading defaults..."
-  settings_hash = deep_merge_hash(PW_DEFAULT_WINDOW_SETTINGS, {})
-  File.write(filename, settings_hash.to_yaml) if name == Char.name
-  settings_hash
-end
-
-def save_window_settings(settings, name: Char.name)
-  filename = window_settings_path(name: name)
-  File.write(filename, settings.to_yaml)
-end
-
-# ... load WINDOW_SETTINGS_PATH, load_window_settings, etc ...
-
-window_settings        = load_window_settings
-window_settings      ||= deep_merge_hash(PW_DEFAULT_WINDOW_SETTINGS, {})
+window_settings        = PlayerWindow.load_window_settings
+window_settings      ||= PlayerWindow.deep_merge_hash(PlayerWindow::PW_DEFAULT_WINDOW_SETTINGS, {})
 player_window_settings = window_settings["playerwindow"] || {}
 
-$use_gtk_playerwindow = player_window_settings["use_gtk_playerwindow"] || false
-$filter_spam      = player_window_settings["filter_spam"]      || false
-$filter_animals   = player_window_settings["filter_animals"]   || false
-$filter_flares    = player_window_settings["filter_flares"]    || false
-$filter_combat_math = player_window_settings["filter_combat_math"] || false
-$pwsingle_column  = player_window_settings["single_column"]    || false
-$show_movement = player_window_settings["show_movement"] || false
-$pw_debug_filter = false # Toggle with *pwdebug
-$pw_flare_patterns = load_flare_filter_patterns
-@gtk_available = begin
+PlayerWindow.use_gtk_playerwindow = player_window_settings["use_gtk_playerwindow"] || false
+PlayerWindow.filter_spam      = player_window_settings["filter_spam"]      || false
+PlayerWindow.filter_animals   = player_window_settings["filter_animals"]   || false
+PlayerWindow.filter_flares    = player_window_settings["filter_flares"]    || false
+PlayerWindow.filter_combat_math = player_window_settings["filter_combat_math"] || false
+PlayerWindow.single_column = player_window_settings["single_column"] || false
+PlayerWindow.show_movement = player_window_settings["show_movement"] || false
+PlayerWindow.debug_filter_enabled = false # Toggle with *pwdebug
+PlayerWindow.flare_patterns = PlayerWindow.load_flare_filter_patterns
+PlayerWindow.gtk_available = begin
   require 'gtk3'
   true
 rescue LoadError => e
@@ -201,35 +265,26 @@ rescue LoadError => e
   false
 end
 
-def gtk_enabled?
-  @gtk_available && $use_gtk_playerwindow
-end
-
-def start_gtk_main_if_needed
-  return unless @gtk_available
-
-  Gtk.main if Gtk.main_level.zero?
-end
-
-@startup_request_gtk = ($use_gtk_playerwindow || $frontend != "stormfront")
+@pw_startup_request_gtk = (PlayerWindow.use_gtk_playerwindow || $frontend != "stormfront")
 
 if $frontend == "stormfront"
   # Open the players window using Wrayth's dynamic dialog.
   puts("<closeDialog id='PlayerWindow'/><openDialog type='dynamic' id='PlayerWindow' title='Players' target='PlayerWindow' scroll='manual' location='main' justify='3' height='100' resident='true'><dialogData id='PlayerWindow'></dialogData></openDialog>")
 end
 
-@last_pcs = []
-@last_filter_state = nil # Track last known state of $filter_spam
+@pw_last_pcs = []
+@pw_last_pcs_snapshot = nil
+@pw_last_filter_state = nil # Track last known state of PlayerWindow.filter_spam
 
 # --- 1) Define your palettes ---
-PW_PALETTES = {
+PlayerWindow::PALETTES = {
   "Lich Dark Mode"     => { bg: "#2E2E2E", fg: "#DADADA" },
   "Lich Light Mode"    => { bg: "#E6E6E6", fg: "#202020" },
   "Middle Ground"      => { bg: "#333333", fg: "#FFFFFF" },
   "White on Black"     => { bg: "#000000", fg: "#FFFFFF" },
   "NQWhite on NQBlack" => { bg: "#111111", fg: "#f6f6f6" },
   "Black on White"     => { bg: "#FFFFFF", fg: "#000000" },
-} unless defined?(PW_PALETTES)
+} unless defined?(PlayerWindow::PALETTES)
 
 class PlayerWindowGtk
   @window       = nil
@@ -242,10 +297,10 @@ class PlayerWindowGtk
   # --- 2) Regenerate & apply CSS using the chosen palette ---
   def self.reload_css
     # Load persisted palette choice (default to "White on Black")
-    settings = load_window_settings
+    settings = PlayerWindow.load_window_settings
     pw       = settings["playerwindow"] ||= {}
     pal_name = pw["palette"] || "White on Black"
-    colors   = PW_PALETTES[pal_name]
+    colors   = PlayerWindow::PALETTES[pal_name]
 
     css = <<~CSS
       /* window frame */
@@ -329,12 +384,12 @@ class PlayerWindowGtk
     return if @window
 
     # --- load persisted settings ---
-    settings = load_window_settings
+    settings = PlayerWindow.load_window_settings
     pw       = settings["playerwindow"] ||= {}
-    $filter_spam    = pw["filter_spam"]    || false
-    $filter_animals = pw["filter_animals"] || false
-    $filter_flares  = pw["filter_flares"]  || false
-    $filter_combat_math = pw["filter_combat_math"] || false
+    PlayerWindow.filter_spam    = pw["filter_spam"]    || false
+    PlayerWindow.filter_animals = pw["filter_animals"] || false
+    PlayerWindow.filter_flares  = pw["filter_flares"]  || false
+    PlayerWindow.filter_combat_math = pw["filter_combat_math"] || false
     @font_size = pw["font_size"] || 14
     pw["palette"] || "White on Black"
 
@@ -352,11 +407,11 @@ class PlayerWindowGtk
     # - Spam Filter toggle -
     spam_toggle = Gtk::ToggleButton.new(label: "Spam")
     spam_toggle.style_context.add_class("header-toggle")
-    spam_toggle.active = $filter_spam
+    spam_toggle.active = PlayerWindow.filter_spam
     spam_toggle.signal_connect("toggled") do |btn|
-      $filter_spam = btn.active?
-      respond "Spam filtering #{$filter_spam ? 'ENABLED' : 'DISABLED'}."
-      pw["filter_spam"] = $filter_spam; save_window_settings(settings)
+      PlayerWindow.filter_spam = btn.active?
+      respond "Spam filtering #{PlayerWindow.filter_spam ? 'ENABLED' : 'DISABLED'}."
+      pw["filter_spam"] = PlayerWindow.filter_spam; PlayerWindow.save_window_settings(settings)
       update_players(GameObj.pcs.reject { |pc| pc.name == Char.name })
     end
     header.pack_start(spam_toggle)
@@ -364,18 +419,18 @@ class PlayerWindowGtk
     # - Flare Filter toggle -
     flare_toggle = Gtk::ToggleButton.new(label: "Flare")
     flare_toggle.style_context.add_class("header-toggle")
-    flare_toggle.active = $filter_flares
+    flare_toggle.active = PlayerWindow.filter_flares
     flare_toggle.signal_connect("toggled") do |btn|
-      if btn.active? && $pw_flare_patterns.empty?
+      if btn.active? && PlayerWindow.flare_patterns.empty?
         btn.active = false
         respond "Flare filtering unavailable. flare_patterns.rb not loaded."
         next
       end
 
-      $filter_flares = btn.active?
-      respond "Flare filtering #{$filter_flares ? 'ENABLED' : 'DISABLED'}."
-      pw["filter_flares"] = $filter_flares
-      save_window_settings(settings)
+      PlayerWindow.filter_flares = btn.active?
+      respond "Flare filtering #{PlayerWindow.filter_flares ? 'ENABLED' : 'DISABLED'}."
+      pw["filter_flares"] = PlayerWindow.filter_flares
+      PlayerWindow.save_window_settings(settings)
       update_players(GameObj.pcs.reject { |pc| pc.name == Char.name })
     end
     header.pack_start(flare_toggle)
@@ -383,12 +438,12 @@ class PlayerWindowGtk
     # - Combat Filter toggle -
     combat_math_toggle = Gtk::ToggleButton.new(label: "Combat")
     combat_math_toggle.style_context.add_class("header-toggle")
-    combat_math_toggle.active = $filter_combat_math
+    combat_math_toggle.active = PlayerWindow.filter_combat_math
     combat_math_toggle.signal_connect("toggled") do |btn|
-      $filter_combat_math = btn.active?
-      respond "Combat filtering #{$filter_combat_math ? 'ENABLED' : 'DISABLED'}."
-      pw["filter_combat_math"] = $filter_combat_math
-      save_window_settings(settings)
+      PlayerWindow.filter_combat_math = btn.active?
+      respond "Combat filtering #{PlayerWindow.filter_combat_math ? 'ENABLED' : 'DISABLED'}."
+      pw["filter_combat_math"] = PlayerWindow.filter_combat_math
+      PlayerWindow.save_window_settings(settings)
       update_players(GameObj.pcs.reject { |pc| pc.name == Char.name })
     end
     header.pack_start(combat_math_toggle)
@@ -396,12 +451,12 @@ class PlayerWindowGtk
     # - Animal Filter toggle -
     animal_toggle = Gtk::ToggleButton.new(label: "Animal")
     animal_toggle.style_context.add_class("header-toggle")
-    animal_toggle.active = $filter_animals
+    animal_toggle.active = PlayerWindow.filter_animals
     animal_toggle.signal_connect("toggled") do |btn|
-      $filter_animals = btn.active?
-      respond "Animal filtering #{$filter_animals ? 'ENABLED' : 'DISABLED'}."
-      pw["filter_animals"] = $filter_animals
-      save_window_settings(settings)
+      PlayerWindow.filter_animals = btn.active?
+      respond "Animal filtering #{PlayerWindow.filter_animals ? 'ENABLED' : 'DISABLED'}."
+      pw["filter_animals"] = PlayerWindow.filter_animals
+      PlayerWindow.save_window_settings(settings)
       update_players(GameObj.pcs.reject { |pc| pc.name == Char.name })
     end
     header.pack_start(animal_toggle)
@@ -415,12 +470,12 @@ class PlayerWindowGtk
     end
     dec_btn.signal_connect("clicked") do
       @font_size = [@font_size - 1, 8].max
-      pw["font_size"] = @font_size; save_window_settings(settings)
+      pw["font_size"] = @font_size; PlayerWindow.save_window_settings(settings)
       reload_css
     end
     inc_btn.signal_connect("clicked") do
       @font_size = [@font_size + 1, 30].min
-      pw["font_size"] = @font_size; save_window_settings(settings)
+      pw["font_size"] = @font_size; PlayerWindow.save_window_settings(settings)
       reload_css
     end
 
@@ -441,16 +496,16 @@ class PlayerWindowGtk
 
     # now fill your popover
     listbox = Gtk::Box.new(:vertical, 0)
-    PW_PALETTES.each_key do |name|
+    PlayerWindow::PALETTES.each_key do |name|
       btn = Gtk::ToggleButton.new(label: name)
       btn.style_context.add_class("header-toggle")
       btn.style_context.add_class("palette-btn")
       btn.active = (name == pw["palette"])
       btn.signal_connect("clicked") do
-        settings = load_window_settings
+        settings = PlayerWindow.load_window_settings
         settings["playerwindow"] ||= {}
         settings["playerwindow"]["palette"] = name
-        save_window_settings(settings)
+        PlayerWindow.save_window_settings(settings)
         reload_css
       end
       listbox.add(btn)
@@ -512,10 +567,10 @@ class PlayerWindowGtk
       else
         x, y = @window.position
         w, h = @window.size
-        s = load_window_settings
+        s = PlayerWindow.load_window_settings
         s["playerwindow"] ||= {}
         s["playerwindow"].merge!("x" => x, "y" => y, "width" => w, "height" => h)
-        save_window_settings(s)
+        PlayerWindow.save_window_settings(s)
       end
       false
     end
@@ -540,7 +595,7 @@ class PlayerWindowGtk
 
     # - initial fill -
     pcs = GameObj.pcs.reject { |pc| pc.name == Char.name }
-    Gtk.queue { update_players(pcs, $playerwindow_group) }
+    Gtk.queue { update_players(pcs, PlayerWindow.group_display) }
   end
 
   # - update_players & player_status_fix remain unchanged -
@@ -561,10 +616,10 @@ class PlayerWindowGtk
       count_lbl.set_xalign(0)
       @flow.add(count_lbl)
       @flow.add(Gtk::Label.new(""))
-      pcs.sort_by { |pc| extract_noun(pc).downcase }.each do |pc|
-        noun   = extract_noun(pc)
-        status = player_status_fix(pc.status)
-        action_cmd = action_for_status(status, pc)
+      pcs.sort_by { |pc| PlayerWindow.extract_noun(pc).downcase }.each do |pc|
+        noun   = PlayerWindow.extract_noun(pc)
+        status = PlayerWindow.player_status_fix(pc.status)
+        action_cmd = PlayerWindow.action_for_status(status, pc)
         btn_label = status ? status : "look" # <--- THIS IS THE KEY
 
         row = Gtk::Box.new(:horizontal, 4)
@@ -599,20 +654,20 @@ class PlayerWindowGtk
   end
 end
 
-if @startup_request_gtk
-  if @gtk_available
+if @pw_startup_request_gtk
+  if PlayerWindow.gtk_available
     respond ""
     respond " Initiating GTK window."
     respond ""
     respond " GTK Playerwindow is active."
     respond ""
     Gtk.queue { PlayerWindowGtk.create_main_window }
-    start_gtk_main_if_needed
+    PlayerWindow.start_gtk_main_if_needed
   else
-    $use_gtk_playerwindow = false
+    PlayerWindow.use_gtk_playerwindow = false
     window_settings["playerwindow"] ||= {}
     window_settings["playerwindow"]["use_gtk_playerwindow"] = false
-    save_window_settings(window_settings)
+    PlayerWindow.save_window_settings(window_settings)
     respond ""
     respond " GTK Playerwindow disabled: gtk3 gem not available."
     respond ""
@@ -620,7 +675,7 @@ if @startup_request_gtk
 end
 
 # Standardize status names for players, prioritizing "stunned" over "prone".
-def player_status_fix(status)
+def PlayerWindow.player_status_fix(status)
   return "dead" if status =~ /dead/i
   return "stunned" if status =~ /stunned/i # Ensure "stunned" takes precedence
   return "sleeping" if status =~ /unconscious|slumber|sleeping/i
@@ -634,7 +689,7 @@ def player_status_fix(status)
   return nil
 end
 
-def oak_wand_check
+def PlayerWindow.oak_wand_check
   wands = {}
   GameObj.containers.each { |container| wands[container[0]] = []; GameObj[container[0]].contents.each { |item| wands[container[0]].push(item) if item.name =~ /oak(?:en)? (?:rod|wand)$/ } }
   return wands.first
@@ -642,12 +697,12 @@ end
 
 # ";e fput('get oak wand'); fput('wave wand at ##{player_id}')"
 # Determine action based on player status.
-def action_for_status(status, pc)
+def PlayerWindow.action_for_status(status, pc)
   case status
   when "stunned"
     if Spell[108].known?
       return ";e Spell[108].force_cast('##{pc.id}') if Spell[108].affordable?"
-    elsif (wand_object = oak_wand_check)
+    elsif (wand_object = PlayerWindow.oak_wand_check)
       wand_container_id = wand_object[0]
       wand = wand_object[1].first # Get the first wand in the array
       if wand # Ensure there's a wand to work with
@@ -668,12 +723,12 @@ def action_for_status(status, pc)
 end
 
 # Extracts the noun from the XML-based name format: <a exist="-11226620" noun="Lamamelodia">Lamamelodia</a>
-def extract_noun(pc)
+def PlayerWindow.extract_noun(pc)
   return pc.noun if pc.respond_to?(:noun) && pc.noun
   return pc.name # Fallback to name if noun is unavailable
 end
 
-def current_group_snapshot
+def PlayerWindow.current_group_snapshot
   group = Lich::Gemstone::Group
 
   group.check if !group.checked? || group.broken?
@@ -686,8 +741,8 @@ rescue StandardError => e
   nil
 end
 
-def get_group_display(snapshot = nil)
-  snapshot ||= current_group_snapshot
+def PlayerWindow.get_group_display(snapshot = nil)
+  snapshot ||= PlayerWindow.current_group_snapshot
   return nil unless snapshot
 
   names = snapshot[:members]
@@ -713,67 +768,66 @@ def get_group_display(snapshot = nil)
 end
 
 # Build and push the player list to the window, sorting by noun with dead players on top and arranged in two columns
-def push_players_to_window(pcs, group_display = nil)
-  group_display ||= $playerwindow_group
+def PlayerWindow.push_players_to_window(pcs, group_display = nil)
+  group_display ||= PlayerWindow.group_display
   sorted_pcs = pcs.sort_by do |pc|
-    status = pc.respond_to?(:status) ? player_status_fix(pc.status) : nil
+    status = pc.respond_to?(:status) ? PlayerWindow.player_status_fix(pc.status) : nil
     is_dead = status == "dead" ? 0 : 1
-    [is_dead, extract_noun(pc).downcase]
+    [is_dead, PlayerWindow.extract_noun(pc).downcase]
   end
 
   output = "<dialogData id='PlayerWindow' clear='t'>"
   current_top = 0
-  #  column_value = $pwsingle_column ? 'Layout: Single Column' : 'Layout: Two Columns'
+  #  column_value = PlayerWindow.single_column ? 'Layout: Single Column' : 'Layout: Two Columns'
   #  column_cmd = "*pwcolumns"
   #  output += "<link id='column_toggle' value='#{column_value}' cmd='#{column_cmd}' echo='Toggling Column Layout...' justify='bottom' left='0' top='#{current_top}' />"
   #  current_top += 20
 
-  if $pwsingle_column
+  if PlayerWindow.single_column
     # First row: Spam Filter toggle
-    filter_value = $filter_spam ? 'Spam Filter: ON' : 'Spam Filter: OFF'
+    filter_value = PlayerWindow.filter_spam ? 'Spam Filter: ON' : 'Spam Filter: OFF'
     filter_cmd = "*filterspam"
     output += "<link id='filter_toggle' value='#{filter_value}' cmd='#{filter_cmd}' echo='Toggling Spam Filter...' justify='bottom' left='0' top='#{current_top}' />"
     current_top += 20
 
-    flare_value = $filter_flares ? 'Flare Filter: ON' : 'Flare Filter: OFF'
+    flare_value = PlayerWindow.filter_flares ? 'Flare Filter: ON' : 'Flare Filter: OFF'
     flare_cmd = "*filterflares"
     output += "<link id='flare_toggle' value='#{flare_value}' cmd='#{flare_cmd}' echo='Toggling Flare Filter...' justify='bottom' left='0' top='#{current_top}' />"
     current_top += 20
 
-    combat_math_value = $filter_combat_math ? 'Combat Filter: ON' : 'Combat Filter: OFF'
+    combat_math_value = PlayerWindow.filter_combat_math ? 'Combat Filter: ON' : 'Combat Filter: OFF'
     combat_math_cmd = "*filtercombat"
     output += "<link id='combat_math_toggle' value='#{combat_math_value}' cmd='#{combat_math_cmd}' echo='Toggling Combat Filter...' justify='bottom' left='0' top='#{current_top}' />"
     current_top += 20
 
     # Animal Filter toggle last
-    animal_value = $filter_animals ? 'Animal Filter: ON' : 'Animal Filter: OFF'
+    animal_value = PlayerWindow.filter_animals ? 'Animal Filter: ON' : 'Animal Filter: OFF'
     animal_cmd = "*filteranimals"
     output += "<link id='animal_toggle' value='#{animal_value}' cmd='#{animal_cmd}' echo='Toggling Animal Filter...' justify='bottom' left='0' top='#{current_top}' />"
     current_top += 20
   else
-    # First row: Spam Filter toggle
-    filter_value = $filter_spam ? 'Spam Filter: ON' : 'Spam Filter: OFF'
+    # Double-column layout: two filter toggles per row (2x2 grid)
+    filter_value = PlayerWindow.filter_spam ? 'Spam Filter: ON' : 'Spam Filter: OFF'
     filter_cmd = "*filterspam"
     output += "<link id='filter_toggle' value='#{filter_value}' cmd='#{filter_cmd}' echo='Toggling Spam Filter...' justify='bottom' left='0' top='#{current_top}' />"
 
-    flare_value = $filter_flares ? 'Flare Filter: ON' : 'Flare Filter: OFF'
+    flare_value = PlayerWindow.filter_flares ? 'Flare Filter: ON' : 'Flare Filter: OFF'
     flare_cmd = "*filterflares"
-    output += "<link id='flare_toggle' value='#{flare_value}' cmd='#{flare_cmd}' echo='Toggling Flare Filter...' justify='bottom' left='0' top='#{current_top}' />"
+    output += "<link id='flare_toggle' value='#{flare_value}' cmd='#{flare_cmd}' echo='Toggling Flare Filter...' justify='bottom' left='180' top='#{current_top}' />"
     current_top += 20
 
-    combat_math_value = $filter_combat_math ? 'Combat Filter: ON' : 'Combat Filter: OFF'
+    combat_math_value = PlayerWindow.filter_combat_math ? 'Combat Filter: ON' : 'Combat Filter: OFF'
     combat_math_cmd = "*filtercombat"
-    output += "<link id='combat_math_toggle' value='#{combat_math_value}' cmd='#{combat_math_cmd}' echo='Toggling Combat Filter...' justify='bottom' left='180' top='#{current_top}' />"
-    current_top += 20
+    output += "<link id='combat_math_toggle' value='#{combat_math_value}' cmd='#{combat_math_cmd}' echo='Toggling Combat Filter...' justify='bottom' left='0' top='#{current_top}' />"
 
     # Animal Filter toggle last
-    animal_value = $filter_animals ? 'Animal Filter: ON' : 'Animal Filter: OFF'
+    animal_value = PlayerWindow.filter_animals ? 'Animal Filter: ON' : 'Animal Filter: OFF'
     animal_cmd = "*filteranimals"
-    output += "<link id='animal_toggle' value='#{animal_value}' cmd='#{animal_cmd}' echo='Toggling Animal Filter...' justify='bottom' left='0' top='#{current_top}' />"
+    output += "<link id='animal_toggle' value='#{animal_value}' cmd='#{animal_cmd}' echo='Toggling Animal Filter...' justify='bottom' left='180' top='#{current_top}' />"
     current_top += 20
   end
 
-  group_display ||= $playerwindow_group
+  group_display ||= PlayerWindow.group_display
   if group_display
     output += "<label id='group' value='#{group_display}' justify='bottom' left='0' top='#{current_top}'/>"
     current_top += 20
@@ -788,20 +842,20 @@ def push_players_to_window(pcs, group_display = nil)
   col_right = 180
   top_offset = current_top / row_height
 
-  slices = $pwsingle_column ? sorted_pcs.each_slice(1) : sorted_pcs.each_slice(2)
+  slices = PlayerWindow.single_column ? sorted_pcs.each_slice(1) : sorted_pcs.each_slice(2)
   slices.with_index do |pair, row|
     pair.each_with_index do |pc, col|
-      if $pwsingle_column
+      if PlayerWindow.single_column
         current_top += sorted_pcs.size * row_height
       else
         grid_rows = (sorted_pcs.size.to_f / 2).ceil
         current_top = row_height * (grid_rows + top_offset)
       end
 
-      noun = extract_noun(pc)
-      status = (pc.respond_to?(:status) && pc.status) ? player_status_fix(pc.status) : nil
+      noun = PlayerWindow.extract_noun(pc)
+      status = (pc.respond_to?(:status) && pc.status) ? PlayerWindow.player_status_fix(pc.status) : nil
       label_value = status ? "#{noun} (#{status})" : noun
-      action_cmd = action_for_status(status, pc)
+      action_cmd = PlayerWindow.action_for_status(status, pc)
 
       left = col == 0 ? col_left : col_right
       top = row_height * (row + top_offset)
@@ -817,113 +871,113 @@ end
 upstream_hook_id   = "#{Script.current.name}_upstream"
 downstream_hook_id = "#{Script.current.name}_downstream"
 
-UpstreamHook.remove(upstream_hook_id)   rescue nil
+UpstreamHook.remove(upstream_hook_id) rescue nil
 DownstreamHook.remove(downstream_hook_id) rescue nil
 
 UpstreamHook.add(upstream_hook_id, proc do |command|
   case command.strip.downcase
   when /\*filterspam/i
-    $filter_spam = !$filter_spam
-    respond "Spam filtering is now #{$filter_spam ? 'ENABLED' : 'DISABLED'}."
+    PlayerWindow.filter_spam = !PlayerWindow.filter_spam
+    respond "Spam filtering is now #{PlayerWindow.filter_spam ? 'ENABLED' : 'DISABLED'}."
 
-    settings = load_window_settings
+    settings = PlayerWindow.load_window_settings
     settings["playerwindow"] ||= {}
-    settings["playerwindow"]["filter_spam"] = $filter_spam
-    save_window_settings(settings)
+    settings["playerwindow"]["filter_spam"] = PlayerWindow.filter_spam
+    PlayerWindow.save_window_settings(settings)
 
     pcs = GameObj.pcs.reject { |pc| pc.name == Char.name }
-    push_players_to_window(pcs)
+    PlayerWindow.push_players_to_window(pcs)
 
   when /\*filteranimal(s)?/i
-    $filter_animals = !$filter_animals
-    respond "Animal filtering is now #{$filter_animals ? 'ENABLED' : 'DISABLED'}."
+    PlayerWindow.filter_animals = !PlayerWindow.filter_animals
+    respond "Animal filtering is now #{PlayerWindow.filter_animals ? 'ENABLED' : 'DISABLED'}."
 
-    settings = load_window_settings
+    settings = PlayerWindow.load_window_settings
     settings["playerwindow"] ||= {}
-    settings["playerwindow"]["filter_animals"] = $filter_animals
-    save_window_settings(settings)
+    settings["playerwindow"]["filter_animals"] = PlayerWindow.filter_animals
+    PlayerWindow.save_window_settings(settings)
 
     pcs = GameObj.pcs.reject { |pc| pc.name == Char.name }
-    push_players_to_window(pcs)
+    PlayerWindow.push_players_to_window(pcs)
 
   when /\*(pwflare|filterflare(s)?)/i
-    if $pw_flare_patterns.empty?
+    if PlayerWindow.flare_patterns.empty?
       respond "Flare filtering unavailable. flare_patterns.rb not loaded."
       next nil
     end
 
-    $filter_flares = !$filter_flares
-    respond "Flare filtering is now #{$filter_flares ? 'ENABLED' : 'DISABLED'}."
+    PlayerWindow.filter_flares = !PlayerWindow.filter_flares
+    respond "Flare filtering is now #{PlayerWindow.filter_flares ? 'ENABLED' : 'DISABLED'}."
 
-    settings = load_window_settings
+    settings = PlayerWindow.load_window_settings
     settings["playerwindow"] ||= {}
-    settings["playerwindow"]["filter_flares"] = $filter_flares
-    save_window_settings(settings)
+    settings["playerwindow"]["filter_flares"] = PlayerWindow.filter_flares
+    PlayerWindow.save_window_settings(settings)
 
     pcs = GameObj.pcs.reject { |pc| pc.name == Char.name }
-    push_players_to_window(pcs)
+    PlayerWindow.push_players_to_window(pcs)
 
   when /\*(pwcombat|filtercombat)/i
-    $filter_combat_math = !$filter_combat_math
-    respond "Combat filtering is now #{$filter_combat_math ? 'ENABLED' : 'DISABLED'}."
+    PlayerWindow.filter_combat_math = !PlayerWindow.filter_combat_math
+    respond "Combat filtering is now #{PlayerWindow.filter_combat_math ? 'ENABLED' : 'DISABLED'}."
 
-    settings = load_window_settings
+    settings = PlayerWindow.load_window_settings
     settings["playerwindow"] ||= {}
-    settings["playerwindow"]["filter_combat_math"] = $filter_combat_math
-    save_window_settings(settings)
+    settings["playerwindow"]["filter_combat_math"] = PlayerWindow.filter_combat_math
+    PlayerWindow.save_window_settings(settings)
 
     pcs = GameObj.pcs.reject { |pc| pc.name == Char.name }
-    push_players_to_window(pcs)
+    PlayerWindow.push_players_to_window(pcs)
 
   when /\*pwcol/i
-    $pwsingle_column = !$pwsingle_column
-    respond "Column Layout: #{$pwsingle_column ? 'Single' : 'Double'}"
+    PlayerWindow.single_column = !PlayerWindow.single_column
+    respond "Column Layout: #{PlayerWindow.single_column ? 'Single' : 'Double'}"
 
-    settings = load_window_settings
+    settings = PlayerWindow.load_window_settings
     settings["playerwindow"] ||= {}
-    settings["playerwindow"]["single_column"] = $pwsingle_column
-    save_window_settings(settings)
+    settings["playerwindow"]["single_column"] = PlayerWindow.single_column
+    PlayerWindow.save_window_settings(settings)
 
     pcs = GameObj.pcs.reject { |pc| pc.name == Char.name }
-    push_players_to_window(pcs)
+    PlayerWindow.push_players_to_window(pcs)
 
     nil
 
   when /\*pwmove/i
-    $show_movement = !$show_movement
-    respond "Player movement filtering: #{$show_movement ? 'ON' : 'OFF'}"
+    PlayerWindow.show_movement = !PlayerWindow.show_movement
+    respond "Player movement filtering: #{PlayerWindow.show_movement ? 'ON' : 'OFF'}"
 
-    settings = load_window_settings
+    settings = PlayerWindow.load_window_settings
     settings["playerwindow"] ||= {}
-    settings["playerwindow"]["show_movement"] = $show_movement
-    save_window_settings(settings)
+    settings["playerwindow"]["show_movement"] = PlayerWindow.show_movement
+    PlayerWindow.save_window_settings(settings)
 
     pcs = GameObj.pcs.reject { |pc| pc.name == Char.name }
-    push_players_to_window(pcs)
+    PlayerWindow.push_players_to_window(pcs)
 
   when /\*pwgtk/i
-    $use_gtk_playerwindow = !$use_gtk_playerwindow
-    respond "GTK Playerwindow is now #{$use_gtk_playerwindow ? 'ENABLED' : 'DISABLED'}."
+    PlayerWindow.use_gtk_playerwindow = !PlayerWindow.use_gtk_playerwindow
+    respond "GTK Playerwindow is now #{PlayerWindow.use_gtk_playerwindow ? 'ENABLED' : 'DISABLED'}."
 
     # persist the new setting
-    settings = load_window_settings
+    settings = PlayerWindow.load_window_settings
     settings["playerwindow"] ||= {}
-    settings["playerwindow"]["use_gtk_playerwindow"] = $use_gtk_playerwindow
-    save_window_settings(settings)
+    settings["playerwindow"]["use_gtk_playerwindow"] = PlayerWindow.use_gtk_playerwindow
+    PlayerWindow.save_window_settings(settings)
 
-    if $use_gtk_playerwindow
-      if @gtk_available
+    if PlayerWindow.use_gtk_playerwindow
+      if PlayerWindow.gtk_available
         Gtk.queue { PlayerWindowGtk.create_main_window }
-        start_gtk_main_if_needed
+        PlayerWindow.start_gtk_main_if_needed
       else
-        $use_gtk_playerwindow = false
+        PlayerWindow.use_gtk_playerwindow = false
         settings["playerwindow"]["use_gtk_playerwindow"] = false
-        save_window_settings(settings)
+        PlayerWindow.save_window_settings(settings)
         respond "GTK unavailable. Install gtk3 gem to enable GTK Playerwindow."
       end
     else
       # close it if it exists
-      if @gtk_available && defined?(PlayerWindowGtk) && PlayerWindowGtk.instance_variable_get(:@window)
+      if PlayerWindow.gtk_available && defined?(PlayerWindowGtk) && PlayerWindowGtk.instance_variable_get(:@window)
         Gtk.queue do
           PlayerWindowGtk.instance_variable_get(:@window).close
         end
@@ -933,28 +987,28 @@ UpstreamHook.add(upstream_hook_id, proc do |command|
     nil
 
   when /\*allgtk/i
-    $use_gtk_playerwindow = !$use_gtk_playerwindow
-    respond "GTK Playerwindow is now #{$use_gtk_playerwindow ? 'ENABLED' : 'DISABLED'}."
+    PlayerWindow.use_gtk_playerwindow = !PlayerWindow.use_gtk_playerwindow
+    respond "GTK Playerwindow is now #{PlayerWindow.use_gtk_playerwindow ? 'ENABLED' : 'DISABLED'}."
 
     # persist the new setting
-    settings = load_window_settings
+    settings = PlayerWindow.load_window_settings
     settings["playerwindow"] ||= {}
-    settings["playerwindow"]["use_gtk_playerwindow"] = $use_gtk_playerwindow
-    save_window_settings(settings)
+    settings["playerwindow"]["use_gtk_playerwindow"] = PlayerWindow.use_gtk_playerwindow
+    PlayerWindow.save_window_settings(settings)
 
-    if $use_gtk_playerwindow
-      if @gtk_available
+    if PlayerWindow.use_gtk_playerwindow
+      if PlayerWindow.gtk_available
         Gtk.queue { PlayerWindowGtk.create_main_window }
-        start_gtk_main_if_needed
+        PlayerWindow.start_gtk_main_if_needed
       else
-        $use_gtk_playerwindow = false
+        PlayerWindow.use_gtk_playerwindow = false
         settings["playerwindow"]["use_gtk_playerwindow"] = false
-        save_window_settings(settings)
+        PlayerWindow.save_window_settings(settings)
         respond "GTK unavailable. Install gtk3 gem to enable GTK Playerwindow."
       end
     else
       # close it if it exists
-      if @gtk_available && defined?(PlayerWindowGtk) && PlayerWindowGtk.instance_variable_get(:@window)
+      if PlayerWindow.gtk_available && defined?(PlayerWindowGtk) && PlayerWindowGtk.instance_variable_get(:@window)
         Gtk.queue do
           PlayerWindowGtk.instance_variable_get(:@window).close
         end
@@ -964,8 +1018,8 @@ UpstreamHook.add(upstream_hook_id, proc do |command|
     nil
 
   when /\*pwdebug/i
-    $pw_debug_filter = !$pw_debug_filter
-    respond "Playerwindow filter debug is now #{$pw_debug_filter ? 'ON' : 'OFF'}."
+    PlayerWindow.debug_filter_enabled = !PlayerWindow.debug_filter_enabled
+    respond "Playerwindow filter debug is now #{PlayerWindow.debug_filter_enabled ? 'ON' : 'OFF'}."
     nil
 
   else
@@ -973,11 +1027,11 @@ UpstreamHook.add(upstream_hook_id, proc do |command|
   end
 end)
 
-def debug_filter(reason, line)
-  echo "*** FILTERED by #{reason}: #{line.inspect}" if $pw_debug_filter
+def PlayerWindow.debug_filter(reason, line)
+  echo "*** FILTERED by #{reason}: #{line.inspect}" if PlayerWindow.debug_filter_enabled
 end
 
-@skip_next_line = false
+@pw_skip_next_line = false
 
 DownstreamHook.add(downstream_hook_id, proc { |line, _server_string|
   line = line.to_s # Ensure line is always a String.
@@ -985,7 +1039,7 @@ DownstreamHook.add(downstream_hook_id, proc { |line, _server_string|
   # Animal Companions, Familiars, Spirits
   blocked_nouns = ["albatross", "badger", "bandicoot", "banishara", "bat", "baza", "bear", "beetle", "bloodhound", "boar", "boarrat", "bobcat", "bush", "bushwag", "buzzard", "caiverine", "caligos", "caracara", "caraval", "canid", "capybara", "castorides", "cat", "catamount", "cheetah", "chameleon", "cockatiel", "colocolo", "condor", "cougar", "coydog", "coyote", "crow", "culpeo", "curhound", "curwolf", "cygnet", "deerhound", "dhole", "dog", "dobrem", "elf-owl", "eagle", "falcon", "fennec", "ferret", "fishing", "fox", "foxhound", "frog", "fossa", "giraffe", "goshawk", "graiphel", "groundhog", "gryfalcon", "gannet", "hare", "harpy", "harrier", "hedgehog", "heron", "howler", "hound", "hawk", "hawk-eagle", "hispid", "hummingbird", "hyena", "iguana", "jackal", "jabady", "jaguar", "jaguarundi", "jungle", "karet", "kingfisher", "kite", "kodkod", "ledisa", "lemur", "leopard", "lion", "lizard", "loper", "lugger", "lynx", "macaw", "magpie", "maned", "margay", "marmot", "marmoset", "mastiff", "melomys", "merlin", "mink", "mongoose", "monkey", "mole", "mouse", "mudcat", "muskrat", "muzzlerat", "narmo", "nutria", "ocicat", "ocelot", "oncilla", "opossum", "osprey", "owl", "panther", "parakeet", "parrot", "passo", "pelican", "penguin", "peregrine", "petrel", "phantom", "phantasma", "pigeonhawk", "pitohui", "porcupine", "pterosaur", "puppet", "puma", "puppy", "pygmy-parrot", "rabbit", "raccoon", "raptor", "rasper", "rat", "raven", "redtail", "ringtail", "rockrat", "rodent", "rowl", "sandrat", "samoyed", "saker", "screech-owl", "seal", "seagull", "seahawk", "sealion", "seal-pup", "serpent", "serval", "shrika", "shrike", "skua", "sloth", "snowcat", "snow-owl", "sparrowhawk", "spirit", "spider", "squirrel", "stratis", "swift", "tanuki", "tamarin", "tarsier", "tigrina", "tiger", "toad", "tothis", "toucan", "trakel", "tunnelcat", "turtle", "vole", "vulture", "warthog", "weasel", "whale", "whiskrat", "wildcat", "wolf", "wolfhound", "wolverine", "woodchuck", "woodpecker", "woodshrew", "wombat", "wyrdling", "viper", "mandrake", "lamb", "scarab", "teadragon", "kitten"]
 
-  if $filter_animals && line =~ /noun="([^"]+)"/i
+  if PlayerWindow.filter_animals && line =~ /noun="([^"]+)"/i
     nouns = line.scan(/noun="([^"]+)"/i).flatten.map(&:downcase)
     debug("Animal filter triggered: #{line.inspect}")
 
@@ -1020,14 +1074,14 @@ DownstreamHook.add(downstream_hook_id, proc { |line, _server_string|
     end
 
     # Animates
-    if $filter_animals && line =~ /<a .*?>([^<]*animated[^<]*)<\/a>/i
+    if PlayerWindow.filter_animals && line =~ /<a .*?>([^<]*animated[^<]*)<\/a>/i
       next nil
     end
   end
 
-  if $filter_flares && !$pw_flare_patterns.empty?
-    if $pw_flare_patterns.any? { |pattern| line =~ pattern }
-      debug_filter("FLARE (...)", line)
+  if PlayerWindow.filter_flares && !PlayerWindow.flare_patterns.empty?
+    if PlayerWindow.flare_patterns.any? { |pattern| line =~ pattern }
+      PlayerWindow.debug_filter("FLARE (...)", line)
       next nil
     end
   end
@@ -1038,16 +1092,55 @@ DownstreamHook.add(downstream_hook_id, proc { |line, _server_string|
   end
 
   # Combat math lines (independent of spam filter toggle)
-  if $filter_combat_math &&
+  if PlayerWindow.filter_combat_math &&
      (line =~ /^\s*AS:\s*/i ||
       line =~ /^\s*CS:\s*/i ||
-			line =~ /^\s*\[SSR result:/i ||
+      line =~ /^\s*\[SSR result:/i ||
       line =~ /^\s*\[SMR result:/i)
-    debug_filter("COMBAT MATH (...)", line)
+    PlayerWindow.debug_filter("COMBAT MATH (...)", line)
     next nil
   end
 
-  next line unless $filter_spam
+  # Suppress whitespace-only lines even when spam filter is disabled.
+  if line.strip.empty?
+    next nil
+  end
+
+  next line unless PlayerWindow.filter_spam
+
+  # Condensed death messaging (separate from decay filters below).
+  # Keep this early so broad pattern filters do not swallow death lines first.
+  if line =~ /collapses to the ground\, dead\.|succumbs to death\.|form goes still\.|surrendering to death\.|life goes out of|as the power animating| collapses\, life|\, lifeless\.|animation departs?|collapses into a puddle|talons and feathers\.|many eyes close\.|death claims|ground\, still\.|goes still in death\.|ground\, unmoving\.|begins (?:to lose|losing) cohesion\.|at last going still\.|sags\, lifeless\,/i
+    death_noun = PlayerWindow.extract_noun_from_line(line)
+    if death_noun && death_noun.downcase != Char.name.downcase
+      respond "#{death_noun} dies {?}".upcase.center(60)
+      next nil
+    end
+  end
+
+  # Filter spell-expiration lines from enemies/other players using built-in spell end messages.
+  if PlayerWindow.spell_falloff_line?(line)
+    PlayerWindow.debug_filter("SPELL FALLOFF (...)", line)
+    next nil
+  end
+
+  # Looting - No Silver
+  if line =~ /(?:<[^>]+>)*\s*(?:He|She|It)(?:<[^>]+>)*\s+didn't carry any silver\./i
+    PlayerWindow.debug_filter("No Silver (loot)", line)
+    next nil
+  end
+
+  # Looting - Nothing of Interest / Value
+  if line =~ /(?:<[^>]+>)*\s*(?:He|She|It)(?:<[^>]+>)*\s+had nothing (?:of interest|else of value)\./i
+    PlayerWindow.debug_filter("Nothing of Interest (loot)", line)
+    next nil
+  end
+
+  # Looting - Decay Message (raw XML-safe, snippet style)
+  if line =~ /goes still in death|immense form decays away into a mound of|crumbles and decays away\.|sublimates rapidly into luminous mist that swiftly disperses into the air|seep into the ground and vanish|collapsing into a lightless sphere that erupts soundlessly\, bathing the area in momentary darkness|falls away to reveal only crumbling bones|quickly decays away|flesh crumbles to reveal the corpse of|Traceries of mold race to reclaim|Rivulets of golden light blush beneath the skin of|Shadows coil around the broken form of|body rots away\, leaving only a small stain on the ground|decays away, leaving behind little more than dust|finally stops twitching and decays away|body\, leaving little behind\.|corpse succumbs to rot|^Creeping decay races across|collapses into a pile of tangled wool and huge bones|remnants rapidly dissolving into the air\.|dissolve away\, leaving nothing behind\.|decays into compost\.|quickly scattering and dissolving out of sight\.|body crumbles until only a pile of rubble marks|then fades from view like a dissipating phantom|decays into a pile|bony form as fingers of rust race to consume|collapses into blanched powder and blows away\.|dance before drifting away\.|leaving little but brittle bones\.|breaking into fine black powder\.|yellowing bones and stinking effluvia\.|the remaining folds of skin\.|into shards of inert ice\.|ruined meat and patchy bristles\.|and soon nothing more than a grim| pile of reddish\-black grit\.|surrenders to decay\.|erupts into a cloud of dust\!|fades into nothingness\,/i
+    PlayerWindow.debug_filter("Decay Message (loot)", line)
+    next nil
+  end
 
   # Always allow core XML state signals through
   if line =~ /<indicator /
@@ -1145,13 +1238,13 @@ DownstreamHook.add(downstream_hook_id, proc { |line, _server_string|
   end
 
   if line =~ %r{^(<nav rm='|<d cmd='go )}
-    @skip_next_line_after_player_component = false
+    @pw_skip_next_line_after_player_component = false
     next line
   end
 
   # Skip certain You lines
-  if line =~ /You are blinded momentarily by a flash of intense light\.|You notice .*? moving stealthily|You hear someone reciting a series of mystical phrases|You hear someone calling upon the powers of the elements|You hear someone chanting an arcane phrase|You feel more refreshed|You hear a distant song that lifts your spirits and touches memories of revelry long past|As your sight returns\, you realize|You see a blur out of the corner of your eye\, and .*? suddenly appears\.|You hear very soft footsteps\.|You hear someone deeply intoning a sonorous mantra|You see a golden ripple of light out of the corner of your eye that is reminiscent of a forge|You notice quicksilver seeping up from a nearby crack in the ground\,|You hear someone preparing a spell nearby|^You hear a slight crackling sound as .* slides .* into .*\.|Rising on the air\, the sound of horses\' clip\-clopping hooves greets your ears\, and within seconds you|^A veritable horde of butterflies descends on the area from every direction\,|^Pale\, swirling mist begins to billow out from nothingness before you\, and quickly coalesces into a small orb of shifting essence\.|^A large iridescent bubble floats into view and drifts down to the ground\,|^A greenish pulsing glow builds around|^A whirling bluish\-gray mist quickly coalesces nearby|^Shattered pieces of porcelain arrive on an errant breeze and begin to assemble themselves before your very eyes|^You feel .* protection extend to you as an incandescent veil coalesces around you|^You discard the .*? useless equipment\./
-    debug_filter("CERTAIN YOU LINE (...)", line)
+  if line =~ /You are blinded momentarily by a flash of intense light\.|You notice .*? moving stealthily|You hear someone reciting a series of mystical phrases|You hear someone calling upon the powers of the elements|You hear someone chanting an arcane phrase|You feel more refreshed|You hear a distant song that lifts your spirits and touches memories of revelry long past|As your sight returns\, you realize|You see a blur out of the corner of your eye\, and .*? suddenly appears\.|You hear very soft footsteps\.|You hear someone deeply intoning a sonorous mantra|You see a golden ripple of light out of the corner of your eye that is reminiscent of a forge|You notice quicksilver seeping up from a nearby crack in the ground\,|You hear someone preparing a spell nearby|^You hear a slight crackling sound as .* slides .* into .*\.|Rising on the air\, the sound of horses\' clip\-clopping hooves greets your ears\, and within seconds you|^A veritable horde of butterflies descends on the area from every direction\,|^Pale\, swirling mist begins to billow out from nothingness before you\, and quickly coalesces into a small orb of shifting essence\.|^A large iridescent bubble floats into view and drifts down to the ground\,|^A greenish pulsing glow builds around|^A whirling bluish\-gray mist quickly coalesces nearby|^Shattered pieces of porcelain arrive on an errant breeze and begin to assemble themselves before your very eyes|^You feel .* protection extend to you as an incandescent veil coalesces around you|^You discard the .*? useless equipment\.|^You twinge slightly as your Empathic Link to|^You feel the unnatural surge of necrotic power wane away/
+    PlayerWindow.debug_filter("CERTAIN YOU LINE (...)", line)
     next nil
   end
 
@@ -1168,159 +1261,141 @@ DownstreamHook.add(downstream_hook_id, proc { |line, _server_string|
   end
 
   # SECOND LINE OF SPELL CAST
-  if @skip_next_line
-    @skip_next_line = false
-    debug_filter("SKIPPING SECOND LINE OF SPELL CAST (...)", line)
+  if @pw_skip_next_line
+    @pw_skip_next_line = false
+    PlayerWindow.debug_filter("SKIPPING SECOND LINE OF SPELL CAST (...)", line)
     next nil
   end
 
   # Gesture & Sing
   if line =~ /gestures at you\./
-    @skip_next_line = false
+    @pw_skip_next_line = false
   elsif line =~ /<a [^>]+>[^<]+<\/a> gestures at <a [^>]+>[^<]+<\/a>\./i ||
         line =~ /<a [^>]+>[^<]+<\/a> gestures at a/i ||
         line =~ /<a [^>]+>[^<]+<\/a> makes a complex gesture at <a [^>]+>[^<]+<\/a>\./i ||
         line =~ /gestures\.|makes a complex gesture\.|continues to wax\.|skillfully begins to weave another verse into|sings a melody\.|gestures into the air\./
-    debug_filter("GESTURE (...)", line)
-    @skip_next_line = true
+    PlayerWindow.debug_filter("GESTURE (...)", line)
+    @pw_skip_next_line = true
     next nil
   end
 
   # STANDARD SPELL PREP
   if line =~ /\.\.\.\s*$/ && line !~ /^You\b/ && line !~ /^Your\b/ && line !~ /#{Regexp.escape(Char.name)}/
-    debug_filter("STANDARD SPELL PREP (...)", line)
+    PlayerWindow.debug_filter("STANDARD SPELL PREP (...)", line)
     next nil
   end
 
   # CUSTOM SPELL PREP
   if line =~ /rips the ethereal image asunder\, the motes coalescing at the tips of|rests a hand on .* chest\, eyes closed\, as a faint hum slowly builds in the air nearby\.|begins to make sinuous gestures with both hands\.|^Weaving .* hands in a complicated pattern\,|.* murmurs words of power into the air, summoning the elements to do .* bidding\.|.* intones a mystical orison, petitioning for the aid of .* patron\.|.* murmurs soft words into the air, the liquid syllables summoning the spirits to .* aid\.|.* traces a burning rune into the air, melding the spiritual and elemental powers by sheer force of will\.|.* whispers quietly into the wind, summoning the forces of nature to .* call\.|.* raises .* voice in rhythmic song, commanding the aid of the elements\.|.* lifts .* voice in a rallying cry, calling confidently on the power of .* patron for aid\.|.* weaves .* hands through the air, streamers of elemental mana twisting between .* fingers\.|.* raises .* clasped hands, fervently calling on the guidance of .* patron\.|.* outlines a luminous rune in the air, summoning the spirits to .* aid\.|.* scribes a hazy, dark sigil into the air, fusing elemental and spiritual power\.|.* casts .* voice into the air, causing the spirits to swirl around (?:him|her|them) with a sound like rustling leaves\.|.* lifts .* voice in song, skillfully twining elemental mana into .* harmony\.|.* traces .* patron's holy symbol in the air, using it to focus .* invocation\.|.* quickly intones a battle chant, imploring .* patron to lend (?:him|her|them) aid\.|.* melds a climactic chord into .* melody, .* voice rising in a crescendo\.|.* murmurs a twisting phrase, commanding both the elements and spirits together\.|.* invokes a short blessing, .* hands clasped in prayer\.|.* chants a short phrase, embers leaping from .* fingertips, as .* clenches .* hand into a smoke-shrouded fist\.|.* intones a mystical phrase, .* words flowing in a burst of speed, as .* hands move rapidly\.|.* chants a reverent prayer, imploring .* patron for aid in restoring the fallen to life\.|.* whispers a mystical phrase, as a nebulous haze shimmers into view around .* hands, casting them in murky shadows\.|.* whispers a mystical phrase, as pearlescent energy builds around .* hands, casting them in an opalescent silhouette\.|.* utters a sharp phrase, tiny thorns rippling across .* arms in a wave that moves toward .* hands\.|.* tucks .* hand behind .* back for a moment before moving it back to .* side\.|.* shower of sparks cascade from .* hands as .* intones a few words\.|.* gallimaufry of sounds pours from .* mouth as .* stumbles over some words\.|.* utters a plaintive plea to .*\.|.* lips move soundlessly\.|.* whispers a short prayer to .* followed by a soft incantation\.|.* fingertips momentarily glow a deep sanguine red as .* murmurs a few words\.|Looking bored, .* drones out a few words in a monotone\.|.* steeples .* fingers together and touches .* forehead to .* thumbs as .* prepares a spell\.|.* makes small, intricately twisting movements with .* hands at .* chest before projecting them outward abruptly\.|Inky shadows and twinkling lights commix around .* in a hypnotic eddy\.|.* rasps out a few words as tendrils of white smoke slither from .* mouth\.|Seven phantom tentacles sprout from the base of .* spine, wrapping .* in a binding embrace\.|.* gestures and quietly utters a phrase of magic\.|.* whispers something softly, and a whirlwind of flower petals envelops (?:him|her|them) before fading away into nothingness\.|Crystalline snowflakes drift softly down upon .* as .* says a few words\.|The scent of mournblooms fills the air as .* speaks a few words\.|A loud ticking sound emanates from .* as .* murmurs a short phrase\.|.* invokes the fury of a storm as .* prepares a spell\.|Anguished whispers amplify into a cacophony of sound that nearly drowns out .* attempts to prepare a spell\.|.* sketches a tart symbol and mutters an invocation to an unintelligible arkati followed by cheerful recitation\.|As .* slowly chants, swirls of tea-scented steam twist about .* before fading to nothingness\.|hands over the ground\, and a sudden chill fills the air as shadows rise to|chants in an arcane language which causes|face suddenly darkens as a ghostly death mask pinches|calling the forces of nature to aid|A swarm of ethereal crimson butterflies circle around|Polychromatic tentacles wrap about .* as .* chants a magical phrase\.|wrists and condenses into thrice\-wrapped coils as|face twisted with pain as if .* very bones are aflame|upturned palms and drift upwards as they build in intensity|traces a series of glowing runes along|whispers a quiet invocation\.|intones a sonorous mantra and shifts|Reciting the mystical phrases of|skin is suffused with a subtle gold glow as|pulses with a white-blue light\!|murmurs a brief incantation with a casual gesture\.|A soft\, white glow briefly surrounds|A strange cracking noise cuts across|hums an ancient hymnal that causes the shadows to strectch towards|intones a soft prayer and the patterns, which now dance like eels beneath waves|Calling out to the powers of chaos and life|Mystical phrases fill the air|whispers and a strawberry-hued wisp is summoned, flitting around|sending the cat back down its awkward perch as it accepts its bounty|murmurs a prayer to the spirits of the|eyes to the heavens as the fading image of Liabo appears behind|quickly growing in size as numerous sinuous misty tentacles reach out from within their untold depths|Someone begins singing|As someone sings|Someone unseen begins singing|eyes in concentration\, the runes on|murmurs a prayer to the dead that is an entreaty for aid|renews .* songs|stops singing\.|shaped vortex of air moves|releases upon .* a flurry of abjurations|Suddenly, a small bolt of energy arcs between them|eyes, looking slightly drained\.|strains, but nothing happens\.|The powerful look leaves|The light blue glow leaves|The very powerful look leaves|The white light leaves|The deep blue glow leaves|an eerie white glow blurring the outline of the bones beneath|Grating out an incomprehensible phrase|asking to be empassioned and have his desires fulfilled\.|fingers weave gossamer threads of energy into a weblike sigil\.|quickly intones a battle chant\, imploring|beseeches a reverent phrase while manifesting the elements\.|beseeches a reverent phrase while manifesting the elements\.|eyes flare and then emanate an amalgamation of elemental energy|With a sudden burst of enthusiasm, the sparks jump into .*? seems to glow with power\.|A vibrant stream of rainbow colors burst forth\, streaming alongside .*? motions before dispersing into an imperceptible mist\.|languidly traces a rune in the air\.|patron as sunlit gold radiance begins to take form\, swirling violently around|removes one of the chords from .*? harmony while maintaining the symmetry of those that remain\.|fingers\.\.\. but little else happens\.|gestures discreetly while murmuring a quiet incantation|stirring fingers through the ephemeral wings on|plucks two illusory strands out of the air and knots them together\.|gestures and utters a phrase of magic\.|prepares to sing\.|skillfully begins to weave another verse into|sings\, a squall of wind briefly swirls about|gestures while calling upon the lesser spirits for aid|A caliginous power manifests around|completes several complex gestures while an incantation tumbles from|intonation carrying a somber but determined quality\.|hums an ancient hymnal that causes the shadows to stretch towards|A salty sea breeze stirs as .* chants an old sailor's ditty|invokes the spirits of the harvest|sings a melody\, directing the sound of|hums a nearly inaudible tune\.|hand through the air\, cutting invisible runes\.|skillfully weaves another verse into|hisses a magical phrase at an incomprehensibly rapid pace\.|^Flickers of verdant green light emanate from|whispers arcane incantations\, and the air about|eyes glow crimson as a swarm of ethereal crimson\-eyed scarabs envelop|invokes the virtues of the stars, swirls of constellations appearing momentarily beneath|^The branches of .* sprout fresh green leaves in harmony with .* magical incantations\.|^The folds of .* float for a moment\, drifting in the currents of a phantom wind as .* calls the spirits to his aid\.|^As .* begins .* incantations\, the .* encircling .* begin to brighten as the fire lashes out\, engulfing/i
-    debug_filter("CUSTOM SPELL PREP (...)", line)
+    PlayerWindow.debug_filter("CUSTOM SPELL PREP (...)", line)
     next nil
   end
 
   # Effects or Spells Beginning
   if line =~ /is surrounded by a white light\.|energy flicker restlessly about|A shimmering aura surrounds|form seems to momentarily waver and blend with the shadows\.|form shifts back from the shadows\.|With a crackling and splintering sound\, a latticework|vines dotted with crimson\-tipped thorns wrap eagerly about|carefully recombining the two halves of|body seems to glow with an internal strength\.|Wisps of blue flame crackle like static around|appears considerably more powerful.|The barrier of thorns surrounding|gains a look of renewed cognition of|assumes a stern, rough countenance, though|A faint blue glow surrounds|As the fragrant haze settles over .*? looks revitalized\.|blurs before your eyes\.|exhibits a much more regal air, power coursing through|appears to be keenly aware of|A faint .*? haze briefly tints the air about|appearance shimmers briefly\.|A brilliant aura surrounds|stands tall and appears more confident\.|as the violet flames surrounding it gain new life|causing violet flames to spring to life around it|blurs before your eyes\.|A fiery aura envelops|stops shimmering\.|The evanescent shield shrouding|Granules of cobalt light coalesce and dance around|Motes of .*? light appear and begin to swirl around|A sphere of snapping and crackling ethereal ripples expands outward from|Bolts of electricity dance restlessly around|The tempest of electricity swirls violently around|The sanguine liquid is visible for only an instant before it sinks into|Strands of translucent mana swirl about .*? in a protective barrier\.|You hear a loud \*POP\* come from .*? muscles\!|A churning spectral aura suddenly materializes around|appears filled with a confident and fearless composure\.|Dark red droplets seep out of .*? skin and evaporate\.|body suddenly grows darker\.|stands taller\, as if bolstered with a sense of confidence\.|body is surrounded by a dim dancing aura\.|is surrounded by a shimmering field of energy\.|appears somehow changed\.|is again\.  Perhaps it was a trick of the light\.|muscles seem to strain for an instant\.  A sense of loss can be seen in|face takes on a curiously blank expression\.|gives .*? arms a quick shake\.|sings something in Guildspeak that you don't understand\.|The .*? seems to respond to the magic of .*? song\.|A look of intense focus comes over|seems to blend into the surroundings better|The air about .*? shimmers slightly\.|looks more aware of the surroundings\.eyes begin to shine with an inner strength\.is surrounded by an aura of natural confidence\.|begins to move with cat\-like grace\.|suddenly looks much more dextrous\.|looks charged with power\.|basks in a divine force that suddenly surrounds|and it dissolves into a puff of emerald-hued smoke\.  A verdant mist seeps from|the gem appears to improve in quality and color\.|sparkles a little more and is void of some natural imperfections\.|the gem appears to improve in quality and color\.|is surrounded by an aura of natural confidence\./ && line !~ /#{Regexp.escape(Char.name)}/
-    debug_filter("EFFECTS BEGINNING (...)", line)
+    PlayerWindow.debug_filter("EFFECTS BEGINNING (...)", line)
     next nil
   end
 
   # Effects or Spells Ending
   if line =~ /seems hesitant, looking unsure of|seems slightly different|air stops shimmering around|spirits are no longer lifted|undulate and grow stronger|slow down and become less nimble|slow down and become a bit less nimble|energy fades from around|gleam fades from|creaks and twists briefly before disintegrating|returns to its natural state|look of grim determination|slowly exhales as|suddenly appears less powerful|seems somewhat less buoyant|posture becomes noticeably more relaxed|The bright luminescence fades from around|appears to be less protected|appears to lose some confidence|The shimmering aura fades from around|loses some awareness\.|seems a bit less imposing\.|appears slightly less composed\.|The wall of force disappears from around|The mote of white light next to|becomes unbalanced for a second, then recovers\.|appears to lose some internal strength\.|The appearance of great calm leaves|The brilliant aura fades away from|The faint blue glow fades from around|complexion returns to normal\.|dull golden nimbus fades from around|look of renewed cognition fades\.|seems to thin slightly\.|becomes solid again\.|aura suddenly vanishes from around|undulate and fade away\.|movements no longer appear to be influenced by a divine power|seems less resolute\.|chest slows before dying away with a final burst of energy|blood shield shrivel and dry|doesn't seem quite the same as|The lust for blood fades from|flare up one last time before vanishing with a staticky crackle\.|suddenly stops moving light\-footedly|A few withered tendrils of .*? fall away from|body\, swiftly dissipating into the air\.|relaxes a little\.|seems to lose some dexterity\.|returns to normal color\.|The brilliant luminescence fades from around|regal air swiftly drifts away\.|Cobalt light separates itself from|Slowly evaporating, a faint hint of brine is all that remains upon|falls away\, unraveling as it fades\.|ethereal censer fades away\, leaving only a faint lingering scent of incense\.|The .*? fades from .*? eyes\.|The misty halo fades from|The focused look leaves|A blue\-green aura briefly flares up .*? before dissipating into nothingness\.|An incandescent veil fades from|The shimmering multicolored sphere fades from around|The tingling sensation and sense of security leaves|The silvery luminescence fades from around|glances around, looking a bit less confident\.|surge of empowerment fades\.|posture relaxes briefly\.|The sparking electricity surrounding|hazy and indistinct form returns to normal\.|appears somehow different\.|is no longer protected by the shimmering field of energy\.|no longer bristles with energy\.|The layer of raw elemental energy surrounding|spell falters as it takes hold on|one last time before fading entirely\.|The swirling whirlwind around|A faint silvery glow fades from around|The forceful strain in|glistening faintly before stilling to normalcy|looks less calm and refreshed than a moment ago\.|skin withdraw\, submerging out of sight|appears less dazed and confused\.|The rage fades from|The fiery aura surrounding|The ineffable aura of allure fades from|A look of concentration briefly passes across|loses .*? murky complexion\.|skin settles into quiescence\.|tension abates somewhat\.|suddenly shoot off in all directions, then quickly fade away\.|appears less confident\.|begins to breathe less deeply\.|The dim aura fades from around|Deep blue motes swirl away from|The opalescent aura fades from around|The dim aura fades from around|The air calms down around|A silvery fog coalesces around|stance\, no longer braced for impact|barrier flashes rapidly and the sound of breaking crystal can be heard as it cascades down around|sloughing away with a faint shimmer\.|The scant motes of darkness clinging to|The subtle nimbus that radiates from|The blood red haze dissipates from around|Swirls of mana encircling .*? slowly dissipate|seems to lose some internal strength\.|flickers once and shudders before fading completely\.|Dim steel grey lines of energy flicker one last time about|The radiant golden light that fills|As abruptly as it began\, the tailwind embracing .*? goes still\.|looks slightly less tense than he did a moment ago\.|intense rage dwindles away\.|appears less secure\.|The pure white radiance swirling around|shimmers and flickers briefly before fading\.|^An ethereal golden collection bowl drifts out of/ && line !~ /#{Regexp.escape(Char.name)}/
-    debug_filter("EFFECTS ENDING (...)", line)
+    PlayerWindow.debug_filter("EFFECTS ENDING (...)", line)
     next nil
   end
 
   # Scripted Items
   if line =~ /idly spins the base of|and adopts a nefarious expression\.|center-most crystal winks briefly, but nothing else happens|A ripple of .*? light shimmers over the surface of the|A brief shimmer of .*? light erupts from inside the|A fiery plume of hissing smoke trails|then sets to work on each piece, meticulously checking the shaft, fletching, and tips for damage|the illumination of its sigils slowly ebbs away|touch, a number of sigils worked into its grain take on a faint luminescence|tracing the outline of an arcane sigil before sinking away|armoire|and the .*? flying above .*? shoulder glow slightly\.|shoulder places its hands out in front of itself|shoulder whispers something to|single .*? tentacle rises from its surface|at the top of .* disappearing back into the|The .*? flying over .*? shoulder says|and removes the silky strands that were binding it to|pushes the heel of .*? empty hand against|Fibrous tendrils of mana coalesce from the surroundings and coats|ear as the magical ward protecting|ripples faintly with contained energy\.|burst into baneful white flames|Impenetrable darkness erupts midair for a moment before vanishing into nothingness\.|separates the weapon into two halves\.|appears incorporated into some of the decorations on the|their rhythmic movement an ever\-shifting constellation|The distorted surface begins to mend as glyphs appear and fade across its surface|shoulder vanishes in a brief, white flash of light\.|eyes glow brightly for a moment and .*? appears energized\!|and adopts a grim look of empowerment\.|burst into pure white flames\!|Several sigils incised along .*? flicker briefly with|A low thrumming \*BOOM\* fills the area as ethereal motes form into a small pile of flickering sand that collects at|by the loop on the end of its handle\.|The latticework of .*? surrounding the|murmured invocation\, the sigil\'s power blazes forth in trails of pale energy and surges into|gently taps and strokes the vines wrapped around .*? and the vines recede|A wayward .*? shoulder and drifts to the floor.|glimmers of .*? energy flicker away from its billowing fabric like sparks and swirl around|runes scribed into the grain of its pole flare bright and fade in sequence one after another in a pattern reminiscent of tumbling embers|and an impenetrable darkness erupts around|fist\, a faint flicker of energy dances about|with a flash of .*?  A powerful burst of .*? lingers briefly in the air\.|hand drags itself by dint of arm strength and sheer will up|A low crackling sound accompanies the momentary flare of a sigil on|The mirror-like clones of the .*? fade away\.|flying over .*? shoulder says|skin painfully rip away\, vines quickly retreating\.|the shroud of misty white thorns coalescing around it part slightly|causing the coraesine relic bound to hilt to take on|invokes the .*? name of the gods|light\.  A low rumble lingers briefly in the air\.|bracer twice in quick succession\, opening a small spring-loaded compartment|easily plucks .*? out of it and twists the end cap back into place\.|With a quick flourish .*? notes the foraged item with a few strokes of chalk before placing the writing instrument back into the|Bending over .*? and plucks it free from|^A lump bulges the skin of|opening its lid and shaking a|into a series of straps on the back of|A hissing cloud of green necrotic haze trails|^With careful precision\,|^With a sudden cross\-body motion toward|lifts the sheer gauze veil on|dramatically brushes .* fingers lightly across .* case\, causing a spark to ignite across the surface\.|^A .* energy trails .* as .* stows it in|^Ribbons of bluish\-green light burn into existence and swirl around|^An ethereal bluish\-green light swirls around the blade of|^A haze of virescent fumes dissipates from around .* as .* slings it over .* shoulder\./ && line !~ /#{Regexp.escape(Char.name)}/
-    debug_filter("SCRIPTED ITEM (...)", line)
+    PlayerWindow.debug_filter("SCRIPTED ITEM (...)", line)
     next nil
   end
 
   # Selling Interaction
   if line =~ /<a [^>]*?noun="([^"]+)">[^<]*<\/a>\s*?(steps)|glances at it briefly\, then hands <a [^>]*?noun="[^"]+">(?:him|her)<\/a>|^[A-Z][a-z]+ asks .* if .* would like to buy.*|^[A-Z][a-z]+ asks .* to appraise|^The <pushBold\/><a [^>]*?noun="([^"]+)">[^<]*<\/a><popBold\/> says\, \"Sorry\, <a [^>]*?noun="([^"]+)">[^<]*<\/a>\, I'm not buying anything this valuable today\.  Maybe tomorrow\.\"|^The <pushBold\/><a [^>]*?noun="([^"]+)">[^<]*<\/a><popBold\/> removes the gems and hands|^The <pushBold\/><a [^>]*?noun="([^"]+)">[^<]*<\/a><popBold\/> takes .*?\, inspects the contents carefully\, and removes the gems|and says\, \"I don't have that much spare silver\, so I will have to give you a|^The <pushBold\/><a [^>]*?noun="([^"]+)">[^<]*<\/a><popBold\/> takes .*? inspects (?:it|the contents) carefully|^The <pushBold\/><a [^>]*?noun="([^"]+)">[^<]*<\/a><popBold\/> says\, \"That's not quite my field\,|^The <pushBold\/><a [^>]*?noun="([^"]+)">[^<]*<\/a><popBold\/> then returns .*? to|^<a [^>]*?noun="([^"]+)">[^<]*<\/a> touches .*? as .*? asks <pushBold\/><a [^>]*?noun="([^"]+)">[^<]*<\/a><popBold\/> a question\.|^[A-Z][a-z]+ steps aside to talk with .*? about|^<pushBold\/><a [^>]*?noun="([^"]+)">[^<]*<\/a><popBold\/> takes .*?\, examines it\, and quickly returns it to .*? with a shrug\.|^<a [^>]*?noun="([^"]+)">[^<]*<\/a> asks .*? (?:to appraise|if he would like to buy)|Grundael takes .*?\.  Realizing it's empty\, his face reddens and he returns it\.|Grundael frowns and says\, \"Oh no no\.\.\./ && line !~ /#{Regexp.escape(Char.name)}/
-    debug_filter("SELLING (...)", line)
+    PlayerWindow.debug_filter("SELLING (...)", line)
     next nil
   end
 
   # Inventory Interaction
   if line =~ /^<a [^>]*?noun="([^"]+)">[^<]*<\/a>\s*?(absent\-mindedly drops|adjusts|attaches|brushes|carefully adds|carefully eyes|carefully hangs|carefully pins|carefully places|carefully pours|carefully removes|carefully secures|carefully unpins|carefully straps|casually tosses|deftly removes|digs|discreetly stows|discreetly removes|drapes|draws|equips|fiddles with the|flips|flutters out from inside .*? dropping|gently layers|grabs|hangs|is admiring|just opened|just closed|passes|pops|pours|presses|produces|pulls|pulls back|pulls on|pushes|puts|put .*? in|put .*? in|quickly whips|raises|reaches|removes|retrieves|rummages|searches through|secures|securely attaches|seizes|sheathes|slides|slings|slips|stows|summons a swarm|swaps|takes|throws|traces|tosses|tries|tucks|twists|unsheathes|vanishes|withdraws|works|opens the various containers on|closes the various containers on)|reaches toward the|slides out a|With a slight roll of .*? shoulder|vanishes into the depths of|seemingly floats up out of|^Slipping its loop from|^Flicking .*? opens the blades of .*? in one smooth\, silent motion\.|^As .*? draws a|from a series of straps on the back of|then suddenly several articles of clothing fly out of the|one of the smaller compartments inside|squeezes .*? with all of .*? might and it shatters apart, revealing|carefully applies dollops of .*? poison to key areas of|picks at the knot holding|ties .*? shut tightly\./ && line !~ /#{Regexp.escape(Char.name)}/
-    debug_filter("INVENTORY (...)", line)
+    PlayerWindow.debug_filter("INVENTORY (...)", line)
     next nil
   end
 
   # Drinking, Eating, Healing, Transferring
   if line =~ /takes a drink|takes a bite|concentrates|gradually fades\, forming on|dwarf empath tattoo|begins to look better as the cuts on|focuses on .* with intense concentration|The cuts on .*? close and the bruises fade|The scar on .*? glows faintly white before fading altogether|The bruises around .*? fade\.|begins to look a little better\.|appears entirely restored\.|looks much more calm and refreshed\.|veins stand out briefly\.|begins to look better|gradually fades\, affecting|fingertips using a gentle\, circular motion\.|pours a dose|flesh as dark essence restores|wavers with sudden fatigue|looks better\.|skin looks healthier\.|loses some of .*? pallor.|bears the wound in|gobbles down a big bite|in one enormous bite|There is a bright flash and|flinches visibly in pain as|with an air of determination\.|An image of Liabo reflects in|is bathed in a column of silver moonlight\, invigorating|is bathed in a column of silver moonlight\, fully restored at|own keeping\, leaving behind new-grown flesh\.|Golden\-green warmth extends from|looks a little better\.|forages around briefly|forages briefly and manages to find|A swarm of scarabs erupts below .*? removing|^Crimson mist seeps from|skin takes on a slight flush as|wounds begin to mend as the argent cocoon pulses with light|then dissolves into thousands of tiny lights before fading away|mouth open\, and pours in a small amount of/ && line !~ /#{Regexp.escape(Char.name)}/
-    @skip_next_line = true
+    @pw_skip_next_line = true
     next nil
   end
 
   # Lockpicking
   if line =~ /^<a [^>]*?noun="([^"]+)">[^<]*<\/a>\s*?(begins to meticulously examine|detaches a|settles into the difficult task of picking the lock on|appears extremely focused|looks up with a big grin on|goes about disarming|no longer appears focused|speaks briefly with|fiddles with .*? for a moment|gets .*? stuck in the lock|carefully pushes a small wad of cotton into the lock mechanism.\|removes a pair of metal grips from|refines .*? a bit\.)|Then\.\.\.CLICK\!  It opens\!|and slips it into the crack between the lid and the base, apparently cutting something within|and carefully reaches into the locking mechanism|The scintillating light fades from .*? hands\.|Using a pair of metal grips|peers thoughtfully into the lock mechanism of|Taking a small lump of putty from/ && line !~ /#{Regexp.escape(Char.name)}/
-    debug_filter("LOCKPICKING(...)", line)
+    PlayerWindow.debug_filter("LOCKPICKING(...)", line)
     next nil
   end
 
   # Magic Items
   if line =~ /rubs a.*?<a [^>]*?noun="[^"]+">[^<]+<\/a>.*?in <a [^>]*?noun="[^"]+">(?:his|her)<\/a> hand\./
-    debug_filter("MAGIC ITEM (...)", line)
-    @skip_next_line = true
+    PlayerWindow.debug_filter("MAGIC ITEM (...)", line)
+    @pw_skip_next_line = true
     next nil
   elsif line =~ /rubs <a [^>]*?noun="[^"]+">(?:his|her)<\/a> <a [^>]*?noun="[^"]+">[^<]+<\/a>/
-    debug_filter("MAGIC ITEM (...)", line)
-    @skip_next_line = true
+    PlayerWindow.debug_filter("MAGIC ITEM (...)", line)
+    @pw_skip_next_line = true
     next nil
   elsif line =~ /suddenly disintegrates\!/i && line !~ /^Your .* suddenly disintegrates\!/
-    debug_filter("MAGIC ITEM (...)", line)
+    PlayerWindow.debug_filter("MAGIC ITEM (...)", line)
     next nil
   end
 
   # Disks
   if line =~ /goes off in search of its master.|arrives in the room, shivering violently.  It then disintegrates./
-    debug_filter("DISK (...)", line)
+    PlayerWindow.debug_filter("DISK (...)", line)
     next nil
   end
 
 
   # Player Ambients
   if line =~ /A feral golden gleam flashes through .*? eyes\./
-    debug_filter("PLAYER AMBIENTS (...)", line)
+    PlayerWindow.debug_filter("PLAYER AMBIENTS (...)", line)
     next nil
   end
 
   # Environment Ambients
   if line =~ /^A swirling current tugs .*? gently back and forth\.|^The sand shifts beneath .*? feet\, sending up small clouds of sea bottom\.|^Something silver and swift darts between .*? ankles\.|^A crab scuttles sideways across a rock carpeted in mossy growth before darting away from|^Shifting currents set .*? hair aswirl in a slow .*? cloud about .*? head and face\.|^Tiny bubbles drift upward from a hidden fissure in the seabed\, floating around .*? before disappearing into the depths\.|^A swell of turbulence sends .*? drifting off to one side\.|^A tiny bubble escapes .*? mustache\.|^A sub\-surface swell bobs .*? lightly up and down\.|almost loses its content as it sways about in the water\.|^A wee bubble of air escapes .*? beard\./
-    debug_filter("ENVIRONMENT (...)", line)
+    PlayerWindow.debug_filter("ENVIRONMENT (...)", line)
     next nil
   end
 
   # NPCs
   if line =~ /stops to speak with|confers quietly with|lumbers in, swathed in darkness\.|falls deeper into bloodthirst\, the darkness swathing|lumbers .*? desiccated tendons in .*? legs popping as he goes\.|slack lips release a tormented moan\.|missing ears as if beset by voices only|taking on monstrous proportions before diminishing back to its original shape\.|decaying teeth in a horrible parody of a warrior's snarl\.|glowing tattoos pulses once, brightening precipitously before returning to normal\.|scampers up to .*? on its wooden legs\./
-    debug_filter("NPC (...)", line)
+    PlayerWindow.debug_filter("NPC (...)", line)
     next nil
   end
 
   # Duskruin
   if line =~ /An announcer shouts\, \"Our next combatant/
-    debug_filter("Duskruin (...)", line)
-    next nil
-  end
-
-  # Looting - No Silver
-  if line =~ /(?:<[^>]+>)*\s*(?:He|She|It)(?:<[^>]+>)*\s+didn't carry any silver\./i
-    debug_filter("No Silver (loot)", line)
-    next nil
-  end
-
-  # Looting - Nothing of Interest / Value
-  if line =~ /(?:<[^>]+>)*\s*(?:He|She|It)(?:<[^>]+>)*\s+had nothing (?:of interest|else of value)\./i
-    debug_filter("Nothing of Interest (loot)", line)
-    next nil
-  end
-
-  # Looting - Decay Message (raw XML-safe, snippet style)
-  if line =~ /goes still in death|immense form decays away into a mound of|crumbles and decays away\.|sublimates rapidly into luminous mist that swiftly disperses into the air|seep into the ground and vanish|collapsing into a lightless sphere that erupts soundlessly\, bathing the area in momentary darkness|falls away to reveal only crumbling bones|quickly decays away|flesh crumbles to reveal the corpse of|Traceries of mold race to reclaim|Rivulets of golden light blush beneath the skin of|Shadows coil around the broken form of|body rots away\, leaving only a small stain on the ground|decays away, leaving behind little more than dust|finally stops twitching and decays away|body\, leaving little behind\.|corpse succumbs to rot|^Creeping decay races across|collapses into a pile of tangled wool and huge bones|remnants rapidly dissolving into the air\.|dissolve away\, leaving nothing behind\.|decays into compost\.|quickly scattering and dissolving out of sight\.|body crumbles until only a pile of rubble marks|then fades from view like a dissipating phantom|decays into a pile|bony form as fingers of rust race to consume|collapses into blanched powder and blows away\.|dance before drifting away\.|leaving little but brittle bones\.|breaking into fine black powder\./i
-    debug_filter("Decay Message (loot)", line)
+    PlayerWindow.debug_filter("Duskruin (...)", line)
     next nil
   end
 
   # initialize tracking variables
-  @pending_joins        ||= {}   # name => Time.first_seen
-  @confirmed_players    ||= []   # names we've announced "enters" for
-  @pending_leavers      ||= []   # names queued for directional-leave handling
-  @last_seen_players    ||= []   # remember who was here last
+  @pw_pending_joins        ||= {}   # name => Time.first_seen
+  @pw_confirmed_players    ||= []   # names we've announced "enters" for
+  @pw_pending_leavers      ||= []   # names queued for directional-leave handling
+  @pw_last_seen_players    ||= []   # remember who was here last
 
-  if $show_movement
+  if PlayerWindow.show_movement
     # drop fluff movement descriptions
     if line =~ /just arrived\.|just left\.|Motes of .*? light flow in and resolve into|A softly scented breeze begins to swirl around|figure partially obscured by the flickering form|the shadows retreat back into the surroundings|belongings into a pile of dust that is swiftly borne away on the wind|tied to a red ribbon jingling follows|the door slams shut and vanishes\, leaving no traces of its existence|slowly fades into view with a gasp of breath and a slightly disoriented look|just moved quietly .*? group following closely\.|flounces in amidst a diffuse cloud of .*? glitter\.|The unmistakable scents of sulphur\, ether\, and brimstone rise from the ground near you\.|The faint sound of .*? tied to a red ribbon jingling touts|body grows more and more translucent until you realize|leaving a fading trail of multicolored footprints behind\.|suddenly appears out of nowhere\, one hand moving away from|You see a blur out of the corner of your eye|dissolves into motes of .*? light that flow|suddenly appears in a flash of .*? light\./
-      debug_filter("MOVEMENT (...)", line)
+      PlayerWindow.debug_filter("MOVEMENT (...)", line)
       next nil
     end
 
     # detect your own movement so we don't mis-attribute joins/leaves
     if line =~ %r{^(?:<nav rm='\d+'/>|<d cmd='go \w+'>\w+</d>|You (?:go|walk|move) \w+)}i
-      @recent_self_movement = true
-      @pending_joins.clear
-      @pending_leavers.clear
+      @pw_recent_self_movement = true
+      @pw_pending_joins.clear
+      @pw_pending_leavers.clear
       next line
     end
 
@@ -1328,26 +1403,26 @@ DownstreamHook.add(downstream_hook_id, proc { |line, _server_string|
     if line =~ /<component id='room players'>(.*?)<\/component>/i
       current_players = $1.scan(/noun="([^"]+)"/i).flatten.map(&:capitalize).uniq
 
-      unless @recent_self_movement
+      unless @pw_recent_self_movement
         # schedule joins
-        (current_players - @last_seen_players).each do |name|
-          @pending_joins[name] = Time.now
+        (current_players - @pw_last_seen_players).each do |name|
+          @pw_pending_joins[name] = Time.now
         end
 
         # schedule leaves
-        leaves = @confirmed_players & (@last_seen_players - current_players)
-        @confirmed_players -= leaves
-        @pending_leavers = leaves.reject { |n| n == Char.name }
+        leaves = @pw_confirmed_players & (@pw_last_seen_players - current_players)
+        @pw_confirmed_players -= leaves
+        @pw_pending_leavers = leaves.reject { |n| n == Char.name }
       else
-        @pending_leavers = []
+        @pw_pending_leavers = []
       end
 
-      @skip_next_line_after_player_component = true
-      $playerwindow_group_dirty = true
+      @pw_skip_next_line_after_player_component = true
+      PlayerWindow.group_dirty = true
 
-      @last_seen_players    = current_players
-      @recent_self_movement = false
-      debug_filter("ROOM PLAYERS (...)", line)
+      @pw_last_seen_players    = current_players
+      @pw_recent_self_movement = false
+      PlayerWindow.debug_filter("ROOM PLAYERS (...)", line)
       next nil
     end
 
@@ -1355,13 +1430,13 @@ DownstreamHook.add(downstream_hook_id, proc { |line, _server_string|
     now    = Time.now
     joined = []
 
-    @pending_joins.dup.each do |name, first_seen|
+    @pw_pending_joins.dup.each do |name, first_seen|
       if now - first_seen >= 3
-        if @last_seen_players.include?(name)
+        if @pw_last_seen_players.include?(name)
           joined << name
-          @confirmed_players << name unless @confirmed_players.include?(name)
+          @pw_confirmed_players << name unless @pw_confirmed_players.include?(name)
         end
-        @pending_joins.delete(name)
+        @pw_pending_joins.delete(name)
       end
     end
 
@@ -1372,7 +1447,7 @@ DownstreamHook.add(downstream_hook_id, proc { |line, _server_string|
     end
 
     # handle directional and plain leaves
-    if @skip_next_line_after_player_component
+    if @pw_skip_next_line_after_player_component
 
       if line =~ /AS\:/i
         next line
@@ -1382,7 +1457,7 @@ DownstreamHook.add(downstream_hook_id, proc { |line, _server_string|
         next line
       end
 
-      @skip_next_line_after_player_component = false
+      @pw_skip_next_line_after_player_component = false
 
       if line =~ %r{^<a [^>]+>[^<]+</a>\s+(?:kneels|stands|sits|lies)}
         next line
@@ -1391,17 +1466,17 @@ DownstreamHook.add(downstream_hook_id, proc { |line, _server_string|
       if line =~ /<a .*?noun="([^"]+)">[^<]+<\/a> just went (?:<d cmd='go (\w+)'>\w+<\/d>|through a <a .*?>(.*?)<\/a>)/i
         name      = $1.capitalize
         direction = $2 || $3&.downcase
-        if @pending_leavers.include?(name)
+        if @pw_pending_leavers.include?(name)
           respond "#{name} leaves #{direction}."
-          @pending_leavers.delete(name)
+          @pw_pending_leavers.delete(name)
           next nil
         end
       end
 
-      if @pending_leavers.any?
-        respond "#{@pending_leavers.shift} leaves."
+      if @pw_pending_leavers.any?
+        respond "#{@pw_pending_leavers.shift} leaves."
       end
-      @pending_leavers = []
+      @pw_pending_leavers = []
 
       next nil
     end
@@ -1411,12 +1486,6 @@ DownstreamHook.add(downstream_hook_id, proc { |line, _server_string|
     echo "*** DEBUG: Unfiltered '>' line passed through: #{line.inspect} ***"
   end
 
-  # Catch-all: suppress stray whitespace lines (including those from raw XML chunks)
-  if line.strip.empty?
-    #		  debug_filter("STRAY WHITE SPACE (...)", line)
-    next nil
-  end
-
   line
 })
 
@@ -1424,53 +1493,59 @@ before_dying do
   UpstreamHook.remove(upstream_hook_id)
   DownstreamHook.remove(downstream_hook_id)
 
-  if @gtk_available && defined?(PlayerWindowGtk) && PlayerWindowGtk.instance_variable_get(:@window)
+  if PlayerWindow.gtk_available && defined?(PlayerWindowGtk) && PlayerWindowGtk.instance_variable_get(:@window)
     Gtk.queue { PlayerWindowGtk.instance_variable_get(:@window).close }
   end
 end
 
 echo "Playerwindow is active." if $frontend == "stormfront"
 
-$playerwindow_group_dirty = true
-@last_group_snapshot = current_group_snapshot
-$playerwindow_group = get_group_display(@last_group_snapshot)
-@next_group_snapshot_check_at = Time.at(0)
+PlayerWindow.group_dirty = true
+@pw_last_group_snapshot = PlayerWindow.current_group_snapshot
+PlayerWindow.group_display = PlayerWindow.get_group_display(@pw_last_group_snapshot)
+@pw_next_group_snapshot_check_at = Time.at(0)
 
 # Main update loop.
 loop do
-  if Time.now >= @next_group_snapshot_check_at
-    current_snapshot = current_group_snapshot
-    if current_snapshot != @last_group_snapshot
-      @last_group_snapshot = current_snapshot
-      $playerwindow_group_dirty = true
+  if Time.now >= @pw_next_group_snapshot_check_at
+    current_snapshot = PlayerWindow.current_group_snapshot
+    if current_snapshot != @pw_last_group_snapshot
+      @pw_last_group_snapshot = current_snapshot
+      PlayerWindow.group_dirty = true
     end
-    @next_group_snapshot_check_at = Time.now + 0.25
+    @pw_next_group_snapshot_check_at = Time.now + 0.25
   end
 
-  if $playerwindow_group_dirty
-    snapshot = @last_group_snapshot || current_group_snapshot
-    @last_group_snapshot = snapshot
-    $playerwindow_group = get_group_display(snapshot)
+  if PlayerWindow.group_dirty
+    snapshot = @pw_last_group_snapshot || PlayerWindow.current_group_snapshot
+    @pw_last_group_snapshot = snapshot
+    PlayerWindow.group_display = PlayerWindow.get_group_display(snapshot)
     pcs = GameObj.pcs.reject { |pc| pc.name == Char.name }
     if $frontend == "stormfront"
-      push_players_to_window(pcs, $playerwindow_group)
+      PlayerWindow.push_players_to_window(pcs, PlayerWindow.group_display)
     end
-    if gtk_enabled?
-      PlayerWindowGtk.update_players(pcs, $playerwindow_group)
+    if PlayerWindow.gtk_enabled?
+      PlayerWindowGtk.update_players(pcs, PlayerWindow.group_display)
     end
-    $playerwindow_group_dirty = false
+    PlayerWindow.group_dirty = false
   end
 
   pcs = GameObj.pcs.reject { |pc| pc.name == Char.name }
+  pcs_snapshot = pcs.sort_by { |pc| pc.id.to_i }.map do |pc|
+    "#{pc.id}:#{pc.status}:#{pc.name}"
+  end.join("|")
 
-  if pcs != @last_pcs || $filter_spam != @last_filter_state
-    @last_pcs = pcs
-    @last_filter_state = $filter_spam
+  if pcs != @pw_last_pcs ||
+     pcs_snapshot != @pw_last_pcs_snapshot ||
+     PlayerWindow.filter_spam != @pw_last_filter_state
+    @pw_last_pcs = pcs
+    @pw_last_pcs_snapshot = pcs_snapshot
+    @pw_last_filter_state = PlayerWindow.filter_spam
     if $frontend == "stormfront"
-      push_players_to_window(pcs, $playerwindow_group)
+      PlayerWindow.push_players_to_window(pcs, PlayerWindow.group_display)
     end
-    if gtk_enabled?
-      PlayerWindowGtk.update_players(pcs, $playerwindow_group)
+    if PlayerWindow.gtk_enabled?
+      PlayerWindowGtk.update_players(pcs, PlayerWindow.group_display)
     end
   end
 
@@ -1481,3 +1556,5 @@ loop do
 
   sleep 0.1
 end
+
+
