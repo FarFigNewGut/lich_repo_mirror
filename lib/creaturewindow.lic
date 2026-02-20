@@ -24,8 +24,15 @@
 
   Author: Phocosoen, ChatGPT
   Tags: wrayth, frontend, mod, window, target, creature, mob, bounty, advguild, avalon, wizard, gtk3
-  Version: 1.5.27
-  Recently changed: Added furrier bounty action button/workflow to go to furrier and ask about bounty using valid GameObj NPC targets.
+  Version: 1.6.0
+  Recently changed:
+    - Added bounty action buttons for workflow automation (guild, guard, furrier, gem, herb, skin).
+    - Added gem bounty automation with inventory-aware handling and gemshop routing controls.
+    - Added herb bounty automation using zzherb and automated herb turn-in flow.
+    - Added skin bounty action that tracks on-hand skin progress and automates furrier turn-in.
+    - Added guard-return workflow support that can prep heirloom turn-ins and run scripted return flow.
+    - Added turn-in NPC targeting safeguards that avoid invalid NPC types (for example familiars/animates).
+	- Added TTK/KPM metrics display support with toggles in the creature window.
 =end
 
 no_kill_all
@@ -193,6 +200,7 @@ end
 @cw_guild_workflow_running = false
 @cw_guard_workflow_running = false
 @cw_furrier_workflow_running = false
+@cw_skin_workflow_running = false
 
 CreatureWindow::CMD_QUEUE = Queue.new unless defined?(CreatureWindow::CMD_QUEUE)
 CreatureWindow::TARGET_CMD_QUEUE = Queue.new unless defined?(CreatureWindow::TARGET_CMD_QUEUE)
@@ -506,6 +514,8 @@ class CreatureWindowGtk
               CreatureWindow::CMD_QUEUE.push("run_guard_bounty_workflow")
             elsif action_cmd == "*cwfurrier"
               CreatureWindow::CMD_QUEUE.push("run_furrier_bounty_workflow")
+            elsif action_cmd == "*cwskin"
+              CreatureWindow::CMD_QUEUE.push("run_skin_bounty_workflow")
             end
           end
           @cw_bounty_box.add(action_btn)
@@ -536,14 +546,14 @@ class CreatureWindowGtk
       # 5) Current target
       if (curr = targets.find { |t| t.id == XMLData.current_target_id })
         st   = CreatureWindow.creature_status_fix(curr.status, curr.name, curr.id)
-        txt  = st ? "#{curr.noun.capitalize} (#{st})" : curr.noun.capitalize
+        txt  = st ? "#{curr.noun} (#{st})" : curr.noun.to_s
         add_full_row("**#{txt}**")
       end
 
       # Other living creatures as buttons
       (targets - [curr]).each do |t|
         st = CreatureWindow.creature_status_fix(t.status, t.name, t.id)
-        btn_label = st ? "#{t.noun.capitalize} (#{st})" : t.noun.capitalize
+        btn_label = st ? "#{t.noun} (#{st})" : t.noun.to_s
         btn = Gtk::Button.new(label: btn_label)
         btn.style_context.add_class("creature-btn")
         btn.signal_connect("clicked") do
@@ -563,7 +573,7 @@ class CreatureWindowGtk
       add_full_row("")
       add_full_row("Dead Creatures: #{dead.size}")
       dead.each do |t|
-        lbl = Gtk::Label.new(t.noun.capitalize)
+        lbl = Gtk::Label.new(t.noun.to_s)
         lbl.set_xalign(0)
         @flow.add(lbl)
       end
@@ -589,17 +599,6 @@ if @cw_startup_request_gtk
     respond ""
     respond " GTK Creaturewindow disabled: gtk3 gem not available."
     respond ""
-  end
-end
-
-Thread.new do
-  loop do
-    begin
-      CreatureWindow.push_recent_line(get.strip)
-    rescue => e
-      echo "Line monitor error: #{e.message}"
-    end
-    sleep 0.05
   end
 end
 
@@ -791,6 +790,12 @@ def CreatureWindow.parse_bounty_from_checkbounty
     @cw_bounty_remaining = "Talk to healer for specifics."
     @cw_bounty_location = bounty_text.match(/task here from the (?:town|outpost) of (.+?)\.  The local .*(?:alchemist|healer)/i)[1]
   # ###################FORAGE
+  elsif bounty_text =~ /working on a concoction that requires (?:an?|a handful of|some) (.+?)\./i &&
+        bounty_text =~ /retrieve (\d+) samples/i
+    @cw_bounty_task_type = :herbspecifics
+    @cw_bounty_herb = bounty_text.match(/working on a concoction that requires (?:an?|a handful of|some) (.+?)\./i)[1]
+    @cw_bounty_remaining = bounty_text.match(/retrieve (\d+) samples/i)[1].to_i
+    @cw_bounty_location = bounty_text.match(/only grows in (?:the )?(.+?) near/i)&.[](1) || @cw_bounty_location
   elsif bounty_text =~ /concoction that requires (?:an?|some) (.+?) found/i && bounty_text =~ /found (?:in|on the) (?:the )?(.+?) near/i && bounty_text =~ /You have been tasked to retrieve (\d+) (?:more )?samples/i
     @cw_bounty_task_type = :herbspecifics
     @cw_bounty_herb = bounty_text.match(/concoction that requires (?:an?|some) (.+?) found/i)[1]
@@ -964,9 +969,9 @@ def CreatureWindow.bounty_status_line
 end
 
 def CreatureWindow.bounty_action_line
-  if @cw_bounty_task_type == :herbspecifics
+  if [:herb, :herbspecifics].include?(@cw_bounty_task_type)
     return "Herb Run Active..." if @cw_herb_workflow_running
-    return "Forage Herbs (ebounty) and Turn In"
+    return "Forage Herbs (zzherb) and Turn In"
   end
 
   if [:gem, :gemspecifics].include?(@cw_bounty_task_type)
@@ -984,6 +989,14 @@ def CreatureWindow.bounty_action_line
     return "Go to Furrier and Ask About Bounty"
   end
 
+  if @cw_bounty_task_type == :skinspecifics
+    return "Skin Run Active..." if @cw_skin_workflow_running
+    summary = CreatureWindow.skin_inventory_breakdown
+    required = @cw_bounty_remaining.to_i
+    required = 1 if required < 1
+    return "Turn In Skins (#{summary[:singles]} singles, #{summary[:bundles]} bundles / need #{required})"
+  end
+
   if [:bandit, :creature, :resident, :heirloom, :completeguard, :completeheirloom].include?(@cw_bounty_task_type)
     return "Guard Run Active..." if @cw_guard_workflow_running
     return "Go to AdvGuard and Ask About Bounty"
@@ -993,10 +1006,11 @@ def CreatureWindow.bounty_action_line
 end
 
 def CreatureWindow.bounty_action_cmd
-  return "*cwherb" if @cw_bounty_task_type == :herbspecifics
+  return "*cwherb" if [:herb, :herbspecifics].include?(@cw_bounty_task_type)
   return "*cwgem" if [:gem, :gemspecifics].include?(@cw_bounty_task_type)
   return "*cwguild" if [:guildvisit, :completeguild].include?(@cw_bounty_task_type)
   return "*cwfurrier" if @cw_bounty_task_type == :skin
+  return "*cwskin" if @cw_bounty_task_type == :skinspecifics
   return "*cwguard" if [:bandit, :creature, :resident, :heirloom, :completeguard, :completeheirloom].include?(@cw_bounty_task_type)
 
   nil
@@ -1019,7 +1033,12 @@ end
 
 def CreatureWindow.stop_active_nonhidden_scripts_for_turnin
   Script.running
-        .find_all { |scr| scr && scr != Script.current && !scr.no_kill_all }
+        .find_all do |scr|
+          scr &&
+            scr != Script.current &&
+            !scr.no_kill_all &&
+            scr.name.to_s.downcase != "go2"
+        end
         .each { |scr| scr.kill }
 end
 
@@ -1051,13 +1070,22 @@ def CreatureWindow.find_guild_taskmaster
   GameObj.npcs.find { |n| n && !CreatureWindow.npc_is_invalid_turnin_target?(n) && n.name.to_s =~ /Guild Taskmaster|taskmaster/i }
 end
 
+def CreatureWindow.prepare_turnin_hands
+  put "stow all"
+rescue StandardError
+  nil
+end
+
 def CreatureWindow.run_guild_bounty_workflow
   return if @cw_guild_workflow_running
 
   @cw_guild_workflow_running = true
   begin
+    CreatureWindow.stop_active_nonhidden_scripts_for_turnin
+
     Script.run("go2", "advguild")
     sleep 0.2 while running?("go2")
+    CreatureWindow.prepare_turnin_hands
 
     npc = CreatureWindow.find_origin_turnin_npc
     npc ||= CreatureWindow.find_guild_taskmaster
@@ -1066,8 +1094,6 @@ def CreatureWindow.run_guild_bounty_workflow
     else
       respond "Creaturewindow: could not find a valid guild bounty NPC here."
     end
-
-    CreatureWindow.parse_bounty_from_checkbounty
   rescue StandardError => e
     respond "Creaturewindow guild workflow error: #{e.class} - #{e.message}"
   ensure
@@ -1092,30 +1118,33 @@ def CreatureWindow.find_advguard_npc
   npc
 end
 
+def CreatureWindow.find_current_turnin_npc
+  GameObj.npcs.find do |n|
+    n && !CreatureWindow.npc_is_invalid_turnin_target?(n) &&
+      n.name.to_s =~ CreatureWindow::BOUNTY_TURNIN_NPC_REGEX
+  end
+end
+
 def CreatureWindow.run_guard_bounty_workflow
   return if @cw_guard_workflow_running
 
   @cw_guard_workflow_running = true
   begin
+    CreatureWindow.stop_active_nonhidden_scripts_for_turnin
+
     Script.run("go2", "advguard")
     sleep 0.2 while running?("go2")
-
-    if [:completeguard, :completeheirloom].include?(@cw_bounty_task_type)
-      CreatureWindow.stop_active_nonhidden_scripts_for_turnin
-    end
+    CreatureWindow.prepare_turnin_hands
 
     CreatureWindow.get_heirloom_for_turnin if @cw_bounty_task_type == :completeheirloom
 
     npc = CreatureWindow.find_advguard_npc
+    npc ||= CreatureWindow.find_current_turnin_npc
     if npc
       fput "ask ##{npc.id} about bounty"
     else
-      fallback = @cw_bounty_turnin_npc.to_s.strip
-      fput "ask #{fallback} about bounty" unless fallback.empty?
-      fput "ask guard about bounty" if fallback.empty?
+      respond "Creaturewindow: could not find a valid bounty NPC here."
     end
-
-    CreatureWindow.parse_bounty_from_checkbounty
   rescue StandardError => e
     respond "Creaturewindow guard workflow error: #{e.class} - #{e.message}"
   ensure
@@ -1131,13 +1160,23 @@ def CreatureWindow.find_furrier_npc
   end
 end
 
+def CreatureWindow.find_healer_bounty_npc
+  GameObj.npcs.find do |n|
+    n && !CreatureWindow.npc_is_invalid_turnin_target?(n) &&
+      n.name.to_s =~ /alchemist|healer|herbalist|Sparkfinger|Maraene/i
+  end
+end
+
 def CreatureWindow.run_furrier_bounty_workflow
   return if @cw_furrier_workflow_running
 
   @cw_furrier_workflow_running = true
   begin
+    CreatureWindow.stop_active_nonhidden_scripts_for_turnin
+
     Script.run("go2", "furrier")
     sleep 0.2 while running?("go2")
+    CreatureWindow.prepare_turnin_hands
 
     npc = CreatureWindow.find_furrier_npc
     if npc
@@ -1145,13 +1184,43 @@ def CreatureWindow.run_furrier_bounty_workflow
     else
       respond "Creaturewindow: could not find a valid furrier NPC here."
     end
-
-    CreatureWindow.parse_bounty_from_checkbounty
   rescue StandardError => e
     respond "Creaturewindow furrier workflow error: #{e.class} - #{e.message}"
   ensure
     @cw_furrier_workflow_running = false
     CreatureWindow.parse_bounty_from_checkbounty
+  end
+end
+
+def CreatureWindow.run_skin_bounty_workflow
+  return if @cw_skin_workflow_running
+
+  unless @cw_bounty_task_type == :skinspecifics
+    respond "Creaturewindow: no active skin-specific bounty."
+    return
+  end
+
+  @cw_skin_workflow_running = true
+  begin
+    CreatureWindow.stop_active_nonhidden_scripts_for_turnin
+
+    Script.run("go2", "furrier")
+    sleep 0.2 while running?("go2")
+    CreatureWindow.prepare_turnin_hands
+
+    npc = CreatureWindow.find_furrier_npc
+    unless npc
+      respond "Creaturewindow: could not find a valid furrier NPC here."
+      return
+    end
+
+    CreatureWindow.sell_skins_to_npc(npc)
+  rescue StandardError => e
+    respond "Creaturewindow skin workflow error: #{e.class} - #{e.message}"
+  ensure
+    @cw_skin_workflow_running = false
+    CreatureWindow.parse_bounty_from_checkbounty
+    CreatureWindow::CMD_QUEUE.push("update_window")
   end
 end
 
@@ -1168,7 +1237,9 @@ end
 
 def CreatureWindow.capture_gem_origin_context
   @cw_bounty_origin_room_id ||= Room.current.id
-  npc = GameObj.npcs.find { |n| n && n.name =~ CreatureWindow::GEM_TURNIN_NPC_REGEX }
+  npc = GameObj.npcs.find do |n|
+    n && !CreatureWindow.npc_is_invalid_turnin_target?(n) && n.name =~ CreatureWindow::GEM_TURNIN_NPC_REGEX
+  end
   return unless npc
 
   @cw_bounty_origin_npc_id = npc.id
@@ -1185,6 +1256,18 @@ end
 
 def CreatureWindow.current_herb_name
   @cw_bounty_herb.to_s.sub(/\Asome\s+/i, "").strip
+end
+
+def CreatureWindow.current_zzherb_name
+  CreatureWindow.current_herb_name
+end
+
+def CreatureWindow.current_herb_noun
+  herb_name = CreatureWindow.current_herb_name
+  return "" if herb_name.empty?
+
+  # forage.lic expects the base noun as a separate arg.
+  herb_name.split(/\s+/).last.to_s.gsub(/[^a-zA-Z'-]/, "").downcase
 end
 
 def CreatureWindow.herb_items_for_turnin
@@ -1204,34 +1287,37 @@ def CreatureWindow.herb_items_for_turnin
   candidates.select { |i| i.name.to_s.downcase.include?(herb_name) }
 end
 
+def CreatureWindow.herb_count_on_hand
+  CreatureWindow.herb_items_for_turnin.inject(0) { |sum, item| sum + CreatureWindow.item_stack_count(item) }
+end
+
 def CreatureWindow.hand_in_herbs_to_npc(npc)
   return unless npc
 
-  original = checkbounty
-  fput "ask ##{npc.id} about bounty"
-  sleep 0.15
-
-  CreatureWindow.herb_items_for_turnin.each do |item|
-    break if checkbounty =~ /succeeded in your task|return to the Adventurer's Guild/i
-
-    fput "get ##{item.id}"
-    fput "give ##{item.id} to ##{npc.id}"
-    sleep 0.03
+  herb_ids = CreatureWindow.herb_items_for_turnin.map(&:id).compact
+  herb_ids.each do |item_id|
+    put "get ##{item_id}"
+    put "give ##{item_id} to ##{npc.id}"
   end
 
-  fput "ask ##{npc.id} about bounty"
-  sleep 0.15
-  CreatureWindow.parse_bounty_from_checkbounty if checkbounty != original
+  put "ask ##{npc.id} about bounty"
+  CreatureWindow.parse_bounty_from_checkbounty
+end
+
+def CreatureWindow.go2_healer_room_for_turnin
+  Script.run("go2", "healer")
+  sleep 0.2 while running?("go2")
+  CreatureWindow.prepare_turnin_hands
 end
 
 def CreatureWindow.find_origin_gem_npc
   npc = nil
   if @cw_bounty_origin_npc_id
-    found_by_id = GameObj.npcs.find { |n| n && n.id == @cw_bounty_origin_npc_id }
+    found_by_id = GameObj.npcs.find { |n| n && !CreatureWindow.npc_is_invalid_turnin_target?(n) && n.id == @cw_bounty_origin_npc_id }
     npc = found_by_id if found_by_id && found_by_id.name =~ CreatureWindow::GEM_TURNIN_NPC_REGEX
   end
-  npc ||= GameObj.npcs.find { |n| n && n.name =~ CreatureWindow::GEM_TURNIN_NPC_REGEX }
-  npc ||= GameObj.npcs.find { |n| n && n.name =~ CreatureWindow::BOUNTY_TURNIN_NPC_REGEX }
+  npc ||= GameObj.npcs.find { |n| n && !CreatureWindow.npc_is_invalid_turnin_target?(n) && n.name =~ CreatureWindow::GEM_TURNIN_NPC_REGEX }
+  npc ||= GameObj.npcs.find { |n| n && !CreatureWindow.npc_is_invalid_turnin_target?(n) && n.name =~ CreatureWindow::BOUNTY_TURNIN_NPC_REGEX }
   npc
 end
 
@@ -1240,8 +1326,13 @@ def CreatureWindow.current_gem_name
 end
 
 def CreatureWindow.blocked_gemshop_room?
+  current_uid_values = []
+  if Room.current.respond_to?(:uid)
+    current_uid_values = Array(Room.current.uid).compact.map { |u| u.to_s.sub(/\Au/i, "") }
+  end
+
   return true if CreatureWindow::BLOCKED_GEMSHOP_ROOM_IDS.include?(Room.current.id.to_i)
-  return true if CreatureWindow::BLOCKED_GEMSHOP_UIDS.any? { |uid| Room.current.id.to_s == uid.to_s }
+  return true if CreatureWindow::BLOCKED_GEMSHOP_UIDS.any? { |uid| current_uid_values.include?(uid.to_s.sub(/\Au/i, "")) }
   return true if Room.current.title.to_s =~ CreatureWindow::BLOCKED_GEMSHOP_TITLES
 
   false
@@ -1254,11 +1345,13 @@ def CreatureWindow.goto_target_gemshop
   if preferred
     Script.run("go2", preferred)
     sleep 0.2 while running?("go2")
+    CreatureWindow.prepare_turnin_hands
     return
   end
 
   Script.run("go2", "gemshop")
   sleep 0.2 while running?("go2")
+  CreatureWindow.prepare_turnin_hands
 end
 
 def CreatureWindow.normalize_bounty_item_name(name)
@@ -1276,6 +1369,12 @@ def CreatureWindow.item_matches_bounty_name?(item_name, bounty_name)
   normalized_bounty = CreatureWindow.normalize_bounty_item_name(bounty_name)
   return false if normalized_item.empty? || normalized_bounty.empty?
   return true if normalized_item.include?(normalized_bounty) || normalized_bounty.include?(normalized_item)
+
+  # Skin/material bounty descriptions often include a dropped adjective in inventory
+  # (e.g. "niveous warg pelts" bounty vs "bundle of warg pelts" item).
+  if (m = normalized_bounty.match(/\A\w+\s+(.+\b(?:pelt|pelts|skin|skins|scale|scales|plume|plumes|mane|manes|trunk|trunks|hide|hides)\b)\z/))
+    return true if normalized_item.include?(m[1])
+  end
 
   bounty_tokens = normalized_bounty.split(/\s+/)
   bounty_tokens.all? { |token| normalized_item.include?(token) }
@@ -1323,74 +1422,179 @@ def CreatureWindow.gem_count_on_hand
   CreatureWindow.gem_items_for_turnin.inject(0) { |sum, item| sum + CreatureWindow.item_stack_count(item) }
 end
 
+def CreatureWindow.current_skin_name
+  @cw_bounty_skin.to_s.strip
+end
+
+def CreatureWindow.skin_items_for_turnin
+  skin_name = CreatureWindow.current_skin_name
+  return [] if skin_name.empty?
+
+  candidates = []
+  GameObj.inv.each do |item|
+    next unless item
+
+    candidates << item
+    if item.respond_to?(:contents) && item.contents
+      item.contents.each { |contained| candidates << contained if contained }
+    end
+  end
+
+  candidates.select { |i| CreatureWindow.item_matches_bounty_name?(i.name.to_s, skin_name) }
+end
+
+def CreatureWindow.skin_count_on_hand
+  CreatureWindow.skin_items_for_turnin.inject(0) { |sum, item| sum + CreatureWindow.item_stack_count(item) }
+end
+
+def CreatureWindow.skin_inventory_breakdown
+  singles = 0
+  bundles = 0
+
+  CreatureWindow.skin_items_for_turnin.each do |item|
+    count = CreatureWindow.item_stack_count(item)
+    if item.name.to_s =~ /bundle of/i
+      bundles += count
+    else
+      singles += count
+    end
+  end
+
+  { singles: singles, bundles: bundles }
+end
+
+def CreatureWindow.sell_skins_to_npc(npc)
+  return unless npc
+
+  target_count = @cw_bounty_remaining.to_i
+  target_count = 1 if target_count < 1
+  skin_ids = CreatureWindow.skin_items_for_turnin.take(target_count).map(&:id)
+
+  skin_ids.each do |skin_id|
+    put "get ##{skin_id}"
+    sleep 0.5
+    put "sell ##{skin_id}"
+  end
+
+  put "ask ##{npc.id} about bounty"
+  CreatureWindow.parse_bounty_from_checkbounty
+end
+
 def CreatureWindow.sell_gems_to_npc(npc)
   return unless npc
 
   target_count = @cw_bounty_remaining.to_i
   target_count = 1 if target_count < 1
-  original = checkbounty
   gem_ids = CreatureWindow.gem_items_for_turnin.take(target_count).map(&:id)
-  sold = 0
 
   gem_ids.each do |gem_id|
-    break if checkbounty =~ /succeeded in your task|return to the Adventurer's Guild/i
-    waitrt?
-    fput "get ##{gem_id}"
-    waitrt?
-    fput "sell ##{gem_id}"
-    sold += 1
-    sleep 0.02
+    put "get ##{gem_id}"
+    sleep 0.5
+    put "sell ##{gem_id}"
   end
 
-  fput "ask ##{npc.id} about bounty"
-  sleep 0.15
-  CreatureWindow.parse_bounty_from_checkbounty if checkbounty != original
+  put "ask ##{npc.id} about bounty"
+  CreatureWindow.parse_bounty_from_checkbounty
 end
 
 def CreatureWindow.run_herb_bounty_workflow
   return if @cw_herb_workflow_running
 
-  unless @cw_bounty_task_type == :herbspecifics
+  unless [:herb, :herbspecifics].include?(@cw_bounty_task_type)
     respond "Creaturewindow: no active herb-specific bounty."
     return
   end
 
   @cw_herb_workflow_running = true
   begin
-    CreatureWindow.capture_gem_origin_context
-    origin_room = @cw_bounty_origin_room_id || Room.current.id
-    forage_herb = CreatureWindow.current_herb_name
-    forage_qty = @cw_bounty_remaining.to_i
-    forage_qty = 1 if forage_qty < 1
+    CreatureWindow.stop_active_nonhidden_scripts_for_turnin
 
-    if running?("ebounty")
-      respond "Creaturewindow: waiting for current ebounty run to finish..."
-      sleep 0.2 while running?("ebounty")
+    needs_specifics = (@cw_bounty_task_type == :herb)
+    needs_specifics ||= @cw_bounty_remaining.to_i < 1
+    needs_specifics ||= CreatureWindow.current_zzherb_name.empty?
+    needs_specifics ||= @cw_bounty_origin_npc_id.nil?
+    needs_specifics ||= @cw_bounty_origin_room_id.nil?
+
+    if needs_specifics
+      CreatureWindow.go2_healer_room_for_turnin
+      healer_npc = CreatureWindow.find_healer_bounty_npc || CreatureWindow.find_current_turnin_npc
+      unless healer_npc
+        respond "Creaturewindow: could not find healer/alchemist for herb specifics."
+        return
+      end
+
+      ask_result = dothistimeout("ask ##{healer_npc.id} about bounty", 8, /concoction that requires|retrieve \d+ samples|You have been tasked to retrieve/i)
+      sleep 0.2 if ask_result.nil?
+
+      # Give checkbounty a short window to reflect freshly asked specifics.
+      8.times do
+        CreatureWindow.parse_bounty_from_checkbounty
+        break if @cw_bounty_task_type == :herbspecifics
+        sleep 0.2
+      end
+      @cw_bounty_origin_room_id = Room.current.id
+      @cw_bounty_origin_npc_id = healer_npc.id
+      @cw_bounty_origin_npc_noun = healer_npc.noun
+    else
+      CreatureWindow.capture_bounty_origin_context
     end
 
-    unless File.exist?(File.join($script_dir, "ebounty.lic"))
-      respond "Creaturewindow: ebounty.lic not found."
+    unless @cw_bounty_task_type == :herbspecifics
+      respond "Creaturewindow: could not fetch herb specifics from healer/alchemist."
       return
     end
 
-    if forage_herb.empty?
-      respond "Creaturewindow: no herb name parsed from bounty."
-    else
-      Script.run("ebounty", %{forage "#{forage_herb}" #{forage_qty}})
+    origin_room = @cw_bounty_origin_room_id || Room.current.id
+    zzherb_name = CreatureWindow.current_zzherb_name
+    needed_count = @cw_bounty_remaining.to_i
+    needed_count = 1 if needed_count < 1
+    on_hand_count = CreatureWindow.herb_count_on_hand
+    find_count = [needed_count - on_hand_count, 0].max
+
+    if running?("zzherb")
+      respond "Creaturewindow: waiting for current zzherb run to finish..."
+      sleep 0.2 while running?("zzherb")
     end
 
-    sleep 0.2 while running?("ebounty")
+    unless File.exist?(File.join($script_dir, "zzherb.lic"))
+      respond "Creaturewindow: zzherb.lic not found."
+      return
+    end
+
+    if zzherb_name.empty?
+      respond "Creaturewindow: no herb name parsed from bounty."
+    elsif find_count > 0
+      # zzherb accepts one arg string: "<herbname> <qty> [location optional]"
+      Script.run("zzherb", %{#{zzherb_name} #{find_count}})
+      sleep 0.2 while running?("zzherb")
+
+      # Fallback for herb tags that require a determiner in Room.tags.
+      if CreatureWindow.herb_count_on_hand < needed_count
+        alt_name = "some #{zzherb_name}"
+        Script.run("zzherb", %{#{alt_name} #{find_count}})
+      end
+    end
+
+    sleep 0.2 while running?("zzherb")
 
     if Room.current.id != origin_room
       Script.run("go2", origin_room.to_s)
       sleep 0.2 while running?("go2")
+      CreatureWindow.prepare_turnin_hands
     end
 
     npc = CreatureWindow.find_origin_turnin_npc
     if npc
       CreatureWindow.hand_in_herbs_to_npc(npc)
     else
-      respond "Creaturewindow: could not find turn-in NPC in origin room."
+      respond "Creaturewindow: turn-in NPC not found in origin room, heading to healer room."
+      CreatureWindow.go2_healer_room_for_turnin
+      healer_npc = CreatureWindow.find_origin_turnin_npc
+      if healer_npc
+        CreatureWindow.hand_in_herbs_to_npc(healer_npc)
+      else
+        respond "Creaturewindow: could not find turn-in NPC in healer room."
+      end
     end
   rescue StandardError => e
     respond "Creaturewindow herb workflow error: #{e.class} - #{e.message}"
@@ -1411,6 +1615,8 @@ def CreatureWindow.run_gem_bounty_workflow
 
   @cw_herb_workflow_running = true
   begin
+    CreatureWindow.stop_active_nonhidden_scripts_for_turnin
+
     CreatureWindow.capture_gem_origin_context
 
     CreatureWindow.goto_target_gemshop
@@ -1426,15 +1632,7 @@ def CreatureWindow.run_gem_bounty_workflow
     end
 
     fput "ask ##{npc.id} about bounty"
-    sleep 0.2
     CreatureWindow.parse_bounty_from_checkbounty
-
-    # One retry for crowded/noisy rooms where first ask doesn't advance details.
-    if @cw_bounty_task_type == :gem
-      fput "ask ##{npc.id} about bounty"
-      sleep 0.2
-      CreatureWindow.parse_bounty_from_checkbounty
-    end
 
     unless @cw_bounty_task_type == :gemspecifics
       respond "Creaturewindow: could not fetch gem specifics from gem dealer."
@@ -1556,7 +1754,7 @@ def CreatureWindow.push_creatures_to_window(targets)
 
   if target_creature
     status = CreatureWindow.creature_status_fix(target_creature.status, target_creature.name, target_creature.id)
-    label_value = status ? "#{target_creature.noun.capitalize} (#{status})" : target_creature.noun.capitalize
+    label_value = status ? "#{target_creature.noun} (#{status})" : target_creature.noun.to_s
     label_value = "**#{label_value}**"
 
     unless @cw_creature_targeted[target_creature.id]
@@ -1579,7 +1777,7 @@ def CreatureWindow.push_creatures_to_window(targets)
 
   creature_pairs.with_index do |pair, row|
     pair.each_with_index do |creature, col|
-      noun = creature.noun.capitalize
+      noun = creature.noun.to_s
       status = CreatureWindow.creature_status_fix(creature.status, creature.name, creature.id)
 
       label_value = status ? "#{noun} (#{status})" : noun
@@ -1610,7 +1808,7 @@ def CreatureWindow.push_creatures_to_window(targets)
 
   if CreatureWindow.single_column
     dead_creatures.each_with_index do |t, index|
-      noun = t.noun.capitalize
+      noun = t.noun.to_s
       output += "<link id='dead_#{index}' value='#{noun}' cmd='loot ##{t.id}' echo='loot ##{t.id}' justify='bottom' left='0' top='#{current_top}' />"
 
       current_top += 20
@@ -1623,7 +1821,7 @@ def CreatureWindow.push_creatures_to_window(targets)
       pair.each_with_index do |t, col|
         left = col == 0 ? col_left : col_right
         top = current_top + row * row_height
-        noun = t.noun.capitalize
+        noun = t.noun.to_s
         output += "<link id='dead_#{row}_#{col}' value='#{noun}' cmd='loot ##{t.id}' echo='loot ##{t.id}' justify='bottom' left='#{left}' top='#{top}' />"
       end
     end
@@ -1670,8 +1868,19 @@ def CreatureWindow.refresh_creature_windows(targets)
 end
 
 upstream_hook_id = "#{Script.current.name}_upstream"
+downstream_hook_id = "#{Script.current.name}_downstream"
 
 UpstreamHook.remove(upstream_hook_id)   rescue nil
+DownstreamHook.remove(downstream_hook_id) rescue nil
+
+DownstreamHook.add(downstream_hook_id, proc do |line|
+  begin
+    CreatureWindow.push_recent_line(line.to_s.strip)
+  rescue StandardError => e
+    echo "Creaturewindow line capture error: #{e.message}"
+  end
+  line
+end)
 
 UpstreamHook.add(upstream_hook_id, proc do |command|
   window_settings = CreatureWindow.load_window_settings
@@ -1728,6 +1937,10 @@ UpstreamHook.add(upstream_hook_id, proc do |command|
 
   when /\*cwfurrier/i
     CreatureWindow::CMD_QUEUE.push("run_furrier_bounty_workflow")
+    nil
+
+  when /\*cwskin/i
+    CreatureWindow::CMD_QUEUE.push("run_skin_bounty_workflow")
     nil
 
   when /\*cwgtk/i
@@ -1799,6 +2012,7 @@ end)
 
 before_dying do
   UpstreamHook.remove(upstream_hook_id)
+  DownstreamHook.remove(downstream_hook_id) rescue nil
 
   if CreatureWindow.gtk_available && defined?(CreatureWindowGtk) && (cw = CreatureWindowGtk.instance_variable_get(:@window))
     Gtk.queue { cw.hide }
@@ -1853,6 +2067,8 @@ loop do
       CreatureWindow.run_guard_bounty_workflow
     elsif cmd == "run_furrier_bounty_workflow"
       CreatureWindow.run_furrier_bounty_workflow
+    elsif cmd == "run_skin_bounty_workflow"
+      CreatureWindow.run_skin_bounty_workflow
     end
   end
 
@@ -1861,9 +2077,6 @@ loop do
     CreatureWindow.capture_bounty_origin_context if @cw_bounty_origin_npc_id.nil?
     CreatureWindow.parse_bounty_from_checkbounty
     CreatureWindow::CMD_QUEUE.push("update_window")
-    CreatureWindow.refresh_creature_windows(current_targets)
-    @cw_last_targets_snapshot = CreatureWindow.targets_snapshot(current_targets)
-    @cw_last_ui_refresh_at = Time.now
     @cw_last_bounty_check = Time.now
   end
 
