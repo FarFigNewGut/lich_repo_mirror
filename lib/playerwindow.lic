@@ -149,8 +149,8 @@ module PlayerWindow
     end
 
     settings_hash
-  rescue Psych::SyntaxError => e
-    echo "Window settings: YAML parse error (#{e.message}). Loading defaults..."
+  rescue StandardError => e
+    echo "Window settings: Error loading settings (#{e.message}). Loading defaults..."
     settings_hash = deep_merge_hash(PW_DEFAULT_WINDOW_SETTINGS, {})
     File.write(filename, settings_hash.to_yaml) if name == Char.name
     settings_hash
@@ -283,16 +283,8 @@ PlayerWindow.filter_animals   = player_window_settings["filter_animals"]   || fa
 PlayerWindow.filter_flares    = player_window_settings["filter_flares"]    || false
 PlayerWindow.filter_combat_math = player_window_settings["filter_combat_math"] || false
 PlayerWindow.single_column = player_window_settings["single_column"] || false
-PlayerWindow.show_filter_buttons = if player_window_settings.key?("show_filter_buttons")
-                                     !!player_window_settings["show_filter_buttons"]
-                                   else
-                                     true
-                                   end
-PlayerWindow.show_movement = if player_window_settings.key?("show_movement")
-                               !!player_window_settings["show_movement"]
-                             else
-                               true
-                             end
+PlayerWindow.show_filter_buttons = player_window_settings.fetch("show_filter_buttons", true)
+PlayerWindow.show_movement       = player_window_settings.fetch("show_movement", true)
 PlayerWindow.debug_filter_enabled = false # Toggle with *pwdebug
 PlayerWindow.flare_patterns = PlayerWindow.load_flare_filter_patterns
 PlayerWindow.gtk_available = begin
@@ -312,7 +304,7 @@ end
 
 @pw_last_pcs = []
 @pw_last_pcs_snapshot = nil
-@pw_last_filter_state = nil # Track last known state of PlayerWindow.filter_spam
+@pw_last_filter_state = nil # Track last known state of all filter flags
 
 # --- 1) Define your palettes ---
 PlayerWindow::PALETTES = {
@@ -716,8 +708,13 @@ end
 
 def PlayerWindow.oak_wand_check
   wands = {}
-  GameObj.containers.each { |container| wands[container[0]] = []; GameObj[container[0]].contents.each { |item| wands[container[0]].push(item) if item.name =~ /oak(?:en)? (?:rod|wand)$/ } }
-  return wands.first
+  GameObj.containers.each do |container|
+    obj = GameObj[container[0]]
+    next unless obj&.contents
+
+    wands[container[0]] = obj.contents.select { |item| item.name =~ /oak(?:en)? (?:rod|wand)$/ }
+  end
+  wands.find { |_id, items| items.any? }
 end
 
 # ";e fput('get oak wand'); fput('wave wand at ##{player_id}')"
@@ -745,6 +742,7 @@ def PlayerWindow.action_for_status(status, pc)
   when nil
     return "look ##{pc.id}"
   end
+  "look ##{pc.id}"
 end
 
 # Extracts the noun from the XML-based name format: <a exist="-11226620" noun="Lamamelodia">Lamamelodia</a>
@@ -803,10 +801,6 @@ def PlayerWindow.push_players_to_window(pcs, group_display = nil)
 
   output = "<dialogData id='PlayerWindow' clear='t'>"
   current_top = 0
-  #  column_value = PlayerWindow.single_column ? 'Layout: Single Column' : 'Layout: Two Columns'
-  #  column_cmd = "*pwcolumns"
-  #  output += "<link id='column_toggle' value='#{column_value}' cmd='#{column_cmd}' echo='Toggling Column Layout...' justify='bottom' left='0' top='#{current_top}' />"
-  #  current_top += 20
 
   if PlayerWindow.show_filter_buttons
     if PlayerWindow.single_column
@@ -872,13 +866,6 @@ def PlayerWindow.push_players_to_window(pcs, group_display = nil)
   slices = PlayerWindow.single_column ? sorted_pcs.each_slice(1) : sorted_pcs.each_slice(2)
   slices.with_index do |pair, row|
     pair.each_with_index do |pc, col|
-      if PlayerWindow.single_column
-        current_top += sorted_pcs.size * row_height
-      else
-        grid_rows = (sorted_pcs.size.to_f / 2).ceil
-        current_top = row_height * (grid_rows + top_offset)
-      end
-
       noun = PlayerWindow.extract_noun(pc)
       status = (pc.respond_to?(:status) && pc.status) ? PlayerWindow.player_status_fix(pc.status) : nil
       label_value = status ? "#{noun} (#{status})" : noun
@@ -999,37 +986,6 @@ upstream_proc = proc do |command|
 
     nil
 
-  when /\*allgtk/i
-    PlayerWindow.use_gtk_playerwindow = !PlayerWindow.use_gtk_playerwindow
-    respond "GTK Playerwindow is now #{PlayerWindow.use_gtk_playerwindow ? 'ENABLED' : 'DISABLED'}."
-
-    # persist the new setting
-    settings = PlayerWindow.load_window_settings
-    settings["playerwindow"] ||= {}
-    settings["playerwindow"]["use_gtk_playerwindow"] = PlayerWindow.use_gtk_playerwindow
-    PlayerWindow.save_window_settings(settings)
-
-    if PlayerWindow.use_gtk_playerwindow
-      if PlayerWindow.gtk_available
-        Gtk.queue { PlayerWindowGtk.create_main_window }
-        Thread.new { PlayerWindow.start_gtk_main_if_needed }
-      else
-        PlayerWindow.use_gtk_playerwindow = false
-        settings["playerwindow"]["use_gtk_playerwindow"] = false
-        PlayerWindow.save_window_settings(settings)
-        respond "GTK unavailable. Install gtk3 gem to enable GTK Playerwindow."
-      end
-    else
-      # close it if it exists
-      if PlayerWindow.gtk_available && defined?(PlayerWindowGtk) && PlayerWindowGtk.instance_variable_get(:@window)
-        Gtk.queue do
-          PlayerWindowGtk.instance_variable_get(:@window).close
-        end
-      end
-    end
-
-    nil
-
   when /\*pwdebug/i
     PlayerWindow.debug_filter_enabled = !PlayerWindow.debug_filter_enabled
     respond "Playerwindow filter debug is now #{PlayerWindow.debug_filter_enabled ? 'ON' : 'OFF'}."
@@ -1050,6 +1006,15 @@ downstream_proc = proc { |line, _server_string|
   line = line.to_s # Ensure line is always a String.
   plain_line = line.gsub(/<[^>]*>/, " ").gsub(/\s+/, " ").strip
 
+  # Always pass through prompt/nav/timing XML early so packet-level filters
+  # cannot accidentally suppress core client update signals.
+  if line =~ /<prompt time='\d+'>.*?<\/prompt>/i ||
+     line =~ /<roundTime value='\d+'\/>/i ||
+     line =~ /<castTime value='\d+'\/>/i ||
+     line =~ %r{^(<nav rm='|<d cmd='go )}i
+    next line
+  end
+
   # Early suppression so XML dialog pass-through rules do not leak this line.
   if PlayerWindow.filter_spam && plain_line =~ /You feel more refreshed\./i
     PlayerWindow.debug_filter("CERTAIN YOU LINE (...)", line)
@@ -1065,14 +1030,12 @@ downstream_proc = proc { |line, _server_string|
        plain_line =~ /Cast Roundtime \d+ Seconds\./i ||
        plain_line =~ /The (?:black panther pin|flyrsilk flower|silk flower) only has \d+ charge(?:s)? remaining\./i ||
        plain_line =~ /The flaming aura enshrouding you interferes with the magic\./i ||
-       plain_line =~ /Roundtime: \d+ sec(?:ond)?s?\./i ||
-       plain_line =~ /Roundtime changed to \d+ second(?:s)?\./i ||
+       plain_line =~ /\ARoundtime: \d+ sec(?:ond)?s?\.\z/i ||
+       plain_line =~ /\ARoundtime changed to \d+ second(?:s)?\.\z/i ||
        plain_line =~ /\[Spell Hindrance for a suit of/i ||
        plain_line =~ /The fingers of the lunatic hand briefly open to take your remaining silver and close with almost a life of their own/i ||
        plain_line =~ /your silvery fossil charm, which takes off in search of silvers.  They locate/i ||
-       plain_line =~ /Wait 1 sec\./i ||
-	   plain_line =~ /Wait 1 seconds\./i ||
-	   plain_line =~ /\.\.\.wait 1 seconds\./i ||
+       plain_line =~ /\A(?:\.\.\.)?wait 1 sec(?:ond)?s?\.\z/i ||
        plain_line =~ /I could not find what you were referring to\./i ||
        plain_line =~ /Your spell falters\, then steadies as the magic finds another path\./i
       next nil
@@ -1081,7 +1044,6 @@ downstream_proc = proc { |line, _server_string|
 
   if PlayerWindow.filter_animals && line =~ /noun="([^"]+)"/i
     nouns = line.scan(/noun="([^"]+)"/i).flatten.map(&:downcase)
-    PlayerWindow.debug_filter("ANIMAL (...)", line)
 
     if line =~ /^<pushBold\/>(Weapons|Armor|Containers|Wands|Magic Items|Scrolls|Clothing|Special) \[/
       next line
@@ -1106,15 +1068,15 @@ downstream_proc = proc { |line, _server_string|
       next line
     end
 
-    #		respond "FILTERED: #{line}" if (nouns & blocked_nouns).any?
     # Block everything else if a blocked animal noun is present
-
     if (nouns & PlayerWindow::BLOCKED_NOUNS).any?
+      PlayerWindow.debug_filter("ANIMAL (...)", line)
       next nil
     end
 
     # Animates
     if PlayerWindow.filter_animals && line =~ /<a .*?>([^<]*animated[^<]*)<\/a>/i
+      PlayerWindow.debug_filter("ANIMAL (...)", line)
       next nil
     end
   end
@@ -1579,7 +1541,7 @@ loop do
       @pw_last_group_snapshot = current_snapshot
       PlayerWindow.group_dirty = true
     end
-    @pw_next_group_snapshot_check_at = Time.now + 0.25
+    @pw_next_group_snapshot_check_at = Time.now + 2.0
   end
 
   if PlayerWindow.group_dirty
@@ -1601,12 +1563,19 @@ loop do
     "#{pc.id}:#{pc.status}:#{pc.name}"
   end.join("|")
 
+  current_filter_state = [
+    PlayerWindow.filter_spam,
+    PlayerWindow.filter_animals,
+    PlayerWindow.filter_flares,
+    PlayerWindow.filter_combat_math
+  ]
+
   if pcs != @pw_last_pcs ||
      pcs_snapshot != @pw_last_pcs_snapshot ||
-     PlayerWindow.filter_spam != @pw_last_filter_state
+     current_filter_state != @pw_last_filter_state
     @pw_last_pcs = pcs
     @pw_last_pcs_snapshot = pcs_snapshot
-    @pw_last_filter_state = PlayerWindow.filter_spam
+    @pw_last_filter_state = current_filter_state
     if $frontend == "stormfront"
       PlayerWindow.push_players_to_window(pcs, PlayerWindow.group_display)
     end
