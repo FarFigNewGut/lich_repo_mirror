@@ -14,7 +14,7 @@
   WARNING: Be careful when dragging and dropping abilities. Perform actions deliberate and avoid spammy drags. There's some stability issues if you blast it.
 
   author: Kyrandos
-  version: 1.2.0
+  version: 1.2.2
   game: gs
   other Scripts: Loresang, volnrestore2
   tags: utility, abilities, manager, list, organization, combat, targeting, GUI, spells, items, tracker, status
@@ -36,6 +36,8 @@
       1.1.8 2/25/2026 - Fixed wiki case sensitivity, added in control click autofire function
       1.1.9 2/25/2026 - UTF 8 default to resolve Mac OS issues
       1.2.0 2/25/2026 - Finished Society implementation: Voln corrected and COL+GOS enabled. Fixed ALL ability colorings.
+      1.2.1 2/26/2026 - Track scripted items by long name for persistence across logins; auto-migrate existing gameobj_id entries
+      1.2.2 2/26/2026 - Fix item_long_name/item_noun not surviving save/load cycle; rebuild item abilities from cache at init
 
   NOTES - PLEASE READ: Drag and drop abilities has some stability issues. Just perform actions deliberately and do not spam. Closing it will save. 
           Please ensure all your spell circles and ability categories appear in the unfiltered pool, I have only tested on Paladin, Wizard, and Bard.
@@ -48,6 +50,7 @@ require 'gtk3'
 
 module Combatical
   SCAN_VERSION = 3 unless defined?(SCAN_VERSION)  # Bump to force rescan when scanner logic changes
+  EXIST = %r{<a exist="(?<id>[^"]+)" noun="(?<noun>[^"]+)">(?<name>[^<]+)</a>} unless defined?(EXIST)
 
   @debug = false
 
@@ -64,7 +67,8 @@ class Ability
                 :wiki_url, :category, :passive,
                 :frequency_seconds, :max_charges, :remaining_charges,
                 :max_upd, :remaining_upd, :upd_last_reset,
-                :item_cooldown_end, :remove_first, :get_first, :item_target
+                :item_cooldown_end, :remove_first, :get_first, :item_target,
+                :item_long_name, :item_noun
 
   def initialize(data = {})
     @name = data[:name] || ""
@@ -84,9 +88,11 @@ class Ability
     @remaining_upd = data[:remaining_upd]          # runtime: remaining uses today
     @upd_last_reset = data[:upd_last_reset]        # runtime: date string of last reset (EST)
     @item_cooldown_end = nil                       # runtime: Time when frequency cooldown expires
-    @remove_first = data[:remove_first] || false   # true = remove item before verb, then wear again
-    @get_first = data[:get_first] || false         # true = get item from container before verb, then return it
-    @item_target = data[:item_target]              # runtime: target string for remove/wear/get (e.g. "my neckchain" or "#25667483")
+    @remove_first    = data[:remove_first] || false  # true = remove item before verb, then wear again
+    @get_first       = data[:get_first]   || false  # true = get item from container before verb, then return it
+    @item_target     = data[:item_target]           # runtime: resolved target string, set fresh in execute_ability
+    @item_long_name  = data[:item_long_name]        # persistent: full game name for GameObj lookup (e.g. "a mithril spear")
+    @item_noun       = data[:item_noun]             # persistent: noun fallback (e.g. "spear")
   end
 
   def to_h
@@ -104,8 +110,10 @@ class Ability
     h[:frequency_seconds] = @frequency_seconds if @frequency_seconds
     h[:max_charges] = @max_charges if @max_charges
     h[:max_upd] = @max_upd if @max_upd
-    h[:remove_first] = true if @remove_first
-    h[:get_first] = true if @get_first
+    h[:remove_first]   = true             if @remove_first
+    h[:get_first]      = true             if @get_first
+    h[:item_long_name] = @item_long_name  if @item_long_name && !@item_long_name.empty?
+    h[:item_noun]      = @item_noun       if @item_noun      && !@item_noun.empty?
     h
   end
 
@@ -886,16 +894,35 @@ module Scanner
     abilities = []
 
     raw_items = []
+    migrated  = false
     proxy_items = CharSettings['combatical']['scripted_items'] || []
     # Extract raw data to avoid SettingsProxy iteration issues
     proxy_items.each do |item|
       verb_list = []
       (item['verbs'] || []).each { |v| verb_list << v.to_s }
       entry = {
-        'name'   => item['name'].to_s,
-        'verbs'  => verb_list,
-        'status' => item['status'].to_s
+        'name'      => item['name'].to_s,
+        'long_name' => item['long_name'].to_s,
+        'noun'      => item['noun'].to_s,
+        'verbs'     => verb_list,
+        'status'    => item['status'].to_s
       }
+      # Auto-migrate: if gameobj_id present but long_name missing, resolve via GameObj this session
+      if entry['long_name'].empty? && !item['gameobj_id'].to_s.empty?
+        gid = item['gameobj_id'].to_s
+        obj = GameObj[gid]
+        if obj
+          entry['long_name'] = obj.name.to_s
+          entry['noun']      = obj.noun.to_s
+          respond "--- Combatical: [MIGRATE] '#{entry['name']}': gameobj_id ##{gid} -> long_name '#{entry['long_name']}'"
+        else
+          # ID no longer valid (logged out); fall back to name as long_name, last word as noun
+          entry['long_name'] = item['name'].to_s
+          entry['noun']      = item['name'].to_s.split(' ').last.to_s
+          respond "--- Combatical: [MIGRATE] '#{entry['name']}': gameobj_id ##{gid} not found, using name as long_name"
+        end
+        migrated = true
+      end
       # Extract verb_meta if present (frequency/charges per verb)
       raw_meta = item['verb_meta']
       if raw_meta
@@ -910,20 +937,23 @@ module Scanner
       raw_items << entry
     end
 
-    # De-duplicate by name (clean up any prior corruption)
+    # De-duplicate by long_name (clean up any prior corruption)
     seen_names = {}
     unique_items = []
     raw_items.each do |item|
-      key = item['name'].downcase
+      key = (item['long_name'].empty? ? item['name'] : item['long_name']).downcase
       unless seen_names[key]
         seen_names[key] = true
         unique_items << item
       end
     end
 
-    # If duplicates were found, clean up CharSettings
+    # Persist back to CharSettings if migrated or duplicates were found
     if unique_items.length < raw_items.length
       respond "--- Combatical: Cleaned up #{raw_items.length - unique_items.length} duplicate item(s)" if Combatical.debug?
+      migrated = true
+    end
+    if migrated
       CharSettings['combatical']['scripted_items'] = unique_items
     end
 
@@ -954,11 +984,10 @@ module Scanner
           bare_verb = raw_verb
         end
 
-        item_target = item['gameobj_id'] ? "##{item['gameobj_id']}" : "my #{item['name']}"
-        item_cmd = "#{bare_verb} #{item_target}"
+        # command stores only the bare verb; target is resolved fresh in execute_ability
         ability_data = {
           name: "#{item['name']} - #{raw_verb}",
-          command: item_cmd,
+          command: bare_verb,
           type: :item,
           resource_type: :none,
           cost: 0,
@@ -968,7 +997,8 @@ module Scanner
           passive: false,
           remove_first: remove_first,
           get_first: get_first,
-          item_target: item_target
+          item_long_name: item['long_name'].to_s,
+          item_noun: item['noun'].to_s
         }
         if parsed
           if parsed[:type] == :frequency
@@ -1209,6 +1239,13 @@ class Window
         end
       end
     end
+
+    # Always rebuild item abilities fresh from scripted_items_cache so that
+    # item_long_name/item_noun are current regardless of what was serialized.
+    # build_item_abilities reads @item_charges/cooldown/upd_tracking caches
+    # (already loaded above) to restore runtime state.
+    @abilities.reject! { |a| a.type == :item }
+    @abilities.concat(build_item_abilities)
 
     if Combatical.debug?
       item_count = @abilities.count { |a| a.type == :item }
@@ -2506,6 +2543,14 @@ class Window
       # Append target for spells (incant accepts target directly)
       command += " #{@current_target}" if @current_target && ability.type == :spell
 
+      # For items: resolve target fresh on every click to handle ID changes (locker, login, etc.)
+      # ability.command holds only the bare verb; we append the live target here.
+      if ability.type == :item && ability.item_long_name
+        item_target = resolve_item_target('long_name' => ability.item_long_name, 'noun' => ability.item_noun.to_s)
+        ability.item_target = item_target
+        command = "#{ability.command} #{item_target}"
+      end
+
       # Consume item charges/cooldown immediately (RT guard above ensures we're not in RT)
       ability.record_item_use! if ability.type == :item
       record_ability_cast(ability.name)
@@ -3187,21 +3232,21 @@ class Window
 
     add_hbox = Gtk::Box.new(:horizontal, 5)
     @item_entry = Gtk::Entry.new
-    @item_entry.set_placeholder_text("Enter item name, Protip: include adjective or use GameObj id...")
+    @item_entry.set_placeholder_text("Enter item long name (e.g. 'a silver neckchain') or use Right Hand button...")
     @item_entry.set_width_chars(30)
-    @item_entry.set_tooltip_text("Add items here, it will ask for verbs next.\nUse 'Right Hand ID' to add the item by ID (preferred)")
+    @item_entry.set_tooltip_text("Add items here, it will ask for verbs next.\nUse 'Right Hand' to auto-fill the name from what you're holding (preferred).")
     add_hbox.pack_start(@item_entry, expand: true, fill: true, padding: 0)
 
     @add_item_button = Gtk::Button.new(label: "Add")
-    @add_item_button.set_tooltip_text("Add items here, it will ask for verbs next.\nUse 'Right Hand ID' to add the item by ID (preferred)")
+    @add_item_button.set_tooltip_text("Add items here, it will ask for verbs next.\nUse 'Right Hand' to auto-fill the name from what you're holding (preferred).")
     @add_item_button.signal_connect('clicked') {
       add_scripted_item
     }
     add_hbox.pack_start(@add_item_button, expand: false, fill: false, padding: 0)
 
-    @rh_id_button = Gtk::Button.new(label: "Right Hand ID")
-    @rh_id_button.set_tooltip_text("Get the GameObj ID of the item in your right hand and fill it into the entry field")
-    @rh_id_button.signal_connect('clicked') { grab_right_hand_id }
+    @rh_id_button = Gtk::Button.new(label: "Right Hand")
+    @rh_id_button.set_tooltip_text("Fill the entry field with the long name of the item currently in your right hand.\nThis name is used for persistent targeting across logins.")
+    @rh_id_button.signal_connect('clicked') { grab_right_hand_info }
     add_hbox.pack_end(@rh_id_button, expand: false, fill: false, padding: 0)
 
     vbox.pack_start(add_hbox, expand: false, fill: false, padding: 0)
@@ -3293,24 +3338,25 @@ class Window
       @items_box.pack_start(label, expand: false, fill: false, padding: 2)
     else
       items.each do |item|
-        name = item['name'].to_s
+        name      = item['name'].to_s
+        long_name = item['long_name'].to_s
+        noun      = item['noun'].to_s
         verbs_text = (item['verbs'] || []).map(&:to_s).join(', ')
-        gid = item['gameobj_id']
 
-        item_gid = gid    # capture for closures
-        item_name = name  # capture for closures
+        item_name      = name       # capture for closures
+        item_long_name = long_name  # capture for closures
+        item_noun      = noun       # capture for closures
 
         hbox = Gtk::Box.new(:horizontal, 0)
         item_label = Gtk::Label.new
-        id_tag = item_gid ? " <span foreground='#88CCFF'>[ID]</span>" : ""
-        item_label.set_markup("#{item_name} <span foreground='#888888'>(#{verbs_text})</span>#{id_tag} ")
+        item_label.set_markup("#{item_name} <span foreground='#888888'>(#{verbs_text})</span> ")
         item_label.set_halign(:start)
         item_ebox = Gtk::EventBox.new
         item_ebox.add(item_label)
         item_ebox.set_tooltip_text("Click to edit verbs for #{item_name}")
         item_ebox.signal_connect('button-release-event') { |widget, event|
           if event.button == 1
-            show_item_verb_dialog(item_name, item_gid)
+            show_item_verb_dialog(item_name, item_long_name, item_noun)
           end
           false
         }
@@ -3322,7 +3368,7 @@ class Window
         x_ebox.add(x_label)
         x_ebox.signal_connect('button-release-event') { |widget, event|
           if event.button == 1
-            remove_scripted_item(item_name, item_gid)
+            remove_scripted_item(item_name, item_long_name)
           end
           false
         }
@@ -3375,6 +3421,59 @@ class Window
   # Extract a plain Ruby array of hashes from CharSettings scripted_items
   # This avoids SettingsProxy issues \u2014 .map on a proxy returns another proxy,
   # so we use .each to build plain Ruby arrays and strings.
+  # Resolve the current game target string for a scripted item.
+  # Called fresh on every execute_ability to handle ID changes (locker, login, etc.)
+  #
+  # Priority:
+  #   1. GameObj search by long_name — uses live #id for precise targeting
+  #   2. "my noun" fallback — reliable even when name changes state (e.g. "distorted")
+  def resolve_item_target(item)
+    long_name = item.is_a?(Hash) ? item['long_name'].to_s : item.to_s
+    noun      = item.is_a?(Hash) ? item['noun'].to_s      : ''
+    fallback  = noun.empty? ? (item.is_a?(Hash) ? item['name'].to_s : '') : noun
+
+    unless long_name.empty?
+      all_objs = []
+      all_objs << GameObj.right_hand if GameObj.right_hand
+      all_objs << GameObj.left_hand  if GameObj.left_hand
+      all_objs.concat(GameObj.inv.to_a) rescue nil
+      begin
+        GameObj.containers.each { |_, items| all_objs.concat(items.to_a) if items }
+      rescue; end
+      match = all_objs.find { |o| o.name == long_name }
+      return "##{match.id}" if match
+    end
+
+    "my #{fallback}"
+  end
+
+  # Search all currently visible GameObj for an item matching the typed text.
+  # Priority: exact name match > name contains typed text (case-insensitive) > noun match.
+  # Returns the matching GameObj, or nil if not found.
+  def find_gameobj_by_search(text)
+    return nil if text.nil? || text.strip.empty?
+    needle = text.strip.downcase
+
+    all_objs = []
+    all_objs << GameObj.right_hand if GameObj.right_hand
+    all_objs << GameObj.left_hand  if GameObj.left_hand
+    all_objs.concat(GameObj.inv.to_a) rescue nil
+    begin
+      GameObj.containers.each { |_, items| all_objs.concat(items.to_a) if items }
+    rescue; end
+
+    # Exact match on full name
+    found = all_objs.find { |o| o.name.to_s.downcase == needle }
+    return found if found
+
+    # Partial match: typed text contained within the object's full name
+    found = all_objs.find { |o| o.name.to_s.downcase.include?(needle) }
+    return found if found
+
+    # Noun match as last resort
+    all_objs.find { |o| o.noun.to_s.downcase == needle }
+  end
+
   def deep_copy_items(proxy_or_array)
     result = []
     return result if proxy_or_array.nil?
@@ -3382,12 +3481,12 @@ class Window
       verb_list = []
       (item['verbs'] || []).each { |v| verb_list << v.to_s }
       entry = {
-        'name'   => item['name'].to_s,
-        'verbs'  => verb_list,
-        'status' => item['status'].to_s
+        'name'      => item['name'].to_s,
+        'long_name' => item['long_name'].to_s,
+        'noun'      => item['noun'].to_s,
+        'verbs'     => verb_list,
+        'status'    => item['status'].to_s
       }
-      # Copy gameobj_id if present (for precise item targeting)
-      entry['gameobj_id'] = item['gameobj_id'].to_s if item['gameobj_id'] && !item['gameobj_id'].to_s.empty?
       # Copy verb_meta if present (frequency/charges per verb)
       raw_meta = item['verb_meta']
       if raw_meta
@@ -3404,56 +3503,60 @@ class Window
     result
   end
 
-  # Add scripted item with ANALYZE
-  # Grab the GameObj ID of the item in the right hand
-  def grab_right_hand_id
+  # Capture long name and noun for the item in the right hand and fill the entry field.
+  # Stores the full game name (persistent across logins) rather than a session-specific ID.
+  def grab_right_hand_info
     rh = GameObj.right_hand
-    if rh.nil? || rh.id.nil? || rh.id.to_s.empty? || rh.noun.nil? || rh.noun.to_s.empty?
+    if rh.nil? || rh.noun.nil? || rh.noun.to_s.empty?
       @item_status_label.set_markup("<span color='orange'>Nothing in right hand</span>")
       return
     end
-    gameobj_id = rh.id.to_s
-    display_name = rh.name.to_s
-    # Strip leading articles for cleaner display
-    display_name = display_name.sub(/^(?:a |an |some |the )/i, '')
-    @item_entry.set_text("##{gameobj_id}")
-    @pending_gameobj_display_name = display_name
-    respond "--- Combatical: Right hand: #{display_name} (GameObj ID: ##{gameobj_id})"
-    @item_status_label.set_markup("<span color='#88CCFF'>##{gameobj_id} = #{display_name}</span>")
+    long_name = rh.name.to_s   # full game name e.g. "a mithril spear"
+    noun      = rh.noun.to_s   # targeting noun e.g. "spear"
+    display_name = long_name.sub(/^(?:a |an |some |the )/i, '')
+    @item_entry.set_text(long_name)
+    @pending_long_name = long_name
+    @pending_noun      = noun
+    respond "--- Combatical: Right hand: #{long_name} (noun: #{noun})"
+    @item_status_label.set_markup("<span color='#88CCFF'>#{display_name} (noun: #{noun})</span>")
   end
 
   # Open verb entry dialog for a new scripted item
   def add_scripted_item
-    item_name = @item_entry.text.strip
-    return if item_name.empty?
+    entry_text = @item_entry.text.strip
+    return if entry_text.empty?
 
-    # Detect GameObj ID format: #12345
-    gameobj_id = nil
-    display_name = item_name
-    if item_name =~ /^#(\d+)$/
-      gameobj_id = $1
-      # Use cached display name from "Right Hand ID" button, or look up live
-      if @pending_gameobj_display_name && !@pending_gameobj_display_name.empty?
-        display_name = @pending_gameobj_display_name
+    # If "Right Hand" button was used, pending_long_name/noun are set; otherwise
+    # treat the typed text as the long_name and derive noun from the last word.
+    if @pending_long_name && !@pending_long_name.empty?
+      long_name = @pending_long_name
+      noun      = @pending_noun.to_s
+      @pending_long_name = nil
+      @pending_noun      = nil
+    else
+      # Try to find a live GameObj matching the typed text for canonical long_name/noun
+      obj = find_gameobj_by_search(entry_text)
+      if obj
+        long_name = obj.name.to_s
+        noun      = obj.noun.to_s
+        display_name = long_name.sub(/^(?:a |an |some |the )/i, '')
+        @item_status_label.set_markup("<span color='#88CCFF'>Found: #{display_name} (noun: #{noun})</span>")
       else
-        obj = GameObj[gameobj_id]
-        if obj
-          display_name = obj.name.to_s.sub(/^(?:a |an |some |the )/i, '')
-        else
-          @item_status_label.set_markup("<span color='orange'>GameObj ##{gameobj_id} not found \u2014 is the item in your inventory?</span>")
-          return
-        end
+        long_name    = entry_text
+        noun         = entry_text.split(' ').last.to_s
+        display_name = long_name.sub(/^(?:a |an |some |the )/i, '')
+        @item_status_label.set_markup("<span color='orange'>Item not found in inventory — using typed name</span>")
       end
-      @pending_gameobj_display_name = nil
     end
 
-    # Show dialog to manually add verbs for this item
-    show_item_verb_dialog(display_name, gameobj_id)
+    display_name ||= long_name.sub(/^(?:a |an |some |the )/i, '')
+    show_item_verb_dialog(display_name, long_name, noun)
   end
 
   # Dialog for manually adding verbs to a scripted item
-  # gameobj_id: optional GameObj ID string for precise targeting
-  def show_item_verb_dialog(item_name, gameobj_id = nil)
+  # long_name: full game name used for persistent storage (e.g. "a mithril spear")
+  # noun:      targeting noun used as fallback (e.g. "spear")
+  def show_item_verb_dialog(item_name, long_name = nil, noun = nil)
     dialog = Gtk::Dialog.new(
       title: "Add Verbs for: #{item_name}",
       parent: @window,
@@ -3516,10 +3619,11 @@ class Window
     verbs_scroll.add(verbs_vbox)
     content.pack_start(verbs_scroll, expand: true, fill: true, padding: 0)
 
-    # Pre-populate with existing verbs if re-editing
+    # Pre-populate with existing verbs if re-editing; match by long_name first, fall back to display name
     raw_items = deep_copy_items(@scripted_items_cache || [])
-    existing = if gameobj_id
-      raw_items.find { |i| i['gameobj_id'].to_s == gameobj_id }
+    existing = if long_name && !long_name.empty?
+      raw_items.find { |i| i['long_name'].to_s.downcase == long_name.downcase } ||
+        raw_items.find { |i| i['name'].to_s.downcase == item_name.downcase }
     else
       raw_items.find { |i| i['name'].to_s.downcase == item_name.downcase }
     end
@@ -3602,7 +3706,7 @@ class Window
         @item_status_label.set_markup("<span color='orange'>No verbs added \u2014 item not saved</span>")
         return
       end
-      save_scripted_item(item_name, verbs_data, gameobj_id)
+      save_scripted_item(item_name, verbs_data, long_name, noun)
     else
       dialog.destroy
       @item_status_label.set_markup("<span color='orange'>Cancelled</span>")
@@ -3612,8 +3716,9 @@ class Window
 
   # Save a scripted item with selected verbs (called after verb selection dialog)
   # verbs_data: array of { 'verb' => "PULL", 'freq_str' => "12h4m32s" }
-  # gameobj_id: optional GameObj ID string for precise targeting
-  def save_scripted_item(item_name, verbs_data, gameobj_id = nil)
+  # long_name:  full game name for persistent matching (e.g. "a mithril spear")
+  # noun:       targeting noun as fallback (e.g. "spear")
+  def save_scripted_item(item_name, verbs_data, long_name = nil, noun = nil)
     @scripted_items_cache ||= []
 
     # Build verb list and metadata from the dialog data
@@ -3625,19 +3730,20 @@ class Window
       end
     end
 
-    # Remove any existing entry for this item, then add with selected verbs
-    # Match by gameobj_id if present (more precise), otherwise by name
-    if gameobj_id
-      @scripted_items_cache.reject! { |i| i['gameobj_id'].to_s == gameobj_id }
+    # Remove any existing entry for this item, then add with selected verbs.
+    # Match by long_name if available, otherwise fall back to display name.
+    if long_name && !long_name.empty?
+      @scripted_items_cache.reject! { |i| i['long_name'].to_s.downcase == long_name.downcase }
     else
-      @scripted_items_cache.reject! { |i| i['gameobj_id'].nil? && i['name'].to_s.downcase == item_name.downcase }
+      @scripted_items_cache.reject! { |i| i['name'].to_s.downcase == item_name.downcase }
     end
     entry = {
-      'name' => item_name,
-      'verbs' => verb_list,
-      'status' => 'verified'
+      'name'      => item_name,
+      'long_name' => long_name.to_s,
+      'noun'      => noun.to_s,
+      'verbs'     => verb_list,
+      'status'    => 'verified'
     }
-    entry['gameobj_id'] = gameobj_id if gameobj_id
     entry['verb_meta'] = verb_meta unless verb_meta.empty?
     @scripted_items_cache << entry
     respond "--- Combatical: Saved item #{item_name} with verbs: #{verb_list.join(', ')} (total items: #{@scripted_items_cache.length})" if Combatical.debug?
@@ -3696,11 +3802,10 @@ class Window
           bare_verb = raw_verb
         end
 
-        item_target = item['gameobj_id'] ? "##{item['gameobj_id']}" : "my #{item['name']}"
-        item_cmd = "#{bare_verb} #{item_target}"
+        # command stores only the bare verb; target is resolved fresh in execute_ability
         ability_data = {
           name: "#{item['name']} - #{raw_verb}",
-          command: item_cmd,
+          command: bare_verb,
           type: :item,
           resource_type: :none,
           cost: 0,
@@ -3710,7 +3815,8 @@ class Window
           passive: false,
           remove_first: remove_first,
           get_first: get_first,
-          item_target: item_target
+          item_long_name: item['long_name'].to_s,
+          item_noun: item['noun'].to_s
         }
 
         if parsed
@@ -3751,16 +3857,16 @@ class Window
     abilities
   end
 
-  # Remove scripted item by name (more robust than index-based removal)
-  def remove_scripted_item(item_name, gameobj_id = nil)
+  # Remove scripted item; match by long_name for precision, fall back to display name
+  def remove_scripted_item(item_name, long_name = nil)
     @scripted_items_cache ||= []
     before_count = @scripted_items_cache.length
 
-    respond "--- Combatical: [ITEM DEBUG] Removing '#{item_name}' (gameobj_id=#{gameobj_id.inspect}) from #{@scripted_items_cache.length} items" if Combatical.debug?
+    respond "--- Combatical: [ITEM DEBUG] Removing '#{item_name}' (long_name=#{long_name.inspect}) from #{@scripted_items_cache.length} items" if Combatical.debug?
 
-    # Prefer matching by gameobj_id for ID-targeted items, fall back to name
-    found_index = if gameobj_id
-                    @scripted_items_cache.index { |i| i['gameobj_id'].to_s == gameobj_id.to_s }
+    found_index = if long_name && !long_name.empty?
+                    @scripted_items_cache.index { |i| i['long_name'].to_s.downcase == long_name.to_s.downcase } ||
+                      @scripted_items_cache.index { |i| i['name'].to_s.downcase == item_name.to_s.downcase }
                   else
                     @scripted_items_cache.index { |i| i['name'].to_s.downcase == item_name.to_s.downcase }
                   end
