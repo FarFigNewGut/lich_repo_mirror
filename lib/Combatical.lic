@@ -14,7 +14,7 @@
   WARNING: Be careful when dragging and dropping abilities. Perform actions deliberate and avoid spammy drags. There's some stability issues if you blast it.
 
   author: Kyrandos
-  version: 1.2.2
+  version: 1.2.3
   game: gs
   other Scripts: Loresang, volnrestore2
   tags: utility, abilities, manager, list, organization, combat, targeting, GUI, spells, items, tracker, status
@@ -38,6 +38,7 @@
       1.2.0 2/25/2026 - Finished Society implementation: Voln corrected and COL+GOS enabled. Fixed ALL ability colorings.
       1.2.1 2/26/2026 - Track scripted items by long name for persistence across logins; auto-migrate existing gameobj_id entries
       1.2.2 2/26/2026 - Fix item_long_name/item_noun not surviving save/load cycle; rebuild item abilities from cache at init
+      1.2.5 2/26/2026 - Significant improvements to crash handling and refresh logic
 
   NOTES - PLEASE READ: Drag and drop abilities has some stability issues. Just perform actions deliberately and do not spam. Closing it will save. 
           Please ensure all your spell circles and ability categories appear in the unfiltered pool, I have only tested on Paladin, Wizard, and Bard.
@@ -1284,6 +1285,7 @@ class Window
     @last_click_time = Time.now.to_f
     @drag_in_progress = false
     @drop_completed_at = nil
+    @last_drag_time = nil
     @timer_stopped = false
 
     # Simple repeating timer on the GTK main thread.
@@ -1292,9 +1294,15 @@ class Window
     @update_timer = GLib::Timeout.add(250) {
       begin
         unless @timer_stopped
-          update_target_lists
-          update_ability_displays
-          update_resource_bars
+          # Pause widget-touching updates while a rebuild is in progress.
+          # rebuild_ui runs asynchronously (via Gtk.queue/idle), so timer ticks
+          # continue firing while widgets are being torn down and recreated.
+          # Skipping here prevents accessing half-destroyed widget trees.
+          unless @rebuilding
+            update_target_lists
+            update_ability_displays
+            update_resource_bars
+          end
 
           # Auto-repeat: fire abilities in repeat mode when game RT is clear
           if @repeat_abilities && !@repeat_abilities.empty?
@@ -1310,29 +1318,54 @@ class Window
             end
           end
 
-          # Safety valve: on Windows, drag-end never fires with manual drop
-          # handling. Wait one event-loop cycle (~100ms) after the drop for
-          # GTK to finish its DnD cleanup, then release the rebuild lock.
+          # Post-drop recovery: drag-end never fires for successful drops on Windows.
+          # After 250ms (one timer tick) the OLE IDropTarget::Drop() stack has fully
+          # returned, so it is safe to clear the drag lock and let the rebuild proceed.
+          # This is the NORMAL exit path for every completed drop — no log needed.
           if @drag_in_progress && @drop_completed_at
-            if (Time.now.to_f - @drop_completed_at) > 0.1
-              respond "--- Combatical: Safety valve \u2014 resetting stuck drag state" if Combatical.debug?
+            if (Time.now.to_f - @drop_completed_at) >= 0.25
               @drag_in_progress = false
               @drop_completed_at = nil
+              @last_drag_time = nil
             end
           end
 
-          # Deferred rebuild after drag-and-drop (safe \u2014 outside drag signal stack)
-          # Skip if a drag is in progress (rebuilding destroys drag source widgets)
+          # True safety valve: detect drags where NO drop ever happened (e.g. the
+          # drop event was lost, OLE never sent IDropTarget::Drop, or drag was aborted
+          # without drag-end firing). Only log after 8 genuine seconds of stuck state.
+          if @drag_in_progress && !@drop_completed_at && @last_drag_time
+            if (Time.now.to_f - @last_drag_time) > 8.0
+              elapsed = (Time.now.to_f - @last_drag_time).round(1)
+              respond "--- Combatical: Safety valve — long stuck drag detected (#{elapsed}s), releasing lock"
+              @drag_in_progress = false
+              @last_drag_time = nil
+            end
+          end
+
+          # Deferred rebuild after drag-and-drop.
+          # Skip if a drag is in progress (rebuilding destroys drag source widgets).
+          # Queue as a GTK idle callback so the current timer frame (and any
+          # still-unwinding drag/OLE signal stack) fully returns before we
+          # destroy and recreate widgets. @rebuilding prevents accumulation.
+          # IMPORTANT: do NOT set @last_rebuild_time here — setting it before the
+          # async rebuild fires causes rebuild_ui's hard debounce to see ~6ms and
+          # bail immediately. @last_rebuild_time is updated by start_roundtime_tracker
+          # at the END of rebuild_ui so the debounce and rate-limiter measure from
+          # when the rebuild actually completed, not when it was queued.
           if @needs_rebuild && !@rebuilding && !@drag_in_progress
             now = Time.now.to_f
             if (now - @last_rebuild_time) >= 0.4
               @needs_rebuild = false
               @rebuilding = true
-              @last_rebuild_time = now
-              begin
-                rebuild_ui
-              ensure
-                @rebuilding = false
+              respond "--- Combatical: [TIMER] queuing async rebuild_ui thread=#{Thread.current.object_id}"
+              Gtk.queue do
+                begin
+                  rebuild_ui
+                rescue => e
+                  respond "--- Combatical: [TIMER REBUILD CRASH] #{e.class}: #{e.message}\n#{e.backtrace[0..8].join("\n")}"
+                ensure
+                  @rebuilding = false
+                end
               end
             end
           end
@@ -1441,6 +1474,7 @@ class Window
 
   # Update resource bars with current XMLData values
   def update_resource_bars
+    return if @rebuilding
     { health: [:health, :max_health],
       mana:   [:mana, :max_mana],
       stamina: [:stamina, :max_stamina],
@@ -1461,6 +1495,8 @@ class Window
 
   # Update all tracked ability widgets with current RT countdown
   def update_ability_displays
+    return if @rebuilding
+    begin
     # Calculate remaining roundtime (max of regular RT and cast RT)
     rt = [0, XMLData.roundtime_end.to_f - Time.now.to_f + XMLData.server_time_offset.to_f].max
     cast_rt = [0, XMLData.cast_roundtime_end.to_f - Time.now.to_f + XMLData.server_time_offset.to_f].max
@@ -1556,6 +1592,9 @@ class Window
         lbl.set_markup("<span foreground='#%02x%02x%02x' strikethrough='true'>%s%s</span>%s%s" %
                        [rgb[0], rgb[1], rgb[2], ability.name, rt_display, charges_suffix, repeat_suffix])
       end
+    end
+    rescue
+      # Stale widget reference during rebuild transition — ignore silently
     end
   end
 
@@ -1907,7 +1946,8 @@ class Window
       begin
         is_dragging = true
         @drag_in_progress = true  # Block rebuilds while dragging
-        @drop_completed_at = nil  # Reset safety valve for new drag
+        @drop_completed_at = nil  # Reset (legacy; kept for handle_ability_drop ensure)
+        @last_drag_time = Time.now.to_f  # Safety valve reference point
         @dragged_ability_name = ability.name  # Store for drop handler (bypasses GTK data transfer)
         respond "--- Combatical: [DND] drag-begin: '#{ability.name}' (pool=#{pool ? 'yes' : 'no'})" if Combatical.debug?
       rescue => e
@@ -1922,6 +1962,7 @@ class Window
         # ALWAYS release the drag lock so rebuilds can proceed
         @drag_in_progress = false
         @drop_completed_at = nil
+        @last_drag_time = nil
         @dragged_ability_name = nil
       end
     }
@@ -2020,35 +2061,63 @@ class Window
     end
 
     # Handle drop using @dragged_ability_name (set in drag-begin).
-    # Also call drag_get_data to complete GTK's DnD protocol and prevent
-    # the state machine from getting stuck (which blocks future drags).
+    # We do NOT call drag_get_data here. On Windows, drag_get_data triggers OLE
+    # clipboard operations (IDataObject::GetData) that accumulate uncleaned state
+    # because drag-end never fires with manual drop handling and drag_finish is not
+    # supported by GdkWin32DragContext. After enough drags this caused OpenClipboard
+    # failures and eventually segfaults in GTK's C cleanup code. We use
+    # @dragged_ability_name instead of the data transfer mechanism, so the call was
+    # always redundant — removing it eliminates the OLE state accumulation entirely.
     widget.signal_connect('drag-drop') { |w, context, x, y, time|
       begin
         clear_drop_indicator
 
-        # Complete GTK's DnD protocol (fire-and-forget)
-        begin
-          target = context.targets.first
-          w.drag_get_data(context, target, time) if target
-        rescue
-          # May fail for cross-container drops on Windows; not fatal
-        end
-
-        # Use stored ability name \u2014 reliable across all drag scenarios
+        # Use stored ability name — reliable across all drag scenarios
         ability_name = @dragged_ability_name
         respond "--- Combatical: [DND] drag-drop fired, ability=#{ability_name.inspect}, box=#{box_index.inspect}" if Combatical.debug?
         if ability_name && !ability_name.empty?
+          # Guard: ability must still exist — catches stale @dragged_ability_name
+          # after a mid-drag rebuild, or drops originating from an external source.
+          unless @abilities.any? { |a| a.name == ability_name }
+            respond "--- Combatical: [DND] DROP SKIPPED: '#{ability_name}' not found in ability list (stale ref or external drag)"
+            ability_name = nil
+          end
+        end
+        if ability_name && !ability_name.empty?
           insert_at = box_index ? find_drop_index(w, y) : nil
-          handle_ability_drop(ability_name, box_index, insert_at)
+          if box_index.nil?
+            # Extra safety: reject ghost pool drops that arrive without an active drag.
+            # This can happen if OLE fires a stale IDropTarget::Drop() after a prior
+            # drag completed (e.g. drag-end never fired, safety valve cleared the flag,
+            # then a belated OLE message triggers drag-drop again).
+            unless @drag_in_progress
+              respond "--- Combatical: [DnD POOL DROP] SKIPPED — ghost drop (drag_in_progress=false, dragged=#{ability_name.inspect})"
+            else
+              # Pool drop — full diagnostics to track crashes
+              ability_obj    = @abilities.find { |a| a.name == ability_name }
+              source_box_idx = nil
+              @boxes.each_with_index { |b, i| source_box_idx = i if (b['abilities'] || []).include?(ability_name) }
+              respond "--- Combatical: [DnD POOL DROP] ability=#{ability_obj&.name.inspect} source_box=#{source_box_idx.inspect} thread=#{Thread.current.object_id}"
+              begin
+                handle_ability_drop(ability_name, box_index, insert_at)
+                respond "--- Combatical: [DnD POOL DROP] move complete, rebuild queued via @needs_rebuild"
+              rescue => e
+                respond "--- Combatical: [DnD POOL DROP CRASH] #{e.class}: #{e.message}\n#{e.backtrace[0..8].join("\n")}"
+              end
+            end
+          else
+            handle_ability_drop(ability_name, box_index, insert_at)
+          end
         end
       rescue => e
-        respond "--- Combatical: drag-drop error: #{e.message}" if Combatical.debug?
+        respond "--- Combatical: drag-drop error: #{e.message} #{e.backtrace.first}"
       end
-      true  # We handled the drop \u2014 do NOT let GTK call drag_finish
+      true  # We handled the drop — do NOT let GTK call drag_finish
     }
 
-    # No-op handler required to complete GTK's DnD protocol after drag_get_data.
-    # Actual drop logic is in the drag-drop handler via @dragged_ability_name.
+    # Registered no-op to satisfy GTK's DnD protocol state machine on some versions.
+    # drag-data-received no longer fires (we removed drag_get_data) but keeping the
+    # handler registered prevents any state machine edge cases.
     widget.signal_connect('drag-data-received') { |w, context, x, y, selection_data, info, time|
       respond "--- Combatical: [DND] drag-data-received (no-op, box=#{box_index.inspect})" if Combatical.debug?
     }
@@ -2181,6 +2250,8 @@ class Window
   # Update target lists with current NPCs and players
   # Only recreates widgets when the data actually changes (fingerprint check)
   def update_target_lists
+    return if @rebuilding
+    begin
     # Filter out player pets/companions from NPCs
     @current_enemies = GameObj.npcs.reject { |npc|
       npc.type =~ /companion|familiar/i ||
@@ -2240,7 +2311,10 @@ class Window
     # Build fingerprint: nouns + statuses + current target + flash state + fled enemies
     enemy_data = @current_enemies.map { |npc| [npc.noun, npc.status.to_s] }
     player_data = @current_players.map { |pc| [pc.noun, pc.status.to_s] }
-    flash_state = @flash_targets.map { |id, info| [id, info[:flash_count]] }
+    # Use on/off visual state (even?) not the raw count — the count changes every
+    # 150ms tick causing the 250ms timer to redundantly rebuild target widgets
+    # every tick. The flash timer already calls update_target_lists directly.
+    flash_state = @flash_targets.map { |id, info| [id, info[:flash_count].even?] }
     fled_nouns = @fled_enemies.map { |f| [f[:noun], f[:direction]] }
     fingerprint = [enemy_data, player_data, @current_target, @current_target_type, flash_state, fled_nouns]
 
@@ -2344,6 +2418,9 @@ class Window
         @current_target_label.set_text("(none)")
         respond "--- Combatical: Target auto-cleared (no longer in room)" if Combatical.debug?
       end
+    end
+    rescue
+      # Stale widget reference during rebuild transition — ignore silently
     end
   end
 
@@ -3056,18 +3133,45 @@ class Window
 
   # Save which category expanders are currently expanded
   def save_expander_states
+    respond "--- Combatical: save_expander_states START pool_expanders=#{@pool_expanders&.keys&.length.inspect} thread=#{Thread.current.object_id}"
     @expanded_categories ||= {}
-    return unless @pool_expanders
-    @pool_expanders.each do |cat_name, expander|
-      @expanded_categories[cat_name] = expander.expanded? rescue false
+    unless @pool_expanders
+      respond "--- Combatical: save_expander_states SKIP (no pool_expanders)"
+      return
     end
+    @pool_expanders.each do |cat_name, expander|
+      begin
+        @expanded_categories[cat_name] = expander.expanded?
+      rescue => e
+        respond "--- Combatical: save_expander_states ERROR on #{cat_name.inspect}: #{e.class}: #{e.message}"
+        @expanded_categories[cat_name] = false
+      end
+    end
+    respond "--- Combatical: save_expander_states END saved=#{@expanded_categories.keys.length}"
   end
 
   # Rebuild entire UI (after refresh or settings change)
   # NOTE: This should be called from GTK context (callback/dialog) or wrapped in Gtk.queue if from background thread
   def rebuild_ui
+    # Hard debounce: ignore spurious rapid calls (timer already throttles to 0.4s,
+    # but settings dialogs and other callers could stack up).
+    now = Time.now.to_f
+    if (now - (@last_rebuild_time || 0)) < 0.3
+      respond "--- Combatical: rebuild_ui DEBOUNCE skip (#{((now - (@last_rebuild_time || 0)) * 1000).round(0)}ms since last)"
+      @rebuilding = false
+      return
+    end
+
+    # Stop the update timer while widgets are being torn down and recreated.
+    # Timer callbacks that fire during widget destruction can access half-freed
+    # objects. @timer_stopped prevents future ticks; GLib::Source.remove stops
+    # the current timer immediately so it can't fire between now and show_all.
+    @timer_stopped = true
+    GLib::Source.remove(@update_timer) if @update_timer
+    @update_timer = nil
+
     start_t = Time.now.to_f
-    respond "--- Combatical: rebuild_ui START" if Combatical.debug?
+    respond "--- Combatical: rebuild_ui START thread=#{Thread.current.object_id} drag_in_progress=#{@drag_in_progress.inspect}"
 
     # Save expander open/closed states before destroying pool
     save_expander_states
@@ -3094,15 +3198,24 @@ class Window
     @target_list_fingerprint = nil  # Force target list rebuild on next tick
 
     # Reapply global colors (in case palette changed)
+    respond "--- Combatical: rebuild_ui apply_global_colors"
     apply_global_colors
 
     # Recreate boxes and pool
+    respond "--- Combatical: rebuild_ui create_boxes_grid"
     create_boxes_grid
+    respond "--- Combatical: rebuild_ui create_unassigned_pool"
     create_unassigned_pool
+    respond "--- Combatical: rebuild_ui show_all"
 
     @window.show_all
     elapsed = ((Time.now.to_f - start_t) * 1000).round(1)
-    respond "--- Combatical: rebuild_ui END (#{elapsed}ms)" if Combatical.debug?
+    respond "--- Combatical: rebuild_ui END (#{elapsed}ms) thread=#{Thread.current.object_id}"
+
+    # Restart the update timer now that all widgets are live.
+    # start_roundtime_tracker resets @rebuilding, @drag_in_progress, and
+    # @last_drag_time so the new timer starts from a clean slate.
+    start_roundtime_tracker
   end
 
   # Open settings dialog
