@@ -109,7 +109,7 @@ NODMGFLARE_PATTERNS = {
   ForestArmor_WoodlandEmpathy: /you suddenly have a clearer understanding of nature/,
   FReward115: /The dull golden nimbus surrounding you flares into life as it glows brightly for a moment/,
   FReproach312_WisdomBonus: /The .*? sphere begins to move in an ever-increasingly fast circle above your head until it shatters into a shower of brilliant energy/,
-  Fyrswnava_Flares: /\*\* Translucent celadon sap pools into a globular spherule\, hurling away from your .*? to coat .*? in a resinous substance\! \*\*/,
+  Fyrswnava_Flares: /Translucent celadon sap pools into a globular spherule\, hurling away from your/,
   Ethereal_Armor: /ethereal chains encase your body against/,
   EonakArm_Block: /your arm suddenly swings out and intercepts it/,
   Ensorcell: /\*\* Necrotic energy from your/,
