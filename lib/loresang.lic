@@ -15,7 +15,7 @@ The following inputs are available:
 			Other Mods: Combatical, volnrestore2
 			tags: utility, economy, bard, loresong, loresing 
 			required: Lich >= 5.12.9
-			version: 1.1.0
+			version: 1.2.0
 		 
 			\Version\\
 			1.0.0 1/22/2026 - initial release
@@ -30,16 +30,23 @@ The following inputs are available:
 			1.0.9 1/30/2026 - Removed debug output
 			1.1.0 2/27/2026 - Detect "song is weak / without sufficient power" and wait for mana
 			                   recovery before retrying; added wait_for_mana_recovery method
+			1.2.0 2/27/2026 - Added HTML report output (html_report_enabled setting): writes
+			                   loresang_report.html after each run with expandable recall text,
+			                   pinnable saved items via browser localStorage, and exportability
 		 
 =end
 
 require 'gtk3' rescue nil
+require 'json'
 
 module Loresang
   class Runner
     def initialize(mode)
       @mode = mode
       @high_value_items = []
+      @report_items = []
+      @last_recall_text = nil
+      @last_item_value = nil
       # Initialize settings hash if it doesn't exist
       UserVars.loresang ||= {}
       migrate_old_settings
@@ -80,6 +87,7 @@ module Loresang
       @value_threshold = (@value_alert_enabled && !value_threshold_text.empty?) ? value_threshold_text.gsub(',', '').to_i : nil
       @sing_container_name = settings[:sing_container].to_s.strip
       @sung_container_name = settings[:sung_container].to_s.strip
+      @html_report_enabled = settings[:html_report_enabled] || false
     end
 
     def parse_item_value(recall_text)
@@ -308,10 +316,13 @@ module Loresang
       recall_lines = reget(35, /.*/) || []
       start_index = recall_lines.rindex { |line| line =~ /As you recall your song/ }
       if start_index
-        recall_lines = recall_lines[start_index..-1]
+        recall_lines = recall_lines[(start_index + 1)..-1]
       end
       if recall_lines.any?
-        recall_text = recall_lines.join(" ")
+        recall_text = recall_lines.join("\n")
+        @last_recall_text = recall_text
+        raw_val = parse_item_value(recall_text)
+        @last_item_value = raw_val > 0 ? raw_val : nil
 
         if @value_threshold
           item_value = parse_item_value(recall_text)
@@ -342,6 +353,9 @@ module Loresang
         noun = item.noun
         Lich::Messaging.msg("yellow", "[Loresang] Starting loresinging on #{noun}...")
 
+        @last_recall_text = nil
+        @last_item_value = nil
+
         begin
           completed = sing_item(item_name, noun, nil)
         ensure
@@ -349,9 +363,16 @@ module Loresang
           pause 0.5 if @use_guildspeak
         end
 
+        if @html_report_enabled
+          @report_items << { name: item_name, noun: noun,
+                             status: completed ? :completed : :failed,
+                             recall_text: @last_recall_text, value: @last_item_value }
+        end
+
         Lich::Messaging.msg("yellow", "[Loresang] #{completed ? 'Finished' : 'Did not complete'}.")
 
         announce_high_value_summary if @high_value_items.any?
+        write_html_report
       else
         Lich::Messaging.msg("yellow", "[Loresang] Nothing in right hand!")
       end
@@ -413,28 +434,34 @@ module Loresang
           recall_lines = reget(35, /.*/) || []
           start_index = recall_lines.rindex { |line| line =~ /As you recall your song/ }
           if start_index
-            recall_lines = recall_lines[start_index..-1]
+            recall_lines = recall_lines[(start_index + 1)..-1]
           end
-          recall_text = recall_lines.join(" ")
+          recall_text = recall_lines.join("\n")
 
           if already_unlocked?(recall_text)
             if @value_threshold
               item_value = parse_item_value(recall_text)
-              
+
               if item_value >= @value_threshold
                 formatted = item_value.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
                 message = "Your item was found to be worth #{formatted} silvers. This is over your value threshold! Congrats! #{items_remaining} items to go!"
                 Lich::Messaging.msg("thought", message)
-                
+
                 if @announce_successes
                   fput "speak common"
                   pause 0.5
                   fput "say #{message}"
                   pause 0.5
                 end
-                
+
                 @high_value_items << { name: item_name, value: item_value }
               end
+            end
+
+            if @html_report_enabled
+              raw_val = parse_item_value(recall_text)
+              @report_items << { name: item_name, noun: noun, status: :already_unlocked,
+                                 recall_text: recall_text, value: raw_val > 0 ? raw_val : nil }
             end
 
             Lich::Messaging.msg("yellow", "[Loresang] #{noun} already fully unlocked - moving to sung container.")
@@ -446,13 +473,19 @@ module Loresang
             next
           end
 
+          @last_recall_text = nil
+          @last_item_value = nil
           completed = sing_item(item_name, noun, items_remaining)
 
           if completed
+            @report_items << { name: item_name, noun: noun, status: :completed,
+                               recall_text: @last_recall_text, value: @last_item_value } if @html_report_enabled
             fput "put ##{item.id} in ##{sung_container.id}"
             items_remaining -= 1
             successfully_unlocked += 1
           else
+            @report_items << { name: item_name, noun: noun, status: :failed,
+                               recall_text: nil, value: nil } if @html_report_enabled
             fput "put ##{item.id} in ##{sing_container.id}"
             failed_items << item.name
           end
@@ -471,6 +504,7 @@ module Loresang
       Lich::Messaging.msg("yellow", "[Loresang] Batch loresinging complete! #{successfully_unlocked} items successfully unlocked and #{already_unlocked_count} items already found unlocked. All moved to #{@sung_container_name}!")
 
       announce_high_value_summary if @high_value_items.any?
+      write_html_report
 
       fput "speak common" if @use_guildspeak
       pause 0.3 if @use_guildspeak
@@ -519,13 +553,200 @@ module Loresang
       item_list = @high_value_items.map { |i| "#{i[:name]}(#{i[:value].to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse})" }.join(", ")
       summary_message = "#{@high_value_items.length} valuable items found! The following deserve attention: #{item_list}"
       Lich::Messaging.msg("thought", summary_message)
-      
+
       if @announce_successes
         fput "speak common"
         pause 0.5
         fput "say #{summary_message}"
         pause 0.5
       end
+    end
+
+    def write_html_report
+      return unless @html_report_enabled
+      return if @report_items.empty?
+
+      char_name   = (XMLData.name rescue nil) || "Unknown"
+      timestamp   = Time.now.strftime("%Y-%m-%d %H:%M")
+      newly_sung  = @report_items.count { |i| i[:status] == :completed }
+      already_done = @report_items.count { |i| i[:status] == :already_unlocked }
+      failed_count = @report_items.count { |i| i[:status] == :failed }
+
+      batch_data = @report_items.map do |item|
+        {
+          'id'          => item[:name].gsub(/[^a-zA-Z0-9]/, '-').downcase,
+          'name'        => item[:name],
+          'noun'        => item[:noun].to_s,
+          'status'      => item[:status].to_s,
+          'recall_text' => (item[:recall_text] || '').gsub("\r", '').strip,
+          'value'       => item[:value]
+        }
+      end
+
+      # Prevent </script> in embedded JSON from closing the script tag early
+      batch_json = batch_data.to_json.gsub('</', '<\/')
+
+      report_path = "#{DATA_DIR}loresang_report.html"
+      File.write(report_path, generate_html(batch_json, timestamp, char_name, newly_sung, already_done, failed_count))
+      Lich::Messaging.msg("yellow", "[Loresang] HTML report written: #{report_path}")
+    rescue => e
+      Lich::Messaging.msg("yellow", "[Loresang] HTML report failed: #{e.message}")
+    end
+
+    def generate_html(batch_json, timestamp, char_name, newly_sung, already_done, failed_count)
+      <<~HTML
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+        <meta charset="UTF-8">
+        <title>Loresang Report - #{char_name}</title>
+        <style>
+        body{font-family:monospace;background:#1c1c1c;color:#c0c0c0;max-width:860px;margin:0 auto;padding:20px;position:relative}
+        h1{color:#d4af37;margin-bottom:4px}
+        h2{color:#999;border-bottom:1px solid #3a3a3a;padding-bottom:4px;margin-top:28px}
+        .summary{color:#777;font-size:.85em;margin-bottom:8px}
+        .item{margin:2px 0}
+        .item-header{display:flex;align-items:center;gap:8px;padding:3px 6px;border-radius:3px}
+        .item-header:hover{background:#252525}
+        .item-name{cursor:pointer;font-weight:bold}
+        .item-name:hover{text-decoration:underline}
+        .completed{color:#7ec850}.already_unlocked{color:#6699cc}.failed{color:#cc5555}
+        .value{color:#d4af37;font-size:.85em;margin-left:4px}
+        .recall{display:none;margin:2px 0 6px 28px;padding:8px 10px;background:#111;border-left:3px solid #3a3a3a;font-size:.82em;white-space:pre-wrap;color:#888;line-height:1.5}
+        .recall.open{display:block}
+        input[type=checkbox]{cursor:pointer;accent-color:#d4af37}
+        #empty-saved{color:#555;font-style:italic;padding:4px 6px}
+        .pending-removal{opacity:0.55}
+        .pending-removal .item-name{text-decoration:line-through;font-style:italic;color:#666}
+        .note-icon{margin-left:auto;font-size:.82em;opacity:0.4;user-select:none;flex-shrink:0;padding:0 3px}
+        .note-icon.has-notes{opacity:1;color:#d4af37}
+        .note-input{flex-shrink:0;width:220px;background:transparent;border:none;border-bottom:1px dashed #2e2e2e;color:#777;font-family:monospace;font-size:.76em;padding:1px 4px;outline:none}
+        .note-input:focus{border-bottom-color:#555;color:#bbb}
+        .note-input::placeholder{color:#2a2a2a}
+        #btn-group{position:absolute;top:20px;right:20px;display:flex;gap:8px;z-index:100}
+        .action-btn{background:#2a2a2a;border:1px solid #3a3a3a;color:#c0c0c0;cursor:pointer;padding:8px 14px;border-radius:6px;text-align:center;font-family:monospace;font-size:.78em;line-height:1.4}
+        .action-btn:hover{background:#333;border-color:#d4af37;color:#d4af37}
+        .action-btn .btn-icon{font-size:2em;display:block;line-height:1.1;margin-bottom:3px}
+        </style>
+        </head>
+        <body>
+        <div id="btn-group">
+          <button class="action-btn" onclick="exportCSV()"><span class="btn-icon">&#x1F3EA;</span>Export saved items .csv<br>for Shops</button>
+          <button class="action-btn" onclick="backupHTML()"><span class="btn-icon">&#x1F4BE;</span>Create backup</button>
+        </div>
+        <h1>Loresang Report</h1>
+        <div class="summary">#{timestamp} &nbsp;|&nbsp; #{char_name} &nbsp;|&nbsp; #{newly_sung} newly sung &nbsp;|&nbsp; #{already_done} already unlocked &nbsp;|&nbsp; #{failed_count} failed</div>
+        <h2>Saved Items</h2>
+        <div id="saved-items"></div>
+        <h2>New Batch</h2>
+        <div id="new-batch"></div>
+        <script type="application/json" id="batch-data">#{batch_json}</script>
+        <script>
+        var BATCH=[];
+        try{BATCH=JSON.parse(document.getElementById('batch-data').textContent);}catch(e){console.error('[Loresang] Failed to parse batch JSON:',e);document.getElementById('new-batch').innerHTML='<div style="color:#c55">[Failed to parse batch data: '+e.message+']</div>';}
+        function load(){try{return JSON.parse(localStorage.getItem('loresang_pinned')||'[]')}catch(e){return[]}}
+        function save(a){localStorage.setItem('loresang_pinned',JSON.stringify(a))}
+        function isPinned(id){return load().some(function(x){return x.id===id})}
+        function updateNote(id,text){
+          var p=load();
+          p.forEach(function(x){if(x.id===id)x.notes=text;});
+          save(p);
+        }
+        function makeItem(item,inSaved){
+          var d=document.createElement('div');d.className='item';
+          var h=document.createElement('div');h.className='item-header';
+          var cb=document.createElement('input');cb.type='checkbox';cb.checked=isPinned(item.id);
+          cb.title=inSaved?'Uncheck to remove from Saved Items':'Pin to Saved Items';
+          cb.onchange=function(){
+            if(inSaved){
+              if(!cb.checked){
+                save(load().filter(function(x){return x.id!==item.id}));
+                d.classList.add('pending-removal');
+              } else {
+                d.classList.remove('pending-removal');
+                var p=load();
+                if(!p.some(function(x){return x.id===item.id}))p.push(item);
+                save(p);
+              }
+            } else {
+              var p=load();
+              if(cb.checked){if(!p.some(function(x){return x.id===item.id}))p.push(item);save(p);}
+              else{save(p.filter(function(x){return x.id!==item.id}));}
+              renderSaved();
+            }
+          };
+          var n=document.createElement('span');n.className='item-name '+item.status;
+          n.textContent=item.name;
+          var r=document.createElement('div');r.className='recall';
+          r.textContent=item.recall_text||'(no recall data)';
+          n.onclick=function(){r.classList.toggle('open')};
+          h.appendChild(cb);h.appendChild(n);
+          if(item.value){
+            var v=document.createElement('span');v.className='value';
+            v.textContent='~'+item.value.toLocaleString()+' silvers';
+            h.appendChild(v);
+          }
+          if(inSaved){
+            var ni=document.createElement('span');
+            ni.className='note-icon'+(item.notes?' has-notes':'');
+            ni.textContent=String.fromCharCode(9999);
+            var inp=document.createElement('input');
+            inp.type='text';inp.className='note-input';inp.placeholder='notes...';inp.value=item.notes||'';
+            inp.oninput=function(){
+              updateNote(item.id,inp.value);
+              ni.className='note-icon'+(inp.value.trim()?' has-notes':'');
+            };
+            h.appendChild(ni);h.appendChild(inp);
+            d.appendChild(h);d.appendChild(r);
+          } else {
+            d.appendChild(h);d.appendChild(r);
+          }
+          return d;
+        }
+        function renderSaved(){
+          var c=document.getElementById('saved-items');c.innerHTML='';
+          var p=load();
+          if(!p.length){c.innerHTML='<div id="empty-saved">No saved items yet. Check the box next to any item in New Batch to pin it here.</div>';return;}
+          p.forEach(function(item){c.appendChild(makeItem(item,true));});
+        }
+        function renderBatch(){
+          var c=document.getElementById('new-batch');c.innerHTML='';
+          BATCH.forEach(function(item){c.appendChild(makeItem(item,false))});
+        }
+        function backupHTML(){
+          var now=new Date();
+          var pad=function(n){return n<10?'0'+n:String(n);};
+          var ts=now.getFullYear()+'-'+pad(now.getMonth()+1)+'-'+pad(now.getDate())+'_'+pad(now.getHours())+'-'+pad(now.getMinutes())+'-'+pad(now.getSeconds());
+          var html='<!DOCTYPE html>\\n'+document.documentElement.outerHTML;
+          var blob=new Blob([html],{type:'text/html'});
+          var a=document.createElement('a');
+          a.href=URL.createObjectURL(blob);
+          a.download='loresang_backup_'+ts+'.html';
+          a.click();
+          URL.revokeObjectURL(a.href);
+        }
+        function exportCSV(){
+          var p=load();
+          if(!p.length){alert('No saved items to export.');return;}
+          var rows=[['Name','Noun','Status','Value (silvers)','Notes','Recall']];
+          p.forEach(function(x){
+            var clean=function(s){return String(s||'').replace(/,/g,'').replace(/[\\r\\n]+/g,' ').trim();};
+            rows.push([clean(x.name),clean(x.noun),clean(x.status),x.value||'',clean(x.notes),clean(x.recall_text)]);
+          });
+          var csv=rows.map(function(r){return r.join(',');}).join('\\r\\n');
+          var blob=new Blob([csv],{type:'text/csv'});
+          var a=document.createElement('a');
+          a.href=URL.createObjectURL(blob);
+          a.download='loresang_saved.csv';
+          a.click();
+          URL.revokeObjectURL(a.href);
+        }
+        try{renderSaved();}catch(e){console.error('[Loresang] renderSaved failed:',e);document.getElementById('saved-items').innerHTML='<div id="empty-saved" style="color:#c55">[Error loading saved items - localStorage may have stale data. Try clearing site data.]</div>';}
+        try{renderBatch();}catch(e){console.error('[Loresang] renderBatch failed:',e);document.getElementById('new-batch').innerHTML='<div style="color:#c55">[Error rendering batch - see browser console (F12) for details.]</div>';}
+        </script>
+        </body>
+        </html>
+      HTML
     end
   end
 
@@ -607,6 +828,12 @@ module Loresang
         guildspeak_check.active = (settings[:use_guildspeak] || false)
         guildspeak_check.set_tooltip_text("Uses speak bard for singing, speak common after each item/finish. Applies to both hand and container modes.")
         grid.attach(guildspeak_check, 0, row, 5, 1)
+        row += 1
+
+        html_report_check = Gtk::CheckButton.new("Maintain HTML report after each session?")
+        html_report_check.active = (settings[:html_report_enabled] || false)
+        html_report_check.set_tooltip_text("Writes loresang_report.html in the Lich data directory after each run. Open in any browser — click items to expand recall text, check the box to pin to Saved Items (persists across sessions via browser localStorage).")
+        grid.attach(html_report_check, 0, row, 5, 1)
         row += 1
 
         low_mana_check = Gtk::CheckButton.new("Say something when mana drops below %:")
@@ -837,6 +1064,7 @@ module Loresang
           settings[:sing_container] = sing_entry.text.strip.empty? ? nil : sing_entry.text.strip
           settings[:sung_container] = sung_entry.text.strip.empty? ? nil : sung_entry.text.strip
           settings[:use_guildspeak] = guildspeak_check.active?
+          settings[:html_report_enabled] = html_report_check.active?
           settings[:announce_successes] = announce_check.active? && value_alert_check.active?
 
           if max_entry.text =~ /^\d+$/
