@@ -1,0 +1,1986 @@
+# frozen_string_literal: true
+
+=begin
+
+Merchantical.lic is an item management window for marking and tracking equipment, and selling it,
+It should make the experience of sorting and selling junk as well as saving and tracking more
+interesting loot for manual sales to players. Includes a data export for shared URL shops.
+Requires ;Loresang to work.
+
+The following inputs are available:
+  ;merchantical       - open merchant item manager
+
+        author: Kyrandos
+        Other scripts: Combatical, VolnRestore2, Loresang
+        game: gs
+        tags: utility, economy, merchant, loresang, sell, pawnshop, shop, item, management
+        version: 1.1.0
+        required: Lich > 5.0, loresang.lic (for source data)
+
+        \Version\
+        1.0.0 2/27/2026 - initial internal build.
+        1.0.1 2/27/2026 - Loresang! button; live stream capture; empty-window
+                          on no data; DATA_DIR path fix.
+        1.0.2 2/27/2026 - Removed get_style_context (not in Ruby-GNOME 4.3.3).
+                          All styling via Pango markup and widget.opacity=.
+        1.0.5 2/28/2026 - Removed material filter. Added many filters. Detail panes hidden by
+                          default (no_show_all). Added multiple buttons and applied logic fixes
+        1.0.6 2/29/2026 - Removed initial run locker visit, fixed item discovery, added validate
+        1.1.0 3/1/2026  - Locker bag validation and sell retrieval, locker items tracked with
+                          package icon and sold by full name;per-character settings file
+                          ;go2 fixes, type filter normalization, pluralization detection
+                          Spell filter: detects imbedded spells, shows [Spell Name] tag
+        
+
+
+=end
+
+require 'gtk3' rescue nil
+require 'json'
+
+module Merchantical
+  _mc_char       = XMLData.name.to_s.downcase.gsub(/[^a-z0-9]/, '_')
+  STATE_FILE     = "#{DATA_DIR}merchantical_#{_mc_char}.json"
+  HTML_FILE      = "#{DATA_DIR}merchantical_#{_mc_char}_loresang.html"
+  LORESANG_HTML  = "#{DATA_DIR}loresang_report.html"
+
+  # Element selectors only — no class selectors (get_style_context unavailable)
+  CSS = <<~CSS
+    window { background-color: #1c1c1c; color: #c0c0c0; }
+    listbox { background-color: #1c1c1c; }
+    listboxrow { background-color: #1c1c1c; color: #c0c0c0; padding: 1px 2px; }
+    listboxrow:hover { background-color: #252525; }
+    entry { background-color: #252525; color: #c0c0c0; }
+    button { background-color: #2a2a2a; color: #c0c0c0; border: 1px solid #383838; }
+    button:hover { background-color: #333; }
+    button#shop_flagged { border: 2px solid #d4af37; }
+    checkbutton { color: #c0c0c0; }
+    label { color: #c0c0c0; }
+    separator { background-color: #333; min-height: 1px; }
+  CSS
+
+  ENCHANT_RANGES = [
+    ['1-5',   '1-5'],   ['6-10',  '6-10'],  ['11-15', '11-15'],
+    ['16-20', '16-20'], ['21-25', '21-25'], ['26-30', '26-30'],
+    ['31-35', '31-35'], ['36-40', '36-40'], ['41-45', '41-45'],
+    ['46-50', '46-50'], ['51-55', '51-55'], ['56-60', '56-60']
+  ].freeze
+
+  WEIGHT_OPTIONS = [
+    ['under1', 'Under 1 lb'],
+    ['1-5',    '1-5 lbs'],
+    ['6-10',   '6-10 lbs'],
+    ['over10', '> 10 lbs']
+  ].freeze
+
+  CHARGES_OPTIONS = [
+    ['0',     '0 charges'],
+    ['1-4',   '1-4'],
+    ['5-10',  '5-10'],
+    ['11-20', '11-20'],
+    ['over20','> 20']
+  ].freeze
+
+  KNOWN_OBJ_TYPES = %w[
+    armor clothing container gem jewelry
+    magic\ item potion scroll shield wand weapon
+  ].freeze
+
+  # Noun-based type detection — matched against the last word(s) of the item name.
+  # Used when recall text alone is insufficient (e.g. 0-charge jewelry, non-charged magic items).
+  JEWELRY_NOUN_RX = /\b(ring|band|signet|necklace|pendant|chain|amulet|medallion|
+    locket|choker|earring|earbob|bracelet|bangle|wristlet|anklet|brooch|
+    stickpin|clasp|buckle|fibula|circlet|diadem|tiara|coronet|gorget|
+    cameo|intaglio|barrette|hairpin|armlet|torque|torc)s?\b/xi.freeze
+
+  MAGIC_ITEM_NOUN_RX = /\b(orb|sceptre|scepter|figurine|statuette|
+    miniature|idol|fetish|totem|sphere|globe)s?\b/xi.freeze
+
+  # Bags, pouches, packs, etc. — many are wearable so Lich types them "clothing";
+  # check these BEFORE jewelry so "canvas bag" doesn't become "jewelry".
+  CONTAINER_NOUN_RX = /\b(bag|sack|pouch|pack|backpack|haversack|rucksack|knapsack|
+    bundle|basket|box|coffer|chest|case|trunk|bin|satchel|purse|quiver|
+    scabbard|sheath|holster|sling|carrier|tote|wallet|ruck|pocketbook)s?\b/xi.freeze
+
+  def self.pango_escape(str)
+    str.to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;')
+  end
+
+  # ---------------------------------------------------------------------------
+  # Parser
+  # ---------------------------------------------------------------------------
+  module Parser
+    def self.extract_items(html)
+      if html =~ /<script[^>]+id="batch-data"[^>]*>(.*?)<\/script>/m
+        items = JSON.parse($1.strip)
+        items.each { |item| item.merge!(parse_recall(item['recall_text'].to_s, item['name'].to_s)) }
+        return items
+      end
+      []
+    rescue => e
+      Lich::Messaging.msg("yellow", "[Merchantical] Parse error: #{e.message}")
+      []
+    end
+
+    # Infer object type from recall text + item name using Gemstone recall output patterns.
+    # ORDER MATTERS: specific patterns must precede catch-alls.
+    # name is checked for known jewelry/magic-item nouns when recall text is ambiguous.
+    def self.parse_obj_type(text, name = '')
+      t = text.to_s.downcase
+      n = name.to_s.downcase
+
+      # Weapons — strong, unambiguous signals in recall text
+      return 'weapon'     if t =~ /\b(edged|blunt|piercing|ranged|brawling|polearm|thrown)\s+weapon\b/ ||
+                             t =~ /\bweapon\s+(type|class)\b/ ||
+                             t =~ /\bpolearm\b/
+
+      # Armor — check before shield; armor mentions protection/hindrance explicitly
+      return 'armor'      if t =~ /\barmor\s+(type|class)\b/ ||
+                             t =~ /points?\s+of\s+protection\b/ ||
+                             t =~ /\bhindrance\b.*\bprotection\b/
+
+      # Shields
+      return 'shield'     if t =~ /\bblocking\b/ || t =~ /\bshield\s+(type|class)\b/
+
+      # Scrolls
+      return 'scroll'     if t =~ /contains?\s+the\s+following\s+spell/
+
+      # Wands (specific "charged item" language)
+      return 'wand'       if t =~ /\bcharged\s+item\b/
+
+      # Containers — check BEFORE jewelry. Many bags/packs/pouches are wearable so
+      # Lich reports gi.type = "clothing"; noun matching corrects this.
+      return 'container'  if !n.empty? && n =~ Merchantical::CONTAINER_NOUN_RX
+
+      # Jewelry — MUST come before the generic magic item/charges check.
+      # Many jewelry items in Gemstone have charges (rings, pendants, earrings, etc.) but
+      # their recall text may lack explicit "worn on" language, especially at 0 charges.
+      # Noun matching covers rings, bands, earrings, pendants, stickpins, clasps, etc.
+      return 'jewelry'    if t =~ /it\s+is\s+an\s+enhancive\s+item/  ||
+                             t =~ /\bworn\s+(on|around|in)\b/          ||
+                             (!n.empty? && n =~ Merchantical::JEWELRY_NOUN_RX)
+
+      # Orbs, sceptres, figurines — magic items that may have 0 charges in recall
+      return 'magic item' if (!n.empty? && n =~ Merchantical::MAGIC_ITEM_NOUN_RX) ||
+                             t =~ /it\s+has\s+\d+\s+charges?/
+
+      ''
+    end
+
+    def self.parse_recall(text, name = '')
+      props = {
+        'weight' => nil, 'enchantment' => nil,
+        'persistent' => false, 'disintegrate' => false, 'spiked' => false,
+        'enhancive' => false, 'crumbly' => false, 'charges' => nil,
+        'spell' => nil, 'obj_type' => ''
+      }
+      return props if text.to_s.empty?
+
+      # Weight
+      if text =~ /It is a small item, under a pound/i
+        props['weight'] = 0.1
+      elsif text =~ /It appears to weigh about ([\d.]+) pound/i
+        props['weight'] = $1.to_f
+      elsif text =~ /weight of ([\d.]+) pound/i
+        props['weight'] = $1.to_f
+      elsif text =~ /weighs? ([\d.]+) pound/i
+        props['weight'] = $1.to_f
+      end
+
+      # Enchantment — primary: "imparts a bonus of +N more than usual"
+      if text =~ /It imparts a bonus of \+?(\d+) more than usual/i
+        props['enchantment'] = $1.to_i
+      elsif text =~ /enchantment of \+?(\d+)/i
+        props['enchantment'] = $1.to_i
+      elsif text =~ /enchanted to \+?(\d+)/i
+        props['enchantment'] = $1.to_i
+      elsif text =~ /\+(\d+)\s+enchant/i
+        props['enchantment'] = $1.to_i
+      end
+
+      # Charges
+      if text =~ /It has (\d+) charges?/i
+        props['charges'] = $1.to_i
+      end
+
+      # Boolean properties
+      props['persistent']   = true if text =~ /It will persist after its last magical charge has been expended/i
+      props['disintegrate'] = true if text =~ /disintegrate/i
+      props['spiked']       = true if text =~ /spiked/i
+      props['enhancive']    = true if text =~ /It is an enhancive item/i
+      props['crumbly']      = true if text =~ /It will crumble into dust after its last enhancive charge has been expended/i
+      if text =~ /currently imbedded with (?:the )?(.+?)\s+spell/i
+        props['spell'] = $1.strip
+      elsif text =~ /could be imbedded/i
+        props['spell'] = 'none'
+      end
+      props['obj_type']     = parse_obj_type(text, name)
+
+      props
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # State
+  # ---------------------------------------------------------------------------
+  module State
+    DEFAULTS = {
+      'locked'       => [],
+      'shop_flagged' => [],
+      'removed'      => [],
+      'options'      => {
+        'locker_room'    => '',
+        'use_locker'     => false,
+        'always_on_top'  => false,
+        'bags'           => ['', '', '', '', '']
+      }
+    }.freeze
+
+    def self.load
+      return deep_dup(DEFAULTS) unless File.exist?(STATE_FILE)
+      base = deep_dup(DEFAULTS)
+      data = JSON.parse(File.read(STATE_FILE))
+      base['locked']       = data['locked']       if data['locked']
+      base['shop_flagged'] = data['shop_flagged']  if data['shop_flagged']
+      base['removed']      = data['removed']       if data['removed']
+      if data['options'].is_a?(Hash)
+        base['options'].merge!(data['options'])
+        base['options']['bags'] = Array.new(5) { |i| data['options']['bags']&.at(i).to_s }
+      end
+      base
+    rescue
+      deep_dup(DEFAULTS)
+    end
+
+    def self.save(data)
+      File.write(STATE_FILE, JSON.generate(data))
+    rescue => e
+      Lich::Messaging.msg("yellow", "[Merchantical] State save error: #{e.message}")
+    end
+
+    def self.deep_dup(obj)
+      case obj
+      when Hash  then obj.transform_values { |v| deep_dup(v) }
+      when Array then obj.map { |v| deep_dup(v) }
+      else obj
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # MainWindow
+  # ---------------------------------------------------------------------------
+  class MainWindow < Gtk::Window
+    SELL_COLOR_IDLE      = '#3c9c3c'.freeze
+    SELL_COLOR_ARMED     = '#3377cc'.freeze
+    REMOVE_COLOR_ARMED   = '#cc3333'.freeze
+    LORESANG_COLOR       = '#a0c8ff'.freeze
+    LORESANG_COLOR_ARMED = '#cc66ff'.freeze
+    FOUND_COLOR      = '#3c9c3c'.freeze
+    NOTFOUND_COLOR   = '#cc5555'.freeze
+    SEARCH_ICON      = "\u{1F50D}".freeze
+    SHOP_ICON        = "\u{1F3EA}".freeze
+    MUSIC_ICON       = "\u266B".freeze   # ♫ text char — responds to Pango foreground
+    GEAR_ICON        = "\u2699".freeze
+    LOCK_ON_ICON     = "\u{1F512}".freeze  # 🔒
+    LOCK_OFF_ICON    = "\u{1F513}".freeze  # 🔓
+    LOCKER_ICON      = "\u{1F4E6}".freeze  # 📦 locker indicator
+
+    def initialize(items, cmd_queue, on_close, state)
+      super()
+      @items             = items
+      @cmd_queue         = cmd_queue
+      @on_close          = on_close
+      @state             = state
+      @options           = state['options'] || {}
+      @row_data          = []
+      @sell_timers       = {}
+      @sell_arm_times    = {}
+      @remove_timers     = {}
+      @remove_arm_times  = {}
+      @loresang_btn      = nil
+      @loresang_lbl      = nil
+      @loresang_timer    = nil
+      @loresang_arm_time = nil
+      @locked_list       = nil
+      @unlocked_list     = nil
+      @main_box          = nil
+      @type_combo        = nil
+      @updating_type_combo = false
+      @filter = {
+        search: '', enchantment_range: nil,
+        persistent: false, disintegrate: false, spiked: false,
+        enhancive: false, crumbly: false, imbued: false,
+        value_min: nil, value_dir: :gte, weight: nil, charges: nil, obj_type: nil
+      }
+
+      self.title = "Merchantical - Item Manager"
+      self.set_default_size(1080, 700)
+      self.set_window_position(:center)
+
+      apply_css
+      build_ui
+      self.keep_above = true if @options['always_on_top']
+      signal_connect('destroy') { @on_close.call }
+    end
+
+    def update_batch(new_items)
+      locked_ids  = @state['locked']       || []
+      flagged_ids = @state['shop_flagged'] || []
+      new_items.each do |item|
+        item[:locked]       = locked_ids.include?(item['id'])
+        item[:shop_flagged] = flagged_ids.include?(item['id'])
+      end
+      @items = new_items
+      repopulate_type_combo
+      rebuild_list
+    end
+
+    def refresh_found_state
+      # Called after inventory validation — rebuilds rows to update found/not-found icons
+      repopulate_type_combo
+      rebuild_list
+    end
+
+    def enable_loresang_btn
+      if @loresang_timer
+        GLib::Source.remove(@loresang_timer) rescue nil
+        @loresang_timer    = nil
+        @loresang_arm_time = nil
+      end
+      @loresang_btn&.sensitive = true
+      @loresang_lbl&.markup = loresang_idle_markup
+    end
+
+    private
+
+    def pe(str)
+      Merchantical.pango_escape(str)
+    end
+
+    def dbg(msg)
+      return unless @options['debug']
+      Lich::Messaging.msg("yellow", "[Merchantical DBG] #{msg}")
+    end
+
+    def loresang_idle_markup
+      "<span foreground='#3399ff'>#{MUSIC_ICON}</span>" \
+      "<span foreground='#{LORESANG_COLOR}' weight='bold'> Loresang!</span>"
+    end
+
+    def apply_css
+      provider = Gtk::CssProvider.new
+      provider.load_from_data(Merchantical::CSS)
+      Gtk::StyleContext.add_provider_for_screen(
+        Gdk::Screen.default, provider,
+        Gtk::StyleProvider::PRIORITY_APPLICATION
+      )
+    rescue => e
+      Lich::Messaging.msg("yellow", "[Merchantical] CSS load warning: #{e.message}")
+    end
+
+    def build_ui
+      vbox = Gtk::Box.new(:vertical, 0)
+      add(vbox)
+      toolbar = build_toolbar
+      vbox.pack_start(toolbar, expand: false, fill: false, padding: 0)
+      repopulate_type_combo
+      vbox.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 0)
+
+      scroll = Gtk::ScrolledWindow.new
+      scroll.hscrollbar_policy = :never
+      scroll.vscrollbar_policy = :automatic
+      vbox.pack_start(scroll, expand: true, fill: true, padding: 0)
+
+      @main_box = Gtk::Box.new(:vertical, 0)
+      scroll.add(@main_box)
+      build_item_list
+    end
+
+    def build_toolbar
+      # Outer is horizontal: title on left spanning both rows, right vbox has action + filter rows
+      outer = Gtk::Box.new(:horizontal, 6)
+      outer.margin = 4
+
+      # ---- Title (left side, spans both rows) ----
+      title_lbl = Gtk::Label.new
+      title_lbl.markup =
+        "<b><span foreground='#d4af37' size='large'>\u{1F4B0} MERCHANTICAL \u{1F4B0}</span></b>"
+      title_lbl.set_alignment(0.5, 0.5)
+      outer.pack_start(title_lbl, expand: false, fill: false, padding: 4)
+
+      # ---- Right vbox: action row on top, filter row below ----
+      right_vbox = Gtk::Box.new(:vertical, 2)
+      outer.pack_start(right_vbox, expand: true, fill: true, padding: 0)
+
+      # ---- Action row ----
+      arow = Gtk::Box.new(:horizontal, 4)
+      right_vbox.pack_start(arow, expand: false, fill: false, padding: 0)
+
+      # Search entry at far left of action row (aligns above Ench: in filter row)
+      search_entry = Gtk::SearchEntry.new
+      search_entry.width_request = 130
+      search_entry.set_tooltip_text("Filter by item name or recall text")
+      search_entry.signal_connect('search-changed') do
+        @filter[:search] = search_entry.text.strip.downcase
+        dbg("Search: '#{search_entry.text.strip}'")
+        schedule_rebuild
+      end
+      arow.pack_start(search_entry, expand: false, fill: false, padding: 0)
+
+      # Expander pushes remaining buttons to the right
+      arow.pack_start(Gtk::Label.new(""), expand: true, fill: true, padding: 0)
+
+      # Loresang! button
+      @loresang_lbl = Gtk::Label.new
+      @loresang_lbl.markup = loresang_idle_markup
+      @loresang_btn = Gtk::Button.new
+      @loresang_btn.add(@loresang_lbl)
+      @loresang_btn.set_tooltip_text(
+        "Run ;loresang and pull new item data from the game stream.\n" \
+        "Click once to arm (flashes purple 3s), click again to confirm.\n" \
+        "NOTE: This will refresh all items below. Lock items you want to keep first!"
+      )
+      @loresang_btn.signal_connect('clicked') do
+        if @loresang_timer
+          # Second click — confirm (0.25s minimum to avoid accidental double-click)
+          next if @loresang_arm_time && (Time.now - @loresang_arm_time) < 0.25
+          GLib::Source.remove(@loresang_timer)
+          @loresang_timer    = nil
+          @loresang_arm_time = nil
+          dbg("Loresang confirmed -- starting run")
+          @loresang_btn.sensitive = false
+          @loresang_lbl.markup =
+            "<span foreground='#555'>#{MUSIC_ICON}</span><span foreground='#666'> Running...</span>"
+          @cmd_queue.push({ run_loresang: true })
+        else
+          # First click — arm with purple flash
+          dbg("Loresang armed -- click again within 3s to confirm")
+          ticks = [0]
+          timer_id = GLib::Timeout.add(500) do
+            ticks[0] += 1
+            if ticks[0] > 6
+              @loresang_lbl.markup = loresang_idle_markup
+              @loresang_timer    = nil
+              @loresang_arm_time = nil
+              false
+            else
+              color = ticks[0].even? ? LORESANG_COLOR_ARMED : LORESANG_COLOR
+              @loresang_lbl.markup =
+                "<span foreground='#3399ff'>#{MUSIC_ICON}</span>" \
+                "<span foreground='#{color}' weight='bold'> Loresang!</span>"
+              true
+            end
+          end
+          @loresang_lbl.markup =
+            "<span foreground='#3399ff'>#{MUSIC_ICON}</span>" \
+            "<span foreground='#{LORESANG_COLOR_ARMED}' weight='bold'> Loresang!</span>"
+          @loresang_timer    = timer_id
+          @loresang_arm_time = Time.now
+        end
+      end
+      arow.pack_start(@loresang_btn, expand: false, fill: false, padding: 4)
+
+      # Validate Items button
+      validate_lbl = Gtk::Label.new
+      validate_lbl.markup = "<span foreground='#80c8ff' weight='bold'>Validate Items</span>"
+      validate_btn = Gtk::Button.new
+      validate_btn.add(validate_lbl)
+      validate_btn.set_tooltip_text(
+        "Checks inventory to validate that items can be found\n" \
+        "* if 'Use locker?' is checked on, will visit locker."
+      )
+      validate_btn.signal_connect('clicked') do
+        dbg("Validate Items triggered")
+        validate_btn.sensitive = false
+        validate_lbl.markup = "<span foreground='#555'>Validating...</span>"
+        @cmd_queue.push({ validate_items: true })
+        GLib::Timeout.add(1500) do
+          validate_btn.sensitive = true
+          validate_lbl.markup = "<span foreground='#80c8ff' weight='bold'>Validate Items</span>"
+          false
+        end
+      end
+      arow.pack_start(validate_btn, expand: false, fill: false, padding: 4)
+
+      # Gear (settings) button
+      gear_lbl = Gtk::Label.new
+      gear_lbl.markup = "<span foreground='#aaa' size='large'>#{GEAR_ICON}</span>"
+      gear_btn = Gtk::Button.new
+      gear_btn.add(gear_lbl)
+      gear_btn.set_tooltip_text("Settings and help")
+      gear_btn.signal_connect('clicked') { show_gear }
+      arow.pack_start(gear_btn, expand: false, fill: false, padding: 2)
+
+      # Copy Shop Data button
+      copy_lbl = Gtk::Label.new
+      copy_lbl.markup =
+        "<span foreground='#d4af37' weight='bold'>Copy Shop Data #{SHOP_ICON}</span>"
+      copy_btn = Gtk::Button.new
+      copy_btn.add(copy_lbl)
+      copy_btn.set_tooltip_text(
+        "Copy all shop-flagged items to clipboard as Markdown.\n" \
+        "Paste into your inventory host, such as a Google Doc."
+      )
+      copy_btn.signal_connect('clicked') { copy_shop_data }
+      arow.pack_start(copy_btn, expand: false, fill: false, padding: 2)
+
+      # ---- Filter row ----
+      frow = Gtk::Box.new(:horizontal, 4)
+      right_vbox.pack_start(frow, expand: false, fill: false, padding: 0)
+
+      frow.pack_start(Gtk::Label.new(" Ench:"), expand: false, fill: false, padding: 0)
+      ench_combo = Gtk::ComboBoxText.new
+      ench_combo.append('', 'Any')
+      ENCHANT_RANGES.each { |id, lbl| ench_combo.append(id, lbl) }
+      ench_combo.active = 0
+      ench_combo.set_tooltip_text("Filter by enchantment (blocks of 5)")
+      ench_combo.signal_connect('changed') do
+        id = ench_combo.active_id.to_s
+        @filter[:enchantment_range] = id.empty? ? nil : id
+        dbg("Filter Enchantment: #{id.empty? ? 'Any' : id}")
+        schedule_rebuild
+      end
+      frow.pack_start(ench_combo, expand: false, fill: false, padding: 0)
+
+      frow.pack_start(Gtk::Label.new(" Wt:"), expand: false, fill: false, padding: 0)
+      wt_combo = Gtk::ComboBoxText.new
+      wt_combo.append('', 'Any')
+      WEIGHT_OPTIONS.each { |id, lbl| wt_combo.append(id, lbl) }
+      wt_combo.active = 0
+      wt_combo.set_tooltip_text("Filter by weight")
+      wt_combo.signal_connect('changed') do
+        id = wt_combo.active_id.to_s
+        @filter[:weight] = id.empty? ? nil : id
+        dbg("Filter Weight: #{id.empty? ? 'Any' : id}")
+        schedule_rebuild
+      end
+      frow.pack_start(wt_combo, expand: false, fill: false, padding: 0)
+
+      frow.pack_start(Gtk::Label.new(" Chrg:"), expand: false, fill: false, padding: 0)
+      chrg_combo = Gtk::ComboBoxText.new
+      chrg_combo.append('', 'Any')
+      CHARGES_OPTIONS.each { |id, lbl| chrg_combo.append(id, lbl) }
+      chrg_combo.active = 0
+      chrg_combo.set_tooltip_text("Filter by number of charges")
+      chrg_combo.signal_connect('changed') do
+        id = chrg_combo.active_id.to_s
+        @filter[:charges] = id.empty? ? nil : id
+        dbg("Filter Charges: #{id.empty? ? 'Any' : id}")
+        schedule_rebuild
+      end
+      frow.pack_start(chrg_combo, expand: false, fill: false, padding: 0)
+
+      frow.pack_start(Gtk::Label.new(" Type:"), expand: false, fill: false, padding: 0)
+      @type_combo = Gtk::ComboBoxText.new
+      @type_combo.append('', 'Any')
+      @type_combo.active = 0
+      @type_combo.set_tooltip_text("Filter by object type (weapon, jewelry, magic, etc.)")
+      @type_combo.signal_connect('changed') do
+        next if @updating_type_combo
+        id = @type_combo.active_id.to_s
+        @filter[:obj_type] = id.empty? ? nil : id
+        dbg("Filter Type: #{id.empty? ? 'Any' : id}")
+        schedule_rebuild
+      end
+      frow.pack_start(@type_combo, expand: false, fill: false, padding: 0)
+
+      # Value filter with clickable >= / <= toggle
+      frow.pack_start(Gtk::Label.new(" Val"), expand: false, fill: false, padding: 0)
+      val_dir_btn = Gtk::Button.new(label: ">=")
+      val_dir_btn.relief = :none
+      val_dir_btn.width_request = 32
+      val_dir_btn.set_tooltip_text("Click to toggle: >= finds items worth at least this value, <= finds items worth at most")
+      val_dir_btn.signal_connect('clicked') do
+        if @filter[:value_dir] == :gte
+          @filter[:value_dir] = :lte
+          val_dir_btn.label = "<="
+        else
+          @filter[:value_dir] = :gte
+          val_dir_btn.label = ">="
+        end
+        dbg("Filter Value direction: #{@filter[:value_dir]}")
+        schedule_rebuild
+      end
+      frow.pack_start(val_dir_btn, expand: false, fill: false, padding: 0)
+      val_entry = Gtk::Entry.new
+      val_entry.width_request = 55
+      val_entry.set_placeholder_text("silvers")
+      val_entry.set_tooltip_text("Filter items by silver value (use the >= / <= button to change direction)")
+      val_entry.signal_connect('changed') do
+        text = val_entry.text.strip.gsub(',', '')
+        @filter[:value_min] = text.empty? ? nil : text.to_i
+        dbg("Filter Value: #{text.empty? ? 'cleared' : "#{text} silvers"}")
+        schedule_rebuild
+      end
+      frow.pack_start(val_entry, expand: false, fill: false, padding: 0)
+
+      [
+        [:persistent,   "Pers",  "Show only persistent items"],
+        [:disintegrate, "Disi",  "Show only disintegrate items"],
+        [:spiked,       "Spkd",  "Show only spiked items"],
+        [:enhancive,    "Enh",   "Show only enhancive items"],
+        [:crumbly,      "Crmb",  "Show only crumbly items"],
+        [:imbued,       "Spell", "Show only items imbedded with a spell"]
+      ].each do |key, label, tip|
+        cb = Gtk::CheckButton.new(label)
+        cb.set_tooltip_text(tip)
+        cb.signal_connect('toggled') do
+          @filter[key] = cb.active?
+          dbg("Filter #{label}: #{cb.active?}")
+          schedule_rebuild
+        end
+        frow.pack_start(cb, expand: false, fill: false, padding: 2)
+      end
+
+      outer
+    end
+
+    def repopulate_type_combo
+      return unless @type_combo
+      @updating_type_combo = true
+      @type_combo.remove_all
+      @type_combo.append('', 'Any')
+      # Use symbol key (from live inventory) if present, else string key (from recall parser)
+      item_types = @items.map { |i|
+        t = i[:obj_type].to_s
+        t.empty? ? i['obj_type'].to_s : t
+      }.reject(&:empty?)
+      types = (KNOWN_OBJ_TYPES + item_types).uniq.sort
+      types.each { |t| @type_combo.append(t, t.capitalize) }
+      @type_combo.active = 0
+      @filter[:obj_type] = nil
+    ensure
+      @updating_type_combo = false
+    end
+
+    def build_item_list
+      @main_box.children.each { |w| @main_box.remove(w) }
+      @row_data = []
+
+      locked_items   = @items.select { |i| i[:locked] }
+      unlocked_items = @items.reject { |i| i[:locked] }
+      locked_items   = locked_items.sort_by   { |i| filter_matches?(i) ? 0 : 1 }
+      unlocked_items = unlocked_items.sort_by { |i| filter_matches?(i) ? 0 : 1 }
+
+      if locked_items.any?
+        lbl = Gtk::Label.new
+        lbl.markup = "<b><span foreground='#7ec850'>Locked Items (Mark and Lock)</span></b>"
+        lbl.halign = :start
+        lbl.margin_start = 8; lbl.margin_top = 3; lbl.margin_bottom = 3
+        @main_box.pack_start(lbl, expand: false, fill: false, padding: 0)
+
+        @locked_list = Gtk::ListBox.new
+        @locked_list.selection_mode = :none
+        @main_box.pack_start(@locked_list, expand: false, fill: false, padding: 0)
+        locked_items.each { |item| add_item_row(@locked_list, item) }
+        @main_box.pack_start(
+          Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 4
+        )
+      end
+
+      hdr = Gtk::Label.new
+      hdr.markup = "<b><span foreground='#d4af37'>Items</span></b>"
+      hdr.halign = :start
+      hdr.margin_start = 8; hdr.margin_top = 3; hdr.margin_bottom = 3
+      @main_box.pack_start(hdr, expand: false, fill: false, padding: 0)
+
+      @unlocked_list = Gtk::ListBox.new
+      @unlocked_list.selection_mode = :none
+      @main_box.pack_start(@unlocked_list, expand: true, fill: true, padding: 0)
+      unlocked_items.each { |item| add_item_row(@unlocked_list, item) }
+
+      if @items.empty?
+        empty_lbl = Gtk::Label.new
+        empty_lbl.markup =
+          "<i>No item data loaded. Click #{MUSIC_ICON} Loresang! above to populate.</i>"
+        empty_lbl.margin = 20
+        @main_box.pack_start(empty_lbl, expand: false, fill: false, padding: 0)
+      end
+
+      @main_box.show_all
+    end
+
+    def add_item_row(list, item)
+      row = Gtk::ListBoxRow.new
+      row.activatable = false
+      row.selectable  = false
+      row.opacity = filter_matches?(item) ? 1.0 : 0.35
+
+      row_vbox = Gtk::Box.new(:vertical, 0)
+      row.add(row_vbox)
+
+      hbox = Gtk::Box.new(:horizontal, 4)
+      hbox.margin_top = 2; hbox.margin_bottom = 2
+      hbox.margin_start = 4; hbox.margin_end = 4
+      row_vbox.pack_start(hbox, expand: false, fill: false, padding: 0)
+
+      # Lock button (🔒 = locked, 🔓 = unlocked)
+      noun = item['noun'].to_s
+      lock_lbl = Gtk::Label.new
+      lock_lbl.markup = "<span size='large'>#{item[:locked] ? LOCK_ON_ICON : LOCK_OFF_ICON}</span>"
+      lock_btn = Gtk::Button.new
+      lock_btn.add(lock_lbl)
+      lock_btn.relief = :none
+      lock_btn.opacity = item[:locked] ? 1.0 : 0.45
+      lock_btn.set_tooltip_text(
+        "Mark and Lock: \u{1F512} pins item to top and sends 'mark #id' in-game.\n" \
+        "Unlocking sends 'mark #id remove' to clear the mark.\n" \
+        "Both get from bag \u2192 mark/unmark \u2192 return. Persists across restarts."
+      )
+      lock_btn.signal_connect('clicked') do
+        item[:locked] = !item[:locked]
+        lock_lbl.markup = "<span size='large'>#{item[:locked] ? LOCK_ON_ICON : LOCK_OFF_ICON}</span>"
+        lock_btn.opacity = item[:locked] ? 1.0 : 0.45
+        dbg("#{item[:locked] ? 'Locked' : 'Unlocked'}: #{item['name']} (id=#{item['id']})")
+        if item[:locked]
+          if item[:gameobj_id]
+            @cmd_queue.push({ mark_item: {
+              item_id:      item[:gameobj_id],
+              container_id: item[:container_id],
+              name:         item['name']
+            }})
+          else
+            Lich::Messaging.msg("yellow",
+              "[Merchantical] #{item['name']}: pinned to top but not in current inventory -- " \
+              "mark skipped. Run Loresang or ensure item is accessible first.")
+          end
+        else
+          if item[:gameobj_id]
+            @cmd_queue.push({ unmark_item: {
+              item_id:      item[:gameobj_id],
+              container_id: item[:container_id],
+              name:         item['name']
+            }})
+          else
+            Lich::Messaging.msg("yellow",
+              "[Merchantical] #{item['name']}: not in current inventory -- " \
+              "mark remove skipped. Run Validate to locate item first.")
+          end
+        end
+        save_state
+        schedule_rebuild
+      end
+      hbox.pack_start(lock_btn, expand: false, fill: false, padding: 0)
+
+      # Inventory found icon (🔍)
+      found_icon_lbl = Gtk::Label.new
+      if item[:found].nil?
+        found_icon_lbl.markup =
+          "<span foreground='#555'>#{SEARCH_ICON}</span>"
+        found_icon_lbl.set_tooltip_text("Inventory status unknown")
+      elsif item[:found]
+        found_icon_lbl.markup =
+          "<span background='#{FOUND_COLOR}'> #{SEARCH_ICON} </span>"
+        found_icon_lbl.set_tooltip_text("Found in inventory")
+      else
+        found_icon_lbl.markup =
+          "<span background='#{NOTFOUND_COLOR}'> #{SEARCH_ICON} </span>"
+        found_icon_lbl.set_tooltip_text("Not found in inventory -- check lockers")
+      end
+      hbox.pack_start(found_icon_lbl, expand: false, fill: false, padding: 0)
+
+      # Item name button
+      name_color = case item['status'].to_s
+                   when 'completed'        then '#7ec850'
+                   when 'already_unlocked' then '#6699cc'
+                   when 'failed'           then '#cc5555'
+                   else '#c0c0c0'
+                   end
+      name_lbl = Gtk::Label.new
+      name_lbl.markup =
+        "<b><span foreground='#{name_color}'>#{pe(item['name'].to_s)}</span></b>"
+      name_btn = Gtk::Button.new
+      name_btn.add(name_lbl)
+      name_btn.relief = :none
+      name_btn.halign = :start
+      name_btn.set_tooltip_text("Click to expand/collapse full recall text")
+      hbox.pack_start(name_btn, expand: false, fill: false, padding: 0)
+
+      # Locker indicator
+      if item[:in_locker]
+        locker_ind_lbl = Gtk::Label.new
+        locker_ind_lbl.markup = "<span foreground='#80c8ff' size='small'> #{LOCKER_ICON}</span>"
+        locker_ind_lbl.set_tooltip_text("Found in locker bag")
+        hbox.pack_start(locker_ind_lbl, expand: false, fill: false, padding: 0)
+      end
+
+      # Object type badge
+      if item[:obj_type].to_s != ''
+        type_lbl = Gtk::Label.new
+        type_lbl.markup =
+          "<span foreground='#666' size='small'>  [#{pe(item[:obj_type])}]</span>"
+        hbox.pack_start(type_lbl, expand: false, fill: false, padding: 0)
+      end
+
+      # Silver value
+      if item['value'].to_i > 0
+        formatted = item['value'].to_i.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\1,').reverse
+        val_lbl = Gtk::Label.new
+        val_lbl.markup =
+          "<span foreground='#d4af37' size='small'>  ~#{formatted} silvers</span>"
+        hbox.pack_start(val_lbl, expand: false, fill: false, padding: 0)
+      end
+
+      # Property badges
+      props = []
+      props << "PERS" if item['persistent']
+      props << "DISI" if item['disintegrate']
+      props << "SPKD" if item['spiked']
+      props << "ENH"  if item['enhancive']
+      props << "CRMB" if item['crumbly']
+      if props.any?
+        prop_lbl = Gtk::Label.new
+        prop_lbl.markup =
+          "<span foreground='#999' size='small'>  [#{props.join(' ')}]</span>"
+        hbox.pack_start(prop_lbl, expand: false, fill: false, padding: 0)
+      end
+
+      # Spell tag — separate brackets, distinct color
+      if item['spell'].to_s != ''
+        spell_lbl = Gtk::Label.new
+        spell_lbl.markup =
+          "<span foreground='#b08adf' size='small'>  [#{pe(item['spell'])}]</span>"
+        hbox.pack_start(spell_lbl, expand: false, fill: false, padding: 0)
+      end
+
+      # Enchant / charges / weight badge
+      detail_parts = []
+      detail_parts << "+#{item['enchantment']}"         if item['enchantment'].to_i > 0
+      detail_parts << "#{item['charges']} chrg"          unless item['charges'].nil?
+      detail_parts << "#{item['weight']} lb"             if item['weight'].to_f > 0
+      if detail_parts.any?
+        detail_lbl = Gtk::Label.new
+        detail_lbl.markup =
+          "<span foreground='#777' size='small'>  #{pe(detail_parts.join(' | '))}</span>"
+        hbox.pack_start(detail_lbl, expand: false, fill: false, padding: 0)
+      end
+
+      hbox.pack_start(Gtk::Label.new(""), expand: true, fill: true, padding: 0)
+
+      # Sell button ($) — flashes every 500ms for 3s when armed
+      sell_lbl = Gtk::Label.new
+      sell_lbl.markup = sell_markup(SELL_COLOR_IDLE)
+      sell_btn = Gtk::Button.new
+      sell_btn.add(sell_lbl)
+      sell_btn.relief = :none
+      sell_btn.set_tooltip_text(
+        "Sell at pawnshop.\nClick once to arm (flashes blue 3s).\nClick again to confirm."
+      )
+      sell_btn.signal_connect('clicked') do
+        if @sell_timers[noun]
+          # Second click — confirm sell (minimum 0.25s after arming to avoid accidental double-click)
+          next if @sell_arm_times[noun] && (Time.now - @sell_arm_times[noun]) < 0.25
+          GLib::Source.remove(@sell_timers[noun])
+          @sell_timers.delete(noun)
+          @sell_arm_times.delete(noun)
+          sell_lbl.markup = sell_markup(SELL_COLOR_IDLE)
+          dbg("Sell confirmed: #{item['name']} (id=#{item['id']}, found=#{item[:found]})")
+          if item[:found] == false
+            flash_not_found(found_icon_lbl)
+          else
+            @cmd_queue.push({ sell_item: {
+              item_id:         item[:gameobj_id],
+              container_id:    item[:container_id],
+              name:            item['name'],
+              item_uid:        item['id'],
+              in_locker:       item[:in_locker],
+              locker_bag_name: item[:locker_bag_name],
+              origin_room:     ((Map.current_room_id rescue nil) || XMLData.room_id).to_s
+            }})
+          end
+        else
+          # First click — arm with flashing text color only
+          dbg("Sell armed: #{item['name']} (id=#{item['id']})")
+          ticks = [0]
+          timer_id = GLib::Timeout.add(500) do
+            ticks[0] += 1
+            if ticks[0] > 6
+              sell_lbl.markup = sell_markup(SELL_COLOR_IDLE)
+              @sell_timers.delete(noun)
+              @sell_arm_times.delete(noun)
+              false
+            else
+              armed = ticks[0].even?
+              sell_lbl.markup = sell_markup(armed ? SELL_COLOR_ARMED : SELL_COLOR_IDLE)
+              true
+            end
+          end
+          sell_lbl.markup = sell_markup(SELL_COLOR_ARMED)
+          @sell_timers[noun]    = timer_id
+          @sell_arm_times[noun] = Time.now
+        end
+      end
+      hbox.pack_start(sell_btn, expand: false, fill: false, padding: 0)
+
+      # Shop flag button (🏪) — opacity dims unflagged; CSS name gives gold border when flagged
+      shop_lbl = Gtk::Label.new
+      shop_lbl.markup = shop_markup
+      shop_btn = Gtk::Button.new
+      shop_btn.add(shop_lbl)
+      shop_btn.relief = :none
+      shop_btn.opacity = item[:shop_flagged] ? 1.0 : 0.35
+      shop_btn.name    = item[:shop_flagged] ? 'shop_flagged' : ''
+      shop_btn.set_tooltip_text(
+        "Flag for shop export.\nGold border + bright = flagged; dim = unflagged."
+      )
+      shop_btn.signal_connect('clicked') do
+        item[:shop_flagged] = !item[:shop_flagged]
+        shop_btn.opacity = item[:shop_flagged] ? 1.0 : 0.35
+        shop_btn.name    = item[:shop_flagged] ? 'shop_flagged' : ''
+        dbg("Shop flag #{item[:shop_flagged] ? 'set' : 'cleared'}: #{item['name']}")
+        save_state
+      end
+      hbox.pack_start(shop_btn, expand: false, fill: false, padding: 0)
+
+      # Remove button (☠) — flashes red for 3s; second click removes item from list
+      remove_uid = item['id'].to_s
+      remove_lbl = Gtk::Label.new
+      remove_lbl.markup = "<span foreground='#666666' size='large'>\u{2620}</span>"
+      remove_btn = Gtk::Button.new
+      remove_btn.add(remove_lbl)
+      remove_btn.relief = :none
+      remove_btn.set_tooltip_text(
+        "Remove this item from the list.\n" \
+        "Click once to arm (flashes red 3s). Click again to confirm.\n" \
+        "Item will reappear if found in a subsequent Loresang!"
+      )
+      remove_btn.signal_connect('clicked') do
+        if @remove_timers[remove_uid]
+          # Second click — confirm remove (0.25s minimum wait)
+          next if @remove_arm_times[remove_uid] && (Time.now - @remove_arm_times[remove_uid]) < 0.25
+          GLib::Source.remove(@remove_timers[remove_uid])
+          @remove_timers.delete(remove_uid)
+          @remove_arm_times.delete(remove_uid)
+          remove_lbl.markup = "<span foreground='#666666' size='large'>\u{2620}</span>"
+          dbg("Remove confirmed: #{item['name']} (uid=#{remove_uid})")
+          remove_sold_item(remove_uid)
+        else
+          # First click — arm with red flash
+          dbg("Remove armed: #{item['name']} (uid=#{remove_uid})")
+          ticks = [0]
+          timer_id = GLib::Timeout.add(500) do
+            ticks[0] += 1
+            if ticks[0] > 6
+              remove_lbl.markup = "<span foreground='#666666' size='large'>\u{2620}</span>"
+              @remove_timers.delete(remove_uid)
+              @remove_arm_times.delete(remove_uid)
+              false
+            else
+              color = ticks[0].even? ? REMOVE_COLOR_ARMED : '#666666'
+              remove_lbl.markup = "<span foreground='#{color}' size='large'>\u{2620}</span>"
+              true
+            end
+          end
+          remove_lbl.markup = "<span foreground='#{REMOVE_COLOR_ARMED}' size='large'>\u{2620}</span>"
+          @remove_timers[remove_uid]    = timer_id
+          @remove_arm_times[remove_uid] = Time.now
+        end
+      end
+      hbox.pack_start(remove_btn, expand: false, fill: false, padding: 0)
+
+      # Recall detail area — hidden by default
+      # no_show_all prevents @main_box.show_all from making it visible
+      detail_frame = Gtk::Frame.new
+      detail_frame.shadow_type  = :in
+      detail_frame.margin_start  = 22
+      detail_frame.margin_end    = 4
+      detail_frame.margin_bottom = 4
+      detail_frame.no_show_all = true
+      detail_frame.visible = false
+
+      recall_text = item['recall_text'].to_s.strip
+      recall_lbl = Gtk::Label.new
+      recall_lbl.markup =
+        "<span foreground='#888' font_family='monospace' size='small'>" \
+        "#{pe(recall_text.empty? ? '(no recall data)' : recall_text)}</span>"
+      recall_lbl.halign    = :start
+      recall_lbl.wrap      = true
+      recall_lbl.selectable = true
+      recall_lbl.xalign    = 0.0
+      recall_lbl.margin    = 6
+      detail_frame.add(recall_lbl)
+      recall_lbl.show  # pre-show so toggling the frame's visible flag reveals it
+      row_vbox.pack_start(detail_frame, expand: false, fill: false, padding: 0)
+
+      name_btn.signal_connect('clicked') do
+        # Use visible= instead of show_all — no_show_all blocks show_all on self
+        detail_frame.visible = !detail_frame.visible?
+      end
+
+      list.add(row)
+      @row_data << { item: item, row: row }
+    end
+
+    def sell_markup(color)
+      "<b><span foreground='#{color}' size='large'>$</span></b>"
+    end
+
+    def shop_markup
+      # Emoji ignores Pango foreground= on Windows; use button.opacity for dim/bright instead
+      "<span size='large'>#{SHOP_ICON}</span>"
+    end
+
+    def flash_not_found(icon_lbl)
+      ticks = [0]
+      GLib::Timeout.add(120) do
+        ticks[0] += 1
+        icon_lbl.markup = if ticks[0].odd?
+          "<span background='#ff4444'> #{SEARCH_ICON} </span>"
+        else
+          "<span background='#{NOTFOUND_COLOR}'> #{SEARCH_ICON} </span>"
+        end
+        if ticks[0] >= 8
+          icon_lbl.markup =
+            "<span background='#{NOTFOUND_COLOR}'> #{SEARCH_ICON} </span>"
+          GLib::Idle.add do
+            dialog = Gtk::MessageDialog.new(
+              parent: self, flags: :destroy_with_parent,
+              type: :warning, buttons_type: :ok,
+              message: "Item not found in inventory.\nCheck your lockers."
+            )
+            dialog.keep_above = true
+            dialog.run
+            dialog.destroy
+            false
+          end
+          false
+        else
+          true
+        end
+      end
+    end
+
+    def filter_matches?(item)
+      f = @filter
+      unless f[:search].empty?
+        return false unless item['name'].to_s.downcase.include?(f[:search]) ||
+                            item['recall_text'].to_s.downcase.include?(f[:search])
+      end
+      if f[:enchantment_range]
+        parts = f[:enchantment_range].split('-')
+        if parts.length == 2
+          low, high = parts[0].to_i, parts[1].to_i
+          return false unless item['enchantment'].to_i.between?(low, high)
+        end
+      end
+      if f[:weight]
+        w = item['weight'].to_f
+        case f[:weight]
+        when 'under1' then return false unless w > 0 && w < 1
+        when '1-5'    then return false unless w >= 1 && w <= 5
+        when '6-10'   then return false unless w >= 6 && w <= 10
+        when 'over10' then return false unless w > 10
+        end
+      end
+      if f[:charges]
+        has_charges = !item['charges'].nil?
+        c = item['charges'].to_i
+        case f[:charges]
+        when '0'      then return false unless has_charges && c == 0
+        when '1-4'    then return false unless has_charges && c.between?(1, 4)
+        when '5-10'   then return false unless has_charges && c.between?(5, 10)
+        when '11-20'  then return false unless has_charges && c.between?(11, 20)
+        when 'over20' then return false unless has_charges && c > 20
+        end
+      end
+      if f[:obj_type]
+        # Prefer live inventory type (symbol key); fall back to recall-parsed type (string key)
+        effective_type = item[:obj_type].to_s
+        effective_type = item['obj_type'].to_s if effective_type.empty?
+        return false unless effective_type.downcase == f[:obj_type].downcase
+      end
+      return false if f[:persistent]   && !item['persistent']
+      return false if f[:disintegrate] && !item['disintegrate']
+      return false if f[:spiked]       && !item['spiked']
+      return false if f[:enhancive]    && !item['enhancive']
+      return false if f[:crumbly]      && !item['crumbly']
+      return false if f[:imbued]       && item['spell'].to_s.empty?
+      if f[:value_min]
+        v = item['value'].to_i
+        return false if f[:value_dir] == :lte ? v > f[:value_min] : v < f[:value_min]
+      end
+      true
+    end
+
+    def schedule_rebuild
+      GLib::Idle.add do
+        rebuild_list
+        false
+      end
+    end
+
+    def rebuild_list
+      @sell_timers.each { |_, tid| GLib::Source.remove(tid) rescue nil }
+      @sell_timers.clear
+      @sell_arm_times.clear
+      @remove_timers.each { |_, tid| GLib::Source.remove(tid) rescue nil }
+      @remove_timers.clear
+      @remove_arm_times.clear
+      build_item_list
+    end
+
+    def save_state
+      @state['locked']       = @items.select { |i| i[:locked] }.map       { |i| i['id'] }
+      @state['shop_flagged'] = @items.select { |i| i[:shop_flagged] }.map { |i| i['id'] }
+      State.save(@state)
+    rescue => e
+      Lich::Messaging.msg("yellow", "[Merchantical] Save error: #{e.message}")
+    end
+
+    def remove_sold_item(uid)
+      @items.reject! { |i| i['id'].to_s == uid }
+      @state['removed'] ||= []
+      @state['removed'] |= [uid]
+      save_state
+      rebuild_list
+    end
+
+    def save_options
+      @state['options'] = @options
+      State.save(@state)
+    rescue => e
+      Lich::Messaging.msg("yellow", "[Merchantical] Options save error: #{e.message}")
+    end
+
+    def copy_shop_data
+      flagged = @items.select { |i| i[:shop_flagged] }
+      if flagged.empty?
+        dialog = Gtk::MessageDialog.new(
+          parent: self, flags: :destroy_with_parent,
+          type: :info, buttons_type: :ok,
+          message: "No items flagged for shop.\nClick #{SHOP_ICON} next to items to flag them."
+        )
+        dialog.keep_above = true
+        dialog.run
+        dialog.destroy
+        return
+      end
+
+      plain = build_shop_plain_text(flagged)
+
+      # ---- Preview / export window ----
+      win = Gtk::Window.new
+      win.title = "Shop Export \u2014 #{flagged.count} item(s)"
+      win.set_default_size(700, 520)
+      win.transient_for = self
+      win.set_window_position(:center_on_parent)
+      win.keep_above = true
+
+      vbox = Gtk::Box.new(:vertical, 6)
+      vbox.margin = 8
+      win.add(vbox)
+
+      # ---- Info bar ----
+      info_lbl = Gtk::Label.new
+      info_lbl.markup =
+        "<span size='small' foreground='#aaa'>" \
+        "Click <b>Copy to Clipboard</b>, then paste into Google Docs, Word, Discord, or any editor." \
+        "</span>"
+      info_lbl.wrap   = true
+      info_lbl.xalign = 0.0
+      vbox.pack_start(info_lbl, expand: false, fill: false, padding: 0)
+
+      # ---- Scrollable plain-text preview ----
+      scroll = Gtk::ScrolledWindow.new
+      scroll.set_policy(:automatic, :automatic)
+      vbox.pack_start(scroll, expand: true, fill: true, padding: 4)
+
+      tv = Gtk::TextView.new
+      tv.editable     = false
+      tv.wrap_mode    = :word_char
+      tv.left_margin  = 6
+      tv.right_margin = 6
+      tv.monospace = true if tv.respond_to?(:monospace=)
+      tv.buffer.text  = plain
+      scroll.add(tv)
+
+      # Pre-select all so Ctrl+C works immediately after the window opens
+      GLib::Idle.add do
+        tv.buffer.select_range(tv.buffer.start_iter, tv.buffer.end_iter)
+        tv.grab_focus
+        false
+      end
+
+      # ---- Button row ----
+      btn_row = Gtk::Box.new(:horizontal, 6)
+      vbox.pack_start(btn_row, expand: false, fill: false, padding: 2)
+
+      copy_lbl_idle = "<b>Copy to Clipboard</b>"
+      copy_lbl = Gtk::Label.new
+      copy_lbl.markup = copy_lbl_idle
+      copy_btn = Gtk::Button.new
+      copy_btn.add(copy_lbl)
+      copy_btn.set_tooltip_text(
+        "Copies formatted plain text to clipboard.\n" \
+        "Paste into Google Docs, Word, Discord, or any editor."
+      )
+      btn_row.pack_start(copy_btn,  expand: false, fill: false, padding: 0)
+
+      close_btn = Gtk::Button.new(label: "Close")
+      btn_row.pack_start(close_btn, expand: false, fill: false, padding: 0)
+
+      copy_btn.signal_connect('clicked') do
+        begin
+          cb = Gtk::Clipboard.get(Gdk::Atom.intern("CLIPBOARD", false))
+          cb.set_text(plain)
+          cb.store
+          copy_lbl.markup = "<b><span foreground='#3c9c3c'>Copied! Now paste into your doc.</span></b>"
+          GLib::Timeout.add(2500) { copy_lbl.markup = copy_lbl_idle rescue nil; false }
+          Lich::Messaging.msg("yellow", "[Merchantical] #{flagged.count} item(s) copied to clipboard.")
+        rescue => e
+          Lich::Messaging.msg("yellow", "[Merchantical] Clipboard error: #{e.message}")
+        end
+      end
+
+      close_btn.signal_connect('clicked') { win.destroy }
+      win.signal_connect('delete-event') { win.destroy; false }
+      win.show_all
+    end
+
+    def build_shop_plain_text(flagged)
+      bar   = "\u2501" * 56
+      lines = ["MERCHANTICAL \u2014 SHOP INVENTORY",
+               "Generated: #{Time.now.strftime('%Y-%m-%d')}",
+               bar, ""]
+      flagged.each do |item|
+        summary = []
+        summary << item['obj_type'].to_s.capitalize unless item['obj_type'].to_s.empty?
+        if item['value'].to_i > 0
+          fv = item['value'].to_i.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\1,').reverse
+          summary << "~#{fv} silvers"
+        end
+        summary << "+#{item['enchantment']}"    if item['enchantment'].to_i > 0
+        summary << "#{item['weight']} lbs"      if item['weight'].to_f > 0
+        summary << "#{item['charges']} charges" unless item['charges'].nil?
+        props = []
+        props << "Persistent"   if item['persistent']
+        props << "Disintegrate" if item['disintegrate']
+        props << "Spiked"       if item['spiked']
+        props << "Enhancive"    if item['enhancive']
+        props << "Crumbly"      if item['crumbly']
+        summary << props.join(", ") unless props.empty?
+        sp = item['spell'].to_s
+        summary << "Spell: #{sp}" if sp != '' && sp != 'none'
+
+        recall = item['recall_text'].to_s.strip
+        lines << item['name'].to_s
+        lines << summary.join("  |  ") unless summary.empty?
+        lines << ""
+        lines << (recall.empty? ? "(No recall data available.)" : recall)
+        lines << ""
+        lines << bar
+        lines << ""
+      end
+      lines.join("\n")
+    end
+
+
+    def show_gear
+      gear_win = Gtk::Window.new
+      gear_win.title = "Merchantical - Settings"
+      gear_win.set_default_size(580, 660)
+      gear_win.transient_for = self
+      gear_win.set_window_position(:center_on_parent)
+      gear_win.keep_above = true
+
+      outer = Gtk::Box.new(:vertical, 0)
+      gear_win.add(outer)
+
+      notebook = Gtk::Notebook.new
+      outer.pack_start(notebook, expand: true, fill: true, padding: 0)
+
+      # ---- Options tab ----
+      opt_scroll = Gtk::ScrolledWindow.new
+      opt_scroll.hscrollbar_policy = :never
+      opt_scroll.vscrollbar_policy = :automatic
+      opt_vbox = Gtk::Box.new(:vertical, 8)
+      opt_vbox.margin = 14
+      opt_scroll.add(opt_vbox)
+
+      use_locker_cb = Gtk::CheckButton.new("Use locker?")
+      use_locker_cb.active = @options['use_locker'] || false
+      use_locker_cb.set_tooltip_text(
+        "On startup, go to your locker and look in listed bags to match inventory."
+      )
+      use_locker_cb.signal_connect('toggled') do
+        @options['use_locker'] = use_locker_cb.active?
+        save_options
+      end
+      opt_vbox.pack_start(use_locker_cb, expand: false, fill: false, padding: 0)
+
+      always_on_top_cb = Gtk::CheckButton.new("Window always on top")
+      always_on_top_cb.active = @options['always_on_top'] || false
+      always_on_top_cb.set_tooltip_text("Keep the Merchantical window above all other windows")
+      always_on_top_cb.signal_connect('toggled') do
+        @options['always_on_top'] = always_on_top_cb.active?
+        self.keep_above = always_on_top_cb.active?
+        save_options
+      end
+      opt_vbox.pack_start(always_on_top_cb, expand: false, fill: false, padding: 0)
+
+      lr_hbox = Gtk::Box.new(:horizontal, 6)
+      lr_hbox.pack_start(Gtk::Label.new("Locker room #:"), expand: false, fill: false, padding: 0)
+      locker_entry = Gtk::Entry.new
+      locker_entry.width_request = 100
+      locker_entry.text = @options['locker_room'].to_s
+      locker_entry.set_tooltip_text("Room number for your locker")
+      locker_entry.signal_connect('changed') do
+        @options['locker_room'] = locker_entry.text.strip
+        save_options
+      end
+      lr_hbox.pack_start(locker_entry, expand: false, fill: false, padding: 0)
+      set_locker_btn = Gtk::Button.new(label: "Get current room #")
+      set_locker_btn.set_tooltip_text("Click to use current room number")
+      set_locker_btn.signal_connect('clicked') do
+        room_num = ((Map.current_room_id rescue nil) || XMLData.room_id).to_s
+        unless room_num.empty?
+          locker_entry.text = room_num
+          @options['locker_room'] = room_num
+          save_options
+        end
+      end
+      lr_hbox.pack_start(set_locker_btn, expand: false, fill: false, padding: 0)
+      opt_vbox.pack_start(lr_hbox, expand: false, fill: false, padding: 0)
+
+      opt_vbox.pack_start(
+        Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 4
+      )
+
+      bags_hdr = Gtk::Label.new
+      bags_hdr.markup = "<b>Locker Bags</b>"
+      bags_hdr.halign = :start
+      opt_vbox.pack_start(bags_hdr, expand: false, fill: false, padding: 0)
+      bags_note = Gtk::Label.new(
+        "Enter the best descript name of each bag in your locker. The script will\n" \
+        "look inside them during a locker inventory search. Do not use short names"
+      )
+      bags_note.halign = :start
+      bags_note.wrap   = true
+      bags_note.xalign = 0.0
+      opt_vbox.pack_start(bags_note, expand: false, fill: false, padding: 0)
+
+      @options['bags'] ||= Array.new(5, '')
+      5.times do |i|
+        bag_hbox = Gtk::Box.new(:horizontal, 6)
+        bag_hbox.pack_start(Gtk::Label.new("Bag #{i + 1}:"), expand: false, fill: false, padding: 0)
+        bag_entry = Gtk::Entry.new
+        bag_entry.text = @options['bags'][i].to_s
+        bag_entry.width_request = 300
+        bag_entry.set_placeholder_text("e.g. black bag, blue rucksack")
+        bag_entry.signal_connect('changed') do
+          @options['bags'][i] = bag_entry.text.strip
+          save_options
+        end
+        bag_hbox.pack_start(bag_entry, expand: false, fill: false, padding: 0)
+        opt_vbox.pack_start(bag_hbox, expand: false, fill: false, padding: 0)
+      end
+
+      opt_vbox.pack_start(
+        Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 4
+      )
+
+      debug_cb = Gtk::CheckButton.new("Debug mode")
+      debug_cb.active = @options['debug'] || false
+      debug_cb.set_tooltip_text(
+        "Enables extra diagnostic output to the game window.\n" \
+        "Useful for troubleshooting sell, validate, or locker issues."
+      )
+      debug_cb.signal_connect('toggled') do
+        @options['debug'] = debug_cb.active?
+        save_options
+      end
+      opt_vbox.pack_start(debug_cb, expand: false, fill: false, padding: 0)
+
+      notebook.append_page(opt_scroll, Gtk::Label.new("Options"))
+
+      # ---- About tab ----
+      about_scroll = Gtk::ScrolledWindow.new
+      about_scroll.hscrollbar_policy = :never
+      about_scroll.vscrollbar_policy = :automatic
+
+      about_vbox = Gtk::Box.new(:vertical, 10)
+      about_vbox.margin = 16
+      about_scroll.add(about_vbox)
+
+      about_title = Gtk::Label.new
+      about_title.markup = "<b>Merchantical - Help &amp; About</b>"
+      about_title.halign = :start
+      about_vbox.pack_start(about_title, expand: false, fill: false, padding: 0)
+
+      help_text = <<~TXT
+        Usage:
+          * Click an item name to expand/collapse its full recall text
+          * Check the lock box to mark & lock (sends 'mark <noun>' to game)
+          * Unlocking sends 'mark <noun> remove' to clear the in-game mark
+          * Click $ once to arm sell (flashes blue); click again within 3s to confirm
+          * Click #{SHOP_ICON} to flag items for Copy Shop Data export
+          * #{SEARCH_ICON} green = found in current inventory;  red = not found
+          * Use the filter bar and search box to narrow the item list
+          * Locked and filter-matching items sort to the top
+          * #{LOCKER_ICON} items can be sold directly from the locker when validated
+          * Blue name = previously unlocked item.  Green = newly lore-unlocked
+
+        ──────────────────────────────────────────────────────────────
+
+        Bugs, missing features, or suggestions?
+        Contact: EducatedBarbarian@proton.me
+
+        My other scripts:
+          * Loresang      - You're already using it
+          * VolnRestore2  - Automatic Voln Symbol of Restoration safetynet
+          * Combatical    - The world's premier ability management tool.
+                            Never forget your powers again.
+
+        Thanks for using Merchantical!
+        If you find it useful -- spread the word!
+      TXT
+
+      help_tv = Gtk::TextView.new
+      help_tv.editable    = false
+      help_tv.cursor_visible = false
+      help_tv.wrap_mode   = :word
+      help_tv.left_margin = 4
+      help_tv.monospace   = true if help_tv.respond_to?(:monospace=)
+      help_tv.buffer.text = help_text
+      about_vbox.pack_start(help_tv, expand: false, fill: false, padding: 0)
+
+      notebook.append_page(about_scroll, Gtk::Label.new("About"))
+
+      close_btn = Gtk::Button.new(label: "Close")
+      close_btn.signal_connect('clicked') { gear_win.destroy }
+      outer.pack_end(close_btn, expand: false, fill: false, padding: 6)
+
+      gear_win.show_all
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # App
+  # ---------------------------------------------------------------------------
+  class App
+    def initialize
+      @cmd_queue = Queue.new
+      @running   = true
+      @items     = []
+      @state     = State.load
+    end
+
+    def run
+      @items = if File.exist?(HTML_FILE)
+                 Lich::Messaging.msg("yellow", "[Merchantical] Loading previous loresang data...")
+                 Parser.extract_items(File.read(HTML_FILE))
+               else
+                 Lich::Messaging.msg("yellow", "[Merchantical] No loresang data -- starting empty.")
+                 Lich::Messaging.msg("yellow", "[Merchantical] Click #{"\u{1F3B6}"} Loresang! to load items.")
+                 []
+               end
+
+      removed_ids = @state['removed']       || []
+      @items.reject! { |i| removed_ids.include?(i['id']) }
+
+      locked_ids  = @state['locked']       || []
+      flagged_ids = @state['shop_flagged'] || []
+      @items.each do |item|
+        item[:locked]       = locked_ids.include?(item['id'])
+        item[:shop_flagged] = flagged_ids.include?(item['id'])
+      end
+
+      # Check live inventory to set found/gameobj_id/container_id on each item
+      match_inventory_items(@items)
+
+      unless defined?(Gtk) && Gtk.respond_to?(:queue)
+        Lich::Messaging.msg("yellow", "[Merchantical] GTK3 not available.")
+        return
+      end
+
+      Thread.new do
+        Gtk.queue do
+          @window = MainWindow.new(@items, @cmd_queue, -> { @running = false }, @state)
+          @window.show_all
+        end
+      end
+
+      while @running
+        task = begin; @cmd_queue.pop(true); rescue ThreadError; nil; end
+        if task
+          if    task[:sell_item]      then do_sell(task[:sell_item])
+          elsif task[:mark_item]      then do_mark_item(task[:mark_item])
+          elsif task[:unmark_item]    then do_unmark_item(task[:unmark_item])
+          elsif task[:run_loresang]   then start_loresang_with_capture
+          elsif task[:validate_items] then do_validate_items
+          end
+        else
+          pause 0.1
+        end
+      end
+
+      save_final_state
+      Lich::Messaging.msg("yellow", "[Merchantical] Window closed. State saved.")
+    end
+
+    private
+
+    def match_inventory_items(items)
+      return if items.empty?
+      # Build pairs of [GameObj, container_id_or_nil] so we know where each item lives.
+      # GameObj.containers keys are the container GameObj IDs; values are arrays of contents.
+      inv_pairs = begin
+        pairs = []
+        GameObj.inv.to_a.each { |gi| pairs << [gi, nil] }
+        if GameObj.respond_to?(:containers)
+          GameObj.containers.each do |cid, contents|
+            contents.to_a.each { |gi| pairs << [gi, cid.to_s] }
+          end
+        end
+        pairs
+      rescue
+        []
+      end
+
+      items.each do |item|
+        # Exact full-name match only — noun-only matching causes false positives
+        item_name = item['name'].to_s.downcase.strip
+        pair = inv_pairs.find { |gi, _| gi.name.to_s.downcase.strip == item_name }
+
+        if pair
+          gi, cid = pair
+          item[:found]        = true
+          item[:gameobj_id]   = gi.id.to_s
+          item[:container_id] = cid   # nil = top-level inv, string = inside this container id
+          # Prefer live GameObj type; fall back to recall-parsed type.
+          # Exception: Lich reports wearable bags as "clothing" — override with recall-parsed
+          # "container" when the item name matches known container nouns.
+          live_type   = (gi.type.to_s rescue '')
+          parsed_type = item['obj_type'].to_s
+          # Normalize Lich type variants: "uncommon weapon" / "light armor" / "magic item" etc. → canonical name
+          normalized_live = case live_type.downcase
+                            when /weapon/     then 'weapon'
+                            when /armor/      then 'armor'
+                            when /shield/     then 'shield'
+                            when /jewelry/    then 'jewelry'
+                            when /magic.item/ then 'magic item'
+                            when /container/  then 'container'
+                            when /clothing/   then 'clothing'
+                            when /\bgem\b/    then 'gem'
+                            when /scroll/     then 'scroll'
+                            when /\bwand\b/   then 'wand'
+                            when /potion/     then 'potion'
+                            else live_type
+                            end
+          item[:obj_type] = if parsed_type == 'container'
+                              'container'
+                            elsif normalized_live.empty?
+                              parsed_type
+                            else
+                              normalized_live
+                            end
+        else
+          item[:found]        = false
+          item[:gameobj_id]   = nil
+          item[:container_id] = nil
+          # Use recall-parsed type when not in inventory
+          item[:obj_type]     = item['obj_type'].to_s
+        end
+      end
+    rescue => e
+      Lich::Messaging.msg("yellow", "[Merchantical] Inventory match error: #{e.message}")
+    end
+
+    def do_validate_items
+      Lich::Messaging.msg("yellow", "[Merchantical] Validating inventory...")
+      @items.each { |i| i[:in_locker] = false }
+      match_inventory_items(@items)
+
+      options = @state['options'] || {}
+      if options['use_locker'] && !options['locker_room'].to_s.empty?
+        Lich::Messaging.msg("yellow", "[Merchantical] Checking locker...")
+        search_locker(options)
+      end
+
+      found_count   = @items.count { |i| i[:found] }
+      locker_count  = @items.count { |i| i[:in_locker] }
+      Lich::Messaging.msg("yellow", "[Merchantical] Validation complete -- #{found_count}/#{@items.count} item(s) found (#{locker_count} in locker).")
+      Gtk.queue { @window&.refresh_found_state } rescue nil
+    rescue => e
+      Lich::Messaging.msg("yellow", "[Merchantical] Validate error: #{e.message}")
+    end
+
+    def do_mark_item(info)
+      item_id      = info[:item_id]
+      container_id = info[:container_id]
+      name         = info[:name].to_s
+      unless item_id
+        Lich::Messaging.msg("yellow", "[Merchantical] Mark skipped for #{name}: no gameobj ID.")
+        return
+      end
+      if container_id
+        Lich::Messaging.msg("yellow", "[Merchantical] Retrieving #{name} from container ##{container_id}...")
+        fput "get ##{item_id} from ##{container_id}"
+        waitrt?
+      end
+      fput "mark ##{item_id}"
+      waitrt?
+      if container_id
+        fput "put ##{item_id} in ##{container_id}"
+        waitrt?
+        Lich::Messaging.msg("yellow", "[Merchantical] Marked #{name} and returned to bag.")
+      else
+        Lich::Messaging.msg("yellow", "[Merchantical] Marked #{name}.")
+      end
+    rescue => e
+      Lich::Messaging.msg("yellow", "[Merchantical] Mark error for #{name}: #{e.message}")
+    end
+
+    def do_unmark_item(info)
+      item_id      = info[:item_id]
+      container_id = info[:container_id]
+      name         = info[:name].to_s
+      unless item_id
+        Lich::Messaging.msg("yellow", "[Merchantical] Unmark skipped for #{name}: no gameobj ID.")
+        return
+      end
+      if container_id
+        Lich::Messaging.msg("yellow", "[Merchantical] Retrieving #{name} to remove mark...")
+        fput "get ##{item_id} from ##{container_id}"
+        waitrt?
+      end
+      fput "mark ##{item_id} remove"
+      waitrt?
+      if container_id
+        fput "put ##{item_id} in ##{container_id}"
+        waitrt?
+        Lich::Messaging.msg("yellow", "[Merchantical] Mark removed from #{name}, returned to bag.")
+      else
+        Lich::Messaging.msg("yellow", "[Merchantical] Mark removed from #{name}.")
+      end
+    rescue => e
+      Lich::Messaging.msg("yellow", "[Merchantical] Unmark error for #{name}: #{e.message}")
+    end
+
+    def do_sell(info)
+      item_id         = info[:item_id]
+      container_id    = info[:container_id]
+      name            = info[:name].to_s
+      in_locker       = info[:in_locker]
+      locker_bag_name = info[:locker_bag_name].to_s
+
+      if in_locker
+        # Locker items: get bag by name, look in to get fresh IDs, then use #id for item
+        options     = @state['options'] || {}
+        locker_room = options['locker_room'].to_s
+        if locker_room.empty?
+          Lich::Messaging.msg("yellow", "[Merchantical] Sell skipped for #{name}: locker room not configured.")
+          return
+        end
+        if locker_bag_name.empty?
+          Lich::Messaging.msg("yellow", "[Merchantical] Sell skipped for #{name}: locker bag name not recorded.")
+          return
+        end
+        Lich::Messaging.msg("yellow", "[Merchantical] Navigating to locker to retrieve #{name}...")
+        start_script("go2", [locker_room])
+        while running?("go2"); pause 0.5; end
+        waitrt?
+        pause 1
+        fput "open locker"
+        waitrt?
+        pause 1
+        fput "get #{locker_bag_name}"
+        waitrt?
+        pause 0.5
+
+        # Snapshot, look in bag, find fresh IDs
+        known_ids    = GameObj.containers.keys.map(&:to_s).to_set
+        fput "look in #{locker_bag_name}"
+        waitrt?
+        pause 1
+        new_entry    = GameObj.containers.find { |cid, _| !known_ids.include?(cid.to_s) }
+        bag_contents = new_entry ? new_entry[1].to_a : []
+        target       = bag_contents.find { |gi| gi.name.to_s.downcase.strip == name.downcase.strip }
+
+        unless target
+          Lich::Messaging.msg("yellow", "[Merchantical] Could not locate #{name} in #{locker_bag_name} -- aborting sell.")
+          fput "put #{locker_bag_name} in locker"
+          return
+        end
+
+        fresh_item_id = target.id.to_s
+        fput "get ##{fresh_item_id}"
+        waitrt?
+        pause 0.5
+        fput "put #{locker_bag_name} in locker"
+        waitrt?
+        pause 0.5
+        item_id = fresh_item_id
+      else
+        # Regular inventory item: use GameObj IDs
+        unless item_id
+          Lich::Messaging.msg("yellow", "[Merchantical] Sell skipped for #{name}: item not found in inventory.")
+          return
+        end
+        if container_id
+          fput "get ##{item_id} from ##{container_id}"
+          waitrt?
+        end
+      end
+
+      room_desc = (XMLData.room_description || "").downcase
+      unless room_desc.include?("pawnshop")
+        Lich::Messaging.msg("yellow", "[Merchantical] Navigating to pawnshop...")
+        start_script("go2", ["pawnshop"])
+        while running?("go2"); pause 0.5; end
+        waitrt?
+        pause 1
+      end
+      fput "sell ##{item_id}"
+      waitrt?
+      Lich::Messaging.msg("yellow", "[Merchantical] Sell sent for #{name}.")
+
+      # Return to origin room
+      origin_room = info[:origin_room].to_s
+      unless origin_room.empty?
+        start_script("go2", [origin_room])
+        while running?("go2"); pause 0.5; end
+        waitrt?
+      end
+
+      # Remove sold item from list and save
+      item_uid = info[:item_uid].to_s
+      unless item_uid.empty?
+        Gtk.queue { @window&.remove_sold_item(item_uid) } rescue nil
+      end
+    rescue => e
+      Lich::Messaging.msg("yellow", "[Merchantical] Sell error for #{name}: #{e.message}")
+    end
+
+    def search_locker(options)
+      origin_room = (Map.current_room_id rescue nil).to_s
+      Lich::Messaging.msg("yellow", "[Merchantical] Searching locker bags...")
+      start_script("go2", [options['locker_room'].to_s])
+      while running?("go2"); pause 0.5; end
+      waitrt?
+      pause 1
+      fput "open locker"
+      waitrt?
+      pause 2
+
+      bag_names = (options['bags'] || []).map(&:strip).reject(&:empty?)
+      bag_names.each do |bag_name|
+        Lich::Messaging.msg("yellow", "[Merchantical] Checking bag: #{bag_name}")
+        fput "get #{bag_name}"
+        waitrt?
+        pause 0.5
+
+        # Snapshot existing container IDs before looking — so we can find exactly
+        # what's new after the look, without touching worn containers
+        known_ids = GameObj.containers.keys.map(&:to_s).to_set
+
+        fput "look in #{bag_name}"
+        waitrt?
+        pause 1
+
+        # The new entry added to GameObj.containers IS the bag we just looked in
+        new_entry    = GameObj.containers.find { |cid, _| !known_ids.include?(cid.to_s) }
+        bag_contents = new_entry ? new_entry[1].to_a : []
+
+        bag_contents.each do |gi|
+          gi_name = gi.name.to_s.downcase.strip
+          matched = @items.find { |i| i['name'].to_s.downcase.strip == gi_name }
+          if matched
+            matched[:found]           = true
+            matched[:in_locker]       = true
+            matched[:locker_bag_name] = bag_name
+            matched[:gameobj_id]      = nil
+            matched[:container_id]    = nil
+            Lich::Messaging.msg("yellow", "[Merchantical]   Found: #{matched['name']}")
+          end
+        end
+
+        fput "put #{bag_name} in locker"
+        waitrt?
+        pause 1
+      end
+
+      unless origin_room.empty?
+        Lich::Messaging.msg("yellow", "[Merchantical] Returning to origin room...")
+        start_script("go2", [origin_room])
+        while running?("go2"); pause 0.5; end
+        waitrt?
+      end
+    rescue => e
+      Lich::Messaging.msg("yellow", "[Merchantical] Locker search error: #{e.message}")
+    end
+
+    def start_loresang_with_capture
+      loresang_paths = [
+        "#{SCRIPT_DIR}loresang.lic",
+        File.join(SCRIPT_DIR, 'loresang.lic'),
+        File.join(SCRIPT_DIR, 'custom', 'loresang.lic')
+      ]
+      unless loresang_paths.any? { |p| File.exist?(p) }
+        Lich::Messaging.msg("yellow", "[Merchantical] Loresang not found.")
+        Lich::Messaging.msg("yellow", "[Merchantical] USER, PLEASE DOWNLOAD AND CONFIGURE LORESANG FIRST: ;repo download loresang")
+        Gtk.queue { @window&.enable_loresang_btn } rescue nil
+        return
+      end
+
+      Lich::Messaging.msg("yellow", "[Merchantical] Starting loresang -- capturing stream...")
+
+      capture_mutex        = Mutex.new
+      captures             = []
+      noun_statuses        = {}
+      current_capture      = nil
+      last_recall_noun     = nil
+      last_recall_fullname = nil
+      hook_id              = "merchantical_cap_#{Time.now.to_i}"
+
+      # DownstreamHook.add requires an explicit Proc as second argument (not a block)
+      hook_proc = proc { |server_string|
+        text = server_string.to_s
+                            .gsub(/<[^>]+>/, '')
+                            .gsub(/\e\[[0-9;]*[mK]/, '')
+                            .gsub(/&lt;/, '<').gsub(/&gt;/, '>').gsub(/&amp;/, '&')
+                            .strip
+
+        # Matches both:
+        #   "As you recall your loresong..."  (normal sing)
+        #   "As you recall Ool's song, you feel a faint resonating vibration from the [item]..."  (already unlocked by another bard)
+        if text =~ /^as you recall/i
+          us = $_LASTUPSTREAM_.to_s
+          last_recall_noun = us =~ /\[loresang\]>recall\s+(\S+)/i ? $1.downcase : nil
+          last_recall_fullname =
+            if text =~ /as you recall your (.+?)(?:,|\.)\s*you/i
+              # "As you recall your [item name], you note..."
+              $1.strip.downcase
+            elsif text =~ /vibration from (?:the|an?) (.+?) in your (?:(?:right|left) )?hand/i
+              # "...resonating vibration from the [full item name] in your hand..."
+              $1.strip.downcase
+            end
+        end
+
+        capture_mutex.synchronize do
+          if text =~ /^as you recall/i
+            captures << current_capture if current_capture && current_capture[:lines].any?
+            current_capture = { noun: last_recall_noun, full_name: last_recall_fullname, lines: [] }
+          elsif current_capture
+            if text =~ /\[Loresang\]|\[Merchantical\]/i
+              captures << current_capture if current_capture[:lines].any?
+              current_capture = nil
+              if text =~ /Loresong Completed.*?,\s*(\S+)/i ||
+                 text =~ /(\S+)\s+fully identified/i
+                noun_statuses[$1.downcase] = :completed
+              elsif text =~ /(\S+)\s+already fully unlocked/i
+                noun_statuses[$1.downcase] = :already_unlocked
+              end
+            elsif !text.empty?
+              # Whitelist: every loresang recall line begins with "It " or "This item ".
+              # Anything else (prompts ">", inventory dumps, spell messages,
+              # item transfer lines, container listings, etc.) is discarded.
+              current_capture[:lines] << text if text =~ /\A(?:It |This item )/i
+            end
+          else
+            if text =~ /\[Loresang\]/i
+              if text =~ /Loresong Completed.*?,\s*(\S+)/i ||
+                 text =~ /(\S+)\s+fully identified/i
+                noun_statuses[$1.downcase] = :completed
+              elsif text =~ /(\S+)\s+already fully unlocked/i
+                noun_statuses[$1.downcase] = :already_unlocked
+              end
+            end
+          end
+        end
+
+        server_string
+      }
+      DownstreamHook.add(hook_id, hook_proc)
+
+      start_script("loresang")
+      while running?("loresang"); pause 0.5; end
+      pause 1
+      DownstreamHook.remove(hook_id)
+
+      capture_mutex.synchronize do
+        captures << current_capture if current_capture && current_capture[:lines].any?
+      end
+
+      noun_to_recall    = {}
+      noun_to_fullname  = {}
+      noun_count        = Hash.new(0)
+      captures.each do |cap|
+        next unless cap[:noun]
+        noun_to_recall[cap[:noun]]   = cap[:lines].join("\n")
+        noun_to_fullname[cap[:noun]] = cap[:full_name] if cap[:full_name]
+        noun_count[cap[:noun]] += 1
+      end
+
+      # Build items from stream capture, using parsed full names where available
+      stream_items = noun_to_recall.map do |noun, recall_text|
+        full_name = noun_to_fullname[noun] || noun
+        parsed    = Parser.parse_recall(recall_text, full_name)
+        value     = recall_text =~ /estimated to be worth about ([\d,]+) silvers/i ?
+                      $1.gsub(',', '').to_i : nil
+        status    = noun_statuses[noun] ||
+                    (noun_count[noun] >= 2 ? :completed : :already_unlocked)
+        item_id   = noun.gsub(/[^a-zA-Z0-9]/, '-').downcase
+        { 'id' => item_id, 'name' => full_name, 'noun' => noun,
+          'status' => status.to_s, 'recall_text' => recall_text,
+          'value' => value }.merge(parsed)
+      end
+
+      # Prefer freshly-written HTML file from loresang if updated within the last 5 minutes —
+      # HTML items have authoritative full names and richer data from loresang's own output.
+      # We read from the shared LORESANG_HTML (written by loresang.lic) then save a
+      # per-character copy to HTML_FILE so other characters' runs don't bleed over.
+      new_items = begin
+        if File.exist?(LORESANG_HTML) && (Time.now - File.mtime(LORESANG_HTML)) < 300
+          html_content = File.read(LORESANG_HTML)
+          html_items   = Parser.extract_items(html_content)
+          if html_items.any?
+            # Save per-character copy for future startups
+            File.write(HTML_FILE, html_content) rescue nil
+            # Merge stream-captured status back in
+            html_items.each do |hi|
+              n = hi['noun'].to_s.downcase
+              hi['status'] = noun_statuses[n].to_s if noun_statuses[n]
+            end
+            Lich::Messaging.msg("yellow", "[Merchantical] Using HTML data (#{html_items.count} items with full names).")
+            html_items
+          else
+            stream_items
+          end
+        else
+          stream_items
+        end
+      rescue
+        stream_items
+      end
+
+      removed_ids = @state['removed'] || []
+      new_items.reject! { |i| removed_ids.include?(i['id']) }
+      match_inventory_items(new_items)
+      @items = new_items
+
+      count = new_items.count
+      Lich::Messaging.msg(
+        "yellow",
+        count > 0 ?
+          "[Merchantical] Loresang complete -- #{count} item(s) captured." :
+          "[Merchantical] Loresang complete -- no items captured. Check ;loresang setup."
+      )
+
+      Gtk.queue do
+        @window&.update_batch(new_items)
+        @window&.enable_loresang_btn
+      end rescue nil
+    end
+
+    def save_final_state
+      @state['locked']       = @items.select { |i| i[:locked] }.map       { |i| i['id'] }
+      @state['shop_flagged'] = @items.select { |i| i[:shop_flagged] }.map { |i| i['id'] }
+      State.save(@state)
+    end
+  end
+end
+
+# Entry point
+Merchantical::App.new.run
