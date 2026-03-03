@@ -1,0 +1,351 @@
+# name: sea-charts
+# author: Peggyanne
+# description: GTK3 minimap for OSA using UIDs. Must first run nautical-charts-update to download the maps and database. To use: run the script and WATCH OCEAN. It will update automatically as your ship moves. I will polish this a lot more in time. Enjoy!
+
+i_stand_alone
+clear
+
+script.want_downstream_xml = true
+
+unless HAVE_GTK
+  respond 'error: ruby-gtk bindings are not installed or failed to load'
+  exit
+end
+
+begin
+  require 'gtk3'
+  require 'json'
+rescue LoadError => e
+  respond "error: #{e}"
+  exit
+end
+
+# ---------- CONFIG ----------
+JSON_PATH = File.join(MAP_DIR, 'OSAMaps\database\oceandb.json')
+PNG_DIR   = File.join(MAP_DIR, 'OSAMaps')
+ICON_DIR  = File.join(MAP_DIR, 'OSAMaps\icons')
+SHIP_FILE = 'ship_icon.png'
+INITIAL_SCALE = 0.50
+MIN_SCALE = 0.40
+MAX_SCALE = 2.50
+SHIP_BASE_PX = 40
+CLICK_THRESHOLD = 15 
+# ----------------------------
+
+def mm_echo(msg)
+  respond "[minimap: #{msg}]" rescue puts msg
+end
+
+def find_room(data, rid_int)
+  rid = rid_int.to_s
+  data.each { |_top, bucket| 
+    return bucket[rid] if bucket.is_a?(Hash) && bucket.key?(rid)
+  }
+  nil
+end
+
+def clamp(v, lo, hi)
+  [[v, lo].max, hi].min
+end
+
+def scaled_pixbuf(pixbuf, scale)
+  w = [(pixbuf.width * scale).round, 1].max
+  h = [(pixbuf.height * scale).round, 1].max
+  pixbuf.scale_simple(w, h, GdkPixbuf::InterpType::BILINEAR)
+end
+
+# ----- Global state -----
+$minimap_win = nil
+$minimap_alive = true
+$scale = INITIAL_SCALE
+$data = nil
+$ship_pixbuf_orig = nil
+$current_room_id = nil
+$current_map_file = nil
+$current_cx = nil
+$current_cy = nil
+$map_pixbuf_orig = nil
+$bg_pixbuf_orig = nil      
+$map_image = nil
+$bg_image = nil            
+$ship_image = nil
+$layout = nil
+$scroller = nil
+$status = nil
+$keep_on_top = false
+
+# --- PERSISTENT SETTINGS ---
+UserVars.sea_charts ||= {}
+$show_background = UserVars.sea_charts[:show_bg].nil? ? true : UserVars.sea_charts[:show_bg]
+$theme_mode = (UserVars.sea_charts[:theme] || 'dark').to_sym 
+
+def save_settings
+  UserVars.sea_charts[:show_bg] = $show_background
+  UserVars.sea_charts[:theme]   = $theme_mode.to_s
+end
+
+def update_theme
+  Gtk.queue do
+    color = if $theme_mode == :light
+              Gdk::RGBA.new(1.0, 1.0, 1.0, 1.0) # White
+            else
+              Gdk::RGBA.new(0.1, 0.1, 0.1, 1.0) # Dark Grey
+            end
+    
+    $layout.override_background_color(:normal, color) if $layout
+    $scroller.override_background_color(:normal, color) if $scroller
+    if $scroller && $scroller.child.respond_to?(:override_background_color)
+      $scroller.child.override_background_color(:normal, color)
+    end
+  end
+end
+
+def update_images
+  return if $map_pixbuf_orig.nil? || $ship_pixbuf_orig.nil?
+  return if $map_image.nil? || $ship_image.nil? || $layout.nil? || $status.nil?
+
+  Gtk.queue do
+    begin
+      map_scaled = scaled_pixbuf($map_pixbuf_orig, $scale)
+      
+      if $show_background && $bg_pixbuf_orig
+        bg_scaled = scaled_pixbuf($bg_pixbuf_orig, $scale)
+        $bg_image.set_from_pixbuf(bg_scaled)
+        $bg_image.show
+      else
+        $bg_image.hide
+      end
+
+      $map_image.set_from_pixbuf(map_scaled)
+
+      ship_target = [(SHIP_BASE_PX * $scale).round, 1].max
+      ow, oh = $ship_pixbuf_orig.width, $ship_pixbuf_orig.height
+      if ow >= oh
+        sw, sh = ship_target, ((oh.to_f / ow.to_f) * ship_target).round
+      else
+        sh, sw = ship_target, ((ow.to_f / oh.to_f) * ship_target).round
+      end
+      
+      ship_scaled = $ship_pixbuf_orig.scale_simple([sw, 1].max, [sh, 1].max, GdkPixbuf::InterpType::BILINEAR)
+      $ship_image.set_from_pixbuf(ship_scaled)
+
+      $layout.set_size(map_scaled.width, map_scaled.height)
+      
+      if $current_cx && $current_cy
+        sx = ($current_cx.to_f * $scale).round - (ship_scaled.width / 2.0).round
+        sy = ($current_cy.to_f * $scale).round - (ship_scaled.height / 2.0).round
+        $layout.move($ship_image, sx, sy)
+        $ship_image.show
+        center_view_on(($current_cx.to_f * $scale), ($current_cy.to_f * $scale))
+      else
+        $ship_image.hide
+      end
+
+      room_display = $current_room_id ? $current_room_id : "None"
+      $status.text = "Map: #{$current_map_file} | Room: #{room_display} | Theme: #{$theme_mode.upcase}"
+    rescue => e
+      mm_echo "Update error: #{e.message}"
+    end
+  end
+end
+
+def center_view_on(x, y)
+  return if $scroller.nil?
+  Gtk.queue do
+    hadj, vadj = $scroller.hadjustment, $scroller.vadjustment
+    next if hadj.nil? || vadj.nil?
+    hadj.value = clamp(x - (hadj.page_size / 2.0), 0, [hadj.upper - hadj.page_size, 0].max)
+    vadj.value = clamp(y - (vadj.page_size / 2.0), 0, [hadj.upper - hadj.page_size, 0].max)
+  end
+end
+
+def find_room_at_coords(map_file, click_x, click_y)
+  orig_x, orig_y = click_x / $scale, click_y / $scale
+  $data.each do |_top_id, bucket|
+    next unless bucket.is_a?(Hash)
+    bucket.each do |rid, room_info|
+      if (room_info['map'] == map_file || room_info['map_file'] == map_file)
+        dist = Math.sqrt((room_info['cx'].to_f - orig_x)**2 + (room_info['cy'].to_f - orig_y)**2)
+        return rid if dist <= CLICK_THRESHOLD
+      end
+    end
+  end
+  nil
+end
+
+def show_context_menu(event)
+  Gtk.queue do
+    menu = Gtk::Menu.new
+
+    bg_toggle = Gtk::CheckMenuItem.new(label: "Show Background")
+    bg_toggle.active = $show_background
+    bg_toggle.signal_connect("toggled") { |w| $show_background = w.active?; save_settings; update_images }
+    menu.append(bg_toggle)
+
+    theme_item = Gtk::MenuItem.new(label: "Window Theme")
+    theme_menu = Gtk::Menu.new
+    theme_item.submenu = theme_menu
+    
+    group = nil
+    [:dark, :light].each do |mode|
+      item = Gtk::RadioMenuItem.new(group, "#{mode.to_s.capitalize} Mode")
+      group = item
+      item.active = ($theme_mode == mode)
+      item.signal_connect("activate") do 
+        if item.active?
+          $theme_mode = mode
+          save_settings
+          update_theme
+          update_images
+        end
+      end
+      theme_menu.append(item)
+    end
+    menu.append(theme_item)
+
+    menu.append(Gtk::SeparatorMenuItem.new)
+
+    map_item = Gtk::MenuItem.new(label: "Select Map")
+    map_menu = Gtk::Menu.new
+    map_item.submenu = map_menu
+
+    if Dir.exist?(PNG_DIR)
+      png_files = Dir.children(PNG_DIR).select { |f| 
+        f.downcase.end_with?('.png') && !f.include?('_background')
+      }.sort
+      png_files.each do |file|
+        next if file == SHIP_FILE
+        item = Gtk::MenuItem.new(label: file)
+        item.signal_connect("activate") do
+          $current_map_file = file
+          load_map_assets(file)
+          $current_room_id = $current_cx = $current_cy = nil
+          update_images
+        end
+        map_menu.append(item)
+      end
+    end
+    menu.append(map_item)
+
+    scale_item = Gtk::MenuItem.new(label: "Scale")
+    scale_menu = Gtk::Menu.new
+    [0.5, 0.75, 1.0, 1.5, 2.0].each do |s|
+      item = Gtk::MenuItem.new(label: "#{(s*100).to_i}%")
+      item.signal_connect("activate") { $scale = s; update_images }
+      scale_menu.append(item)
+    end
+    scale_item.submenu = scale_menu
+    menu.append(scale_item)
+
+    menu.append(Gtk::SeparatorMenuItem.new)
+    
+    top_item = Gtk::CheckMenuItem.new(label: "Keep window on top")
+    top_item.active = !!$keep_on_top
+    top_item.signal_connect("toggled") { |w| 
+      $keep_on_top = w.active?; Gtk.queue { $minimap_win.set_keep_above($keep_on_top) }
+    }
+    menu.append(top_item)
+
+    menu.show_all
+    menu.popup_at_pointer(event)
+  end
+end
+
+def load_map_assets(map_file)
+  map_path = File.join(PNG_DIR, map_file)
+  bg_file = map_file.sub('.png', '_background.png')
+  bg_path = File.join(PNG_DIR, bg_file)
+
+  temp_grid = GdkPixbuf::Pixbuf.new(file: map_path)
+  $map_pixbuf_orig = temp_grid.add_alpha(true, 255, 255, 255)
+  
+  $bg_pixbuf_orig = File.exist?(bg_path) ? GdkPixbuf::Pixbuf.new(file: bg_path) : nil
+  $current_map_file = map_file
+end
+
+def load_room!(room_id, force: false)
+  room = find_room($data, room_id)
+  return false if room.nil?
+  map_file = room["map"] || room["map_file"]
+  cx, cy = room["cx"], room["cy"]
+
+  return false if map_file.nil? || cx.nil? || cy.nil?
+
+  if $current_map_file != map_file || $map_pixbuf_orig.nil? || force
+    load_map_assets(map_file)
+  end
+
+  $current_room_id, $current_cx, $current_cy = room_id.to_i, cx, cy
+  update_images
+  true
+end
+
+# Startup
+begin
+  $data = JSON.parse(File.read(JSON_PATH))
+  $ship_pixbuf_orig = GdkPixbuf::Pixbuf.new(file: File.join(ICON_DIR, SHIP_FILE))
+rescue => e
+  mm_echo "Init Error: #{e.message}"; exit
+end
+
+GLib::Idle.add do
+  $minimap_win = Gtk::Window.new("Sea Charts")
+  $minimap_win.set_default_size(420, 460)
+  vbox = Gtk::Box.new(:vertical, 2)
+  $minimap_win.add(vbox)
+
+  $status = Gtk::Label.new("Waiting for movement...")
+  vbox.pack_start($status, expand: false, fill: true, padding: 2)
+
+  $scroller = Gtk::ScrolledWindow.new
+  vbox.pack_start($scroller, expand: true, fill: true, padding: 0)
+
+  $layout = Gtk::Layout.new
+  $bg_image = Gtk::Image.new   # Bottom Layer
+  $map_image = Gtk::Image.new  # Middle Layer
+  $ship_image = Gtk::Image.new # Top Layer
+
+  $layout.put($bg_image, 0, 0)
+  $layout.put($map_image, 0, 0)
+  $layout.put($ship_image, 0, 0)
+
+  $layout.add_events([:button_press_mask])
+  $layout.signal_connect('button-press-event') do |_w, event|
+    if event.button == 3
+      show_context_menu(event)
+      true
+    elsif event.button == 1
+      if $current_map_file
+        clicked_rid = find_room_at_coords($current_map_file, event.x, event.y)
+        mm_echo "Room ID: #{clicked_rid}" if clicked_rid
+      end
+      false
+    else
+      false
+    end
+  end
+
+  $scroller.add($layout)
+  update_theme
+  $minimap_win.signal_connect('destroy') { $minimap_alive = false }
+  $minimap_win.show_all
+  false
+end
+
+last_seen_id = nil
+while $minimap_alive
+  line = get
+  if line =~ /style id="roomName" \/>.*?\((\d+)\)/
+    rid = $1.to_i
+    
+    # Check if we need to update because the ROOM changed 
+    # OR because the CURRENT MAP doesn't match the room's map
+    room = find_room($data, rid)
+    room_map = room ? (room["map"] || room["map_file"]) : nil
+    
+    if rid != last_seen_id || $current_map_file != room_map
+      load_room!(rid) && last_seen_id = rid
+    end
+  end
+  sleep 0.1
+end
