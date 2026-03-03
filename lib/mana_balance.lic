@@ -1,0 +1,236 @@
+=begin
+  mana balancer which:
+    1. collects current mana from all participating characters
+    2. equalizes mana across participants (capped at 300)
+    3. issues direct send commands via queen
+
+  flow:
+    - mana_balance creates and manages the sqlite table
+    - queen wall triggers mana_report on all clients
+    - mana_report writes name, mana, timestamp
+    - mana_balance computes transfers (assumes ~5% loss)
+    - queen executes "<source> send <amount> <target>"
+
+         author: Lucullan
+   contributors:
+           game: Gemstone
+           tags: mana, balance, group, queen, utility
+        version: 1.0.0
+   requirements:
+    - sequel gem
+
+  Version Control:
+  Major_change.feature_addition.bugfix
+    v1.0.0 - 2026-03-02
+      - Initial release
+      - SQLite-backed coordination
+      - Automatic table lifecycle (create/drop)
+      - Stabilized participant detection
+      - Loss-aware transfer planning (~5%)
+=end
+
+# mana_balance.lic
+#
+# Coordinator script. No args needed.
+# Flow:
+#  1) drop+create mana_reports table
+#  2) sleep 1s
+#  3) wall mana_report (participants self-select)
+#  4) wait for participant set to stabilize + meet minimum
+#  5) compute target (cap @ 300) + transfer plan (assume ~5% loss)
+#  6) Script.run('queen', "<source> send <amount> <target>") with 0.5s delay
+#  7) drop table
+
+require 'sequel'
+
+DB_FILE = File.join($data_dir, "mana_balance.db")
+DB      = Sequel.sqlite(DB_FILE)
+
+MANA_CAP            = 300
+LOSS_RATE           = 0.05
+GAIN_RATE           = 1.0 - LOSS_RATE
+
+CREATE_PAUSE_S      = 1.0
+WAIT_TIMEOUT_S      = 25
+POLL_INTERVAL_S     = 0.25
+QUEEN_DELAY_S       = 0.5
+
+REPORT_FRESH_S      = 20   # only accept rows newer than now - REPORT_FRESH_S
+MIN_PARTICIPANTS    = 2
+STABLE_POLLS_NEEDED = 4    # stop early when participant set unchanged N polls
+
+# --- script dependency check (like flare_patterns.rb) ---
+SCRIPTS_DIR = "#{$script_dir}"   # Lich script directory
+MANA_REPORT_FILENAME = "mana_report.lic"
+MANA_REPORT_PATH = File.join(SCRIPTS_DIR, MANA_REPORT_FILENAME)
+
+def ensure_script_present!(filename, full_path)
+  return if File.exist?(full_path)
+
+  msg =
+    "\n\n\n" \
+    "************************************************************\n" \
+    "*                                                          *\n" \
+    "*   #{filename} is missing.                                *\n" \
+    "*                                                          *\n" \
+    "*   Please download it using:                              *\n" \
+    "*                                                          *\n" \
+    "*     ;repo download #{filename}                           *\n" \
+    "*                                                          *\n" \
+    "*   Then re-run ;mana_balance                              *\n" \
+    "*                                                          *\n" \
+    "************************************************************\n" \
+    "\n\n\n"
+
+  echo(msg)
+  exit
+end
+
+ensure_script_present!(MANA_REPORT_FILENAME, MANA_REPORT_PATH)
+
+def recreate_table(db)
+  db.drop_table?(:mana_reports)
+  db.create_table(:mana_reports) do
+    String  :name, primary_key: true
+    Integer :cur_mana,    null: false
+    Integer :max_mana,    null: false
+    Integer :capped_mana, null: false
+    Integer :ts,          null: false
+  end
+end
+
+def drop_table(db)
+  db.drop_table?(:mana_reports)
+end
+
+def load_recent_reports(reports_ds, fresh_after_ts)
+  rows = reports_ds.where { ts >= fresh_after_ts }.all
+  # { "Name" => {cur:, max:, cap:, ts:} }
+  out = {}
+  rows.each do |r|
+    out[r[:name]] = {
+      cur: r[:cur_mana].to_i,
+      max: r[:max_mana].to_i,
+      cap: r[:capped_mana].to_i,
+      ts: r[:ts].to_i
+    }
+  end
+  out
+end
+
+def build_plan(reports, target, gain_rate)
+  donors = []    # [name, surplus_cap]
+  receivers = [] # [name, deficit_cap]
+
+  reports.each do |name, r|
+    cap = r[:cap]
+    if cap > target
+      donors << [name, cap - target]
+    elsif cap < target
+      receivers << [name, target - cap]
+    end
+  end
+
+  return [] if donors.empty? || receivers.empty?
+
+  plan = []
+  donor_i = 0
+
+  receivers.each do |to_name, deficit|
+    need = deficit.to_f
+
+    while need > 0.0001 && donor_i < donors.size
+      from_name, surplus = donors[donor_i]
+      if surplus <= 0
+        donor_i += 1
+        next
+      end
+
+      # receiver_gain ≈ send * gain_rate
+      max_gain = surplus * gain_rate
+      gain     = [max_gain, need].min
+
+      send = (gain / gain_rate).ceil
+      if send > surplus
+        send = surplus
+        gain = send * gain_rate
+      end
+
+      plan << { from: from_name, to: to_name, send: send }
+
+      donors[donor_i][1] -= send
+      need -= gain
+      donor_i += 1 if donors[donor_i][1] <= 0
+    end
+  end
+
+  plan
+end
+
+begin
+  recreate_table(DB)
+  sleep CREATE_PAUSE_S
+
+  Script.run('queen', 'wall ;mana_report')
+
+  reports_ds = DB[:mana_reports]
+  deadline = Time.now + WAIT_TIMEOUT_S
+
+  stable_polls = 0
+  last_keys = nil
+  reports = {}
+
+  while Time.now < deadline
+    fresh_after = Time.now.to_i - REPORT_FRESH_S
+    reports = load_recent_reports(reports_ds, fresh_after)
+
+    keys = reports.keys.sort
+    if keys == last_keys
+      stable_polls += 1
+    else
+      stable_polls = 0
+      last_keys = keys
+    end
+
+    break if keys.size >= MIN_PARTICIPANTS && stable_polls >= STABLE_POLLS_NEEDED
+    sleep POLL_INTERVAL_S
+  end
+
+  participants = reports.keys.sort
+  if participants.size < MIN_PARTICIPANTS
+    echo "mana_balance: not enough participants (got #{participants.size}, need #{MIN_PARTICIPANTS})"
+    exit
+  end
+
+  sum_caps = participants.sum { |n| reports[n][:cap] }
+  target = (sum_caps / participants.size)
+  target = [target, MANA_CAP].min
+
+  echo "---- mana_balance ----"
+  echo "participants=#{participants.size} sum_caps=#{sum_caps} target=#{target} cap=#{MANA_CAP}"
+  participants.each do |n|
+    r = reports[n]
+    echo "#{n}: cur=#{r[:cur]} max=#{r[:max]} cap=#{r[:cap]} ts=#{r[:ts]}"
+  end
+
+  plan = build_plan(reports, target, GAIN_RATE)
+  if plan.empty?
+    echo "No transfers needed."
+    exit
+  end
+
+  echo "---- transfer plan (loss ~#{(LOSS_RATE * 100).to_i}%) ----"
+  plan.each_with_index do |p, i|
+    echo "#{i+1}. #{p[:from]} -> #{p[:to]} send=#{p[:send]}"
+  end
+
+  plan.each do |p|
+    Script.run('queen', "#{p[:from]} send #{p[:send]} #{p[:to]}")
+    sleep QUEEN_DELAY_S
+  end
+
+  echo "mana_balance: commands issued."
+ensure
+  drop_table(DB)
+  echo "mana_balance: table dropped."
+end
