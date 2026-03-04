@@ -1,0 +1,296 @@
+# animatekeeper.lic
+# v10 + DEBUG LOGGING + REFRESH SUCCESS/FAIL DETECTION
+#
+# Key change:
+# - 'sacrifice channel' can FAIL ("overwhelm" message). We now detect that and do not
+#   claim success or set last_refresh unless it actually worked.
+# - Uses FULL verbiage "sacrifice channel" (not "sac channel") for refresh attempts.
+
+# === CONFIG ===
+$safety_buffer_seconds         = 60      # refresh when <= this many seconds remain
+$essence_max                   = 5
+$check_interval                = 10      # main loop tick
+$essence_check_interval        = 300     # refresh resource read every 5 minutes (unless forced)
+$stock_cooldown_seconds        = 8       # rate limit sacrifice attempts for stocking
+$refresh_cooldown_seconds      = 10      # prevent double-refresh if timeleft doesn't update immediately (ONLY on success)
+$refresh_fail_backoff_seconds  = 3       # backoff after a failed refresh attempt so we don't spam
+
+# Debug controls
+$debug                     = false
+$debug_tick_seconds         = 10
+$debug_show_spell_dump      = false
+$debug_show_pending_lines   = false
+
+# Fallback timer (only used if we can't read spell timeleft for any reason)
+$default_refresh_minutes = 25
+$refresh_interval = [ ($default_refresh_minutes * 60) - $safety_buffer_seconds, 180 ].max
+
+ANIMATE_DEAD_SPELL_ID = 730
+
+$decay_message_regex = /
+  Your\ animate\
+  (?:begins\ to\ crumble|
+     appears\ to\ weaken|
+     form\ blurs|
+     wavers\ slightly|
+     starts\ fading|
+     looks\ tired|
+     is\ starting\ to\ decay
+  )
+/xi
+
+# === Channel refresh: failure/success messaging ===
+# Failure line you observed:
+# "You try to compel ... but the broken life forces of the dead overwhelm your ability ..."
+$refresh_fail_regex = /
+  broken\ life\ forces.*overwhelm
+/xi
+
+# Success line observed from another sorcerer:
+# "Focusing on the bond to your animate, you force shadow essence into ... leveraging its broken life forces...
+#  ...ends in the unnatural revitalization of its animate matter."
+$refresh_success_regex = /
+  focusing\ on\ the\ bond\ to\ your\ animate|
+  force\ shadow\ essence\ into|
+  unnatural\ revitalization
+/xi
+
+def log_debug(msg)
+  return unless $debug
+  echo "[DBG] #{msg}"
+end
+
+echo "AnimateKeeper v10 started! (debug=#{$debug})"
+echo "Refresh logic: Animate Dead (#{ANIMATE_DEAD_SPELL_ID}) via Spells.active timeleft"
+echo "NOTE: Spell#timeleft is minutes; script converts to seconds internally."
+echo "Safety buffer: #{$safety_buffer_seconds}s"
+echo "Refresh cooldown (success only): #{$refresh_cooldown_seconds}s"
+echo "Refresh fail backoff: #{$refresh_fail_backoff_seconds}s"
+echo "Fallback timer (if spell time unreadable): ~#{(($refresh_interval + $safety_buffer_seconds) / 60.0).round(1)} min"
+
+# === State ===
+$cached_essence        = 0
+$last_essence_check    = Time.now - 10_000
+$last_stock_attempt    = Time.now - 10_000
+$last_refresh          = Time.now - 10_000   # only updated on success
+$last_refresh_fail     = Time.now - 10_000
+$warned_no_essence     = false
+$pending_lines         ||= []
+$last_debug_tick       = Time.now - 10_000
+
+def animate_dead_timeleft_seconds
+  spells = Spells.active
+  return nil unless spells.respond_to?(:find)
+
+  s = spells.find { |sp| sp.respond_to?(:num) && sp.num.to_i == ANIMATE_DEAD_SPELL_ID }
+  return nil unless s
+
+  minutes =
+    if s.respond_to?(:timeleft)
+      s.timeleft
+    elsif s.instance_variable_defined?(:@timeleft)
+      s.instance_variable_get(:@timeleft)
+    end
+
+  return nil unless minutes.is_a?(Numeric)
+  minutes * 60.0
+end
+
+def spell_dump_compact
+  spells = Spells.active
+  return "Spells.active=#{spells.class}" unless spells.respond_to?(:map)
+  spells
+    .select { |s| s.respond_to?(:num) && (s.respond_to?(:timeleft) || s.instance_variable_defined?(:@timeleft)) }
+    .map { |s|
+      tl = s.respond_to?(:timeleft) ? s.timeleft : s.instance_variable_get(:@timeleft)
+      "#{s.num}:#{tl.is_a?(Numeric) ? tl.round(2) : tl}"
+    }
+    .join(", ")
+end
+
+def parse_essence_from_lines
+  re = /(?:shadow|accumulated)?\s*essence.*?(\d+)/i
+  30.times do
+    line = get
+    $pending_lines << line
+    if (m = line.match(re))
+      n = m[1].to_i
+      return n if n <= ($essence_max + 1)
+    end
+  end
+  nil
+end
+
+def get_essence_count(force = false)
+  if !force && (Time.now - $last_essence_check) < $essence_check_interval
+    return $cached_essence
+  end
+
+  log_debug("Essence recount: sending 'resource' (force=#{force})")
+  fput 'resource'
+  sleep 1.0
+
+  count = parse_essence_from_lines
+  if count
+    $cached_essence = count
+    $last_essence_check = Time.now
+    log_debug("Essence updated: #{$cached_essence}/#{$essence_max}")
+
+    if count == 0 && !$warned_no_essence
+      $warned_no_essence = true
+    elsif count > 0
+      $warned_no_essence = false
+    end
+  else
+    echo "Essence parse failed - using cached: #{$cached_essence}"
+    log_debug("Essence parse failed after resource read")
+  end
+
+  $cached_essence
+end
+
+def attempt_refresh!
+  before = animate_dead_timeleft_seconds
+  before_m = before ? (before / 60.0) : nil
+
+  log_debug("ACTION: refresh -> 'sacrifice channel' (timeleft_before=#{before_m ? "#{before_m.round(2)}m" : "nil"})")
+  fput 'sacrifice channel'  # FULL VERBIAGE
+
+  # Read immediate feedback lines (blocking reads)
+  12.times do
+    line = get
+    log_debug("refresh_rsp: #{line}") if $debug_show_pending_lines
+
+    if line =~ $refresh_fail_regex
+      $last_refresh_fail = Time.now
+      log_debug("REFRESH FAILED (matched fail regex)")
+      return :fail
+    end
+
+    if line =~ $refresh_success_regex
+      # Double-check timeleft bumped
+      sleep 0.2
+      after = animate_dead_timeleft_seconds
+      if after && before && after > before + 5
+        log_debug("REFRESH SUCCESS (success line + timeleft increased)")
+        return :ok
+      end
+      log_debug("REFRESH SUCCESS (success line)")
+      return :ok
+    end
+
+    break if line.strip == ">" || line =~ /^>\s*$/
+  end
+
+  # No explicit success/fail line found: infer by timeleft increase
+  sleep 0.4
+  after = animate_dead_timeleft_seconds
+  after_m = after ? (after / 60.0) : nil
+
+  if before && after && after > before + 5
+    log_debug("REFRESH SUCCESS (timeleft increased #{before_m&.round(2)}m -> #{after_m&.round(2)}m)")
+    return :ok
+  end
+
+  $last_refresh_fail = Time.now
+  log_debug("REFRESH UNKNOWN/FAIL (timeleft did not increase #{before_m&.round(2)}m -> #{after_m&.round(2)}m)")
+  :fail
+end
+
+# === Initial forced essence check ===
+get_essence_count(true)
+echo "Current shadow essence: #{$cached_essence}/#{$essence_max}"
+echo "AnimateKeeper ready. Stop with ;kill animatekeeper"
+
+# === Main loop ===
+loop do
+  current_essence = get_essence_count
+
+  # === Heartbeat debug tick ===
+  if $debug && (Time.now - $last_debug_tick) >= $debug_tick_seconds
+    $last_debug_tick = Time.now
+    animate_present = GameObj.npcs.any? { |npc| npc.name =~ /animate/i }
+    tl_s = animate_dead_timeleft_seconds
+    tl_m = tl_s ? (tl_s / 60.0) : nil
+
+    log_debug("Heartbeat: animate_present=#{animate_present} essence=#{current_essence}/#{$essence_max} timeleft=#{tl_m ? "#{tl_m.round(2)}m" : "nil"} last_refresh_age=#{(Time.now - $last_refresh).round(1)}s last_fail_age=#{(Time.now - $last_refresh_fail).round(1)}s")
+    log_debug("Spells: #{spell_dump_compact}") if $debug_show_spell_dump
+  end
+
+  # === Stock essence while hunting (opportunistic) ===
+  if current_essence < $essence_max && (Time.now - $last_stock_attempt) > $stock_cooldown_seconds
+    target = GameObj.npcs.find { |npc|
+      npc.status &&
+      name = npc.name.to_s.downcase
+      stat = npc.status.to_s.downcase
+      !name.include?('animate') &&
+      !name.include?('undead') &&
+      !stat.include?('dead') &&
+      %w[stunned prone webbed bound immobilized rooted unconscious].any? { |s| stat.include?(s) }
+    }
+
+    if target
+      $last_stock_attempt = Time.now
+      log_debug("Stock target found: id=#{target.id} noun=#{target.noun} name=#{target.name.inspect} status=#{target.status.inspect}")
+      fput "sacrifice ##{target.id}"
+      sleep 3
+      get_essence_count(true)
+      echo "Stock attempt on #{target.noun} (essence: #{$cached_essence}/#{$essence_max})"
+      sleep 0.1
+      next
+    end
+  end
+
+  # === Decay detection (watch incoming text) ===
+  decay_detected = false
+  while (line = get?)
+    $pending_lines << line
+    decay_detected = true if line =~ $decay_message_regex
+  end
+
+  until $pending_lines.empty?
+    decay_detected = true if $pending_lines.shift =~ $decay_message_regex
+  end
+
+  # === Animate + refresh decision ===
+  animate_present = GameObj.npcs.any? { |npc| npc.name =~ /animate/i }
+  timeleft_seconds = animate_dead_timeleft_seconds
+  timeleft_minutes = timeleft_seconds ? (timeleft_seconds / 60.0) : nil
+
+  refresh_due =
+    if animate_present && timeleft_seconds.is_a?(Numeric)
+      timeleft_seconds <= $safety_buffer_seconds
+    else
+      animate_present && (Time.now - $last_refresh) > $refresh_interval
+    end
+
+  refresh_allowed = (Time.now - $last_refresh) > $refresh_cooldown_seconds
+  fail_backoff_ok = (Time.now - $last_refresh_fail) > $refresh_fail_backoff_seconds
+
+  log_debug("Decision: animate_present=#{animate_present} timeleft=#{timeleft_minutes ? "#{timeleft_minutes.round(2)}m" : "nil"} refresh_due=#{refresh_due} decay_detected=#{decay_detected} refresh_allowed=#{refresh_allowed} fail_backoff_ok=#{fail_backoff_ok} essence=#{current_essence}")
+
+  # === Refresh animate if needed & essence available ===
+  if fail_backoff_ok && (decay_detected || refresh_due) && animate_present && current_essence > 0 && refresh_allowed
+    result = attempt_refresh!
+
+    if result == :ok
+      $last_refresh = Time.now
+      get_essence_count(true)
+      echo "Refreshed animate (timeleft was #{timeleft_minutes ? timeleft_minutes.round(2) : 'unknown'}m, essence: #{$cached_essence}/#{$essence_max})"
+      $warned_no_essence = false
+      sleep 0.1
+      next
+    else
+      echo "Refresh attempt FAILED (timeleft was #{timeleft_minutes ? timeleft_minutes.round(2) : 'unknown'}m). Will retry."
+    end
+  end
+
+  # === Warn if no essence when refresh would be needed (keep monitoring) ===
+  if (decay_detected || refresh_due) && animate_present && $cached_essence.zero? && !$warned_no_essence
+    echo "Animate needs refresh but no essence available! Monitoring continues."
+    log_debug("WARN: refresh needed but essence=0")
+    $warned_no_essence = true
+  end
+
+  sleep $check_interval
+end
