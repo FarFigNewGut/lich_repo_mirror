@@ -1,0 +1,237 @@
+=begin
+  wealth-table.lic
+  Silently runs wealth-related commands and prints a formatted summary table.
+=end
+
+# ================================================================
+# EDIT HERE -- Service Items Configuration
+#
+# Add, remove, or rename your tracked service items below.
+#
+# Each line follows this format:
+#   { cmd: "analyze <noun>",  label: "Display Name" },
+#
+# Use the same noun you'd type in-game after "analyze".
+# The label is what appears in the table -- name it whatever you like.
+#
+# If an item doesn't report its max charges in the analyze output,
+# add   max: <number>   to supply it manually. Example:
+#   { cmd: "analyze penn",  label: "Lor Pennant",  max: 200 },
+#
+# The "resource" command is special -- it reads Covert Arts charges.
+# Leave it as-is unless you don't use Covert Arts.
+# ================================================================
+SERVICE_ITEMS = [
+  { cmd: "analyze tattoo",  label: "Mystic Tattoo"      },
+  { cmd: "analyze standard",    label: "Battle Standard",   max: 200 },
+  { cmd: "analyze pendant",  label: "Bloodstone Jewelry" },
+  { cmd: "resource",        label: "Covert Arts"        },
+]
+# ================================================================
+# END OF USER CONFIGURATION -- no need to edit below this line
+# ================================================================
+
+# ============================================================
+# Capture helper
+# Registers a DownstreamHook to intercept and accumulate server
+# lines silently, then removes it when done.
+# ============================================================
+def wcapture(command, end_pattern, timeout: 7)
+  lines   = []
+  done    = false
+  hook_id = "wealth_capture_#{command.gsub(/\W/, '_')}"
+
+  DownstreamHook.add(hook_id, proc { |server_string|
+    unless done
+      clean = server_string.gsub(/<[^>]*>/, '').strip
+      unless clean.empty?
+        lines << clean
+        done = true if clean =~ end_pattern
+      end
+    end
+    # Return nil to suppress the line from appearing in the client
+    nil
+  })
+
+  fput command
+
+  deadline = Time.now + timeout
+  sleep 0.1 until done || Time.now > deadline
+
+  DownstreamHook.remove(hook_id)
+  lines
+rescue => e
+  echo "wealth-table: capture error (#{command}): #{e}"
+  DownstreamHook.remove(hook_id) rescue nil
+  []
+end
+
+# ============================================================
+# 1. WEALTH ALL  (sentinel: Dust line, which is last)
+# ============================================================
+wealth_lines = wcapture("wealth all", /Dust in your reserves/i)
+
+silver_on_hand  = nil
+redsteel_marks  = nil
+dust_reserves   = nil
+gigas_fragments = nil
+
+wealth_lines.each do |l|
+  case l
+  when /(\d[\d,]*) silver with you/i             then silver_on_hand  = $1
+  when /(\d[\d,]*) redsteel marks/i              then redsteel_marks  = $1
+  when /(\d[\d,]*) Dust in your reserves/i       then dust_reserves   = $1
+  when /(\d[\d,]*) gigas artifact fragments/i    then gigas_fragments = $1
+  end
+end
+
+# Special case: "no silver" means 0
+silver_on_hand ||= "0" if wealth_lines.any? { |l| l =~ /no silver with you/i }
+
+# ============================================================
+# 2. TICKET BALANCE  (sentinel: raikhen line, which is last)
+# ============================================================
+ticket_lines = wcapture("ticket balance", /raikhen/i, timeout: 8)
+
+general_tickets = nil
+bloodscrip      = nil
+ethereal_scrip  = nil
+soul_shards     = nil
+raikhen         = nil
+
+ticket_lines.each do |l|
+  case l
+  when /(\d[\d,]*)\s*tickets?/i          then general_tickets = $1
+  when /(\d[\d,]*)\s*bloodscrip/i        then bloodscrip      = $1
+  when /(\d[\d,]*)\s*ethereal scrip/i    then ethereal_scrip  = $1
+  when /(\d[\d,]*)\s*soul shards?/i      then soul_shards     = $1
+  when /(\d[\d,]*)\s*raikhen/i           then raikhen         = $1
+  end
+end
+
+# ============================================================
+# 3. BOUNTY  (sentinel: unspent bounty points line)
+# ============================================================
+bounty_lines = wcapture("bounty", /unspent bounty points/i, timeout: 7)
+
+unspent_bounty = nil
+bounty_lines.each do |l|
+  unspent_bounty = $1 if l =~ /(\d[\d,]*) unspent bounty points/i
+end
+
+# ============================================================
+# 4. BANK ACCOUNT  (sentinel: Total line)
+# ============================================================
+bank_lines = wcapture("bank account", /^\s*Total:/i, timeout: 7)
+
+bank_total = nil
+bank_lines.each do |l|
+  bank_total = $1 if l =~ /Total:\s*([\d,]+)/i
+end
+
+# ============================================================
+# 5. PREM START  (sentinel: Total Pooled Points remaining)
+# ============================================================
+prem_lines = wcapture("prem start", /Total Pooled Points remaining/i, timeout: 7)
+
+pooled_remaining = nil
+prem_lines.each do |l|
+  pooled_remaining = $1 if l =~ /Total Pooled Points remaining:\s*([\d,]+)/i
+end
+
+
+def parse_analyze_charges(lines)
+  lines.each do |l|
+    return "#{$1}/#{$2}" if l =~ /(\d[\d,]*)\s+of\s+(\d[\d,]*)\s+charges?\s+remaining/i
+    return $1            if l =~ /Charges:\s*([\d,]+)/i
+  end
+  nil
+end
+
+def parse_resource_charges(lines)
+  lines.each do |l|
+    return $1.gsub(/\s*\/\s*/, '/') if l =~ /Covert Arts Charges:\s*([\d,\/]+)/i
+  end
+  nil
+end
+
+service_results = SERVICE_ITEMS.map do |item|
+  lines = if item[:cmd] == "resource"
+    wcapture(item[:cmd], /Covert Arts Charges/i)
+  else
+    wcapture(item[:cmd], /(?:may not be lightened|charges? remaining|Charges:\s*\d)/i)
+  end
+
+  charges = if item[:cmd] == "resource"
+    parse_resource_charges(lines)
+  else
+    parse_analyze_charges(lines)
+  end
+
+  display = charges ? (item[:max] ? "#{charges}/#{item[:max]}" : charges) : "n/a"
+  { label: item[:label], charges: display }
+end
+
+# ============================================================
+# TABLE RENDERING
+# ============================================================
+n = "n/a"
+
+rows = [
+  [ "Silver",       "On Hand",                    silver_on_hand   || n ],
+  [ "Silver",       "Bank Total",                 bank_total       || n ],
+  [ "Ascension",    "Dust (Reserves)",            dust_reserves    || n ],
+  [ "Ascension",    "Gigas Artifact Fragments",   gigas_fragments  || n ],
+  [ "Alt Currency", "General Tickets",            general_tickets  || n ],
+  [ "Alt Currency", "Bloodscrip (Duskruin)",      bloodscrip       || n ],
+  [ "Alt Currency", "Ethereal Scrip (Reim)",      ethereal_scrip   || n ],
+  [ "Alt Currency", "Soul Shards (Ebon Gate)",    soul_shards      || n ],
+  [ "Alt Currency", "Raikhen (Rumor Woods)",      raikhen          || n ],
+  [ "Other",        "Redsteel Marks",             redsteel_marks   || n ],
+  [ "Other",        "Unspent Bounty Points",      unspent_bounty   || n ],
+  [ "Other",        "Pooled Premium Points Left", pooled_remaining || n ],
+]
+
+col_w      = [ 18, 28, 16 ]
+divider    = "+-#{'-' * col_w[0]}-+-#{'-' * col_w[1]}-+-#{'-' * col_w[2]}-+"
+header     = "| #{"CATEGORY".ljust(col_w[0])} | #{"DESCRIPTION".ljust(col_w[1])} | #{"AMOUNT".rjust(col_w[2])} |"
+total_w    = col_w.sum + (col_w.length * 3) + 1
+title_line = "+" + "WEALTH SUMMARY".center(total_w - 2, "=") + "+"
+
+respond ""
+respond title_line
+respond divider
+respond header
+respond divider
+
+last_cat = nil
+rows.each do |cat, label, val|
+  respond divider if last_cat && cat != last_cat
+  cat_display = (cat == last_cat) ? "" : cat
+  respond "| #{cat_display.ljust(col_w[0])} | #{label.ljust(col_w[1])} | #{val.rjust(col_w[2])} |"
+  last_cat = cat
+end
+
+respond divider
+respond ""
+
+# ============================================================
+# SERVICE ITEMS TABLE
+# ============================================================
+si_col_w      = [ 22, 16 ]
+si_divider    = "+-#{'-' * si_col_w[0]}-+-#{'-' * si_col_w[1]}-+"
+si_header     = "| #{"ITEM".ljust(si_col_w[0])} | #{"CHARGES".rjust(si_col_w[1])} |"
+si_total_w    = si_col_w.sum + (si_col_w.length * 3) + 1
+si_title_line = "+" + "SERVICE ITEMS".center(si_total_w - 2, "=") + "+"
+
+respond si_title_line
+respond si_divider
+respond si_header
+respond si_divider
+
+service_results.each do |r|
+  respond "| #{r[:label].ljust(si_col_w[0])} | #{r[:charges].rjust(si_col_w[1])} |"
+end
+
+respond si_divider
+respond ""
