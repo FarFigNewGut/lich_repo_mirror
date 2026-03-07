@@ -1113,6 +1113,21 @@ def CreatureWindow.collect_all_inv_items(items = GameObj.inv, depth: 0, max_dept
   result
 end
 
+def CreatureWindow.collect_all_inv_items_with_parent(items = GameObj.inv, parent: nil, depth: 0, max_depth: 3)
+  return [] if depth > max_depth
+
+  result = []
+  items.each do |item|
+    next unless item
+
+    result << { item: item, parent: parent }
+    if item.respond_to?(:contents) && item.contents
+      result.concat(collect_all_inv_items_with_parent(item.contents, parent: item, depth: depth + 1, max_depth: max_depth))
+    end
+  end
+  result
+end
+
 def CreatureWindow.heirloom_item_for_turnin
   heirloom_name = @cw_bounty_heirloom.to_s.strip
   return nil if heirloom_name.empty?
@@ -1483,11 +1498,154 @@ def CreatureWindow.gem_items_for_turnin
   gem_name = CreatureWindow.current_gem_name
   return [] if gem_name.empty?
 
-  CreatureWindow.collect_all_inv_items.select { |i| CreatureWindow.item_matches_bounty_name?(i.name.to_s, gem_name) }
+  CreatureWindow.collect_all_inv_items.select do |i|
+    CreatureWindow.item_matches_bounty_name?(i.name.to_s, gem_name) &&
+      !CreatureWindow.gem_container_item?(i)
+  end
 end
 
 def CreatureWindow.gem_count_on_hand
   CreatureWindow.gem_items_for_turnin.inject(0) { |sum, item| sum + CreatureWindow.item_stack_count(item) }
+end
+
+def CreatureWindow.gem_container_item?(item)
+  return false unless item
+
+  noun = item.respond_to?(:noun) ? item.noun.to_s.downcase : ""
+  name = item.name.to_s.downcase
+  noun.match?(/\b(?:jar|bottle)\b/) || name.match?(/\b(?:jar|bottle)\b/)
+end
+
+def CreatureWindow.inventory_container_item?(item)
+  return false unless item
+
+  name = item.name.to_s.downcase
+  name.match?(/\b(?:pack|cloak|satchel|sack|bag|pouch|backpack|rucksack|case|kit|basket|coffer|chest|box|trunk)\b/)
+end
+
+def CreatureWindow.hydrate_inventory_containers_for_gem_search
+  Array(GameObj.inv).each do |item|
+    next unless CreatureWindow.inventory_container_item?(item)
+
+    dothistimeout(
+      "look in ##{item.id}",
+      4,
+      /In the .*?:|In the .* you see|There is nothing in the .*\.|That is closed\.|What were you referring to\?|I could not find what you were referring to\./i
+    )
+    sleep 0.1
+  end
+end
+
+def CreatureWindow.find_gem_bounty_container
+  gem_name = CreatureWindow.current_gem_name
+  return nil if gem_name.empty?
+
+  inventory_entries = CreatureWindow.collect_all_inv_items_with_parent
+
+  # Preferred: explicit name match if the gem name is included on the item itself.
+  found = inventory_entries.find do |entry|
+    item = entry[:item]
+    CreatureWindow.gem_container_item?(item) &&
+      CreatureWindow.item_matches_bounty_name?(item.name.to_s, gem_name)
+  end
+  return found if found
+
+  CreatureWindow.hydrate_inventory_containers_for_gem_search
+  inventory_entries = CreatureWindow.collect_all_inv_items_with_parent
+  found = inventory_entries.find do |entry|
+    item = entry[:item]
+    CreatureWindow.gem_container_item?(item) &&
+      CreatureWindow.item_matches_bounty_name?(item.name.to_s, gem_name)
+  end
+  return found if found
+
+  # Fallback: some items expose only "bottle/jar" in object name, with "containing <gem>"
+  # shown outside the item tag in LOOK output.
+  inventory_entries.find do |entry|
+    CreatureWindow.gem_container_item?(entry[:item])
+  end
+end
+
+def CreatureWindow.held_gem_bounty_container
+  gem_name = CreatureWindow.current_gem_name
+  return nil if gem_name.empty?
+
+  [GameObj.right_hand, GameObj.left_hand].find do |item|
+    item &&
+      CreatureWindow.gem_container_item?(item) &&
+      CreatureWindow.item_matches_bounty_name?(item.name.to_s, gem_name)
+  end
+end
+
+def CreatureWindow.try_get_gem_container_from_inventory
+  gem_name = CreatureWindow.current_gem_name
+  return nil if gem_name.empty?
+
+  commands = [
+    { cmd: "get my bottle containing #{gem_name}", parent_id: nil },
+    { cmd: "get my jar containing #{gem_name}", parent_id: nil },
+  ]
+
+  Array(GameObj.inv).each do |container|
+    next unless CreatureWindow.inventory_container_item?(container)
+    commands << { cmd: "get my bottle containing #{gem_name} from ##{container.id}", parent_id: container.id }
+    commands << { cmd: "get my jar containing #{gem_name} from ##{container.id}", parent_id: container.id }
+    commands << { cmd: "get my bottle from ##{container.id}", parent_id: container.id }
+    commands << { cmd: "get my jar from ##{container.id}", parent_id: container.id }
+  end
+
+  commands.uniq { |entry| entry[:cmd] }.each do |entry|
+    dothistimeout(
+      entry[:cmd],
+      4,
+      /You (?:remove|get|reach|retrieve|grab).*|You already have that\.|Get what\?|I could not find what you were referring to\.|What were you referring to\?/i
+    )
+    held = CreatureWindow.held_gem_bounty_container
+    return { item: held, parent: nil, parent_id: entry[:parent_id] } if held
+  end
+
+  nil
+end
+
+def CreatureWindow.return_gem_container_to_source(container_item, parent_id)
+  return unless container_item
+
+  if parent_id
+    fput "put ##{container_item.id} in ##{parent_id}"
+  else
+    fput "stow ##{container_item.id}"
+  end
+end
+
+def CreatureWindow.shake_and_sell_gems_from_container(npc, container_item, needed_count)
+  return 0 unless npc && container_item
+
+  sold_count = 0
+  held = CreatureWindow.held_gem_bounty_container
+  fput "get ##{container_item.id}" unless held && held.id == container_item.id
+
+  needed_count.times do |i|
+    fput "shake ##{container_item.id}"
+    sleep 0.2
+
+    gem_item = [GameObj.left_hand, GameObj.right_hand].find do |item|
+      item &&
+        !CreatureWindow.gem_container_item?(item) &&
+        CreatureWindow.item_matches_bounty_name?(item.name.to_s, CreatureWindow.current_gem_name)
+    end
+    gem_item ||= CreatureWindow.gem_items_for_turnin.first
+    unless gem_item
+      respond "Creaturewindow: no gem found to sell after shake #{i + 1}/#{needed_count}."
+      next
+    end
+
+    held_gem = [GameObj.left_hand, GameObj.right_hand].any? { |item| item && item.id == gem_item.id }
+    fput "get ##{gem_item.id}" unless held_gem
+    fput "sell ##{gem_item.id}"
+    sold_count += 1
+  end
+
+  sold_count
 end
 
 def CreatureWindow.current_skin_name
@@ -1695,15 +1853,39 @@ def CreatureWindow.run_gem_bounty_workflow
       return
     end
 
-    CreatureWindow.ask_bounty_and_sync(npc)
+    # Clear stale gem specifics so we only proceed on freshly parsed ask/checkbounty data.
+    @cw_bounty_task_type = :gem
+    @cw_bounty_gem = nil
+    @cw_bounty_remaining = 0
+    CreatureWindow.ask_bounty_and_sync(npc, timeout: 3.0, interval: 0.2)
 
-    unless @cw_bounty_task_type == :gemspecifics
-      respond "Creaturewindow: could not fetch gem specifics from gem dealer."
+    unless @cw_bounty_task_type == :gemspecifics &&
+           !CreatureWindow.current_gem_name.empty? &&
+           @cw_bounty_remaining.to_i > 0
+      respond "Creaturewindow: could not fetch fresh gem specifics from gem dealer."
       return
     end
 
     required = @cw_bounty_remaining.to_i
     required = 1 if required < 1
+    bounty_container_entry = CreatureWindow.find_gem_bounty_container
+    bounty_container_entry ||= CreatureWindow.try_get_gem_container_from_inventory
+    if bounty_container_entry
+      bounty_container = bounty_container_entry[:item]
+      bounty_parent_id = bounty_container_entry[:parent_id] || bounty_container_entry[:parent]&.id
+      respond "Creaturewindow: found gem bounty container in inventory; shaking and selling up to #{required}."
+      begin
+        CreatureWindow.shake_and_sell_gems_from_container(npc, bounty_container, required)
+      ensure
+        CreatureWindow.return_gem_container_to_source(bounty_container, bounty_parent_id)
+      end
+      CreatureWindow.ask_bounty_and_sync(npc, use_put: true)
+      required = @cw_bounty_remaining.to_i
+      required = 1 if required < 1
+    end
+
+    return if @cw_bounty_remaining.to_i <= 0
+
     on_hand = CreatureWindow.gem_count_on_hand
 
     if on_hand < required
