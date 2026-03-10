@@ -1,0 +1,593 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'base64'
+require 'fileutils'
+require 'json'
+require 'rbconfig'
+require 'time'
+require 'timeout'
+
+SCRIPT_NAME = 'gs4tools'
+SCRIPT_VERSION = '0.2.0'
+DEFAULT_PROFILE_URL = 'https://gs4tools.com/profile/profile.html'
+SITE_ROOT_URL = 'https://gs4tools.com'
+DATA_DIR = File.expand_path('../data/gstools/profiles', __dir__)
+CONSENT_FILE = File.expand_path('../data/gstools/consent.json', __dir__)
+PAGE_URLS = {
+  'home' => "#{SITE_ROOT_URL}/index.html",
+  'profile' => "#{SITE_ROOT_URL}/profile/profile.html",
+  'encumbrance' => "#{SITE_ROOT_URL}/encumbrance.html",
+  'calculator' => "#{SITE_ROOT_URL}/calculator.html",
+  'spells' => "#{SITE_ROOT_URL}/spells.html",
+  'badge' => "#{SITE_ROOT_URL}/badge.html",
+  'resources' => "#{SITE_ROOT_URL}/profession-services/resources.html",
+  'stat-optimizer' => "#{SITE_ROOT_URL}/stat-optimizer/stat-optimizer.html",
+  'lumnis' => "#{SITE_ROOT_URL}/lumnis.html",
+  'violet-orb' => "#{SITE_ROOT_URL}/violet-orb.html"
+}.freeze
+
+def say(message)
+  respond "--- #{SCRIPT_NAME}: #{message}"
+end
+
+def usage
+  say ''
+  say 'usage:'
+  say '  ;gs4tools                 # show status + help'
+  say '  ;gs4tools sync            # collect blocks, save local, open profile import'
+  say '  ;gs4tools open <page>     # open page (no sync, profile optional)'
+  say '  ;gs4tools open <page> --sync  # sync first, then land on target page'
+  say '  ;gs4tools load            # show local raw capture summary'
+  say '  ;gs4tools load --raw      # print local raw capture JSON'
+  say '  ;gs4tools show            # print local raw capture path'
+  say '  ;gs4tools allow           # grant consent for automated collection/open'
+  say '  ;gs4tools revoke          # revoke consent'
+  say ''
+  say 'pages:'
+  say "  #{PAGE_URLS.keys.join(', ')}"
+  say ''
+  say 'privacy:'
+  say '  gs4tools.com is a static page and does not store your data server-side'
+  say '  this script stores data only on your local machine under lich5/data/gstools'
+  say ''
+  say 'note: first run requires explicit consent via ;gs4tools allow'
+end
+
+def script_args
+  vars = Script.current.vars
+  return [] unless vars.respond_to?(:to_a)
+  vars.to_a
+      .compact
+      .flat_map { |value| value.to_s.strip.split(/\s+/) }
+      .reject(&:empty?)
+end
+
+def character_name
+  name = if defined?(Char) && Char.respond_to?(:name)
+           Char.name
+         elsif defined?(XMLData) && XMLData.respond_to?(:name)
+           XMLData.name
+         else
+           nil
+         end
+  cleaned = name.to_s.gsub(/<[^>]+>/, '').strip
+  cleaned.empty? ? 'character' : cleaned
+end
+
+def character_key
+  character_name.downcase.gsub(/[^a-z0-9]+/, '_').gsub(/\A_+|_+\z/, '')
+end
+
+def data_path
+  FileUtils.mkdir_p(DATA_DIR)
+  File.join(DATA_DIR, "#{character_key}.json")
+end
+
+def normalized_profile_path
+  FileUtils.mkdir_p(DATA_DIR)
+  File.join(DATA_DIR, "#{character_key}.profile.json")
+end
+
+def decode_html_entities(text)
+  text.to_s
+      .gsub('&gt;', '>')
+      .gsub('&lt;', '<')
+      .gsub('&amp;', '&')
+      .gsub('&quot;', '"')
+      .gsub('&#39;', "'")
+end
+
+def sanitize_block_for_hash(text)
+  source = text.to_s
+  return nil if source.strip.empty?
+
+  cleaned = source
+            .gsub(/<prompt\b[^>]*>.*?<\/prompt>/im, '')
+            .gsub(/<dialogData\b[^>]*>.*?<\/dialogData>/im, '')
+            .gsub(/<output\b[^>]*\/>/im, '')
+            .gsub(/<pushBold\/>|<popBold\/>/im, '')
+            .gsub(/<[^>]+>/, '')
+  cleaned = decode_html_entities(cleaned)
+  lines = cleaned.split(/\r?\n/).map { |line| line.gsub(/\s+$/, '') }
+  lines.reject! { |line| line.strip.empty? }
+  lines.reject! { |line| line.strip.match?(/^[a-z]{0,3}>$/i) }
+  result = lines.join("\n").strip
+  result.empty? ? nil : result
+end
+
+def compact_payload_for_url(payload)
+  blocks = payload[:blocks] || {}
+  {
+    version: payload[:version],
+    character: payload[:character],
+    collectedAt: payload[:collectedAt],
+    blocks: {
+      infoStart: sanitize_block_for_hash(blocks[:infoStart]),
+      skills: sanitize_block_for_hash(blocks[:skills]),
+      exp: sanitize_block_for_hash(blocks[:exp]),
+      ascList: sanitize_block_for_hash(blocks[:ascList]),
+      ascMilestones: sanitize_block_for_hash(blocks[:ascMilestones]),
+      enhanciveList: sanitize_block_for_hash(blocks[:enhanciveList]),
+      enhanciveTotals: sanitize_block_for_hash(blocks[:enhanciveTotals]),
+      enhanciveTotalsDetails: sanitize_block_for_hash(blocks[:enhanciveTotalsDetails])
+    }
+  }
+end
+
+def load_consent
+  return {} unless File.exist?(CONSENT_FILE)
+  JSON.parse(File.read(CONSENT_FILE))
+rescue StandardError
+  {}
+end
+
+def save_consent(consent_map)
+  FileUtils.mkdir_p(File.dirname(CONSENT_FILE))
+  File.write(CONSENT_FILE, JSON.pretty_generate(consent_map))
+end
+
+def consent_granted?
+  consent = load_consent
+  consent[character_key] == true
+end
+
+def grant_consent
+  consent = load_consent
+  consent[character_key] = true
+  save_consent(consent)
+  say "consent granted for #{character_name}"
+end
+
+def revoke_consent
+  consent = load_consent
+  consent.delete(character_key)
+  save_consent(consent)
+  say "consent revoked for #{character_name}"
+end
+
+def print_consent_prompt
+  say 'before running, this script will:'
+  say '1) send INFO START / SKILLS / EXP / ASC LIST / ASC MILESTONES / INV ENH ...'
+  say '2) save raw capture data locally under lich5/data/gstools'
+  say '3) open your browser to gs4tools.com with encoded data in URL hash'
+  say 'privacy: gs4tools.com is a static site and does not store submitted data'
+  say 'privacy: your script data stays local unless you choose to save profiles in your browser'
+  say "if you agree, run: ;gs4tools allow"
+  say "to cancel, do nothing. you can revoke later with: ;gs4tools revoke"
+end
+
+def prompt_line?(line)
+  strip_ansi(line).strip.match?(/^[a-z]{0,3}>$/i)
+end
+
+def strip_ansi(line)
+  text = line.to_s.gsub(/\e\[[\d;?]*[ -\/]*[@-~]/, '')
+  text = text
+         .gsub(/<prompt\b[^>]*>.*?<\/prompt>/im, '>')
+         .gsub(/<dialogData\b[^>]*>.*?<\/dialogData>/im, '')
+         .gsub(/<output\b[^>]*\/>/im, '')
+         .gsub(/<pushBold\/>|<popBold\/>/im, '')
+         .gsub(/<[^>]+>/, '')
+         .gsub('&gt;', '>')
+         .gsub('&lt;', '<')
+         .gsub('&amp;', '&')
+         .gsub('&quot;', '"')
+         .gsub('&#39;', "'")
+  text
+end
+
+def capture_block(command:, start_pattern:, timeout_seconds: 20, idle_timeout_seconds: 0.35, require_prompt: false)
+  hook_name = "gs4tools-capture-#{Time.now.to_i}-#{rand(100_000)}"
+  output = []
+  started = false
+  saw_prompt_after_start = false
+  last_activity_at = nil
+  deadline = Time.now + timeout_seconds
+
+  save_downstream = Script.current.want_downstream
+  save_downstream_xml = Script.current.want_downstream_xml
+  Script.current.want_downstream = true
+  Script.current.want_downstream_xml = false
+
+  begin
+    DownstreamHook.add(hook_name, proc { |line|
+      text = strip_ansi(line.to_s).rstrip
+      next line if text.empty?
+
+      if started
+        if prompt_line?(text)
+          saw_prompt_after_start = true
+        else
+          output << text
+        end
+        last_activity_at = Time.now
+        next line
+      end
+
+      if text.match?(start_pattern)
+        started = true
+        output << text
+        last_activity_at = Time.now
+      end
+      line
+    })
+
+    put command
+    loop do
+      break if Time.now > deadline
+      sleep 0.05
+      break if started && saw_prompt_after_start
+      if started && !require_prompt && last_activity_at && (Time.now - last_activity_at) >= idle_timeout_seconds
+        break
+      end
+    end
+  rescue StandardError => e
+    say "capture failed for '#{command}': #{e.class}"
+    return nil
+  ensure
+    DownstreamHook.remove(hook_name) rescue nil
+    Script.current.want_downstream = save_downstream
+    Script.current.want_downstream_xml = save_downstream_xml
+  end
+
+  return nil unless started
+  output.pop while output.any? && prompt_line?(output.last)
+  output.pop while output.any? && output.last.strip.empty?
+  text = output.join("\n").strip
+  text.empty? ? nil : text
+end
+
+def collect_blocks
+  say 'collecting INFO START...'
+  info_start = capture_block(
+    command: 'info start',
+    start_pattern: /Level 0 Stats for|Strength \(STR\):/i,
+    timeout_seconds: 25
+  )
+
+  say 'collecting SKILLS...'
+  skills = capture_block(
+    command: 'skills',
+    start_pattern: /current skill bonuses and ranks/i,
+    timeout_seconds: 25
+  )
+
+  say 'collecting EXP...'
+  exp = capture_block(
+    command: 'exp',
+    start_pattern: /Level:\s*[0-9,]+\s+Fame:/i,
+    timeout_seconds: 20
+  )
+
+  say 'collecting ASC LIST...'
+  asc_list = capture_block(
+    command: 'asc list',
+    start_pattern: /Ascension Abilities are available:/i,
+    timeout_seconds: 30
+  )
+
+  say 'collecting ASC MILESTONES...'
+  asc_milestones = capture_block(
+    command: 'asc milestones',
+    start_pattern: /Ascension Milestones are as follows:/i,
+    timeout_seconds: 20
+  )
+
+  say 'collecting INV ENH LIST...'
+  enhancive_list = capture_block(
+    command: 'inv enh list',
+    start_pattern: /You are (?:not holding any|holding the following|wearing the following) enhancive items|^\(Items:\s*\d+\)$/i,
+    timeout_seconds: 8,
+    require_prompt: true
+  )
+
+  say 'collecting INV ENH TOTALS...'
+  enhancive_totals = capture_block(
+    command: 'inv enh totals',
+    start_pattern: /^(Stats|Skills|Resources|Statistics):|enhancive (?:items|properties|amount)|no enhancive/i,
+    timeout_seconds: 8,
+    require_prompt: true
+  )
+
+  say 'collecting INV ENH TOTALS DETAILS...'
+  enhancive_totals_details = capture_block(
+    command: 'inv enh totals details',
+    start_pattern: /^(Stats|Skills|Resources|Statistics):|enhancive (?:items|properties|amount)|no enhancive/i,
+    timeout_seconds: 8,
+    require_prompt: true
+  )
+
+  payload = {
+    version: 1,
+    character: character_name,
+    collectedAt: Time.now.utc.iso8601,
+    blocks: {
+      infoStart: info_start,
+      skills: skills,
+      exp: exp,
+      ascList: asc_list,
+      ascMilestones: asc_milestones,
+      enhanciveList: enhancive_list,
+      enhanciveTotals: enhancive_totals,
+      enhanciveTotalsDetails: enhancive_totals_details
+    }
+  }
+
+  File.write(data_path, JSON.pretty_generate(payload))
+  say "saved #{data_path}"
+  payload
+end
+
+def load_payload
+  path = data_path
+  return nil unless File.exist?(path)
+  JSON.parse(File.read(path), symbolize_names: true)
+rescue StandardError => e
+  say "could not load #{path}: #{e.class}"
+  nil
+end
+
+def present_block?(payload, key)
+  blocks = payload[:blocks] || {}
+  value = blocks[key]
+  value.is_a?(String) && !value.strip.empty?
+end
+
+def summarize_payload(payload)
+  say "character: #{payload[:character] || 'unknown'}"
+  say "collectedAt: #{payload[:collectedAt] || 'unknown'}"
+  say "infoStart: #{present_block?(payload, :infoStart) ? 'yes' : 'no'}"
+  say "skills: #{present_block?(payload, :skills) ? 'yes' : 'no'}"
+  say "exp: #{present_block?(payload, :exp) ? 'yes' : 'no'}"
+  say "ascList: #{present_block?(payload, :ascList) ? 'yes' : 'no'}"
+  say "ascMilestones: #{present_block?(payload, :ascMilestones) ? 'yes' : 'no'}"
+  say "enhanciveList: #{present_block?(payload, :enhanciveList) ? 'yes' : 'no'}"
+  say "enhanciveTotals: #{present_block?(payload, :enhanciveTotals) ? 'yes' : 'no'}"
+  say "enhanciveTotalsDetails: #{present_block?(payload, :enhanciveTotalsDetails) ? 'yes' : 'no'}"
+end
+
+def load_normalized_profile
+  path = normalized_profile_path
+  return nil unless File.exist?(path)
+  JSON.parse(File.read(path), symbolize_names: true)
+rescue StandardError => e
+  say "could not load #{path}: #{e.class}"
+  nil
+end
+
+def file_timestamp(path)
+  return 'unknown' unless File.exist?(path)
+  File.mtime(path).utc.iso8601
+rescue StandardError
+  'unknown'
+end
+
+def count_nonzero_skill_entries(skills)
+  Array(skills).count do |entry|
+    next false unless entry.is_a?(Hash)
+    entry[:finalRanks].to_i.positive? || entry[:ranks].to_i.positive?
+  end
+end
+
+def count_nonzero_ascension_abilities(abilities)
+  Array(abilities).count do |entry|
+    next false unless entry.is_a?(Hash)
+    entry[:ranks].to_i.positive?
+  end
+end
+
+def say_json_object(object)
+  JSON.pretty_generate(object).split("\n").each { |line| say line }
+end
+
+def summarize_normalized_profile(profile)
+  say 'legacy normalized profile:'
+  say "  path: #{normalized_profile_path}"
+  say "  last synced: #{file_timestamp(normalized_profile_path)}"
+  say "  name: #{profile[:name] || 'unknown'}"
+  say "  race/profession: #{profile[:race] || 'unknown'} / #{profile[:profession] || 'unknown'}"
+  say "  level: #{profile[:level] || 0}"
+  say "  experience: #{profile[:experience] || 0}"
+  say "  ascension exp: #{profile[:ascensionExperience] || 0}"
+  say "  ascension milestones: #{profile[:ascensionMilestones] || 0}"
+  say "  trained skills: #{count_nonzero_skill_entries(profile[:skills])}"
+  say "  ascension abilities trained: #{count_nonzero_ascension_abilities(profile[:ascensionAbilities])}"
+  enh_state = profile.dig(:equipment, :enhancives) || {}
+  imported = enh_state[:importedSnapshot] || {}
+  manual = enh_state[:manualResolutions] || {}
+  say "  enhancive imported items: #{Array(imported[:items]).length}"
+  say "  enhancive unresolved: #{Array(imported[:unresolved]).length}"
+  say "  enhancive manual resolutions: #{Array(manual[:items]).length}"
+end
+
+def status
+  say "character: #{character_name}"
+  say "consent: #{consent_granted? ? 'granted' : 'not granted'}"
+  if File.exist?(data_path)
+    payload = load_payload
+    if payload
+      say "saved data: #{data_path}"
+      say "last collected: #{payload[:collectedAt] || 'unknown'}"
+    end
+  end
+  unless File.exist?(data_path)
+    say "saved data: none (#{data_path})"
+  end
+  if File.exist?(normalized_profile_path)
+    say "legacy normalized profile: #{normalized_profile_path}"
+  end
+end
+
+def base64url_encode(raw)
+  Base64.strict_encode64(raw).tr('+/', '-_').delete('=')
+end
+
+def build_open_url(base_url, payload:, next_page_key: nil)
+  encoded = base64url_encode(payload.to_json)
+  params = ["gstools=#{encoded}"]
+  params << "next=#{next_page_key}" if next_page_key && !next_page_key.empty?
+  "#{base_url}##{params.join('&')}"
+end
+
+def resolve_page_key(raw)
+  key = raw.to_s.strip.downcase
+  return 'home' if key.empty?
+  aliases = {
+    'enc' => 'encumbrance',
+    'encumbrance' => 'encumbrance',
+    'encumberance' => 'encumbrance',
+    'profile' => 'profile',
+    'profiles' => 'profile',
+    'calc' => 'calculator',
+    'calculator' => 'calculator',
+    'spell' => 'spells',
+    'spells' => 'spells',
+    'badge' => 'badge',
+    'resource' => 'resources',
+    'resources' => 'resources',
+    'service' => 'resources',
+    'services' => 'resources',
+    'optimizer' => 'stat-optimizer',
+    'statoptimizer' => 'stat-optimizer',
+    'stat-optimizer' => 'stat-optimizer',
+    'lumnis' => 'lumnis',
+    'orb' => 'violet-orb',
+    'violet-orb' => 'violet-orb',
+    'home' => 'home'
+  }
+  aliases[key] || key
+end
+
+def open_page(page_key)
+  url = PAGE_URLS[page_key]
+  unless url
+    say "unknown page '#{page_key}'. valid pages: #{PAGE_URLS.keys.join(', ')}"
+    return false
+  end
+  open_browser(url)
+  true
+end
+
+def open_browser(url)
+  host_os = RbConfig::CONFIG['host_os'].to_s.downcase
+  cmd = if host_os.include?('darwin')
+          ['open', url]
+        elsif host_os.include?('linux')
+          ['xdg-open', url]
+        elsif host_os.include?('mswin') || host_os.include?('mingw')
+          ['cmd', '/c', 'start', '', url]
+        end
+
+  if cmd
+    begin
+      pid = Process.spawn(*cmd, out: '/dev/null', err: '/dev/null')
+      Process.detach(pid)
+      say "opened #{url}"
+    rescue StandardError => e
+      say "could not auto-open browser (#{e.class}); open manually: #{url}"
+    end
+  else
+    say "open this URL manually: #{url}"
+  end
+end
+
+args = script_args
+action = (args[0] || 'help').downcase
+say "version #{SCRIPT_VERSION}"
+wants_sync = args.any? { |arg| arg.to_s.downcase == '--sync' }
+needs_consent = %w[sync collect].include?(action) || (action == 'open' && wants_sync)
+
+if needs_consent && !consent_granted?
+  print_consent_prompt
+  exit
+end
+
+case action
+when 'allow', 'consent'
+  grant_consent
+when 'collect'
+  collect_blocks
+when 'open'
+  page_key = resolve_page_key(args[1])
+  if wants_sync
+    payload = collect_blocks
+    compact_payload = compact_payload_for_url(payload)
+    open_browser(
+      build_open_url(
+        DEFAULT_PROFILE_URL,
+        payload: compact_payload,
+        next_page_key: (page_key == 'profile' ? nil : page_key)
+      )
+    )
+  else
+    open_page(page_key)
+    say "opened #{page_key} without sync"
+  end
+when 'sync'
+  payload = collect_blocks
+  compact_payload = compact_payload_for_url(payload)
+  open_browser(
+    build_open_url(
+      DEFAULT_PROFILE_URL,
+      payload: compact_payload
+    )
+  )
+when 'load'
+  if args.any? { |arg| arg.to_s.downcase == '--raw' }
+    payload = load_payload
+    if payload
+      say_json_object(payload)
+    else
+      say 'no saved raw capture found; run ;gs4tools sync first'
+    end
+  end
+  normalized = load_normalized_profile
+  summarize_normalized_profile(normalized) if normalized
+  payload = load_payload
+  if payload
+    say 'raw capture:'
+    say "  path: #{data_path}"
+    say "  last collected: #{payload[:collectedAt] || file_timestamp(data_path)}"
+    say "  blocks: infoStart=#{present_block?(payload, :infoStart) ? 'yes' : 'no'}, skills=#{present_block?(payload, :skills) ? 'yes' : 'no'}, exp=#{present_block?(payload, :exp) ? 'yes' : 'no'}, ascList=#{present_block?(payload, :ascList) ? 'yes' : 'no'}, ascMilestones=#{present_block?(payload, :ascMilestones) ? 'yes' : 'no'}, enhList=#{present_block?(payload, :enhanciveList) ? 'yes' : 'no'}, enhTotals=#{present_block?(payload, :enhanciveTotals) ? 'yes' : 'no'}, enhDetails=#{present_block?(payload, :enhanciveTotalsDetails) ? 'yes' : 'no'}"
+  end
+when 'show'
+  say "raw capture: #{data_path}"
+  say "legacy normalized profile: #{normalized_profile_path}" if File.exist?(normalized_profile_path)
+when 'status'
+  status
+when 'revoke'
+  revoke_consent
+when 'help', '--help', '-h'
+  status
+  usage
+else
+  direct_page_key = resolve_page_key(action)
+  if PAGE_URLS.key?(direct_page_key)
+    open_page(direct_page_key)
+    say "opened #{direct_page_key} without sync"
+  else
+    status
+    usage
+  end
+end
