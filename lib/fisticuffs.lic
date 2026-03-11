@@ -1,26 +1,20 @@
 =begin
   fisticuffs.lic: UCS script for auto-tiering up.
 
-  Some primary changes from sloot include using in-game STOW settings instead of variables.
-  Locksmith pool handling, loot room, exclusion support, appraise limits.
-  eloot also auto-writes settings to your Lich5/Data/eloot folder per character.
-
             author: Bhuryn
    Spiritual Guide: Combo.lic
-        maintainer: elanthia-online
-      contributors: SpiffyJr, Athias, Demandred, Tysong, Deysh, Ondreian, Lieo, Lobe, Etheirys
-              wiki: https://gswiki.play.net/Lich:Script_Eloot
               game: Gemstone
               tags: UCS, Unarmed, Combo, Brawling
-          required: Lich >= 5.12.9
-           version: 0.2
+           version: 1.25
+
   Improvements:
   Major_change.feature_addition.bugfix
-		v0.1 - Initial Release
-		v0.2 - Added Single Target Mode, RoomChange flag
+    v0.1 - Initial Release
+    v0.2 -    v1.25 - buncha changes, supports fury, clash and spin kick
+    Known issues: Spin kick isn't always fired. Sometimes it likes to jab too much when it shouldn't, not sure if room move works to stop it yet.  Needs more testing
 =end
 
-before_dying { fput "stance #{CharSettings['fisticuffs_stance'] || 'defensive'}" }
+require 'timeout'
 
 CharSettings['fisticuffs_tierup'] ||= 'jab'
 CharSettings['fisticuffs_tier3'] ||= 'punch'
@@ -30,11 +24,509 @@ CharSettings['fisticuffs_allow_kick'] = true if CharSettings['fisticuffs_allow_k
 CharSettings['fisticuffs_single'] = false if CharSettings['fisticuffs_single'].nil?
 CharSettings['fisticuffs_roomstop'] = false if CharSettings['fisticuffs_roomstop'].nil?
 
+CharSettings['fisticuffs_use_fury'] = false if CharSettings['fisticuffs_use_fury'].nil?
+CharSettings['fisticuffs_use_clash'] = false if CharSettings['fisticuffs_use_clash'].nil?
+CharSettings['fisticuffs_clash_min'] = 3 if CharSettings['fisticuffs_clash_min'].nil?
+CharSettings['fisticuffs_use_spinkick'] = false if CharSettings['fisticuffs_use_spinkick'].nil?
+
+def desired_return_stance
+  CharSettings['fisticuffs_stance'] || 'defensive'
+end
+
+def normalize_tool_result(result)
+  return nil if result.nil?
+  return result.last if result.is_a?(Array)
+  result
+end
+
+def send_return_stance
+  stance_cmd = "stance #{desired_return_stance}"
+  stance_success_regex = /^You are now in an? .* stance\.|^You move into an? .* stance\.|^You fall back into an? .* stance\.|^You are already in an? .* stance\./
+
+  6.times do
+    waitrt?
+
+    unless standing?
+      stand_raw = dothistimeout "stand", 2,
+                                /^You stand/,
+                                /^You are already standing\./,
+                                /^\.\.\.wait (\d+) seconds?\.$/,
+                                /^[Ww]ait (\d+) sec/,
+                                /^Roundtime:\s*(\d+) sec/
+      stand_result = normalize_tool_result(stand_raw)
+      wait_seconds = wait_seconds_from_result(stand_result)
+      if wait_seconds
+        sleep(wait_seconds + 0.1)
+        next
+      end
+    end
+
+    raw = dothistimeout stance_cmd, 2,
+                        /^You are now in an? .* stance\./,
+                        /^You move into an? .* stance\./,
+                        /^You fall back into an? .* stance\./,
+                        /^You are already in an? .* stance\./,
+                        /^\.\.\.wait (\d+) seconds?\.$/,
+                        /^[Ww]ait (\d+) sec/,
+                        /^Roundtime:\s*(\d+) sec/,
+                        /^Try standing up first\.$/,
+                        /You cannot do that while lying down\./
+    result = normalize_tool_result(raw)
+    return true if result && result =~ stance_success_regex
+
+    if result && (result =~ /^Try standing up first\.$/ || result =~ /You cannot do that while lying down\./)
+      put "stand"
+      sleep 0.2
+      next
+    end
+
+    wait_seconds = wait_seconds_from_result(result)
+    if wait_seconds
+      sleep(wait_seconds + 0.1)
+    else
+      sleep 0.2
+    end
+  end
+
+  false
+rescue
+  false
+end
+
+def cleanup_and_exit(message = "Combat ended.")
+  send_return_stance
+  echo message
+  exit
+end
+
+def kick_substitute_attack
+  substitute = CharSettings['fisticuffs_tier3'].to_s.strip.downcase
+  return 'punch' if substitute.empty? || substitute == 'kick'
+  substitute
+end
+
+def sanitize_attack(attack)
+  attack = attack.to_s.strip.downcase
+  return kick_substitute_attack if attack == 'kick' && !CharSettings['fisticuffs_allow_kick']
+  attack
+end
+
+def echo_settings
+  respond "fisticuffs settings:"
+  respond "  tierup: #{CharSettings['fisticuffs_tierup']}"
+  respond "  tier3: #{CharSettings['fisticuffs_tier3']}"
+  respond "  stance: #{CharSettings['fisticuffs_stance']}"
+  respond "  aim: #{CharSettings['fisticuffs_aim'] || 'off'}"
+  respond "  kick: #{CharSettings['fisticuffs_allow_kick'] ? 'on' : 'off'}"
+  respond "  single: #{CharSettings['fisticuffs_single'] ? 'on' : 'off'}"
+  respond "  roomstop: #{CharSettings['fisticuffs_roomstop'] ? 'on' : 'off'}"
+  respond "  fury: #{CharSettings['fisticuffs_use_fury'] ? 'on' : 'off'}"
+  respond "  clash: #{CharSettings['fisticuffs_use_clash'] ? 'on' : 'off'}"
+  respond "  clashmin: #{CharSettings['fisticuffs_clash_min']}"
+  respond "  spinkick: #{CharSettings['fisticuffs_use_spinkick'] ? 'on' : 'off'}"
+end
+
+def normalize_target_name(text)
+  text.to_s.downcase.sub(/^an?\s+/, '').strip
+end
+
+def positioning_line_matches_current_target?(line_target_name)
+  normalized_line_target = normalize_target_name(line_target_name)
+  normalized_targets = []
+
+  tgt = current_target_obj
+  if tgt
+    normalized_targets.concat([tgt.name, tgt.noun].compact.map { |name| normalize_target_name(name) })
+  end
+
+  normalized_targets << $fisticuffs_expected_target_name if $fisticuffs_expected_target_name
+  normalized_targets << $fisticuffs_position_target_name if $fisticuffs_position_target_name
+  normalized_targets.compact!
+  normalized_targets.reject!(&:empty?)
+  return true if normalized_targets.empty?
+
+  normalized_targets.uniq.include?(normalized_line_target)
+rescue
+  true
+end
+
+def refresh_combat_state
+  status_tags
+rescue
+  nil
+end
+
+def hostile_targets
+  GameObj.targets || []
+rescue
+  []
+end
+
+def dead_targets
+  GameObj.dead || []
+rescue
+  []
+end
+
+def current_target_obj
+  GameObj.target
+rescue
+  nil
+end
+
+def current_target_id
+  tgt = current_target_obj
+  tgt ? tgt.id : nil
+end
+
+def current_attack_target_id
+  current_target_id
+end
+
+def current_attack_target_name
+  tgt = current_target_obj
+  return nil unless tgt
+
+  normalize_target_name(tgt.name || tgt.noun)
+rescue
+  nil
+end
+
+def remembered_attack_target_id
+  current_attack_target_id || $fisticuffs_expected_target_id
+end
+
+def remember_attack_target!(target_obj = current_target_obj)
+  return unless target_obj
+
+  $fisticuffs_expected_target_id = target_obj.id
+  $fisticuffs_expected_target_name = normalize_target_name(target_obj.name || target_obj.noun)
+rescue
+  nil
+end
+
+def reset_sticky_excellent!
+  $fisticuffs_sticky_excellent = false
+  $fisticuffs_position_target_id = nil
+  $fisticuffs_position_target_name = nil
+  $fisticuffs_expected_target_id = nil
+  $fisticuffs_expected_target_name = nil
+end
+
+def update_position_state_from_text(new_position, line_target_name = nil)
+  target_id = remembered_attack_target_id
+  target_name = normalize_target_name(line_target_name)
+
+  if target_name.empty?
+    target_name = current_attack_target_name || $fisticuffs_expected_target_name || $fisticuffs_position_target_name
+  end
+
+  if target_id.nil?
+    $fisticuffs_position = new_position
+    $fisticuffs_sticky_excellent = false if new_position != 'excellent'
+    return
+  end
+
+  if $fisticuffs_position_target_id != target_id
+    $fisticuffs_sticky_excellent = false
+  end
+
+  $fisticuffs_position = new_position
+  $fisticuffs_position_target_id = target_id
+  $fisticuffs_position_target_name = target_name unless target_name.nil? || target_name.empty?
+
+  if new_position == 'excellent'
+    $fisticuffs_sticky_excellent = true
+  else
+    $fisticuffs_sticky_excellent = false
+  end
+end
+
+def target_in_dead_list?(npc)
+  return false unless npc
+  dead_targets.any? { |dead| dead.id == npc.id }
+rescue
+  false
+end
+
+def dead_npc?(npc)
+  return true if npc.nil?
+
+  status = npc.status.to_s.downcase
+  return true if status =~ /dead|corpse|gone/
+  return true if target_in_dead_list?(npc)
+
+  false
+rescue
+  false
+end
+
+def live_hostile_targets
+  hostile_targets.reject { |npc| dead_npc?(npc) }
+end
+
+def living_target_count
+  live_hostile_targets.count
+end
+
+def current_target_alive?
+  tgt = current_target_obj
+  return false if tgt.nil?
+  !dead_npc?(tgt)
+end
+
+def no_targets_left?
+  refresh_combat_state
+  return false if current_target_alive?
+  live_hostile_targets.empty?
+end
+
+def single_target_done?(locked_target_id)
+  return false unless CharSettings['fisticuffs_single']
+  return false if locked_target_id.nil?
+
+  live_ids = live_hostile_targets.map(&:id)
+  !live_ids.include?(locked_target_id)
+end
+
+def no_target_regex
+  /You currently have no valid target|^You do not have a target\.|^What were you referring to\?$|^It looks like somebody already did the job for you\.$|^Could not find a valid target\.|^There are no other valid targets\.$/
+end
+
+def unreachable_target_regex
+  /You can't reach .* from here\./
+end
+
+def choose_attack(position, followup_attack = nil)
+  return sanitize_attack(followup_attack) if followup_attack && !followup_attack.to_s.strip.empty?
+
+  current_id = remembered_attack_target_id
+  effective_position = position
+
+  if !current_id.nil? &&
+     !$fisticuffs_position_target_id.nil? &&
+     current_id != $fisticuffs_position_target_id
+    reset_sticky_excellent!
+    effective_position = "decent"
+    $fisticuffs_position = "decent"
+  elsif !current_id.nil? &&
+        $fisticuffs_position_target_id == current_id &&
+        !$fisticuffs_position.to_s.strip.empty?
+    effective_position = $fisticuffs_position
+  end
+
+  if $fisticuffs_sticky_excellent &&
+     !current_id.nil? &&
+     $fisticuffs_position_target_id == current_id
+    return sanitize_attack(CharSettings['fisticuffs_tier3'])
+  end
+
+  attack =
+    if effective_position =~ /good|excellent/i
+      CharSettings['fisticuffs_tier3']
+    else
+      CharSettings['fisticuffs_tierup']
+    end
+
+  sanitize_attack(attack)
+end
+
+def send_attack_command(cmd)
+  fput "stand" unless standing?
+  fput "stance offensive" unless percentstance(0)
+  remember_attack_target!
+  put cmd
+  :ok
+end
+
+def do_attack(position, followup_attack = nil, use_aim: true)
+  attack_type = choose_attack(position, followup_attack)
+  aimed_attack = use_aim && CharSettings['fisticuffs_aim'] && attack_type !~ /jab/i
+  $fisticuffs_last_action_source = :attack
+
+  if aimed_attack
+    send_attack_command("#{attack_type} #{CharSettings['fisticuffs_aim']}")
+  else
+    send_attack_command(attack_type)
+  end
+
+  {
+    status: :ok,
+    position: position,
+    attack_type: attack_type,
+    aimed: aimed_attack,
+    followup_attack: followup_attack
+  }
+end
+
+def psm_ready?(skill_name)
+  return false unless Weapon.known?(skill_name)
+  return false unless Weapon.available?(skill_name)
+  return false unless PSMS.assess(skill_name, "Weapon", true)
+  true
+rescue
+  false
+end
+
+def weapon_skill_command(skill_name)
+  tgt = current_target_obj
+
+  if tgt
+    "weapon #{skill_name} ##{tgt.id}"
+  else
+    "weapon #{skill_name}"
+  end
+end
+
+def wait_seconds_from_result(result)
+  text = result.to_s
+  return $1.to_i if text =~ /^\.\.\.wait (\d+) seconds?\.$/
+  return $1.to_i if text =~ /^[Ww]ait (\d+) sec/
+  return $1.to_i if text =~ /^Roundtime:\s*(\d+) sec/
+  nil
+end
+
+def run_weapon_skill(skill_name)
+  cmd = weapon_skill_command(skill_name)
+  $fisticuffs_last_action_source = :weapon_skill
+  remember_attack_target!
+  raw = dothistimeout cmd, 4, /^You |#{PSMS::FAILURES_REGEXES}|^\.\.\.wait \d+ sec|^\.\.\.wait \d+ seconds\.|^[Ww]ait \d+ sec|^Roundtime:|#{no_target_regex}|#{unreachable_target_regex}/
+  result = normalize_tool_result(raw)
+
+  return :no_target if result && result.to_s =~ no_target_regex
+  return :unreachable if result && result.to_s =~ unreachable_target_regex
+  wait_seconds = wait_seconds_from_result(result)
+  return [:wait, wait_seconds] if wait_seconds
+  return false if result.nil?
+  return false if result.to_s =~ PSMS::FAILURES_REGEXES
+  true
+rescue
+  false
+end
+
+def run_reaction_skill(cmd)
+  raw = dothistimeout cmd, 4, /^You |^\.\.\.wait \d+ sec|^\.\.\.wait \d+ seconds\.|^[Ww]ait \d+ sec|^Roundtime:|#{no_target_regex}|#{unreachable_target_regex}/
+  result = normalize_tool_result(raw)
+
+  return :no_target if result && result.to_s =~ no_target_regex
+  return :unreachable if result && result.to_s =~ unreachable_target_regex
+  return false if result.nil?
+  true
+rescue
+  false
+end
+
+def try_clash
+  return false unless CharSettings['fisticuffs_use_clash']
+  return false unless living_target_count >= CharSettings['fisticuffs_clash_min'].to_i
+  return false unless psm_ready?("Clash")
+  run_weapon_skill("clash")
+end
+
+def try_fury
+  return false unless CharSettings['fisticuffs_use_fury']
+  return false unless psm_ready?("Fury")
+  return false unless current_target_alive?
+  run_weapon_skill("fury")
+end
+
+def try_spinkick
+  return false unless CharSettings['fisticuffs_use_spinkick']
+
+  $fisticuffs_last_action_source = :spinkick
+  put "weapon spin kick"
+  true
+rescue
+  false
+end
+
+def next_line_or_nil(timeout_seconds = 0.15)
+  Timeout.timeout(timeout_seconds) { get }
+rescue Timeout::Error
+  nil
+end
+
+def room_changed?(start_room_id)
+  CharSettings['fisticuffs_roomstop'] && Room.current.id != start_room_id
+end
+
+def try_target_next
+  raw = dothistimeout "target next", 2,
+                      /^You are now targeting /,
+                      /^Could not find a valid target\.$/,
+                      /^There are no other valid targets\.$/,
+                      /^You do not have a target\.$/,
+                      /^What were you referring to\?$/
+  result = normalize_tool_result(raw)
+
+  return false if result.nil?
+  return false if result =~ /^Could not find a valid target\.$/
+  return false if result =~ /^There are no other valid targets\.$/
+  return false if result =~ /^You do not have a target\.$/
+  return false if result =~ /^What were you referring to\?$/
+
+  reset_sticky_excellent!
+  true
+rescue
+  false
+end
+
+def handle_unreachable_target(position, pending_followup)
+  refresh_combat_state
+  return [:wait, nil] if living_target_count <= 1
+  return [:wait, nil] unless try_target_next
+
+  [:attack_sent, do_attack(position, pending_followup)]
+end
+
+def recover_failed_attack(last_attack_context)
+  position = last_attack_context[:position]
+  followup_attack = last_attack_context[:followup_attack]
+
+  if last_attack_context[:aimed]
+    return [:attack_sent, do_attack(position, followup_attack, use_aim: false)]
+  end
+
+  handle_unreachable_target(position, followup_attack)
+end
+
+def perform_next_action(position, single_target_id, pending_followup)
+  return [:break, pending_followup, nil, nil] if single_target_done?(single_target_id)
+  return [:break, pending_followup, nil, nil] if no_targets_left?
+
+  clash_result = try_clash
+  if clash_result == :no_target
+    return [:break, pending_followup, nil, nil]
+  elsif clash_result == :unreachable
+    unreachable_state, attack_result = handle_unreachable_target(position, pending_followup)
+    return [:wait, pending_followup, nil, 0.25] if unreachable_state == :wait
+    return [:continue, pending_followup, attack_result, nil]
+  elsif clash_result.is_a?(Array) && clash_result.first == :wait
+    return [:wait, pending_followup, nil, clash_result.last]
+  elsif clash_result == true
+    return [:continue, pending_followup, nil, nil]
+  end
+
+  fury_result = try_fury
+  if fury_result == :no_target
+    return [:break, pending_followup, nil, nil]
+  elsif fury_result == :unreachable
+    unreachable_state, attack_result = handle_unreachable_target(position, pending_followup)
+    return [:wait, pending_followup, nil, 0.25] if unreachable_state == :wait
+    return [:continue, pending_followup, attack_result, nil]
+  elsif fury_result.is_a?(Array) && fury_result.first == :wait
+    return [:wait, pending_followup, nil, fury_result.last]
+  elsif fury_result == true
+    return [:continue, pending_followup, nil, nil]
+  end
+
+  [:ok, pending_followup, do_attack(position, pending_followup), nil]
+end
+
 cmd = script.vars[1].to_s.downcase
 
 if !cmd.empty?
   case cmd
-
   when 'tierup'
     if script.vars[2]
       CharSettings['fisticuffs_tierup'] = script.vars[2].downcase
@@ -58,12 +550,10 @@ if !cmd.empty?
     exit
 
   when 'stance'
-
     valid_stances = %w[offensive advance forward neutral guarded defensive]
 
     if script.vars[2]
       stance_value = script.vars[2].downcase
-
       if valid_stances.include?(stance_value)
         CharSettings['fisticuffs_stance'] = stance_value
         respond "Return stance set to #{CharSettings['fisticuffs_stance']}"
@@ -71,13 +561,11 @@ if !cmd.empty?
         respond "Invalid stance: #{script.vars[2]}"
         respond "Valid stances: offensive, advance, forward, neutral, guarded, defensive"
       end
-
     else
       respond "Usage: ;fisticuffs stance <offensive|advance|forward|neutral|guarded|defensive>"
       respond "Current: #{CharSettings['fisticuffs_stance']}"
       respond "Stance you return to after combat."
     end
-
     exit
 
   when 'aim'
@@ -98,13 +586,13 @@ if !cmd.empty?
     if script.vars[2].nil?
       respond "Usage: ;fisticuffs kick <on|off>"
       respond "Current: #{CharSettings['fisticuffs_allow_kick'] ? 'on' : 'off'}"
-      respond "If off, kick attacks are replaced with punch."
+      respond "If off, kick attacks are replaced with your tier3 attack, unless tier3 is kick, then punch."
     elsif script.vars[2].downcase == 'on'
       CharSettings['fisticuffs_allow_kick'] = true
       respond "Kick enabled."
     elsif script.vars[2].downcase == 'off'
       CharSettings['fisticuffs_allow_kick'] = false
-      respond "Kick disabled — punch substituted."
+      respond "Kick disabled — substituted with tier3 attack, or punch if tier3 is kick."
     else
       respond "Usage: ;fisticuffs kick <on|off>"
     end
@@ -112,9 +600,9 @@ if !cmd.empty?
 
   when 'single'
     if script.vars[2].nil?
-      respond "Usage: ;fisticuffs single <on|off> - Stop script after finishing a foe"
+      respond "Usage: ;fisticuffs single <on|off>"
       respond "Current: #{CharSettings['fisticuffs_single'] ? 'on' : 'off'}"
-      respond "Stops after the current target dies or changes."
+      respond "Stops after the current target dies."
     elsif script.vars[2].downcase == 'on'
       CharSettings['fisticuffs_single'] = true
       respond "Single-target mode enabled."
@@ -128,7 +616,7 @@ if !cmd.empty?
 
   when 'roomstop'
     if script.vars[2].nil?
-      respond "Usage: ;fisticuffs roomstop <on|off> - stops script when changing rooms"
+      respond "Usage: ;fisticuffs roomstop <on|off>"
       respond "Current: #{CharSettings['fisticuffs_roomstop'] ? 'on' : 'off'}"
       respond "Stops script if you move rooms."
     elsif script.vars[2].downcase == 'on'
@@ -142,152 +630,230 @@ if !cmd.empty?
     end
     exit
 
-  when 'help'
+  when 'fury'
+    if script.vars[2].nil?
+      respond "Usage: ;fisticuffs fury <on|off>"
+      respond "Current: #{CharSettings['fisticuffs_use_fury'] ? 'on' : 'off'}"
+      respond "Uses Fury when available and stamina allows."
+    elsif script.vars[2].downcase == 'on'
+      CharSettings['fisticuffs_use_fury'] = true
+      respond "Fury enabled."
+    elsif script.vars[2].downcase == 'off'
+      CharSettings['fisticuffs_use_fury'] = false
+      respond "Fury disabled."
+    else
+      respond "Usage: ;fisticuffs fury <on|off>"
+    end
+    exit
 
+  when 'clash'
+    if script.vars[2].nil?
+      respond "Usage: ;fisticuffs clash <on|off>"
+      respond "Current: #{CharSettings['fisticuffs_use_clash'] ? 'on' : 'off'}"
+      respond "Uses Clash when enough hostile targets are in the room."
+    elsif script.vars[2].downcase == 'on'
+      CharSettings['fisticuffs_use_clash'] = true
+      respond "Clash enabled."
+    elsif script.vars[2].downcase == 'off'
+      CharSettings['fisticuffs_use_clash'] = false
+      respond "Clash disabled."
+    else
+      respond "Usage: ;fisticuffs clash <on|off>"
+    end
+    exit
+
+  when 'clashmin'
+    if script.vars[2] && script.vars[2].to_i > 0
+      CharSettings['fisticuffs_clash_min'] = script.vars[2].to_i
+      respond "Clash minimum targets set to #{CharSettings['fisticuffs_clash_min']}"
+    else
+      respond "Usage: ;fisticuffs clashmin <number>"
+      respond "Current: #{CharSettings['fisticuffs_clash_min']}"
+      respond "Minimum living hostile targets before Clash is used."
+    end
+    exit
+
+  when 'spinkick'
+    if script.vars[2].nil?
+      respond "Usage: ;fisticuffs spinkick <on|off>"
+      respond "Current: #{CharSettings['fisticuffs_use_spinkick'] ? 'on' : 'off'}"
+      respond "Uses weapon spinkick immediately when the game says: You could use this opportunity to Spin Kick!"
+    elsif script.vars[2].downcase == 'on'
+      CharSettings['fisticuffs_use_spinkick'] = true
+      respond "Spin Kick enabled."
+    elsif script.vars[2].downcase == 'off'
+      CharSettings['fisticuffs_use_spinkick'] = false
+      respond "Spin Kick disabled."
+    else
+      respond "Usage: ;fisticuffs spinkick <on|off>"
+    end
+    exit
+
+  when 'settings'
+    echo_settings
+    exit
+
+  when 'help'
     respond "FISTICUFFS — UCS combat helper"
     respond ""
     respond ";fisticuffs"
+    respond ";fisticuffs settings"
     respond ";fisticuffs tierup <jab|punch|grapple|kick>"
     respond ";fisticuffs tier3 <punch|grapple|kick>"
-    respond ";fisticuffs stance <offensive|advance|forward|neutral|guarded|defensive> - stance to enter when script ends"
+    respond ";fisticuffs stance <offensive|advance|forward|neutral|guarded|defensive>"
     respond ";fisticuffs aim <bodypart>"
     respond ";fisticuffs aim off"
-    respond ";fisticuffs kick <on|off> - enables or disables kick (substitutes punch if disabled)"
-    respond ";fisticuffs single <on|off> - Stop script after finishing a foe"
-    respond ";fisticuffs roomstop <on|off> - stops script when changing rooms"
+    respond ";fisticuffs kick <on|off>"
+    respond ";fisticuffs single <on|off>"
+    respond ";fisticuffs roomstop <on|off>"
+    respond ";fisticuffs fury <on|off>"
+    respond ";fisticuffs clash <on|off>"
+    respond ";fisticuffs clashmin <number>"
+    respond ";fisticuffs spinkick <on|off>"
     exit
-
   end
 end
-
-
-def sanitize_attack(attack)
-  attack = attack.to_s.strip.downcase
-  return 'punch' if attack == 'kick' && !CharSettings['fisticuffs_allow_kick']
-  attack
-end
-
-
-def choose_attack(position)
-
-  attack =
-    if position =~ /good|excellent/i
-      CharSettings['fisticuffs_tier3']
-    else
-      CharSettings['fisticuffs_tierup']
-    end
-
-  sanitize_attack(attack)
-
-end
-
-
-def normalize_followup(followup, position)
-
-  return choose_attack(position) if followup.nil?
-  sanitize_attack(followup)
-
-end
-
-
-def do_attack(position, followup=nil)
-
-  fput "stand" unless standing?
-  fput "stance offensive" unless percentstance(0)
-
-  attack_type = normalize_followup(followup, position)
-
-  if CharSettings['fisticuffs_aim'] && attack_type !~ /jab/
-    fput "#{attack_type} #{CharSettings['fisticuffs_aim']}"
-  else
-    fput attack_type
-  end
-
-end
-
-
-def current_target_id
-
-  tgt = GameObj.target
-  tgt ? tgt.id : nil
-
-end
-
-
-def single_target_done?(locked_target_id)
-
-  return false unless CharSettings['fisticuffs_single']
-  return false if locked_target_id.nil?
-
-  current_id = current_target_id
-  current_id.nil? || current_id != locked_target_id
-
-end
-
 
 start_room_id = Room.current.id
 
 fput "stance offensive"
 
 position = "decent"
-pending_followup = nil
+position_updated_at = Time.now
 single_target_id = nil
+next_action_at = nil
+last_attack_at = nil
+awaiting_position_refresh = false
+pending_followup = nil
+active_followup_attack = nil
+last_attack_context = nil
 
-do_attack(position)
+$fisticuffs_position = "decent"
+$fisticuffs_position_target_id = current_target_id
+$fisticuffs_position_target_name = current_attack_target_name
+$fisticuffs_sticky_excellent = false
+$fisticuffs_expected_target_id = current_target_id
+$fisticuffs_expected_target_name = current_attack_target_name
 
+if no_targets_left?
+  reset_sticky_excellent!
+  cleanup_and_exit
+end
 
-loop do
+attack_result = do_attack(position)
+last_attack_context = attack_result
+last_attack_at = Time.now
+awaiting_position_refresh = true
 
-  if CharSettings['fisticuffs_roomstop'] && Room.current.id != start_room_id
-    echo "Room changed — stopping fisticuffs."
-    break
+process_due_action = lambda do
+  return :idle unless next_action_at && Time.now >= next_action_at
+
+  awaiting_position_refresh = false if awaiting_position_refresh
+  return :idle if position_updated_at && (Time.now - position_updated_at) < 0.15
+
+  next_action_at = nil
+
+  action_state, pending_followup, attack_result, retry_delay = perform_next_action(position, single_target_id, pending_followup)
+  return :break if action_state == :break
+
+  if attack_result
+    last_attack_context = attack_result
+    active_followup_attack = attack_result[:followup_attack]
+    pending_followup = nil if attack_result[:followup_attack]
+    last_attack_at = Time.now
+    awaiting_position_refresh = true
+  elsif action_state == :wait
+    next_action_at = Time.now + (retry_delay || 0.25)
   end
 
-  line = get
+  :acted
+end
+
+loop do
+  cleanup_and_exit("Room changed — stopping fisticuffs.") if room_changed?(start_room_id)
+
+  line = next_line_or_nil(0.15)
+
+  cleanup_and_exit("Room changed — stopping fisticuffs.") if room_changed?(start_room_id)
+
+  if line.nil?
+    due_action_result = process_due_action.call
+    if due_action_result == :break
+      break
+    elsif due_action_result == :acted
+      next
+    end
+
+    if no_targets_left? && (!last_attack_at || Time.now - last_attack_at > 0.6)
+      break
+    end
+
+    next
+  end
+
+  if CharSettings['fisticuffs_use_spinkick'] &&
+     line.to_s =~ /You could use this opportunity to Spin Kick!?/i
+    spin_result = try_spinkick
+    if spin_result == true
+      next_action_at = nil
+      last_attack_at = Time.now
+      awaiting_position_refresh = true
+    end
+    break if spin_result == :no_target
+    if spin_result == :unreachable
+      unreachable_state, attack_result = handle_unreachable_target(position, active_followup_attack)
+      if attack_result
+        last_attack_context = attack_result
+        active_followup_attack = attack_result[:followup_attack]
+        pending_followup = nil if attack_result[:followup_attack]
+        last_attack_at = Time.now
+        awaiting_position_refresh = true
+      elsif unreachable_state == :wait
+        next_action_at = Time.now + 0.25
+      end
+    end
+    next
+  end
 
   case line
+  when /^Roundtime:\s*(\d+) sec/
+    next_action_at = Time.now + $1.to_i
+
+  when /^\.\.\.wait (\d+) seconds?\.$/, /^[Ww]ait (\d+) sec/
+    wait_seconds = $1.to_i
+    target_time = Time.now + wait_seconds
+    next_action_at = [next_action_at || target_time, target_time].max
 
   when /^You attempt to (jab|punch|grapple|kick)\b/
-
+    last_attack_at = Time.now
+    awaiting_position_refresh = true
+    active_followup_attack = nil
     if CharSettings['fisticuffs_single'] && single_target_id.nil?
       single_target_id = current_target_id
     end
 
-  when /You have (decent|good|excellent) positioning/
+  when /You have (decent|good|excellent) positioning against (.+)\./
+    next unless positioning_line_matches_current_target?($2)
 
-    position = $1
+    position = $1.downcase
+    position_updated_at = Time.now
+    awaiting_position_refresh = false
+    update_position_state_from_text(position, $2)
+
+  when /You have (decent|good|excellent) positioning/
+    position = $1.downcase
+    position_updated_at = Time.now
+    awaiting_position_refresh = false
+    update_position_state_from_text(position)
 
   when /Strike leaves foe vulnerable to a followup (.*) attack!/
+    pending_followup = $1.to_s.strip.downcase
 
-    pending_followup = $1
+  when /^You /i
+    current_id = current_target_id
 
-  when /Roundtime:/
-
-    waitrt?
-    script.clear
-
-    break if single_target_done?(single_target_id)
-
-    if pending_followup
-      do_attack(position, pending_followup)
-      pending_followup = nil
-    else
-      do_attack(position)
-    end
-
-  when /^\.\.\.wait (\d+) seconds?\.$/, /^[Ww]ait (\d+) sec/
-
-    sleep_time = $1.to_i
-    sleep(sleep_time) if sleep_time > 0
-    script.clear
-
-    break if single_target_done?(single_target_id)
-
-    if pending_followup
-      do_attack(position, pending_followup)
-      pending_followup = nil
-    else
-      do_attack(position)
+    if CharSettings['fisticuffs_single'] && single_target_id.nil? && current_id
+      single_target_id = current_id
     end
 
   when /You currently have no valid target/,
@@ -296,54 +862,61 @@ loop do
        /^It looks like somebody already did the job for you\.$/,
        /^Could not find a valid target\.$/,
        /^There are no other valid targets\.$/
-
+    awaiting_position_refresh = false
+    pending_followup = nil
+    reset_sticky_excellent!
     break
 
   when /^Try standing up first\.$/,
        /You cannot do that while lying down\./
-
     fput "stand"
-    script.clear
-
-    break if single_target_done?(single_target_id)
-
-    if pending_followup
-      do_attack(position, pending_followup)
-      pending_followup = nil
-    else
-      do_attack(position)
-    end
 
   when /You fail to find an opening/
-
-    script.clear
-
-    break if single_target_done?(single_target_id)
-
-    if pending_followup
-      do_attack(position, pending_followup)
-      pending_followup = nil
-    else
-      do_attack(position)
-    end
+    awaiting_position_refresh = false
+    next_action_at = Time.now
 
   when /You cannot aim that high/
+    awaiting_position_refresh = false
+    retry_state, attack_result = recover_failed_attack(last_attack_context || { position: position, followup_attack: active_followup_attack, aimed: true })
 
-    break if single_target_done?(single_target_id)
+    if attack_result
+      last_attack_context = attack_result
+      active_followup_attack = attack_result[:followup_attack]
+      pending_followup = nil if attack_result[:followup_attack]
+      last_attack_at = Time.now
+      awaiting_position_refresh = true
+      next_action_at = nil
+    elsif retry_state == :wait
+      next_action_at = Time.now + 0.25
+    end
 
-    attack_type = choose_attack(position)
-    fput attack_type
+  when /You can't reach .* from here\./
+    awaiting_position_refresh = false
+    retry_state, attack_result = recover_failed_attack(last_attack_context || { position: position, followup_attack: active_followup_attack, aimed: false })
+
+    if attack_result
+      last_attack_context = attack_result
+      active_followup_attack = attack_result[:followup_attack]
+      pending_followup = nil if attack_result[:followup_attack]
+      last_attack_at = Time.now
+      awaiting_position_refresh = true
+      next_action_at = nil
+    elsif retry_state == :wait
+      next_action_at = Time.now + 0.25
+    end
 
   when /You are still stunned/,
        /unable to muster the will to attack/,
        /entangled in a web/
-
     echo "Combat halted."
+    reset_sticky_excellent!
     break
-
   end
+
+  due_action_result = process_due_action.call
+  break if due_action_result == :break
+  next if due_action_result == :acted
 end
 
-
-fput "stance #{CharSettings['fisticuffs_stance']}"
-echo "Combat ended."
+reset_sticky_excellent!
+cleanup_and_exit
