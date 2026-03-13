@@ -8,7 +8,7 @@
             author: Bhuryn
               game: GemStone
               tags: grimoire, spellbook, utility, scrolls
-           version: 0.24
+           version: 0.29
 
   Improvements:
   Major_change.feature_addition.bugfix
@@ -36,6 +36,11 @@
     v0.22 - Fixed live charge so the source scroll stays in hand through the second transfer confirmation and is returned to the container afterward
     v0.23 - Made charge all continue recharging spells while matching regular scrolls remain instead of stopping after one charge per spell number
     v0.24 - Expanded help output with an initial setup block for saving the grimoire and scroll container
+    v0.25 - updated page scanning so it supports 1-X pages properly
+    v0.26 - Fixed get book so it can retrieve the saved grimoire by id even when Lich has not mapped it properly
+    v0.27 - Auto-refreshes the saved grimoire id when the same held grimoire is found by name after its GameObj id changes
+    v0.28 - Saves the grimoire noun and falls back to GET by noun when the saved grimoire id has changed on logout
+    v0.29 - Added a configurable default grimoire noun setting for books that do not use the standard grimoire noun
 =end
 
 require 'pp'
@@ -46,6 +51,8 @@ DEFAULT_CHARGE_TEST_MODE = false
 GRIMOIRE_NOUN = 'grimoire'
 GRIMOIRE_ID_SETTING = 'librarian_grimoire_id'
 GRIMOIRE_NAME_SETTING = 'librarian_grimoire_name'
+GRIMOIRE_NOUN_SETTING = 'librarian_grimoire_noun'
+DEFAULT_GRIMOIRE_NOUN_SETTING = 'librarian_default_grimoire_noun'
 SCROLL_CONTAINER_ID_SETTING = 'librarian_scroll_container_id'
 SCROLL_CONTAINER_NAME_SETTING = 'librarian_scroll_container_name'
 CHARGE_TEST_MODE_SETTING = 'librarian_charge_test_mode'
@@ -88,9 +95,24 @@ def configured_grimoire_name
   CharSettings[GRIMOIRE_NAME_SETTING]
 end
 
+def configured_grimoire_noun
+  CharSettings[GRIMOIRE_NOUN_SETTING]
+end
+
+def configured_default_grimoire_noun
+  value = CharSettings[DEFAULT_GRIMOIRE_NOUN_SETTING]
+  stripped = value.to_s.strip
+  stripped.empty? ? GRIMOIRE_NOUN : stripped
+end
+
+def save_default_grimoire_noun!(noun)
+  CharSettings[DEFAULT_GRIMOIRE_NOUN_SETTING] = noun.to_s.strip.downcase
+end
+
 def save_grimoire!(item)
   CharSettings[GRIMOIRE_ID_SETTING] = item.id.to_s
   CharSettings[GRIMOIRE_NAME_SETTING] = item.name.to_s
+  CharSettings[GRIMOIRE_NOUN_SETTING] = item.noun.to_s
 end
 
 def save_scroll_container!(item)
@@ -160,13 +182,29 @@ def current_grimoire
     item = held_items.find { |held| held.id.to_s == saved_id }
     return item if item
 
+    saved_name = configured_grimoire_name.to_s.strip.downcase
+    unless saved_name.empty?
+      exact_name_matches = held_items.select { |held| held.name.to_s.strip.downcase == saved_name }
+      if exact_name_matches.length == 1
+        save_grimoire!(exact_name_matches.first)
+        return exact_name_matches.first
+      end
+    end
+
+    fallback_noun = configured_default_grimoire_noun
+    noun_matches = held_items.select { |held| held.noun.to_s.downcase == fallback_noun.downcase }
+    if noun_matches.length == 1
+      save_grimoire!(noun_matches.first)
+      return noun_matches.first
+    end
+
     fail_with("Saved grimoire ##{saved_id}#{configured_grimoire_name ? " (#{configured_grimoire_name})" : ''} is not currently held. Use ;librarian add while holding the book.")
   end
 
-  item = held_items.find { |held| held.noun.to_s.downcase == GRIMOIRE_NOUN }
+  item = held_items.find { |held| held.noun.to_s.downcase == configured_default_grimoire_noun.downcase }
   return item if item
 
-  fail_with('Hold your grimoire in either hand before using librarian, or set it with ;librarian add <held item name>.')
+  fail_with("Hold your #{configured_default_grimoire_noun} in either hand before using librarian, or set it with ;librarian add <held item name>.")
 end
 
 def current_scroll_container
@@ -407,6 +445,28 @@ def get_item_by_id(item_id, container_id: nil, label:)
   fail_with("Could not get #{label}: #{response_text.empty? ? 'the item did not move to hand.' : response_text}")
 end
 
+def get_item_by_noun(noun, label:)
+  stripped_noun = noun.to_s.strip
+  fail_with("Could not get #{label}: no saved noun is available.") if stripped_noun.empty?
+
+  already_held = held_items.find { |item| item.noun.to_s.downcase == stripped_noun.downcase }
+  return already_held if already_held
+
+  result = dothistimeout("get #{stripped_noun}", 5, /You (?:pick up|remove|pull|reach|grab|retrieve|carefully remove)|You (?:need|are already|can't)|Get what|What were you referring to|You have to empty your hands|You are too injured|You should unload/i)
+
+  held_item = nil
+  20.times do
+    held_item = held_items.find { |item| item.noun.to_s.downcase == stripped_noun.downcase }
+    break if held_item
+    sleep 0.1
+  end
+
+  return held_item if held_item
+
+  response_text = result.to_s.strip
+  fail_with("Could not get #{label} by noun '#{stripped_noun}': #{response_text.empty? ? 'the item did not move to hand.' : response_text}")
+end
+
 def put_item_in_container(item_id, container_id:, container_name:, label:)
   item_id_text = item_id.to_s
   existing_pair = known_container_for_item(item_id_text)
@@ -501,12 +561,8 @@ def scan_grimoire
 
   first_page = read_current_page
   page_map = { first_page[:page] => first_page[:slots] }
-  guard = 0
 
   loop do
-    guard += 1
-    fail_with('Stopped scanning grimoire after 50 turns. The page loop did not return to the start page.') if guard > 50
-
     page_data = turn_page
     break if page_data[:page] == first_page[:page]
 
@@ -834,6 +890,18 @@ def handle_testmode(arg)
   end
 end
 
+def handle_booknoun(arg)
+  stripped = arg.to_s.strip.downcase
+
+  if stripped.empty? || stripped == 'status'
+    echo("Default grimoire noun is '#{configured_default_grimoire_noun}'.")
+    return
+  end
+
+  save_default_grimoire_noun!(stripped)
+  echo("Default grimoire noun set to '#{stripped}'.")
+end
+
 def handle_add(query)
   item = find_held_item(query)
   fail_with('Hold the grimoire first, then run ;librarian add <held item name>.') unless item
@@ -896,13 +964,20 @@ def handle_get(args)
     saved_id = configured_grimoire_id
     fail_with('No grimoire is saved. Use ;librarian add <held item name>.') unless saved_id
 
-    item = known_item_by_id(saved_id)
-    fail_with("Saved grimoire ##{saved_id}#{configured_grimoire_name ? " (#{configured_grimoire_name})" : ''} could not be found in your current inventory state.") unless item
-
     container_pair = known_container_for_item(saved_id)
     container_id = container_pair ? container_pair[0] : nil
-    get_item_by_id(saved_id, container_id: container_id, label: configured_grimoire_name || item.name)
-    echo("Got #{configured_grimoire_name || item.name}.")
+    label = configured_grimoire_name || 'saved grimoire'
+    begin
+      get_item_by_id(saved_id, container_id: container_id, label: label)
+    rescue RuntimeError => e
+      fallback_noun = configured_grimoire_noun.to_s.strip
+      fallback_noun = configured_default_grimoire_noun if fallback_noun.empty?
+      raise e if container_id
+
+      item = get_item_by_noun(fallback_noun, label: label)
+      save_grimoire!(item) if item
+    end
+    echo("Got #{label}.")
   when 'scroll', 'skscroll'
     query = (args[1..-1] || []).join(' ')
     fail_with("Usage: ;librarian get #{noun} <partial spell name or number>") if query.strip.empty?
@@ -954,6 +1029,7 @@ def show_help
   echo(';librarian charge <spell number>')
   echo(';librarian charge all')
   echo(';librarian testmode <on|off|status|toggle>')
+  echo(';librarian booknoun <noun|status>')
   echo(';librarian add <held item name>')
   echo(';librarian scrollcontainer <item name>')
   echo(';librarian scrolls')
@@ -991,6 +1067,8 @@ begin
     handle_charge(args[1])
   when 'testmode'
     handle_testmode(args[1])
+  when 'booknoun'
+    handle_booknoun((args[1..-1] || []).join(' '))
   when 'memory', 'dump'
     handle_memory_dump
   when 'help', '--help', '-h'
