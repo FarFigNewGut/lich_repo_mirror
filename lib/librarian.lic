@@ -1,0 +1,1003 @@
+=begin
+  librarian.lic: Grimoire helper for managing grimoires and scroll containers
+
+  Please note: This script is still very beta, use at your own risk.  You can turn TEST MODE on to test things like charging.  No 1750 support since I don't have that unlocked, but if anyone wants to send me the game output for it I can try to add it for you.  I still have some work to do with charge all, currently it charges the highest entry found that is not full if there are multiples.  I can add a setting to charge the lowest possible (like if you had three at 40, 25, 1 it would charge the 1 instead of the 25).
+
+  Let me know!
+
+            author: Bhuryn
+              game: GemStone
+              tags: grimoire, spellbook, utility, scrolls
+           version: 0.24
+
+  Improvements:
+  Major_change.feature_addition.bugfix
+    v0.1 - Initial release with page scanning, spell lookup, find, and clean support for spell book grimoires
+    v0.2 - Added a memory dump command for inspecting the scanned in-memory grimoire state
+    v0.3 - Fixed command capture for current Lich builds, added scan alias, and added saved grimoire id support via ;librarian add
+    v0.4 - Made clean capture and report the grimoire response so daily cooldown failures do not look like successful restores
+    v0.5 - Recognizes the grimoire clean cooldown messaging explicitly for clearer reporting
+    v0.6 - Added saved scroll container support via ;librarian scrollcontainer <item name>
+    v0.7 - Added scroll container scanning to read stored scrolls and summarize regular versus spell knowledge spells
+    v0.8 - Added get book, get scroll, and get skscroll commands for retrieving the saved grimoire or matching scrolls
+    v0.9 - Made scroll source names clickable in scroll summaries so clicking them gets the matching scroll by id
+    v0.10 - Switched retrieval to live get/drag commands with hand verification instead of the quiet command capture helper
+    v0.11 - Added ;librarian charge <spell number> to fetch a matching regular scroll and transfer its charges into a selected grimoire slot
+    v0.12 - Fixed charge transfer confirmation handling so it waits for the actual confirm prompt before sending the second transfer command
+    v0.13 - Temporarily disabled the second transfer confirmation step for charge testing and added a dry-run status line
+    v0.14 - Added ;librarian sellskscrolls to pull and sell every spell knowledge scroll from the saved scroll container
+    v0.15 - Removed the incorrect drag fallback from item retrieval so failed gets report the real hand-state error instead of sending the in-game DRAG verb
+    v0.16 - Made charge test mode stop after the confirmation prompt instead of rescanning and reporting a false no-change result
+    v0.17 - Returns the source scroll to the saved scroll container after charge attempts, including test mode
+    v0.18 - Added ;librarian charge all to walk chargeable grimoire spells that also have matching regular scrolls available
+    v0.19 - Re-enabled live charge confirmation and changed duplicate spell targeting to prefer the highest non-full grimoire copy
+    v0.20 - Added a persisted ;librarian testmode command so charge dry-run mode can be enabled or disabled without editing the script
+    v0.21 - Made scroll reads use a scroll-specific capture pattern and deduped repeated spell hits from the same scroll item during get and charge selection
+    v0.22 - Fixed live charge so the source scroll stays in hand through the second transfer confirmation and is returned to the container afterward
+    v0.23 - Made charge all continue recharging spells while matching regular scrolls remain instead of stopping after one charge per spell number
+    v0.24 - Expanded help output with an initial setup block for saving the grimoire and scroll container
+=end
+
+require 'pp'
+require 'cgi'
+
+MAX_GRIMOIRE_CHARGES = 40
+DEFAULT_CHARGE_TEST_MODE = false
+GRIMOIRE_NOUN = 'grimoire'
+GRIMOIRE_ID_SETTING = 'librarian_grimoire_id'
+GRIMOIRE_NAME_SETTING = 'librarian_grimoire_name'
+SCROLL_CONTAINER_ID_SETTING = 'librarian_scroll_container_id'
+SCROLL_CONTAINER_NAME_SETTING = 'librarian_scroll_container_name'
+CHARGE_TEST_MODE_SETTING = 'librarian_charge_test_mode'
+PAGE_START_PATTERN = /You glance down at your .* and carefully study page \d+\.\.\./.freeze
+PAGE_NUMBER_PATTERN = /carefully study page (\d+)\.\.\./.freeze
+SLOT_PATTERN = /^(\d+)\.\s+(?:The (.+?) \((\d+)\) spell with (\d+) charges remaining\.|This section is blank\.)$/.freeze
+PONDER_START_PATTERN = /You ponder over your .*grimoire, shifting your attention to the \d+(?:st|nd|rd|th) section on the page/.freeze
+CLEAN_COOLDOWN_PATTERN = /runes seem to shift and elude your understanding\.\s*\[This ability is still on cooldown\.\]/i.freeze
+SCROLL_CONTAINER_LOOK_PATTERN = /^(?:In the|There is nothing in there\.|That is closed\.|You glance at)/.freeze
+SCROLL_READ_START_PATTERN = /^It takes you a moment to focus on the .*?\.$/.freeze
+SCROLL_READ_HEADER_PATTERN = /^On the .* you see$/.freeze
+SCROLL_READ_FAILURE_PATTERN = /^(?:Read what\?|What were you referring to\?|You can't read that\.|You cannot read that\.)$/.freeze
+SCROLL_SPELL_LINE_PATTERN = /^\((\d+)\)\s+(.+?)(?: in vibrant ink)?$/.freeze
+TRANSFER_CONFIRM_PATTERN = /Repeat this command within 30 seconds to confirm\./.freeze
+TRANSFER_SUCCESS_PATTERN = /Working diligently, you trace over the runes inscribed in your .*grimoire\./.freeze
+TRANSFER_FAILURE_PATTERN = /What were you referring to|You can't|You cannot|You must|already fully charged|not currently holding|don't seem to be holding|nothing happens|unable to transfer/i.freeze
+TRANSFER_FIRST_RESPONSE_PATTERN = Regexp.union(TRANSFER_CONFIRM_PATTERN, TRANSFER_SUCCESS_PATTERN, TRANSFER_FAILURE_PATTERN).freeze
+TRANSFER_SECOND_RESPONSE_PATTERN = Regexp.union(TRANSFER_SUCCESS_PATTERN, TRANSFER_FAILURE_PATTERN, TRANSFER_CONFIRM_PATTERN, /their ink seems to become darker and sharper/i).freeze
+
+def script_args
+  values = Script.current.vars.map { |value| value.to_s.strip }.reject(&:empty?)
+  values = values[1..] if values.length > 1 && values[0].include?(' ')
+  values
+end
+
+def fail_with(message)
+  raise RuntimeError, message
+end
+
+def held_items
+  [GameObj.right_hand, GameObj.left_hand].select { |item| item && item.id }
+end
+
+def configured_grimoire_id
+  value = CharSettings[GRIMOIRE_ID_SETTING]
+  value.nil? ? nil : value.to_s
+end
+
+def configured_grimoire_name
+  CharSettings[GRIMOIRE_NAME_SETTING]
+end
+
+def save_grimoire!(item)
+  CharSettings[GRIMOIRE_ID_SETTING] = item.id.to_s
+  CharSettings[GRIMOIRE_NAME_SETTING] = item.name.to_s
+end
+
+def save_scroll_container!(item)
+  CharSettings[SCROLL_CONTAINER_ID_SETTING] = item.id.to_s
+  CharSettings[SCROLL_CONTAINER_NAME_SETTING] = item.name.to_s
+end
+
+def configured_scroll_container_id
+  value = CharSettings[SCROLL_CONTAINER_ID_SETTING]
+  value.nil? ? nil : value.to_s
+end
+
+def configured_scroll_container_name
+  CharSettings[SCROLL_CONTAINER_NAME_SETTING]
+end
+
+def charge_test_mode_enabled?
+  value = CharSettings[CHARGE_TEST_MODE_SETTING]
+  return DEFAULT_CHARGE_TEST_MODE if value.nil?
+
+  %w[true on 1 yes enabled].include?(value.to_s.strip.downcase)
+end
+
+def save_charge_test_mode!(enabled)
+  CharSettings[CHARGE_TEST_MODE_SETTING] = enabled ? 'true' : 'false'
+end
+
+def inventory_items
+  GameObj.inv.to_a.select { |item| item && item.id }
+end
+
+def find_held_item(query = nil)
+  items = held_items
+  return nil if items.empty?
+
+  return items.first if query.to_s.strip.empty? && items.length == 1
+
+  downcased = query.to_s.strip.downcase
+  matches = items.select do |item|
+    item.name.to_s.downcase.include?(downcased) || item.noun.to_s.downcase.include?(downcased)
+  end
+
+  return matches.first if matches.length == 1
+  return nil if matches.empty?
+
+  fail_with("More than one held item matched '#{query}'.")
+end
+
+def find_inventory_item(query)
+  stripped = query.to_s.strip
+  fail_with('Usage: ;librarian scrollcontainer <item name>') if stripped.empty?
+
+  downcased = stripped.downcase
+  matches = inventory_items.select do |item|
+    item.name.to_s.downcase.include?(downcased) || item.noun.to_s.downcase.include?(downcased)
+  end
+
+  return matches.first if matches.length == 1
+  fail_with("No inventory item matched '#{query}'.") if matches.empty?
+
+  fail_with("Multiple inventory items matched '#{query}'. Refine the name.")
+end
+
+def current_grimoire
+  saved_id = configured_grimoire_id
+  if saved_id
+    item = held_items.find { |held| held.id.to_s == saved_id }
+    return item if item
+
+    fail_with("Saved grimoire ##{saved_id}#{configured_grimoire_name ? " (#{configured_grimoire_name})" : ''} is not currently held. Use ;librarian add while holding the book.")
+  end
+
+  item = held_items.find { |held| held.noun.to_s.downcase == GRIMOIRE_NOUN }
+  return item if item
+
+  fail_with('Hold your grimoire in either hand before using librarian, or set it with ;librarian add <held item name>.')
+end
+
+def current_scroll_container
+  saved_id = configured_scroll_container_id
+  fail_with('No scroll container is saved. Use ;librarian scrollcontainer <item name>.') unless saved_id
+
+  item = inventory_items.find { |inv| inv.id.to_s == saved_id }
+  return item if item
+
+  fail_with("Saved scroll container ##{saved_id}#{configured_scroll_container_name ? " (#{configured_scroll_container_name})" : ''} is not currently in inventory.")
+end
+
+def grimoire_ref
+  "##{current_grimoire.id}"
+end
+
+def known_item_by_id(item_id)
+  item_id_text = item_id.to_s
+  held_items.find { |item| item.id.to_s == item_id_text } ||
+    inventory_items.find { |item| item.id.to_s == item_id_text } ||
+    GameObj.containers.values.flatten.find { |item| item.id.to_s == item_id_text }
+end
+
+def known_container_for_item(item_id)
+  item_id_text = item_id.to_s
+  GameObj.containers.find { |_container_id, contents| contents.any? { |item| item.id.to_s == item_id_text } }
+end
+
+def normalize_lines(lines)
+  Array(lines).map { |line| CGI.unescapeHTML(line.to_s.gsub(/<[^>]+>/, '')).strip }.reject(&:empty?)
+end
+
+def issue_grimoire_command(command, start_pattern, timeout: 5)
+  waitrt?
+  lines = Lich::Util.issue_command(command, start_pattern, /<prompt/, include_end: false, timeout: timeout, usexml: true, quiet: true, use_fput: false)
+  normalized = normalize_lines(lines)
+  fail_with("No grimoire output matched for '#{command}'.") if normalized.empty?
+
+  normalized
+end
+
+def capture_command_until_prompt(command, timeout: 5)
+  waitrt?
+  lines = Lich::Util.issue_command(command, /^.+$/, /<prompt/, include_end: false, timeout: timeout, usexml: true, quiet: true, use_fput: false)
+  normalize_lines(lines)
+end
+
+def read_scroll_lines(item_id, timeout: 6)
+  waitrt?
+  lines = Lich::Util.issue_command("read ##{item_id}", Regexp.union(SCROLL_READ_START_PATTERN, SCROLL_READ_FAILURE_PATTERN), /<prompt/, include_end: false, timeout: timeout, usexml: true, quiet: true, use_fput: false)
+  normalize_lines(lines)
+end
+
+def refresh_scroll_container_contents
+  container = current_scroll_container
+  lines = Lich::Util.issue_command("look in ##{container.id}", SCROLL_CONTAINER_LOOK_PATTERN, /<prompt/, include_end: false, timeout: 5, usexml: true, quiet: true, use_fput: false)
+  normalized = normalize_lines(lines)
+
+  if normalized.any? { |line| line == 'That is closed.' }
+    waitrt?
+    open_result = dothistimeout("open ##{container.id}", 5, /You open|That is already open|You carefully open|You unwrap|You loosen/i)
+    fail_with("Could not open #{container.name}.") unless open_result =~ /You open|That is already open|You carefully open|You unwrap|You loosen/i
+
+    lines = Lich::Util.issue_command("look in ##{container.id}", SCROLL_CONTAINER_LOOK_PATTERN, /<prompt/, include_end: false, timeout: 5, usexml: true, quiet: true, use_fput: false)
+    normalized = normalize_lines(lines)
+  end
+
+  return [container, []] if normalized.any? { |line| line == 'There is nothing in there.' }
+
+  contents = nil
+  20.times do
+    contents = GameObj.containers[container.id]
+    break if contents.is_a?(Array)
+    sleep 0.1
+  end
+
+  fail_with("Could not determine the contents of #{container.name}.") unless contents.is_a?(Array)
+
+  [container, contents]
+end
+
+def parse_scroll_read(item, lines)
+  return nil unless lines.any? { |line| line =~ SCROLL_READ_START_PATTERN }
+  return nil unless lines.any? { |line| line =~ SCROLL_READ_HEADER_PATTERN }
+
+  spells = []
+  lines.each do |line|
+    match = SCROLL_SPELL_LINE_PATTERN.match(line)
+    next unless match
+
+    spells << {
+      number: match[1].to_i,
+      name: match[2],
+      spell_knowledge: line.end_with?('in vibrant ink')
+    }
+  end
+
+  return nil if spells.empty?
+
+  {
+    id: item.id.to_s,
+    name: item.name.to_s,
+    noun: item.noun.to_s,
+    spells: spells
+  }
+end
+
+def scan_scroll_container
+  container, contents = refresh_scroll_container_contents
+  scanned_scrolls = []
+  skipped_items = []
+
+  contents.each do |item|
+    lines = read_scroll_lines(item.id, timeout: 6)
+    parsed = parse_scroll_read(item, lines)
+    if parsed
+      scanned_scrolls << parsed
+    else
+      skipped_items << item
+    end
+  end
+
+  regular = Hash.new { |hash, key| hash[key] = { count: 0, name: nil, scrolls: [] } }
+  spell_knowledge = Hash.new { |hash, key| hash[key] = { count: 0, name: nil, scrolls: [] } }
+
+  scanned_scrolls.each do |scroll|
+    scroll[:spells].each do |spell|
+      target = spell[:spell_knowledge] ? spell_knowledge : regular
+      target[spell[:number]][:count] += 1
+      target[spell[:number]][:name] = spell[:name]
+      unless target[spell[:number]][:scrolls].any? { |entry| entry[:id] == scroll[:id] }
+        target[spell[:number]][:scrolls] << { id: scroll[:id], name: scroll[:name] }
+      end
+    end
+  end
+
+  {
+    container: container,
+    scanned_scrolls: scanned_scrolls,
+    skipped_items: skipped_items,
+    regular_spells: regular,
+    spell_knowledge_spells: spell_knowledge
+  }
+end
+
+def echo_spell_table(title, spells)
+  echo(title)
+  if spells.empty?
+    echo('  none')
+    return
+  end
+
+  spells.keys.sort.each do |number|
+    spell = spells[number]
+    linked_scrolls = spell[:scrolls].map do |scroll|
+      Lich::Messaging.make_cmd_link(scroll[:name], "get ##{scroll[:id]} from ##{current_scroll_container.id}")
+    end
+    line = Lich::Messaging.xml_encode(format('  (%4d) %-28s x%-2d [', number, spell[:name], spell[:count]))
+    line += linked_scrolls.join(', ')
+    line += Lich::Messaging.xml_encode(']')
+    Lich::Messaging.mono("[#{Script.current.name}: #{line}]")
+  end
+end
+
+def scroll_spell_entries(scanned_scrolls, spell_knowledge:)
+  entries = []
+  scanned_scrolls.each do |scroll|
+    scroll[:spells].each do |spell|
+      next unless spell[:spell_knowledge] == spell_knowledge
+
+      entries << {
+        scroll_id: scroll[:id].to_s,
+        scroll_name: scroll[:name],
+        spell_number: spell[:number],
+        spell_name: spell[:name]
+      }
+    end
+  end
+  entries.sort_by { |entry| [entry[:spell_name].downcase, entry[:scroll_name].downcase, entry[:spell_number]] }
+end
+
+def find_scroll_spell_matches(entries, query)
+  stripped = query.to_s.strip
+  return [] if stripped.empty?
+
+  if stripped.match?(/^\d+$/)
+    entries.select { |entry| entry[:spell_number] == stripped.to_i }
+  else
+    downcased = stripped.downcase
+    entries.select { |entry| entry[:spell_name].downcase.include?(downcased) }
+  end
+end
+
+def dedupe_scroll_spell_matches(matches)
+  seen = {}
+  matches.each_with_object([]) do |entry, unique_matches|
+    next if seen[entry[:scroll_id]]
+
+    seen[entry[:scroll_id]] = true
+    unique_matches << entry
+  end
+end
+
+def choose_scroll_spell_target(matches, query)
+  return nil if matches.empty?
+  return matches.first if matches.length == 1
+
+  downcased = query.to_s.strip.downcase
+  return matches.first if downcased.match?(/^\d+$/)
+
+  exact_matches = matches.select { |entry| entry[:spell_name].downcase == downcased }
+  return exact_matches.first if exact_matches.any?
+
+  matches.first
+end
+
+def get_item_by_id(item_id, container_id: nil, label:)
+  item_id_text = item_id.to_s
+  already_held = held_items.find { |item| item.id.to_s == item_id_text }
+  if already_held
+    echo("Already holding #{label}.")
+    return already_held
+  end
+
+  command = container_id ? "get ##{item_id_text} from ##{container_id}" : "get ##{item_id_text}"
+  result = dothistimeout(command, 5, /You (?:pick up|remove|pull|reach|grab|carefully remove)|You (?:need|are already|can't)|Get what|What were you referring to|You have to empty your hands|You are too injured|You should unload/i)
+
+  held_item = nil
+  20.times do
+    held_item = held_items.find { |item| item.id.to_s == item_id_text }
+    break if held_item
+    sleep 0.1
+  end
+
+  return held_item if held_item
+
+  response_text = result.to_s.strip
+  fail_with("Could not get #{label}: #{response_text.empty? ? 'the item did not move to hand.' : response_text}")
+end
+
+def put_item_in_container(item_id, container_id:, container_name:, label:)
+  item_id_text = item_id.to_s
+  existing_pair = known_container_for_item(item_id_text)
+  return true if existing_pair && existing_pair[0].to_s == container_id.to_s
+
+  result = dothistimeout("put ##{item_id_text} in ##{container_id}", 5, /You (?:put|slip|tuck|drop)|Put what|What were you referring to|You (?:can't|cannot|need|must|have to)/i)
+
+  stored_pair = nil
+  20.times do
+    stored_pair = known_container_for_item(item_id_text)
+    break if stored_pair && stored_pair[0].to_s == container_id.to_s
+    sleep 0.1
+  end
+
+  return true if stored_pair && stored_pair[0].to_s == container_id.to_s
+
+  response_text = result.to_s.strip
+  fail_with("Could not return #{label} to #{container_name}: #{response_text.empty? ? 'the item did not appear in the container.' : response_text}")
+end
+
+def parse_page(lines)
+  page_match = nil
+  lines.each do |line|
+    page_match = PAGE_NUMBER_PATTERN.match(line)
+    break if page_match
+  end
+  fail_with('Could not determine the current grimoire page from READ/TURN output.') unless page_match
+
+  page_number = page_match[1].to_i
+  slots = []
+  lines.each do |line|
+    normalized_line = line.dup
+    selected = false
+
+    if normalized_line.sub!(/\A(?:>|&gt;)\s*/, '')
+      selected = true
+    end
+
+    match = SLOT_PATTERN.match(normalized_line)
+    next unless match
+
+    slot = {
+      page: page_number,
+      slot: match[1].to_i,
+      selected: selected,
+      blank: match[2].nil?
+    }
+
+    unless slot[:blank]
+      slot[:name] = match[2]
+      slot[:number] = match[3].to_i
+      slot[:charges] = match[4].to_i
+    end
+
+    slots << slot
+  end
+
+  fail_with("Could not parse spell slots on grimoire page #{page_number}.") if slots.empty?
+
+  {
+    page: page_number,
+    slots: slots,
+    selected_slot: slots.find { |slot| slot[:selected] }&.dig(:slot)
+  }
+end
+
+def read_current_page
+  parse_page(issue_grimoire_command("read #{grimoire_ref}", PAGE_START_PATTERN))
+end
+
+def turn_page(page_number = nil)
+  command = page_number ? "turn #{grimoire_ref} to #{page_number}" : "turn #{grimoire_ref}"
+  parse_page(issue_grimoire_command(command, PAGE_START_PATTERN))
+end
+
+def build_spell_indices(slots)
+  spells_by_number = Hash.new { |hash, key| hash[key] = [] }
+  spells_by_name = Hash.new { |hash, key| hash[key] = [] }
+
+  slots.each do |slot|
+    next if slot[:blank]
+
+    spells_by_number[slot[:number]] << slot
+    spells_by_name[slot[:name].downcase] << slot
+  end
+
+  [spells_by_number, spells_by_name]
+end
+
+def scan_grimoire
+  current_grimoire
+
+  first_page = read_current_page
+  page_map = { first_page[:page] => first_page[:slots] }
+  guard = 0
+
+  loop do
+    guard += 1
+    fail_with('Stopped scanning grimoire after 50 turns. The page loop did not return to the start page.') if guard > 50
+
+    page_data = turn_page
+    break if page_data[:page] == first_page[:page]
+
+    if page_map.key?(page_data[:page])
+      fail_with("Encountered grimoire page #{page_data[:page]} twice before returning to page #{first_page[:page]}.")
+    end
+
+    page_map[page_data[:page]] = page_data[:slots]
+  end
+
+  slots = page_map.keys.sort.flat_map { |page| page_map[page] }
+  spells_by_number, spells_by_name = build_spell_indices(slots)
+
+  {
+    current_page: first_page[:page],
+    current_selected_slot: first_page[:selected_slot],
+    page_map: page_map,
+    page_numbers: page_map.keys.sort,
+    slots: slots,
+    spells_by_number: spells_by_number,
+    spells_by_name: spells_by_name
+  }
+end
+
+def list_slots(slots, header)
+  echo(header)
+  slots.sort_by { |slot| [slot[:page], slot[:slot]] }.each do |slot|
+    marker = slot[:selected] ? '>' : ' '
+    if slot[:blank]
+      echo(format('%s page %-2d slot %-2d Blank', marker, slot[:page], slot[:slot]))
+    else
+      echo(format('%s page %-2d slot %-2d %-28s (%4d) %2d/%d', marker, slot[:page], slot[:slot], slot[:name], slot[:number], slot[:charges], MAX_GRIMOIRE_CHARGES))
+    end
+  end
+end
+
+def find_matches(state, query)
+  stripped = query.to_s.strip
+  return [] if stripped.empty?
+
+  if stripped.match?(/^\d+$/)
+    state[:spells_by_number][stripped.to_i].sort_by { |slot| [slot[:page], slot[:slot]] }
+  else
+    downcased = stripped.downcase
+    state[:slots]
+      .reject { |slot| slot[:blank] }
+      .select { |slot| slot[:name].downcase.include?(downcased) }
+      .sort_by { |slot| [slot[:page], slot[:slot]] }
+  end
+end
+
+def choose_find_target(matches, query)
+  return nil if matches.empty?
+  return matches.first if matches.length == 1
+
+  downcased = query.to_s.strip.downcase
+  return nil if downcased.match?(/^\d+$/)
+
+  exact_matches = matches.select { |slot| slot[:name].downcase == downcased }
+  return exact_matches.first if exact_matches.length == 1
+
+  nil
+end
+
+def choose_grimoire_charge_target(state, spell_number)
+  matches = state[:spells_by_number][spell_number].sort_by { |slot| [slot[:page], slot[:slot]] }
+  fail_with("Spell #{spell_number} was not found in the grimoire.") if matches.empty?
+
+  target = matches
+    .select { |slot| slot[:charges] < MAX_GRIMOIRE_CHARGES }
+    .max_by { |slot| [slot[:charges], -slot[:page], -slot[:slot]] }
+  fail_with("Spell #{spell_number} is already fully charged in every matching slot.") unless target
+
+  [matches, target]
+end
+
+def chargeable_spell_targets(state, scroll_result)
+  available_numbers = scroll_spell_entries(scroll_result[:scanned_scrolls], spell_knowledge: false)
+    .map { |entry| entry[:spell_number] }
+    .uniq
+
+  targets = available_numbers.each_with_object([]) do |spell_number, entries|
+    matches = state[:spells_by_number][spell_number]
+    next if matches.nil? || matches.empty?
+
+    target = matches
+      .select { |slot| slot[:charges] < MAX_GRIMOIRE_CHARGES }
+      .max_by { |slot| [slot[:charges], -slot[:page], -slot[:slot]] }
+    entries << target if target
+  end
+
+  targets.sort_by { |slot| [slot[:page], slot[:slot], slot[:number]] }
+end
+
+def navigate_to_spell(target, current_page:)
+  page_data =
+    if current_page == target[:page]
+      read_current_page
+    else
+      turn_page(target[:page])
+    end
+
+  selected_slot = page_data[:selected_slot]
+  fail_with("Could not determine the selected slot on page #{target[:page]}.") unless selected_slot
+
+  slots_on_page = page_data[:slots].map { |slot| slot[:slot] }.max
+  fail_with("Could not determine slot count for page #{target[:page]}.") unless slots_on_page
+
+  ponders_needed = (target[:slot] - selected_slot) % slots_on_page
+  ponders_needed.times do
+    waitrt?
+    result = dothistimeout("ponder #{grimoire_ref}", 5, PONDER_START_PATTERN)
+    fail_with("Ponder failed while selecting #{target[:name]} (#{target[:number]}).") unless result =~ PONDER_START_PATTERN
+  end
+
+  verification = read_current_page
+  unless verification[:page] == target[:page] && verification[:selected_slot] == target[:slot]
+    fail_with("Failed to select #{target[:name]} (#{target[:number]}) on page #{target[:page]}, slot #{target[:slot]}.")
+  end
+
+  verification
+end
+
+def handle_list
+  state = scan_grimoire
+  list_slots(state[:slots], "Scanned #{state[:page_numbers].length} grimoire page(s).")
+end
+
+def handle_find(query)
+  fail_with('Usage: ;librarian find <partial spell name or number>') if query.to_s.strip.empty?
+
+  state = scan_grimoire
+  matches = find_matches(state, query)
+  target = choose_find_target(matches, query)
+
+  if matches.empty?
+    fail_with("No grimoire spell matched '#{query}'.")
+  elsif target.nil?
+    list_slots(matches, "Multiple grimoire spells matched '#{query}'.")
+    fail_with('Refine the spell name or use the exact spell number.')
+  end
+
+  navigate_to_spell(target, current_page: state[:current_page])
+  echo("Selected #{target[:name]} (#{target[:number]}) on page #{target[:page]}, slot #{target[:slot]} with #{target[:charges]} charges.")
+end
+
+def handle_clean(spell_number_text)
+  fail_with('Usage: ;librarian clean <spell number>') unless spell_number_text.to_s.match?(/^\d+$/)
+
+  spell_number = spell_number_text.to_i
+  state = scan_grimoire
+  matches, target = choose_grimoire_charge_target(state, spell_number)
+
+  if matches.length > 1
+    echo("Found #{matches.length} copies of spell #{spell_number}; targeting page #{target[:page]}, slot #{target[:slot]} at #{target[:charges]} charges.")
+  end
+
+  navigate_to_spell(target, current_page: state[:current_page])
+  before_charges = target[:charges]
+
+  clean_command = "clean #{grimoire_ref}"
+  clean_output = capture_command_until_prompt(clean_command, timeout: 8)
+  clean_text = clean_output.reject { |line| line.casecmp(clean_command).zero? }.join(' ')
+
+  updated_state = scan_grimoire
+  updated_slot = updated_state[:spells_by_number][spell_number].find { |slot| slot[:page] == target[:page] && slot[:slot] == target[:slot] }
+  fail_with("Unable to verify the updated charges for spell #{spell_number}.") unless updated_slot
+
+  if updated_slot[:charges] > before_charges
+    echo("Cleaned #{updated_slot[:name]} (#{spell_number}) on page #{updated_slot[:page]}, slot #{updated_slot[:slot]}: #{before_charges} -> #{updated_slot[:charges]} charges.")
+    echo(clean_text) unless clean_text.empty?
+  else
+    if clean_text =~ CLEAN_COOLDOWN_PATTERN
+      echo("Clean is on cooldown: #{clean_text}")
+    elsif clean_text =~ /already|again tomorrow|once per day|used|today|daily/i
+      echo("Clean appears to be unavailable right now for #{updated_slot[:name]} (#{spell_number}): #{clean_text}")
+    elsif clean_text.empty?
+      echo("No charge change detected for #{updated_slot[:name]} (#{spell_number}) on page #{updated_slot[:page]}, slot #{updated_slot[:slot]}. Clean may be on cooldown or the grimoire output may have changed.")
+    else
+      echo("No charge change detected for #{updated_slot[:name]} (#{spell_number}) on page #{updated_slot[:page]}, slot #{updated_slot[:slot]}: #{clean_text}")
+    end
+  end
+end
+
+def charge_single_spell(spell_number)
+  test_mode = charge_test_mode_enabled?
+  state = scan_grimoire
+  matches, target = choose_grimoire_charge_target(state, spell_number)
+
+  if matches.length > 1
+    echo("Found #{matches.length} copies of spell #{spell_number}; targeting page #{target[:page]}, slot #{target[:slot]} at #{target[:charges]} charges.")
+  end
+
+  navigate_to_spell(target, current_page: state[:current_page])
+  before_charges = target[:charges]
+
+  scroll_result = scan_scroll_container
+  entries = scroll_spell_entries(scroll_result[:scanned_scrolls], spell_knowledge: false)
+  scroll_matches = dedupe_scroll_spell_matches(find_scroll_spell_matches(entries, spell_number.to_s))
+  fail_with("No regular scroll matched spell #{spell_number} in #{scroll_result[:container].name}.") if scroll_matches.empty?
+
+  scroll_target = choose_scroll_spell_target(scroll_matches, spell_number.to_s)
+  if scroll_matches.length > 1
+    echo("Found #{scroll_matches.length} regular scroll entries for #{scroll_target[:spell_name]} (#{spell_number}); getting #{scroll_target[:scroll_name]}.")
+  end
+
+  scroll_container = scroll_result[:container]
+  get_item_by_id(scroll_target[:scroll_id], container_id: scroll_container.id, label: scroll_target[:scroll_name])
+  transfer_command = "transfer #{spell_number} #{grimoire_ref}"
+  outcome = nil
+
+  begin
+    confirmation_result = dothistimeout(transfer_command, 8, TRANSFER_FIRST_RESPONSE_PATTERN)
+    fail_with("Transfer setup failed for spell #{spell_number}: no matching transfer response was captured.") if confirmation_result.nil? || confirmation_result.to_s.strip.empty?
+
+    transfer_result =
+      if confirmation_result =~ TRANSFER_CONFIRM_PATTERN
+        if test_mode
+          echo("Charge test mode: would now confirm transfer with '#{transfer_command}'.")
+          return :test_mode
+        end
+
+        second_result = dothistimeout(transfer_command, 8, TRANSFER_SECOND_RESPONSE_PATTERN)
+        fail_with("Transfer confirmation failed for spell #{spell_number}: no matching transfer response was captured.") if second_result.nil? || second_result.to_s.strip.empty?
+        second_result
+      else
+        confirmation_result
+      end
+
+    updated_state = scan_grimoire
+    updated_slot = updated_state[:spells_by_number][spell_number].find { |slot| slot[:page] == target[:page] && slot[:slot] == target[:slot] }
+    fail_with("Unable to verify the updated charges for spell #{spell_number}.") unless updated_slot
+
+    if updated_slot[:charges] > before_charges
+      echo("Charged #{updated_slot[:name]} (#{spell_number}) on page #{updated_slot[:page]}, slot #{updated_slot[:slot]}: #{before_charges} -> #{updated_slot[:charges]} charges.")
+      outcome = :charged
+    else
+      response_text = transfer_result.to_s.strip
+      echo("No charge change detected for #{updated_slot[:name]} (#{spell_number}) during transfer#{response_text.empty? ? '.' : ": #{response_text}"}")
+      outcome = :no_change
+    end
+  ensure
+    held_scroll = held_items.find { |item| item.id.to_s == scroll_target[:scroll_id].to_s }
+    if held_scroll
+      put_item_in_container(scroll_target[:scroll_id], container_id: scroll_container.id, container_name: scroll_container.name, label: scroll_target[:scroll_name])
+    end
+  end
+
+  outcome
+end
+
+def handle_charge_all
+  test_mode = charge_test_mode_enabled?
+  results = Hash.new(0)
+  blocked_numbers = {}
+  guard = 0
+  started = false
+
+  loop do
+    guard += 1
+    fail_with('Charge all stopped after 100 attempts. The charge loop did not converge.') if guard > 100
+
+    state = scan_grimoire
+    scroll_result = scan_scroll_container
+    targets = chargeable_spell_targets(state, scroll_result)
+    targets.reject! { |target| blocked_numbers[target[:number]] }
+
+    unless started
+      if targets.empty?
+        echo("No grimoire spells are both under #{MAX_GRIMOIRE_CHARGES} charges and available on regular scrolls in #{scroll_result[:container].name}.")
+        return
+      end
+
+      echo(test_mode ? "Attempting one test charge per eligible spell number." : 'Attempting to charge eligible spells until matching regular scrolls run out or the book slots are full.')
+      started = true
+    end
+
+    break if targets.empty?
+
+    target = targets.first
+    begin
+      outcome = charge_single_spell(target[:number])
+      results[outcome] += 1
+      blocked_numbers[target[:number]] = true if outcome != :charged
+    rescue RuntimeError => e
+      results[:failed] += 1
+      blocked_numbers[target[:number]] = true
+      echo("Charge failed for #{target[:name]} (#{target[:number]}): #{e.message}")
+    end
+  end
+
+  echo("Charge all complete: #{results[:charged]} charged, #{results[:test_mode]} test-only, #{results[:no_change]} no change, #{results[:failed]} failed.")
+end
+
+def handle_charge(spell_number_text)
+  stripped = spell_number_text.to_s.strip.downcase
+  if stripped == 'all'
+    handle_charge_all
+    return
+  end
+
+  fail_with('Usage: ;librarian charge <spell number>|all') unless spell_number_text.to_s.match?(/^\d+$/)
+
+  charge_single_spell(spell_number_text.to_i)
+end
+
+def handle_testmode(arg)
+  stripped = arg.to_s.strip.downcase
+
+  case stripped
+  when '', 'status'
+    echo("Charge test mode is #{charge_test_mode_enabled? ? 'ON' : 'OFF'}.")
+  when 'on', 'true', '1', 'enable', 'enabled'
+    save_charge_test_mode!(true)
+    echo('Charge test mode enabled.')
+  when 'off', 'false', '0', 'disable', 'disabled'
+    save_charge_test_mode!(false)
+    echo('Charge test mode disabled.')
+  when 'toggle'
+    enabled = !charge_test_mode_enabled?
+    save_charge_test_mode!(enabled)
+    echo("Charge test mode #{enabled ? 'enabled' : 'disabled'}.")
+  else
+    fail_with('Usage: ;librarian testmode <on|off|status|toggle>')
+  end
+end
+
+def handle_add(query)
+  item = find_held_item(query)
+  fail_with('Hold the grimoire first, then run ;librarian add <held item name>.') unless item
+
+  save_grimoire!(item)
+  echo("Saved #{item.name} as librarian grimoire ##{item.id}.")
+end
+
+def handle_scrollcontainer(query)
+  item = find_inventory_item(query)
+  save_scroll_container!(item)
+  echo("Saved #{item.name} as librarian scroll container ##{item.id}.")
+end
+
+def handle_scrolls
+  result = scan_scroll_container
+  container = result[:container]
+
+  echo("Scanned #{result[:scanned_scrolls].length} readable scroll(s) in #{container.name}.")
+  echo_spell_table('Regular scroll spells:', result[:regular_spells])
+  echo_spell_table('Spell knowledge scroll spells:', result[:spell_knowledge_spells])
+
+  return if result[:skipped_items].empty?
+
+  skipped_names = result[:skipped_items].map(&:name).uniq.sort
+  echo("Skipped non-scroll or unreadable items: #{skipped_names.join(', ')}")
+end
+
+def handle_sell_sk_scrolls
+  result = scan_scroll_container
+  container = result[:container]
+  sk_scrolls = result[:scanned_scrolls]
+    .select { |scroll| scroll[:spells].any? { |spell| spell[:spell_knowledge] } }
+    .sort_by { |scroll| scroll[:name].downcase }
+
+  if sk_scrolls.empty?
+    echo("No spell knowledge scrolls found in #{container.name}.")
+    return
+  end
+
+  echo("Selling #{sk_scrolls.length} spell knowledge scroll(s) from #{container.name}.")
+
+  sk_scrolls.each do |scroll|
+    get_item_by_id(scroll[:id], container_id: container.id, label: scroll[:name])
+    result_text = dothistimeout("sell ##{scroll[:id]}", 8, /You (?:sell|offer|hand|give)|Sell what|What were you referring to|You can't|You cannot|You need/i)
+    response_text = result_text.to_s.strip
+    if response_text.empty?
+      echo("Issued sell for #{scroll[:name]} ##{scroll[:id]}.")
+    else
+      echo("Sell result for #{scroll[:name]} ##{scroll[:id]}: #{response_text}")
+    end
+  end
+end
+
+def handle_get(args)
+  noun = args[0].to_s.downcase
+
+  case noun
+  when 'book', 'grimoire', 'grim'
+    saved_id = configured_grimoire_id
+    fail_with('No grimoire is saved. Use ;librarian add <held item name>.') unless saved_id
+
+    item = known_item_by_id(saved_id)
+    fail_with("Saved grimoire ##{saved_id}#{configured_grimoire_name ? " (#{configured_grimoire_name})" : ''} could not be found in your current inventory state.") unless item
+
+    container_pair = known_container_for_item(saved_id)
+    container_id = container_pair ? container_pair[0] : nil
+    get_item_by_id(saved_id, container_id: container_id, label: configured_grimoire_name || item.name)
+    echo("Got #{configured_grimoire_name || item.name}.")
+  when 'scroll', 'skscroll'
+    query = (args[1..-1] || []).join(' ')
+    fail_with("Usage: ;librarian get #{noun} <partial spell name or number>") if query.strip.empty?
+
+    result = scan_scroll_container
+    entries = scroll_spell_entries(result[:scanned_scrolls], spell_knowledge: noun == 'skscroll')
+    matches = dedupe_scroll_spell_matches(find_scroll_spell_matches(entries, query))
+    fail_with("No #{noun == 'skscroll' ? 'spell knowledge' : 'regular'} scroll matched '#{query}'.") if matches.empty?
+
+    target = choose_scroll_spell_target(matches, query)
+    if matches.length > 1
+      echo("Found #{matches.length} matching #{noun == 'skscroll' ? 'spell knowledge' : 'regular'} scroll entries; getting #{target[:scroll_name]} for #{target[:spell_name]} (#{target[:spell_number]}).")
+    end
+
+    get_item_by_id(target[:scroll_id], container_id: result[:container].id, label: target[:scroll_name])
+    echo("Got #{target[:scroll_name]} for #{target[:spell_name]} (#{target[:spell_number]}).")
+  else
+    fail_with("Usage: ;librarian get book | ;librarian get scroll <spell> | ;librarian get skscroll <spell>")
+  end
+end
+
+def handle_memory_dump
+  state = scan_grimoire
+  echo('In-memory grimoire state:')
+  PP.pp(state, +'').each_line do |line|
+    echo(line.chomp)
+  end
+  scroll_container_id = CharSettings[SCROLL_CONTAINER_ID_SETTING]
+  scroll_container_name = CharSettings[SCROLL_CONTAINER_NAME_SETTING]
+  if scroll_container_id
+    echo("Saved scroll container: #{scroll_container_name} ##{scroll_container_id}")
+  end
+  echo("Charge test mode: #{charge_test_mode_enabled? ? 'ON' : 'OFF'}")
+end
+
+def show_help
+  echo('Usage:')
+  echo('Setup:')
+  echo('  1. Hold your grimoire.')
+  echo('  2. ;librarian add <held item name>')
+  echo('  3. ;librarian scrollcontainer <item name>')
+  echo('  4. ;librarian scrolls')
+  echo('  5. Optional: ;librarian testmode on')
+  echo(';librarian')
+  echo(';librarian list')
+  echo(';librarian scan')
+  echo(';librarian find <partial spell name or number>')
+  echo(';librarian clean <spell number>')
+  echo(';librarian charge <spell number>')
+  echo(';librarian charge all')
+  echo(';librarian testmode <on|off|status|toggle>')
+  echo(';librarian add <held item name>')
+  echo(';librarian scrollcontainer <item name>')
+  echo(';librarian scrolls')
+  echo(';librarian sellskscrolls')
+  echo(';librarian get book')
+  echo(';librarian get scroll <partial spell name or number>')
+  echo(';librarian get skscroll <partial spell name or number>')
+  echo(';librarian memory')
+  echo(';librarian dump')
+  echo('The script expects the saved grimoire to be held in either hand.')
+end
+
+args = script_args
+command = args[0]&.downcase
+
+begin
+  case command
+  when nil, '', 'list', 'scan'
+    handle_list
+  when 'add'
+    handle_add((args[1..-1] || []).join(' '))
+  when 'scrollcontainer'
+    handle_scrollcontainer((args[1..-1] || []).join(' '))
+  when 'scrolls'
+    handle_scrolls
+  when 'sellskscrolls'
+    handle_sell_sk_scrolls
+  when 'get'
+    handle_get(args[1..-1] || [])
+  when 'find'
+    handle_find((args[1..-1] || []).join(' '))
+  when 'clean'
+    handle_clean(args[1])
+  when 'charge'
+    handle_charge(args[1])
+  when 'testmode'
+    handle_testmode(args[1])
+  when 'memory', 'dump'
+    handle_memory_dump
+  when 'help', '--help', '-h'
+    show_help
+  else
+    fail_with("Unknown librarian command '#{command}'. Try ';librarian help'.")
+  end
+rescue RuntimeError => e
+  echo(e.message)
+end
