@@ -1,14 +1,15 @@
 =begin
-	   Sail2 Version: 1.0.0 (March 7, 2026)
+	   Sail2 Version: 1.0.1 (March 14, 2026)
 
 	   This Is A Go2 Style Script For OSA Shipboard Travel. Using The Oceandb, Sail2 Will
 	   Sail Your Ship From Any Location In The Ocean To Any Other Using UIDs And Port Names.
-	   Must Be Ran From Your Ship While Your Ship Is At Sea. In Order For This To Work You 
-	   Must Install Map Files Via Nautical-Charts-Update.lic.
+	   Must Be Ran From Your Ship While Your Ship Is At Sea. First Time Users Must Run ;sail2 update
+	   First To Download Appropriate Mapdb files.
 
 	   Use:
 	       ;sail2 <Port or UID>                        Will Begin Sailing To Destination.
 	       ;sail2 <Port or UID> <Port or UID>          Will Display Step-by-step Route For Designated Travel.
+	       ;sail2 update                               Will Check For Up-To-Date Ocean Mapdb files.
 	   
 	   Available Ports:
 	   
@@ -23,6 +24,7 @@
 	                   Solhaven                        solhaven
 	                   Teras Isle                      teras
 	                   Ta'Vaalor                       vaalor
+	                   Talon Isle                      talon
 					   
 	   Enjoy!
 	
@@ -33,11 +35,76 @@
 	   Change Log:
 	 
                 March 7, 2026 - Initial Release. I'll Be Doing Cleanup On The Interface Over Time But All Should Be Functional.
+               March 14, 2026 - Added Support For Getting Your Ship Underway For You. Added Update Support. (Removing Nautical-Charts-Update Dependancy)
 =end 
 
+i_stand_alone
 require 'json'
 require 'set'
 require 'timeout'
+require 'open-uri'
+require 'fileutils'
+
+# JSON Data
+JSON_GIT_USER  = 'jmbreitfeld'
+JSON_GIT_REPO  = 'OSA-Ocean-Database'
+JSON_GIT_PATH  = ''
+LOCAL_JSON_DIR = File.join(MAP_DIR, 'OSAMaps', 'Database')
+
+def sync_echo(msg); respond "[MapSync: #{msg}]" rescue puts msg; end
+
+def download_folder(user, repo, api_path, local_dir)
+  FileUtils.mkdir_p(local_dir) unless Dir.exist?(local_dir)
+  api_url = "https://api.github.com/repos/#{user}/#{repo}/contents/#{api_path}"
+  
+  begin
+    # GitHub API requires a User-Agent header [cite: 26, 27]
+    response = URI.open(api_url, "User-Agent" => "Lich-Map-Syncer").read
+    data = JSON.parse(response)
+
+    unless data.is_a?(Array)
+      sync_echo("Error: #{api_path} in #{repo} is not a folder.")
+      return 0
+    end
+
+    count = 0
+    data.each do |file|
+      next unless file['type'] == 'file' # Only download files, skip folders [cite: 30]
+      
+      file_name    = file['name']
+      remote_size  = file['size'].to_i
+      download_url = file['download_url']
+      local_path   = File.join(local_dir, file_name)
+
+      # Only download if file is missing or size has changed [cite: 31]
+      if !File.exist?(local_path) || File.size(local_path) != remote_size
+        sync_echo("Downloading: #{file_name} from #{repo}...")
+        URI.open(download_url) do |remote|
+          File.open(local_path, "wb") { |local| local.write(remote.read) }
+        end
+        count += 1
+      end
+    end
+    count
+  rescue => e
+    sync_echo("Error syncing #{repo}/#{api_path}: #{e.message}")
+    0
+  end
+end
+
+def sync_all
+  sync_echo("Connecting to GitHub APIs...")
+  
+  # 1. Sync the JSON data from the separate Git 
+  json_updates = download_folder(JSON_GIT_USER, JSON_GIT_REPO, JSON_GIT_PATH, LOCAL_JSON_DIR)
+
+  total = json_updates
+  if total > 0
+    sync_echo("Success! Updated #{total} files from one repository.")
+  else
+    sync_echo("All files are up to date.")
+  end
+end
 
 MAP_FILE = 'oceandb.json'
 
@@ -52,7 +119,8 @@ PORTS = {
   "riversrest"   => "7116700",
   "solhaven"     => "7116362",
   "teras"        => "7116279",
-  "vaalor"       => "7137293"
+  "vaalor"       => "7137293",
+  "talon"        => "7116648"
 }
 
 script.want_downstream_xml = true
@@ -60,6 +128,26 @@ script.want_downstream_xml = true
 $current_room_id = nil
 $ocean_watch_started = false
 $current_heading = nil
+
+def wait_for_go2
+  Timeout.timeout(30) do
+    loop do
+      break unless Script.running?("go2")
+      sleep 0.2
+    end
+  end
+rescue Timeout::Error
+  echo "--- WARNING: go2 did not finish within 30 seconds."
+end
+
+def ensure_at_helm
+  return if Room.current.tags.include?("helm")
+
+  echo "--- Moving to helm"
+  start_script("go2", ["helm"])
+  wait_for_go2
+  waitrt?
+end
 
 def ship_flag
 	check_flag = Lich::Util.quiet_command("ship flag", //, end_pattern = /\[To change your flag please provide a valid option. Valid options: WHITE, BLACK, or NEUTRAL\]/, include_end = false ,timeout = 3, silent = true)
@@ -74,10 +162,42 @@ end
 
 def start_nav
 	ensure_at_helm
-	check_city = Lich::Util.quiet_command("look ocean", //, end_pattern = /(Open waters: (.*)|Obvious paths: (.*))/, include_end = false ,timeout = 3, silent = true)
-	if check_city.to_s =~ /Potential docking options include (.*)./
+	check_city = Lich::Util.quiet_command("look ocean", //, end_pattern = /(Open waters: (.*)|Obvious paths: (.*))/, include_end = true ,timeout = 3, silent = true)
+	if check_city.to_s =~ /Potential docking options include (.*).|Open waters: (.*)/
 		nil
 		ship_flag
+	elsif check_city.to_s =~ /Obvious paths: (.*)/
+		if Room.current.id.between?(29039, 29042)
+			$mast_count = 1
+		elsif Room.current.id.between?(310145, 310147)
+			$mast_count = 2
+		elsif Room.current.id.between?(30119, 30127)
+			$mast_count = 2
+		elsif Room.current.id.between?(30176, 30185)
+			$mast_count = 2
+		elsif Room.current.id.between?(30166, 30175)
+			$mast_count = 2
+		elsif Room.current.id.between?(30129, 30139)
+			$mast_count = 3
+		end
+		if $mast_count >= 1
+			main_mast
+			fput "pull gang"
+			lower_sail
+		end
+		if $mast_count >= 2
+			forward_mast
+			lower_sail
+		end
+		if $mast_count == 3
+			mid_mast
+			lower_sail
+		end
+		ensure_at_helm
+		raise_anchor
+		waitrt?
+		fput "depart"
+		fput "depart"
 	else
 		echo "Please get your ship underway, then restart Sail2.lic."
 		exit
@@ -85,12 +205,6 @@ def start_nav
 end
 
 def ship_type
-	if Room.current.location != "Ships"
-		echo "You are not currently on a ship! Please restart from your ship."
-		exit
-	else
-		start_nav
-	end
 	if Room.current.id.between?(29039, 29042)
 		$mast_count = 1
 	elsif Room.current.id.between?(310145, 310147)
@@ -101,7 +215,7 @@ def ship_type
 		$mast_count = 2
 	elsif Room.current.id.between?(30166, 30175)
 		$mast_count = 2
-	elsif Room.current.id.between?(30129, 30139)
+	elsif Room.current.id.between?(30128, 30139)
 		$mast_count = 3
 	end
 	#Sloop Map
@@ -336,6 +450,17 @@ def ship_type
 		Room[30130].wayto["30778"] = StringProc.new("fput \"push gang\";fput \"go gang\"")
 		Room[30130].timeto["30778"] = 0.2
 	end
+	if Room.current.location != "Ships"
+		echo "You are not currently on a ship! Please restart from your ship."
+		exit
+	else
+		start_nav
+	end
+end
+
+if script.vars[1] == 'update'
+	sync_all
+	exit
 end
 
 ship_type
@@ -506,26 +631,6 @@ end
 
 def current_sea_room
   $current_room_id.to_s
-end
-
-def wait_for_go2
-  Timeout.timeout(30) do
-    loop do
-      break unless Script.running?("go2")
-      sleep 0.2
-    end
-  end
-rescue Timeout::Error
-  echo "--- WARNING: go2 did not finish within 30 seconds."
-end
-
-def ensure_at_helm
-  return if Room.current.tags.include?("helm")
-
-  echo "--- Moving to helm"
-  start_script("go2", ["helm"])
-  wait_for_go2
-  waitrt?
 end
 
 def set_heading(dir)
