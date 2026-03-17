@@ -1,0 +1,1278 @@
+=begin
+  Flare Window - Real-Time Flare Tracking Window
+
+  Creates a dedicated Wrayth window that tracks your flare activity during combat.
+  It uses flare patterns from flare_patterns.rb and shows summary stats.
+	Flaretracker_2 will no longer be supported but you can continue to use it.
+
+  Tracking scope:
+    - Only tracks while Lich claim is active for you/group (Lich::Claim.mine?).
+    - Outside claim, tracking pauses to avoid picking up room traffic.
+
+  Persistence:
+    - Flare stats and combo history persist between sessions per character in
+      data/<game>/<char>/flarewindow_data.yaml.
+    - The highest combo record is stored separately inside that file and survives
+      resets (use ;send fwcombo reset to clear it explicitly).
+    - The Discord webhook URL is saved in CharSettings (character-specific,
+      persistent across sessions).
+
+  Usage:
+    ;flarewindow
+
+  Startup Options:
+    ;flarewindow              - Start with persisted data (display mode COMBOS ONLY)
+    ;flarewindow none         - Display COMBOS ONLY (default)
+    ;flarewindow full         - Display FLARES ONLY (all flares)
+    ;flarewindow top5         - Display FLARES ONLY (top 5 flares)
+    ;flarewindow top <N>      - Display FLARES ONLY (top N flares, e.g. top 10)
+    ;flarewindow import       - Import/merge flaretracker_2 yaml data into flarewindow data
+    ;flarewindow reset        - Clear persisted flarewindow data, then start fresh
+    ;flarewindow delete       - Delete persisted flarewindow data file, then start fresh
+
+  Runtime ;send Commands (while running):
+    ;send fwstats             - Output all individual flare stats
+    ;send fwstats top<N>      - Output top N individual flare stats (e.g. fwstats top5)
+    ;send fwcombo             - Copy most recent combo to clipboard
+    ;send fwcombo NUMBER      - Copy combo 2, 3, 4, etc from Recent Combo History
+    ;send fwcombo highest     - Copy highest-ever combo to clipboard
+    ;send fwcombo reset       - Reset highest combo record (does not affect history)
+    ;send fwdiscord set <URL> - Set Discord webhook URL for combo sends
+                                 Example: ;send fwdiscord set https://discord.com/api/webhooks/ID/TOKEN
+                                 URL may optionally be wrapped in parentheses.
+    ;send fwdiscord status    - Show Discord webhook status (URL token is masked)
+    ;send fwdiscord off       - Disable Discord sends and clear saved webhook
+
+  Author: Codex, ClaudeCode, Phocosoen
+  Tags: wrayth, frontend, flares, tracking, window
+  Version: 1.0.0
+=end
+
+module FlareWindow
+  extend self
+
+  no_kill_all
+  require 'yaml'
+  require 'net/http'
+  require 'uri'
+  require 'json'
+
+  WINDOW_ID = 'FlareWindow'
+  WINDOW_TITLE = 'Flares'
+  FLARE_PATTERNS_PATH = File.join($script_dir.to_s, 'flare_patterns.rb')
+  SAVE_INTERVAL_SECONDS = 15
+  SAVE_EVENT_THRESHOLD = 20
+  MAX_STORED_COMBOS = 100
+  RENDER_THROTTLE_SECONDS = 0.15
+  KI_COMBO_LABELS = {
+    3  => 'TRIPLE',
+    4  => 'SUPER',
+    5  => 'HYPER',
+    6  => 'BRUTAL',
+    7  => 'MASTER',
+    8  => 'AWESOME',
+    9  => 'BLASTER',
+    10 => 'MONSTER',
+    11 => 'KING',
+    12 => 'KILLER',
+    13 => 'ULTRA',
+    14 => 'FLAWLESS',
+    15 => 'MASTERWORK',
+    16 => 'PERFECT',
+    17 => 'BRILLIANT',
+    18 => 'RESPLENDENT',
+    19 => 'MAGNIFICIENT',
+    20 => 'SPECTACULAR',
+    21 => 'TRANSCENDENT',
+    22 => 'AVALUKA',
+    23 => 'KENSTROM',
+    24 => 'MARSTREFORN',
+    25 => 'ZISSU',
+    26 => 'NAIKEN',
+    27 => 'NYXUS',
+    28 => 'ESTILD',
+    29 => 'RETSER',
+    30 => 'WYROM'
+
+  }.freeze
+  FLARE_COMBO_TIME_WINDOW = 1.5
+  COMBO_IGNORE_TOKENS = ['DoT', 'FAura1706', 'Defensive', 'Sward319', 'WThorns640', 'VolnArmor', 'Untrammel209', 'TwistedArmor_Augmentation', 'TrollHeart', 'TBlood1125'].freeze
+  MIN_COMBO_CAPTURE = 3
+  MAX_ATTACK_LINES = 240
+  PRE_ATTACK_CONTEXT_SECONDS = 1.0
+
+  def data_dir
+    dir = "#{$data_dir}#{XMLData.game}/#{Char.name}/"
+    Dir.mkdir("#{$data_dir}#{XMLData.game}") unless Dir.exist?("#{$data_dir}#{XMLData.game}")
+    Dir.mkdir(dir) unless Dir.exist?(dir)
+    dir
+  end
+
+  def persisted_data_path
+    File.join(data_dir, 'flarewindow_data.yaml')
+  end
+
+  def flaretracker_data_path
+    File.join(data_dir, 'flaredata.yaml')
+  end
+
+  def initial_persisted_data
+    {
+      'damage_data' => {},
+      'total_attacks' => 0,
+      'highest_as' => 0,
+      'highest_cs' => 0,
+      'total_combos' => 0,
+      'combo_count_sum' => 0,
+      'total_combo_damage' => 0,
+      'current_flare_streak' => 0,
+      'highest_flare_streak' => 0,
+      'signature_combo_counts' => {},
+      'highest_flare_combo' => 0,
+      'combo_history' => [],
+      'highest_combo_event' => {}
+    }
+  end
+
+  def load_persisted_data(path)
+    return initial_persisted_data unless File.exist?(path)
+
+    raw = YAML.safe_load(File.read(path), permitted_classes: [Symbol])
+    return initial_persisted_data unless raw.is_a?(Hash)
+
+    merged = initial_persisted_data.merge(raw)
+    merged['combo_history'] = Array(merged['combo_history']).last(MAX_STORED_COMBOS)
+    merged
+  rescue StandardError
+    initial_persisted_data
+  end
+
+  def save_persisted_data(path, state)
+    payload = {
+      'damage_data' => state[:damage_data].each_with_object({}) { |(k, v), h| h[k.to_s] = Array(v) },
+      'total_attacks' => state[:total_attacks].to_i,
+      'highest_as' => state[:highest_as].to_i,
+      'highest_cs' => state[:highest_cs].to_i,
+      'total_combos' => state[:total_combos].to_i,
+      'combo_count_sum' => state[:combo_count_sum].to_i,
+      'total_combo_damage' => state[:total_combo_damage].to_i,
+      'current_flare_streak' => state[:current_flare_streak].to_i,
+      'highest_flare_streak' => state[:highest_flare_streak].to_i,
+      'signature_combo_counts' => state[:signature_combo_counts].is_a?(Hash) ? state[:signature_combo_counts] : {},
+      'highest_flare_combo' => state[:highest_flare_combo].to_i,
+      'combo_history' => Array(state[:combo_history]).last(MAX_STORED_COMBOS),
+      'highest_combo_event' => state[:highest_combo_event].is_a?(Hash) ? state[:highest_combo_event] : {}
+    }
+
+    temp_path = "#{path}.tmp"
+    File.open(temp_path, 'w') { |f| f.write(payload.to_yaml) }
+    File.rename(temp_path, path)
+  rescue StandardError => e
+    File.delete(temp_path) rescue nil if defined?(temp_path) && File.exist?(temp_path.to_s)
+    echo "flarewindow: save failed (#{e.class}: #{e.message})"
+  end
+
+  def buffer_attack_line(lines, text)
+    return if text.nil? || text.empty? || lines.last == text
+
+    lines << text
+    lines.shift while lines.size > MAX_ATTACK_LINES
+  end
+
+  def save_if_needed(path, state, last_save_at, event_counter, force: false)
+    should_save = force || event_counter >= SAVE_EVENT_THRESHOLD || (Time.now - last_save_at) >= SAVE_INTERVAL_SECONDS
+    return [last_save_at, event_counter] unless should_save
+
+    save_persisted_data(path, state)
+    [Time.now, 0]
+  end
+
+  def import_flaretracker_data(existing_data)
+    src_path = flaretracker_data_path
+    return [nil, "flarewindow: flaretracker source not found at #{src_path}."] unless File.exist?(src_path)
+
+    src = YAML.safe_load(File.read(src_path), permitted_classes: [Symbol])
+    return [nil, 'flarewindow: flaretracker yaml is invalid.'] unless src.is_a?(Hash)
+
+    src_damage = src['damage_data']
+    return [nil, 'flarewindow: flaretracker yaml missing damage_data.'] unless src_damage.is_a?(Hash)
+
+    merged = initial_persisted_data.merge(existing_data || {})
+    merged['damage_data'] ||= {}
+
+    imported_rows = 0
+    src_damage.each do |k, v|
+      key = k.to_s
+      vals = Array(v)
+      merged['damage_data'][key] ||= []
+      merged['damage_data'][key].concat(vals)
+      imported_rows += vals.size
+    end
+
+    merged['total_attacks'] = merged['total_attacks'].to_i + src['total_attacks'].to_i
+    imported_combo = src.dig('highest_combo', 'flare_count')&.to_i || 0
+    merged['highest_flare_combo'] = [merged['highest_flare_combo'].to_i, imported_combo].max
+    merged['highest_as'] = merged['highest_as'].to_i
+    merged['highest_cs'] = merged['highest_cs'].to_i
+    merged['total_combos'] = merged['total_combos'].to_i
+    merged['combo_count_sum'] = merged['combo_count_sum'].to_i
+    merged['total_combo_damage'] = merged['total_combo_damage'].to_i
+    merged['current_flare_streak'] = merged['current_flare_streak'].to_i
+    merged['highest_flare_streak'] = merged['highest_flare_streak'].to_i
+    merged['signature_combo_counts'] = merged['signature_combo_counts'].is_a?(Hash) ? merged['signature_combo_counts'] : {}
+    merged['combo_history'] = Array(merged['combo_history']).last(MAX_STORED_COMBOS)
+    merged['highest_combo_event'] = merged['highest_combo_event'].is_a?(Hash) ? merged['highest_combo_event'] : {}
+
+    message = "flarewindow: imported #{imported_rows} flare records from flaretracker_2."
+    [merged, message]
+  rescue StandardError => e
+    [nil, "flarewindow: import failed (#{e.class}: #{e.message})"]
+  end
+
+  def parse_startup_options
+    args = Script.current.vars[1..].to_a.map { |v| v.to_s.strip.downcase }.reject(&:empty?)
+
+    options = {
+      action: nil,
+      display_mode: :none, # default
+      top_n: nil,
+      unknown: []
+    }
+
+    idx = 0
+    while idx < args.size
+      token = args[idx]
+      case token
+      when 'reset', 'delete', 'import'
+        options[:action] = token
+      when 'none'
+        options[:display_mode] = :none
+        options[:top_n] = nil
+      when 'full'
+        options[:display_mode] = :full
+        options[:top_n] = nil
+      when /\Atop(\d+)\z/
+        n = Regexp.last_match(1).to_i
+        if n.positive?
+          options[:display_mode] = :top
+          options[:top_n] = n
+        else
+          options[:unknown] << token
+        end
+      when 'top'
+        nxt = args[idx + 1]
+        if nxt && nxt =~ /\A\d+\z/
+          n = nxt.to_i
+          if n.positive?
+            options[:display_mode] = :top
+            options[:top_n] = n
+          else
+            options[:unknown] << "top #{nxt}"
+          end
+          idx += 1
+        else
+          options[:unknown] << token
+        end
+      else
+        options[:unknown] << token
+      end
+      idx += 1
+    end
+
+    options
+  rescue StandardError
+    { action: nil, display_mode: :none, top_n: nil, unknown: [] }
+  end
+
+  def sanitize_xml(value)
+    value.to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;').gsub("'", '&apos;').gsub('"', '&quot;')
+  end
+
+  def fmt_int(value)
+    value.to_i.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
+  end
+
+  # Match flaretracker_2's calculate_appearance_rate: pct = this flare's hits / ALL flare hits.
+  # (The "1 per X atks" display still uses total_attacks via calc_flares_per_attack.)
+  def calc_rate(flare_hits, total_flare_hits)
+    return 0.0 if total_flare_hits <= 0
+    ((flare_hits.to_f / total_flare_hits) * 100.0).round(1)
+  end
+
+  def calc_flares_per_attack(flare_hits, total_attacks)
+    return 'NA' if flare_hits <= 0 || total_attacks <= 0
+    format('%.1f', total_attacks.to_f / flare_hits)
+  end
+
+  def calc_overall_flare_rate(total_flares, total_attacks)
+    return 0.0 if total_attacks <= 0
+    ((total_flares.to_f / total_attacks) * 100.0).round(1)
+  end
+
+  def combo_label_for(count)
+    KI_COMBO_LABELS[count.to_i]
+  end
+
+  def combo_display_text(count)
+    label = combo_label_for(count)
+    return "#{count} #{label} Combo" if label
+    "#{count} Combo"
+  end
+
+  def summary_line(key, value, width = 19)
+    "#{key.to_s.ljust(width)}: #{value}"
+  end
+
+  def parse_as_cs(line)
+    as_val = nil
+    cs_val = nil
+
+    if (m = line.match(/\bAS:\s*\+?(-?\d+)/i))
+      as_val = m[1].to_i
+    end
+
+    if (m = line.match(/\bCS:\s*\+?(-?\d+)/i))
+      cs_val = m[1].to_i
+    end
+
+    [as_val, cs_val]
+  end
+
+  def claim_owned_room?
+    defined?(Lich::Claim) && Lich::Claim.mine?
+  rescue StandardError
+    false
+  end
+
+  def short_flare_name(flare_type)
+    flare_type.to_s.gsub('_', ' ')[0, 26]
+  end
+
+  def flare_stats(flare_type, values, total_attacks, total_flare_hits)
+    hits = values.size
+    {
+      flare: flare_type,
+      name: short_flare_name(flare_type),
+      total: hits,
+      pct: calc_rate(hits, total_flare_hits),
+      fpa: calc_flares_per_attack(hits, total_attacks)
+    }
+  end
+
+  def build_individual_stats_lines(damage_data, total_attacks, last_seen, limit = nil)
+    ordered = damage_data.keys.sort_by do |flare_type|
+      [-(damage_data[flare_type]&.size || 0), -(last_seen[flare_type] || Time.at(0)).to_f]
+    end
+
+    total_flare_hits = damage_data.values.sum { |v| Array(v).size }
+    stats = ordered.map { |ft| flare_stats(ft, damage_data[ft], total_attacks, total_flare_hits) }
+    stats = stats.select { |s| s[:pct].to_f >= 0.1 }
+    stats = stats.first(limit.to_i) if limit && limit.to_i > 0
+
+    return ['No flares tracked yet above 0.1 pct.'] if stats.empty?
+
+    stats.map do |s|
+      "#{s[:name]}: #{fmt_int(s[:total])} | #{s[:pct]} pct equals 1 per #{s[:fpa]} atks"
+    end
+  end
+
+  def open_window
+    return unless $frontend.to_s.downcase == 'stormfront'
+
+    puts("<closeDialog id='#{WINDOW_ID}'/><openDialog type='dynamic' id='#{WINDOW_ID}' title='#{WINDOW_TITLE}' target='#{WINDOW_ID}' scroll='manual' location='main' justify='3' height='120' resident='true'><dialogData id='#{WINDOW_ID}'></dialogData></openDialog>")
+  end
+
+  def close_window
+    return unless $frontend.to_s.downcase == 'stormfront'
+    puts("<closeDialog id='#{WINDOW_ID}'/>")
+  end
+
+  def render_window(damage_data, total_attacks, highest_as, highest_cs, total_combos, combo_count_sum, current_flare_streak, highest_flare_streak, last_seen, highest_flare_combo, display_mode, top_n, last_combo_notice, combo_history, highest_combo_event)
+    return unless $frontend.to_s.downcase == 'stormfront'
+
+    total_flares = damage_data.values.map(&:size).sum
+    overall_rate = calc_overall_flare_rate(total_flares, total_attacks)
+    combos_only = (display_mode == :none)
+
+    output = "<dialogData id='#{WINDOW_ID}' clear='t'>"
+    top = 0
+
+    left_col = 0
+    right_col = 100
+    row_h = 20
+    output += "<label id='sum_l_1' value='Overall Rate' justify='left' left='#{left_col}' top='#{top}' />"
+    output += "<label id='sum_r_1' value='#{sanitize_xml("#{overall_rate} pct")}' justify='left' left='#{right_col}' top='#{top}' />"
+    top += row_h
+    output += "<label id='sum_l_2' value='Total Attacks' justify='left' left='#{left_col}' top='#{top}' />"
+    output += "<label id='sum_r_2' value='#{sanitize_xml(fmt_int(total_attacks))}' justify='left' left='#{right_col}' top='#{top}' />"
+    top += row_h
+    output += "<label id='sum_l_3' value='Total Flares' justify='left' left='#{left_col}' top='#{top}' />"
+    output += "<label id='sum_r_3' value='#{sanitize_xml(fmt_int(total_flares))}' justify='left' left='#{right_col}' top='#{top}' />"
+    top += row_h
+    combo_rate = if total_attacks > 0
+                   format('%.2f pct', (total_combos.to_f / total_attacks.to_f) * 100.0)
+                 else
+                   '0.00 pct'
+                 end
+    output += "<label id='sum_l_4' value='Combo Rate' justify='left' left='#{left_col}' top='#{top}' />"
+    output += "<label id='sum_r_4' value='#{sanitize_xml(combo_rate)}' justify='left' left='#{right_col}' top='#{top}' />"
+    top += row_h
+    output += "<label id='sum_l_5' value='Total Combos' justify='left' left='#{left_col}' top='#{top}' />"
+    output += "<label id='sum_r_5' value='#{sanitize_xml(fmt_int(total_combos))}' justify='left' left='#{right_col}' top='#{top}' />"
+    top += row_h
+    streak_text = fmt_int(current_flare_streak)
+    output += "<label id='sum_l_6' value='Flare Streak' justify='left' left='#{left_col}' top='#{top}' />"
+    output += "<label id='sum_r_6' value='#{sanitize_xml(streak_text)}' justify='left' left='#{right_col}' top='#{top}' />"
+    top += row_h
+
+    if combos_only
+      output += "<label id='highscore_sep_top' value='-----------------------------------' justify='left' left='0' top='#{top}' />"
+      top += row_h
+      output += "<link id='highscore_link' value='Click - High Scores' cmd=';send fwcombo highest' echo='Sending High Scores List...' justify='left' left='0' top='#{top}' />"
+      top += row_h
+      output += "<label id='highscore_sep_bottom' value='-----------------------------------' justify='left' left='0' top='#{top}' />"
+      top += row_h
+
+      recent_combos = Array(combo_history).last(10).reverse
+      if recent_combos.any?
+        output += "<label id='combo_hdr' value='Click - Recent Combos' justify='left' left='0' top='#{top}' />"
+        top += 20
+        recent_combos.each_with_index do |evt, idx|
+          ts = evt['timestamp'].to_i > 0 ? Time.at(evt['timestamp'].to_i) : Time.now
+          label = "#{ts.strftime('%H:%M')} - #{combo_display_text(evt['count'].to_i)}"
+          output += "<link id='combo_link_#{idx + 1}' value='#{sanitize_xml(label)}' cmd=';send fwcombo #{idx + 1}' echo='Copying combo #{idx + 1} to clipboard...' justify='left' left='0' top='#{top}' />"
+          top += 20
+        end
+      end
+    end
+
+    if combos_only
+      output += '</dialogData>'
+      puts(output)
+      return
+    end
+
+    ordered = damage_data.keys.sort_by do |flare_type|
+      [-(damage_data[flare_type]&.size || 0), -(last_seen[flare_type] || Time.at(0)).to_f]
+    end
+
+    ordered = ordered.first(top_n) if display_mode == :top && top_n && top_n > 0
+    total_flare_hits = damage_data.values.sum { |v| Array(v).size }
+    stats = ordered.map { |ft| flare_stats(ft, damage_data[ft], total_attacks, total_flare_hits) }
+
+    row_height = 20
+    col_left = 0
+    col_right = 260
+
+    if stats.empty?
+      output += "<label id='empty' value='No flares tracked yet.' justify='left' left='0' top='#{top}' />"
+    else
+      stats.each_slice(2).with_index do |pair, row|
+        pair.each_with_index do |s, col|
+          left = col == 0 ? col_left : col_right
+          value = "#{s[:name]}: #{fmt_int(s[:total])}"
+          output += "<label id='ft_#{row}_#{col}' value='#{sanitize_xml(value)}' justify='left' left='#{left}' top='#{top + (row * (row_height * 2))}' />"
+        end
+        pair.each_with_index do |s, col|
+          left = col == 0 ? col_left : col_right
+          value = "#{s[:pct]} pct equals 1 per #{s[:fpa]} atks"
+          output += "<label id='rp_#{row}_#{col}' value='#{sanitize_xml(value)}' justify='left' left='#{left}' top='#{top + (row * (row_height * 2)) + row_height}' />"
+        end
+      end
+    end
+
+    output += '</dialogData>'
+    puts(output)
+  end
+
+  def notify_missing_patterns
+    echo 'flarewindow: missing flare_patterns.rb. Run: ;repo download flare_patterns.rb'
+  end
+
+  def parse_damage_from_line(line)
+    values = []
+    values << Regexp.last_match(1).to_i if line =~ /(\d+) points? of damage!/i
+    values << Regexp.last_match(1).to_i if line =~ /suffers an additional (\d+) damage!/i
+    if (m = line.match(/You feel (\d+) mana surge into you|You gain (\d+) mana/i))
+      values << (m[1] || m[2]).to_i
+    end
+    values
+  end
+
+  def record_flare_event!(flare_type, total_damage, damage_data, last_seen)
+    damage_data[flare_type] ||= []
+    damage_data[flare_type] << (total_damage.nil? ? nil : total_damage)
+    last_seen[flare_type] = Time.now
+
+    damage_label = total_damage.nil? ? 'no damage captured' : "damage #{total_damage}"
+    {
+      flare: flare_type,
+      flare_name: flare_type.to_s.gsub('_', ' '),
+      damage: total_damage,
+      parsed: "#{flare_type}: #{damage_label}"
+    }
+  end
+
+  def combo_ignored_flare?(flare_type)
+    COMBO_IGNORE_TOKENS.any? { |tok| flare_type.to_s.include?(tok) }
+  end
+
+  def format_combo_export(combo_event)
+    lines = []
+    lines << "Flare Combo Capture"
+    lines << "Time: #{combo_event['time']}"
+    lines << "Character: #{Char.name}"
+    count = combo_event['count'].to_i
+    label = combo_label_for(count)
+    lines << "Combo: #{label ? "#{count} #{label}" : count}"
+    lines << "Flares: #{combo_event['flare_names'].join(', ')}"
+    lines << ''
+    lines << 'Parsed Flare Lines:'
+    if combo_event['parsed_lines'].empty?
+      lines << '  (none)'
+    else
+      combo_event['parsed_lines'].each { |l| lines << "  #{l}" }
+    end
+    lines << ''
+    lines << 'Attack Transcript:'
+    if combo_event['attack_lines'].empty?
+      lines << '  (none)'
+    else
+      combo_event['attack_lines'].each { |l| lines << "  #{l}" }
+    end
+    lines.join("\n")
+  end
+
+  def build_high_scores_export(highest_combo_event, highest_as, highest_cs, damage_data, total_attacks, total_combos, combo_count_sum, total_combo_damage, current_flare_streak, highest_flare_streak, signature_combo_counts, combo_history)
+    lines = []
+    lines << 'Flarewindow High Scores List'
+    lines << "Generated: #{Time.now.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+    lines << "Character: #{Char.name}"
+    lines << ''
+    lines << "Highest AS: #{fmt_int(highest_as)}"
+    lines << "Highest CS: #{fmt_int(highest_cs)}"
+    lines << ''
+
+    mvf_type = damage_data.keys.max_by { |k| damage_data[k].size }
+    mvf_hits = mvf_type ? damage_data[mvf_type].size : 0
+    mvf_name = mvf_type ? mvf_type.to_s.gsub('_', ' ') : 'N/A'
+    lines << "Most Valuable Flare (MVF): #{mvf_name} (#{fmt_int(mvf_hits)} procs)"
+
+    combo_level = total_combos.to_i > 0 ? (combo_count_sum.to_f / total_combos.to_f) : 0.0
+    lines << "Combo Level: #{format('%.2f', combo_level)}"
+    avg_combo_damage = total_combos.to_i > 0 ? (total_combo_damage.to_f / total_combos.to_f) : 0.0
+    lines << "Average Combo Damage: #{format('%.2f', avg_combo_damage)}"
+    lines << "Best Flare Streak: #{fmt_int(highest_flare_streak)}"
+
+    if combo_history.any?
+      mode_counts = Hash.new(0)
+      combo_history.each { |evt| mode_counts[evt['count'].to_i] += 1 }
+      mode_combo = mode_counts.max_by { |k, v| [v, k] }
+      if mode_combo
+        label = combo_label_for(mode_combo[0])
+        combo_text = label ? "#{mode_combo[0]} #{label}" : mode_combo[0].to_s
+        lines << "Most Common Combo: #{combo_text} (#{fmt_int(mode_combo[1])} times)"
+      end
+    else
+      lines << 'Most Common Combo: N/A'
+    end
+
+    top_damage_type = damage_data.keys.max_by do |k|
+      Array(damage_data[k]).select { |v| v.is_a?(Numeric) }.sum
+    end
+    if top_damage_type
+      top_damage_vals = Array(damage_data[top_damage_type]).select { |v| v.is_a?(Numeric) }
+      top_damage_sum = top_damage_vals.sum
+      lines << "Top Damage Flare: #{top_damage_type.to_s.gsub('_', ' ')} (#{fmt_int(top_damage_sum)} total damage)"
+    else
+      lines << 'Top Damage Flare: N/A'
+    end
+
+    highest_single = damage_data.each_with_object([]) do |(k, vals), arr|
+      Array(vals).each do |v|
+        arr << [k, v.to_i] if v.is_a?(Numeric)
+      end
+    end.max_by { |entry| entry[1] }
+    if highest_single
+      lines << "Highest Single-Hit Flare: #{highest_single[0].to_s.gsub('_', ' ')} (#{fmt_int(highest_single[1])})"
+    else
+      lines << 'Highest Single-Hit Flare: N/A'
+    end
+
+    if signature_combo_counts.is_a?(Hash) && !signature_combo_counts.empty?
+      sig, count = signature_combo_counts.max_by { |_k, v| v.to_i }
+      lines << "Signature Combo: #{sig} (#{fmt_int(count)} times)"
+    else
+      lines << 'Signature Combo: N/A'
+    end
+
+    lines << ''
+    lines << '--------------------------------'
+    lines << 'Highest Combo (Detailed)'
+    lines << '--------------------------------'
+    lines << format_combo_export(highest_combo_event)
+    lines.join("\n")
+  end
+
+  def copy_to_clipboard(text)
+    begin
+      require 'copy_to_clipboard'
+      if defined?(CopyToClipboard)
+        CopyToClipboard.copy(text.to_s)
+        return true
+      end
+    rescue LoadError
+      # gem not available; try next method
+    rescue StandardError
+      # fall through
+    end
+
+    begin
+      require 'win32/clipboard'
+      Win32::Clipboard.set_data(text.to_s)
+      return true
+    rescue LoadError
+      # gem not available; try next method
+    rescue StandardError
+      # fall through
+    end
+
+    begin
+      IO.popen('clip', 'w') { |io| io.write(text.to_s) }
+      return true
+    rescue StandardError
+      false
+    end
+  end
+
+  def discord_webhook_url
+    raw = nil
+    begin
+      raw = ::CharSettings['flarewindow_discord_webhook']
+      raw = ::CharSettings[:flarewindow_discord_webhook] if raw.to_s.strip.empty?
+    rescue StandardError
+      raw = nil
+    end
+
+    text = raw.to_s.strip
+    return '' if text.empty?
+
+    if (m = text.match(/\((https?:\/\/discord(?:app)?\.com\/api\/webhooks\/[^)\s]+)\)/i))
+      return m[1]
+    end
+
+    text
+  rescue StandardError
+    ''
+  end
+
+  def discord_enabled?
+    !discord_webhook_url.empty?
+  end
+
+  def set_discord_webhook(value)
+    ::CharSettings['flarewindow_discord_webhook'] = value.to_s
+  rescue StandardError
+    nil
+  end
+
+  def send_combo_to_discord(combo_text, combo_event)
+    url = discord_webhook_url
+    return :not_configured if url.empty?
+
+    file_name = "flare_combo_#{Time.now.strftime('%Y%m%d_%H%M%S')}.txt"
+
+    uri = URI.parse(url)
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = (uri.scheme == 'https')
+    http.open_timeout = 3
+    http.read_timeout = 5
+
+    payload = {
+      username: "#{Char.name} FlareWindow"
+    }
+
+    boundary = "----FlareWindowBoundary#{rand(1_000_000_000)}"
+    body = +''
+    body << "--#{boundary}\r\n"
+    body << "Content-Disposition: form-data; name=\"payload_json\"\r\n"
+    body << "Content-Type: application/json\r\n\r\n"
+    body << payload.to_json
+    body << "\r\n"
+    body << "--#{boundary}\r\n"
+    body << "Content-Disposition: form-data; name=\"file\"; filename=\"#{file_name}\"\r\n"
+    body << "Content-Type: text/plain\r\n\r\n"
+    body << combo_text.to_s
+    body << "\r\n--#{boundary}--\r\n"
+
+    req = Net::HTTP::Post.new(uri.request_uri)
+    req['Content-Type'] = "multipart/form-data; boundary=#{boundary}"
+    req.body = body
+    res = http.request(req)
+    return "HTTP #{res.code}" unless res.code.to_i.between?(200, 299)
+
+    :ok
+  rescue StandardError => e
+    "#{e.class}: #{e.message}"
+  end
+
+  unless File.exist?(FLARE_PATTERNS_PATH)
+    notify_missing_patterns
+    exit
+  end
+
+  load FLARE_PATTERNS_PATH
+
+  unless defined?(DMGFLARE_PATTERNS) && defined?(NODMGFLARE_PATTERNS) && defined?(ATTACK_PATTERNS)
+    echo 'flarewindow: required flare pattern constants are missing.'
+    exit
+  end
+
+  compiled_dmg_patterns = DMGFLARE_PATTERNS.transform_values { |p| Regexp.new(p) }
+  compiled_nodmg_patterns = NODMGFLARE_PATTERNS.transform_values { |p| Regexp.new(p) }
+  compiled_attack_patterns = ATTACK_PATTERNS.transform_values { |p| Regexp.new(p) }
+  combined_patterns = compiled_nodmg_patterns.merge(compiled_dmg_patterns).merge(compiled_attack_patterns)
+
+  persist_path = persisted_data_path
+  startup = parse_startup_options
+  action = startup[:action]
+  display_mode = startup[:display_mode]
+  top_n = startup[:top_n]
+
+  case action
+  when 'reset'
+    save_persisted_data(persist_path, {
+      damage_data: Hash.new { |h, k| h[k] = [] },
+      total_attacks: 0, highest_as: 0, highest_cs: 0,
+      total_combos: 0, combo_count_sum: 0, total_combo_damage: 0,
+      current_flare_streak: 0, highest_flare_streak: 0,
+      signature_combo_counts: {}, highest_flare_combo: 0,
+      combo_history: [], highest_combo_event: {}
+    })
+    echo 'flarewindow: persisted data reset on startup.'
+  when 'delete'
+    File.delete(persist_path) if File.exist?(persist_path)
+    echo 'flarewindow: persisted data file deleted on startup.'
+  when 'import'
+    existing = load_persisted_data(persist_path)
+    imported, msg = import_flaretracker_data(existing)
+    echo msg
+    if imported
+      save_persisted_data(persist_path, {
+        damage_data: Hash(imported['damage_data']),
+        total_attacks: imported['total_attacks'].to_i,
+        highest_as: imported['highest_as'].to_i,
+        highest_cs: imported['highest_cs'].to_i,
+        total_combos: imported['total_combos'].to_i,
+        combo_count_sum: imported['combo_count_sum'].to_i,
+        total_combo_damage: imported['total_combo_damage'].to_i,
+        current_flare_streak: imported['current_flare_streak'].to_i,
+        highest_flare_streak: imported['highest_flare_streak'].to_i,
+        signature_combo_counts: Hash(imported['signature_combo_counts']),
+        highest_flare_combo: imported['highest_flare_combo'].to_i,
+        combo_history: Array(imported['combo_history']),
+        highest_combo_event: imported['highest_combo_event']
+      })
+    end
+  end
+
+  unless startup[:unknown].empty?
+    echo "flarewindow: unknown startup option(s): #{startup[:unknown].join(', ')}"
+    echo 'flarewindow: valid options include import, reset, delete, none, full, top#'
+  end
+
+  mode_label = case display_mode
+               when :none then 'COMBOS ONLY'
+               when :full then 'FLARES ONLY'
+               when :top then "FLARES ONLY (TOP #{top_n})"
+               else 'COMBOS ONLY'
+               end
+  echo "flarewindow: display mode #{mode_label}."
+  echo "flarewindow: startup action #{action}." if action
+  if discord_enabled?
+    echo 'flarewindow: Discord combo send ON.'
+  else
+    echo 'flarewindow: Discord combo send OFF.'
+    echo "flarewindow: setup -> ;send fwdiscord set https://discord.com/api/webhooks/ID/TOKEN"
+  end
+
+  persisted = load_persisted_data(persist_path)
+
+  damage_data = Hash.new { |h, k| h[k] = [] }
+  Hash(persisted['damage_data']).each { |k, v| damage_data[k.to_sym] = Array(v) }
+  combo_history = Array(persisted['combo_history']).last(MAX_STORED_COMBOS)
+  highest_combo_event = persisted['highest_combo_event'].is_a?(Hash) ? persisted['highest_combo_event'] : {}
+
+  last_seen = {}
+  damage_data.each_key { |k| last_seen[k] = Time.now }
+  total_attacks = persisted['total_attacks'].to_i
+  highest_as = persisted['highest_as'].to_i
+  highest_cs = persisted['highest_cs'].to_i
+  total_combos = persisted['total_combos'].to_i
+  combo_count_sum = persisted['combo_count_sum'].to_i
+  total_combo_damage = persisted['total_combo_damage'].to_i
+  current_flare_streak = persisted['current_flare_streak'].to_i
+  highest_flare_streak = persisted['highest_flare_streak'].to_i
+  signature_combo_counts = Hash(persisted['signature_combo_counts'])
+  if total_combos <= 0 && combo_history.any?
+    total_combos = combo_history.size
+    combo_count_sum = combo_history.map { |evt| evt['count'].to_i }.sum
+  end
+  if total_combo_damage <= 0 && combo_history.any?
+    total_combo_damage = combo_history.map { |evt| evt['combo_damage'].to_i }.sum
+  end
+  if signature_combo_counts.empty? && combo_history.any?
+    combo_history.each do |evt|
+      sig = evt['signature'].to_s.strip
+      next if sig.empty?
+      signature_combo_counts[sig] = signature_combo_counts.fetch(sig, 0).to_i + 1
+    end
+  end
+  highest_flare_combo = persisted['highest_flare_combo'].to_i
+
+  attack_open = false
+  current_attack_flare_count = 0
+  current_attack_combo_damage = 0
+  current_attack_lines = []
+  current_attack_parsed = []
+  current_attack_flare_names = []
+  flare_events = []
+
+  claim_active = claim_owned_room?
+  pre_attack_context = []
+
+  dirty = true
+  last_render = Time.at(0)
+  last_save_at = Time.now
+  event_counter = 0
+  last_combo_notice = nil
+
+  handle_combo_copy = lambda do |index_text|
+    evt = nil
+    if index_text.to_s.strip.downcase == 'highest'
+      evt = highest_combo_event if highest_combo_event.is_a?(Hash) && highest_combo_event['count'].to_i > 0
+      unless evt
+        echo 'flarewindow: highest combo record not found.'
+        next
+      end
+    else
+      idx = index_text.to_i
+      if idx <= 0
+        echo 'flarewindow: invalid combo index.'
+        next
+      end
+
+      recent = combo_history.last(10).reverse
+      evt = recent[idx - 1]
+      unless evt
+        echo "flarewindow: combo index #{idx} not found."
+        next
+      end
+    end
+
+    combo_text = if index_text.to_s.strip.downcase == 'highest'
+                   build_high_scores_export(
+                     evt,
+                     highest_as,
+                     highest_cs,
+                     damage_data,
+                     total_attacks,
+                     total_combos,
+                     combo_count_sum,
+                     total_combo_damage,
+                     current_flare_streak,
+                     highest_flare_streak,
+                     signature_combo_counts,
+                     combo_history
+                   )
+                 else
+                   format_combo_export(evt)
+                 end
+    copied = copy_to_clipboard(combo_text)
+    discord_result = send_combo_to_discord(combo_text, evt)
+    ts = evt['timestamp'].to_i > 0 ? Time.at(evt['timestamp'].to_i).strftime('%Y-%m-%d %H:%M:%S %Z') : evt['time'].to_s
+    clip_msg = copied ? 'copied to clipboard' : 'available in yaml (clipboard copy failed)'
+    discord_msg = case discord_result
+                  when :ok
+                    'sent to Discord'
+                  when :not_configured
+                    'Discord not configured'
+                  else
+                    "Discord send failed (#{discord_result})"
+                  end
+    echo "flarewindow: combo from #{ts} #{clip_msg}; #{discord_msg}."
+  end
+
+  finalize_attack = lambda do |reason|
+    # Match flaretracker_2 behavior: combo resolution is driven by recent flare events
+    # at Roundtime, not strictly by seeing an explicit attack pattern first.
+    if !attack_open && current_attack_flare_count <= 0
+      flare_events = []
+      return
+    end
+
+    if current_attack_flare_count > 0
+      current_flare_streak += 1
+      highest_flare_streak = [highest_flare_streak, current_flare_streak].max
+    else
+      current_flare_streak = 0
+    end
+
+    if current_attack_flare_count >= MIN_COMBO_CAPTURE
+      combo_signature = current_attack_flare_names.uniq.sort.join(' + ')
+      combo_event = {
+        'time' => Time.now.strftime('%Y-%m-%d %H:%M:%S %Z'),
+        'timestamp' => Time.now.to_i,
+        'count' => current_attack_flare_count,
+        'combo_damage' => current_attack_combo_damage.to_i,
+        'signature' => combo_signature,
+        'reason' => reason,
+        'flare_names' => current_attack_flare_names.uniq,
+        'parsed_lines' => current_attack_parsed.dup,
+        'attack_lines' => current_attack_lines.dup
+      }
+
+      combo_history << combo_event
+      combo_history.shift while combo_history.size > MAX_STORED_COMBOS
+      total_combos += 1
+      combo_count_sum += current_attack_flare_count
+      total_combo_damage += current_attack_combo_damage.to_i
+      signature_combo_counts[combo_signature] = signature_combo_counts.fetch(combo_signature, 0).to_i + 1
+
+      stamp = Time.now.strftime('%Y-%m-%d %H:%M:%S %Z')
+      last_combo_notice = "#{stamp} - #{combo_display_text(current_attack_flare_count)} captured. Click recent combo link to copy."
+      echo "flarewindow: captured #{combo_display_text(current_attack_flare_count)}."
+      event_counter += 1
+      dirty = true
+    end
+
+    highest_flare_combo = [highest_flare_combo, current_attack_flare_count].max
+    if current_attack_flare_count >= MIN_COMBO_CAPTURE && current_attack_flare_count >= highest_flare_combo
+      highest_combo_event = {
+        'time' => Time.now.strftime('%Y-%m-%d %H:%M:%S %Z'),
+        'timestamp' => Time.now.to_i,
+        'count' => current_attack_flare_count,
+        'reason' => reason,
+        'flare_names' => current_attack_flare_names.uniq,
+        'parsed_lines' => current_attack_parsed.dup,
+        'attack_lines' => current_attack_lines.dup
+      }
+    end
+    attack_open = false
+    current_attack_flare_count = 0
+    current_attack_lines = []
+    current_attack_parsed = []
+    current_attack_flare_names = []
+    current_attack_combo_damage = 0
+    flare_events = []
+    dirty = true
+  end
+
+  build_state = lambda {
+    {
+      damage_data: damage_data,
+      total_attacks: total_attacks,
+      highest_as: highest_as,
+      highest_cs: highest_cs,
+      total_combos: total_combos,
+      combo_count_sum: combo_count_sum,
+      total_combo_damage: total_combo_damage,
+      current_flare_streak: current_flare_streak,
+      highest_flare_streak: highest_flare_streak,
+      signature_combo_counts: signature_combo_counts,
+      highest_flare_combo: highest_flare_combo,
+      combo_history: combo_history,
+      highest_combo_event: highest_combo_event
+    }
+  }
+
+  open_window
+  render_window(damage_data, total_attacks, highest_as, highest_cs, total_combos, combo_count_sum, current_flare_streak, highest_flare_streak, last_seen, highest_flare_combo, display_mode, top_n, last_combo_notice, combo_history, highest_combo_event)
+
+  begin
+    pending_line = nil
+    while true
+      line = pending_line || get
+      pending_line = nil
+      stripped = line.to_s.strip
+      now = Time.now
+
+      if stripped =~ /^fwstats(?:\s+(?:top\s*)?(\d+))?$/i
+        limit = Regexp.last_match(1)&.to_i
+        lines = build_individual_stats_lines(damage_data, total_attacks, last_seen, limit)
+        scope = (limit && limit > 0) ? "Top #{limit}" : 'All'
+        echo "flarewindow: #{scope} Individual Flare Stats"
+        lines.each { |l| echo("  #{l}") }
+        next
+      end
+
+      if stripped =~ /^fwcombo\s+reset$/i
+        highest_flare_combo = 0
+        highest_combo_event = {}
+        last_combo_notice = nil
+        last_save_at, event_counter = save_if_needed(persist_path, build_state.call, last_save_at, event_counter, force: true)
+        echo 'flarewindow: highest combo record reset.'
+        dirty = true
+        next
+      end
+
+      if stripped =~ /^fwcombo(?:\s+(\d+|highest))?$/i
+        target = Regexp.last_match(1).to_s.strip
+        target = '1' if target.empty?
+        handle_combo_copy.call(target)
+        next
+      end
+
+      if stripped =~ /^fwdiscord(?:\s+(status|off))?$/i
+        mode = Regexp.last_match(1).to_s.downcase
+        if mode == 'off'
+          set_discord_webhook('')
+          echo 'flarewindow: Discord webhook cleared (OFF).'
+        end
+
+        url = discord_webhook_url
+        if url.empty?
+          echo 'flarewindow: Discord status OFF.'
+          echo "flarewindow: set with -> ;send fwdiscord set https://discord.com/api/webhooks/ID/TOKEN"
+        else
+          masked = url.sub(%r{(https?://discord(?:app)?\.com/api/webhooks/\d+/).+}i, '\1[hidden]')
+          echo "flarewindow: Discord status ON (#{masked})."
+        end
+        next
+      end
+
+      if stripped =~ /^fwdiscord\s+set$/i
+        echo 'flarewindow: missing webhook URL.'
+        echo 'flarewindow: example -> ;send fwdiscord set https://discord.com/api/webhooks/ID/TOKEN'
+        next
+      end
+
+      if stripped =~ /^fwdiscord\s+set\s+(.+)$/i
+        candidate = Regexp.last_match(1).to_s.strip
+        if (m = candidate.match(/\((https?:\/\/discord(?:app)?\.com\/api\/webhooks\/[^)\s]+)\)/i))
+          candidate = m[1]
+        end
+        set_discord_webhook(candidate)
+        if discord_enabled?
+          echo 'flarewindow: Discord webhook saved (ON).'
+        else
+          echo 'flarewindow: Discord webhook not recognized. Use full webhook URL.'
+        end
+        next
+      end
+
+      if claim_active && attack_open && !stripped.empty?
+        current_attack_lines << stripped
+        current_attack_lines.shift while current_attack_lines.size > MAX_ATTACK_LINES
+      elsif claim_active && !attack_open && !stripped.empty?
+        pre_attack_context << [now.to_f, stripped]
+        cutoff = now.to_f - PRE_ATTACK_CONTEXT_SECONDS
+        pre_attack_context.shift while pre_attack_context.any? && pre_attack_context.first[0] < cutoff
+      end
+
+      new_claim_active = claim_owned_room?
+      if new_claim_active != claim_active
+        claim_active = new_claim_active
+        unless claim_active
+          attack_open = false
+          current_attack_flare_count = 0
+          current_attack_combo_damage = 0
+          current_attack_lines = []
+          current_attack_parsed = []
+          current_attack_flare_names = []
+          flare_events = []
+          pre_attack_context = []
+        end
+      end
+
+      if claim_active
+        as_val, cs_val = parse_as_cs(line)
+        if as_val && as_val > highest_as
+          highest_as = as_val
+          event_counter += 1
+          dirty = true
+        end
+        if cs_val && cs_val > highest_cs
+          highest_cs = cs_val
+          event_counter += 1
+          dirty = true
+        end
+
+        if compiled_attack_patterns.any? { |_k, pattern| line =~ pattern }
+          total_attacks += 1
+          unless attack_open
+            attack_open = true
+            current_attack_flare_count = 0
+            current_attack_combo_damage = 0
+            current_attack_lines = pre_attack_context.map { |entry| entry[1] }
+            current_attack_parsed = []
+            current_attack_flare_names = []
+            buffer_attack_line(current_attack_lines, stripped)
+            pre_attack_context = []
+          end
+
+          event_counter += 1
+          dirty = true
+        end
+
+        combined_patterns.each do |flare_type, pattern|
+          next unless line =~ pattern
+
+          # Match flaretracker_2 behavior: ignore attack patterns in flare parsing pass.
+          next if compiled_attack_patterns.key?(flare_type)
+
+          # If a flare is detected before an explicit attack-pattern match, still open
+          # the capture context so high-count combos resolve the same as flaretracker_2.
+          unless attack_open
+            attack_open = true
+            current_attack_flare_count = 0
+            current_attack_combo_damage = 0
+            current_attack_lines = pre_attack_context.map { |entry| entry[1] }
+            current_attack_parsed = []
+            current_attack_flare_names = []
+            pre_attack_context = []
+          end
+
+          flare_events << {
+            type: flare_type,
+            time: Time.now,
+            ignored: combo_ignored_flare?(flare_type),
+            muckled: (respond_to?(:muckled?) ? !!muckled? : false)
+          }
+
+          damage_data[flare_type] ||= []
+
+          is_damaging_pattern = compiled_dmg_patterns.key?(flare_type)
+          is_nodmg_pattern = compiled_nodmg_patterns.key?(flare_type)
+          damage_lines = []
+
+          # Same non-damage gating flaretracker_2 uses for Symbol of Dreams noise.
+          if is_nodmg_pattern && !Effects::Buffs.active?('Symbol of Dreams')
+            damage_data[flare_type] << nil
+            flare_events.last[:damage] = 0
+            flare_events.last[:flare_name] = flare_type.to_s.gsub('_', ' ')
+            flare_events.last[:parsed] = "#{flare_type}: no damage captured"
+            event_counter += 1
+            dirty = true
+            break
+          end
+
+          if (match = line.match(/(\d+) points? of damage!/))
+            damage_lines << match[1].to_i
+          elsif (match = line.match(/suffers an additional (\d+) damage!/))
+            damage_lines << match[1].to_i
+            flare_type = :SanguineSacrifice
+            damage_data[flare_type] ||= []
+            damage_data[flare_type] << match[1].to_i
+            flare_events.last[:type] = flare_type
+            flare_events.last[:damage] = match[1].to_i
+            flare_events.last[:flare_name] = flare_type.to_s.gsub('_', ' ')
+            flare_events.last[:parsed] = "#{flare_type}: damage #{match[1].to_i}"
+            last_seen[flare_type] = Time.now
+            event_counter += 1
+            dirty = true
+            next
+          end
+
+          if is_damaging_pattern && (
+            flare_type.to_s.include?('DoT') ||
+            flare_type.to_s.include?('GEF') ||
+            flare_type.to_s.include?('Firewheel') ||
+            flare_type.to_s.include?('Greater_Rhimar') ||
+            flare_type.to_s.include?('HolyFire') ||
+            flare_type.to_s.include?('ELink1117_Propagation')
+          )
+            5.times do
+              damage_line = get
+              damage_line_stripped = damage_line.to_s.strip
+              buffer_attack_line(current_attack_lines, damage_line_stripped) if claim_active && attack_open
+
+              is_new_pattern = combined_patterns.any? { |_k, pat| damage_line =~ pat }
+              if is_new_pattern
+                pending_line = damage_line
+                break
+              end
+
+              if (match = damage_line.match(/(\d+) points? of damage!/))
+                damage_lines << match[1].to_i
+              elsif damage_line =~ /AS\: .* vs DS\: .* with AvD|Roundtime|CS\: .* vs TD\: .* \+ CvA|is unaffected|with little effect|no effect|thorny barrier surrounding .* blocks|blinks and looks around in confusion for a moment|manages to dodge the licking flames|unharmed by the|scoffs at the/i
+                break
+              end
+            end
+          elsif is_damaging_pattern
+            3.times do
+              damage_line = get
+              damage_line_stripped = damage_line.to_s.strip
+              buffer_attack_line(current_attack_lines, damage_line_stripped) if claim_active && attack_open
+
+              is_new_pattern = combined_patterns.any? { |_k, pat| damage_line =~ pat }
+              if is_new_pattern
+                pending_line = damage_line
+                break
+              end
+
+              if (match = damage_line.match(/(\d+) points? of damage!/))
+                damage_lines << match[1].to_i
+                break
+              elsif damage_line =~ /AS\: .* vs DS\: .* with AvD|Roundtime|CS\: .* vs TD\: .* \+ CvA|is unaffected|with little effect|no effect|thorny barrier surrounding .* blocks|blinks and looks around in confusion for a moment|manages to dodge the licking flames|unharmed by the|scoffs at the/i
+                break
+              elsif (mana_match = damage_line.match(/You feel (\d+) mana surge into you|You gain (\d+) mana/i))
+                mana_val = mana_match[1] || mana_match[2]
+                damage_lines << mana_val.to_i if mana_val
+                break
+              end
+            end
+          end
+
+          if damage_lines.any?
+            total_flare_damage = damage_lines.sum
+            damage_data[flare_type] << total_flare_damage
+            flare_events.last[:damage] = total_flare_damage
+            flare_events.last[:flare_name] = flare_type.to_s.gsub('_', ' ')
+            flare_events.last[:parsed] = "#{flare_type}: damage #{total_flare_damage}"
+            last_seen[flare_type] = Time.now
+          else
+            damage_data[flare_type] << nil
+            flare_events.last[:damage] = 0
+            flare_events.last[:flare_name] = flare_type.to_s.gsub('_', ' ')
+            flare_events.last[:parsed] = "#{flare_type}: no damage captured"
+            last_seen[flare_type] = Time.now
+          end
+
+          event_counter += 1
+          dirty = true
+          break
+        end
+
+        if line =~ /Roundtime/i
+          current_time = Time.now
+          recent_flares = flare_events.select do |event|
+            (current_time - event[:time]) <= FLARE_COMBO_TIME_WINDOW && !event[:ignored] && !event[:muckled]
+          end
+          current_attack_flare_count = recent_flares.size
+          current_attack_combo_damage = recent_flares.map { |e| e[:damage].is_a?(Numeric) ? e[:damage].to_i : 0 }.sum
+          current_attack_flare_names = recent_flares.map { |e| e[:flare_name] }
+          current_attack_parsed = recent_flares.map { |e| e[:parsed] }
+          finalize_attack.call('roundtime')
+        end
+      end
+
+      if dirty && (now - last_render >= RENDER_THROTTLE_SECONDS)
+        render_window(damage_data, total_attacks, highest_as, highest_cs, total_combos, combo_count_sum, current_flare_streak, highest_flare_streak, last_seen, highest_flare_combo, display_mode, top_n, last_combo_notice, combo_history, highest_combo_event)
+        dirty = false
+        last_render = now
+      end
+
+      last_save_at, event_counter = save_if_needed(persist_path, build_state.call, last_save_at, event_counter)
+    end
+  rescue Interrupt
+    # user stop
+  rescue StandardError => e
+    echo "flarewindow error: #{e.class} - #{e.message}"
+  ensure
+    save_if_needed(persist_path, build_state.call, last_save_at, event_counter, force: true)
+
+    render_window(damage_data, total_attacks, highest_as, highest_cs, total_combos, combo_count_sum, current_flare_streak, highest_flare_streak, last_seen, highest_flare_combo, display_mode, top_n, last_combo_notice, combo_history, highest_combo_event)
+    close_window
+  end
+end
