@@ -2,7 +2,7 @@
   Documentation: https://elanthipedia.play.net/Lich_script_development#dependency
 =end
 
-$DEPENDENCY_VERSION = '2.4.4'
+$DEPENDENCY_VERSION = '2.4.7'
 $DR_SCRIPTS_DISCORD_LINK = 'https://discord.gg/f8ne99pVva'
 $MIN_LICH_VERSION = '5.15.0'
 
@@ -25,6 +25,8 @@ unless XMLData.game =~ /^DR/
   exit
 end
 
+echo("Dependency version #{$DEPENDENCY_VERSION}")
+
 while Script.running?('repository')
   echo("Repository is running, pausing for 10 seconds.")
   pause 10
@@ -41,12 +43,15 @@ unless Settings['dependency_version'] == $DEPENDENCY_VERSION
     end
     Script.start("repository", "unset-mapdb-updatable")
   end
+  # Invalidate cached GitHub tree status so we get fresh SHAs
+  Settings['status'] = nil
+  Settings['status_time'] = nil
   Settings['dependency_version'] = $DEPENDENCY_VERSION
   Settings.save
 end
 
 # Merge Settings['autostart'] (per-game global) into UserVars.autostart_scripts (per-character).
-# Settings is script-scoped and per-game — shared across all characters but only dependency can see it.
+# Settings is script-scoped and per-game - shared across all characters but only dependency can see it.
 # We merge on every login so the global list acts as a baseline for all characters.
 # We do NOT clear Settings['autostart'] because it needs to persist for other characters.
 UserVars.autostart_scripts ||= []
@@ -73,7 +78,7 @@ unless UserVars.dependency_setflags
   UserVars.dependency_setflags = Time.now
 end
 
-if defined?(Lich::Common::ArgParser)
+if Lich::Common.const_defined?(:ArgParser, false)
   DRC.message("--- Dependency: ArgParser provided by core Lich. Skipping inline definition.")
 else
   class ArgParser
@@ -208,7 +213,7 @@ else
       item
     end
   end
-end # if/else defined?(Lich::Common::ArgParser)
+end # if/else Lich::Common.const_defined?(:ArgParser, false)
 
 def parse_args(defn, flex_args = false)
   ArgParser.new.parse_args(defn, flex_args)
@@ -244,6 +249,7 @@ class ScriptManager
     @request_authorization = load_personal_github_token
     @versions = nil
     @dependency_updated = false
+    @downloads_occurred = false
   end
 
   def dependency_updated?
@@ -261,7 +267,7 @@ class ScriptManager
   def build_version_hash
     Dir[File.join(SCRIPT_DIR, '*.lic')].each_with_object({}) do |path, versions|
       file = File.basename(path)
-      body = File.open(File.join(SCRIPT_DIR, "#{file}"), 'r').readlines.join('')
+      body = File.binread(File.join(SCRIPT_DIR, file))
       sha = Digest::SHA1.hexdigest('blob' + " #{body.size}" + "\0" + body)
       versions[file] = sha
     end
@@ -269,7 +275,6 @@ class ScriptManager
 
   def get_script(filename, force = false)
     filename = filename.dup
-    echo("checking:#{filename} force:#{force}") if @debug
     download_script(filename, force)
   end
 
@@ -280,7 +285,18 @@ class ScriptManager
   def start_scripts(force = false)
     start_time = Time.now
     @versions = nil
-    repo_scripts.each { |(name, _)| get_script(name, force) }
+    scripts = repo_scripts
+    echo("Checking #{scripts.length} scripts for updates...")
+    updated = 0
+    scripts.each do |(name, _)|
+      updated += 1 if get_script(name, force)
+    end
+    if updated > 0
+      echo("Updated #{updated} script#{updated == 1 ? '' : 's'}.")
+      invalidate_status_cache
+    else
+      echo("All scripts are up to date.")
+    end
     autostarts.each do |script|
       next if handle_obsolete_autostart(script)
 
@@ -292,19 +308,22 @@ class ScriptManager
   end
 
   def download_script(filename, force = false)
-    return if filename.nil? || filename.empty?
+    return false if filename.nil? || filename.empty?
 
     echo("downloading:#{filename}") if @debug
     info = get_file_status(filename)
-    return unless info
-    return if get_versions[filename] == info['sha'] && !force
+    return false unless info
+    return false if get_versions[filename] == info['sha'] && !force
 
     echo("info:#{info}") if @debug
     content = download_raw_file(filename)
-    return unless content
+    return false unless content
 
     File.open(File.join(SCRIPT_DIR, "#{filename}"), 'w') { |file| file.print(content) }
+    @downloads_occurred = true
     @dependency_updated = true if filename == 'dependency.lic'
+    echo("Downloaded #{filename}")
+    true
   end
 
   def verify_or_make_dir(path)
@@ -328,21 +347,26 @@ class ScriptManager
   def check_base_files
     start_time = Time.now
     verify_or_make_dir File.join(SCRIPT_DIR, 'profiles')
-    get_status['tree']
-      .select { |data| data['path'] =~ %r{^profiles/base(?:-empty)?\.yaml$} }
-      .reject { |setup_file|
+    to_update = get_status['tree']
+                .select { |data| data['path'] =~ %r{^profiles/base(?:-empty)?\.yaml$} }
+                .reject { |setup_file|
+                  filename = File.basename(setup_file['path'])
+                  File.exist?(File.join(SCRIPT_DIR, 'profiles', filename)) && setup_file['sha'] == Settings['base_versions'][filename]
+                }
+    if to_update.empty?
+      echo("Base profile files are up to date.")
+    else
+      echo("Updating #{to_update.length} base profile file#{to_update.length == 1 ? '' : 's'}...")
+      to_update.each do |setup_file|
         filename = File.basename(setup_file['path'])
-        File.exist?(File.join(SCRIPT_DIR, 'profiles', filename)) && setup_file['sha'] == Settings['base_versions'][filename]
-      }
-      .each do |setup_file|
-        filename = File.basename(setup_file['path'])
-        echo("downloading #{filename}") if @debug
         content = download_raw_file(setup_file['path'])
         next unless content
 
         File.open(File.join(SCRIPT_DIR, "profiles/#{filename}"), 'w') { |file| file.print(content) }
         Settings['base_versions'][filename] = setup_file['sha']
+        echo("Downloaded #{filename}")
       end
+    end
     Settings.save
     finish_time = Time.now
     run_time = finish_time - start_time
@@ -352,21 +376,26 @@ class ScriptManager
   def check_data_files
     start_time = Time.now
     verify_or_make_dir File.join(SCRIPT_DIR, 'data')
-    get_status['tree']
-      .select { |data| data['path'] =~ %r{^data/base.+yaml$} }
-      .reject { |setup_file|
+    to_update = get_status['tree']
+                .select { |data| data['path'] =~ %r{^data/base.+yaml$} }
+                .reject { |setup_file|
+                  filename = File.basename(setup_file['path'])
+                  File.exist?(File.join(SCRIPT_DIR, 'data', filename)) && setup_file['sha'] == Settings['base_versions'][filename]
+                }
+    if to_update.empty?
+      echo("Data files are up to date.")
+    else
+      echo("Updating #{to_update.length} data file#{to_update.length == 1 ? '' : 's'}...")
+      to_update.each do |setup_file|
         filename = File.basename(setup_file['path'])
-        File.exist?(File.join(SCRIPT_DIR, 'data', filename)) && setup_file['sha'] == Settings['base_versions'][filename]
-      }
-      .each do |setup_file|
-        filename = File.basename(setup_file['path'])
-        echo("downloading #{filename}") if @debug
         content = download_raw_file(setup_file['path'])
         next unless content
 
         File.open(File.join(SCRIPT_DIR, "data/#{filename}"), 'w') { |file| file.print(content) }
         Settings['base_versions'][filename] = setup_file['sha']
+        echo("Downloaded #{filename}")
       end
+    end
     Settings.save
     finish_time = Time.now
     run_time = finish_time - start_time
@@ -385,8 +414,15 @@ class ScriptManager
     get_status['tree'].find { |element| element['path'] == filename }
   end
 
+  def invalidate_status_cache
+    echo("Invalidating cached status (files were downloaded)") if @debug
+    Settings['status'] = nil
+    Settings['status_time'] = nil
+    Settings.save
+  end
+
   def get_status
-    if Settings['status'] && Time.now - Settings['status_time'] <= 3600
+    if Settings['status'] && Time.now - Settings['status_time'] <= 120
       echo("Returning cached status response") if @debug
       return Settings['status']
     end
@@ -507,7 +543,7 @@ class ScriptManager
   end
 end
 
-if defined?(Lich::Common::SetupFiles)
+if Lich::Common.const_defined?(:SetupFiles, false)
   DRC.message("--- Dependency: SetupFiles provided by core Lich. Skipping inline definition.")
 else
   class SetupFiles
@@ -1064,7 +1100,7 @@ else
       OpenStruct.new
     end
   end
-end # if/else defined?(Lich::Common::SetupFiles)
+end # if/else Lich::Common.const_defined?(:SetupFiles, false)
 
 $setupfiles = SetupFiles.new(debug)
 $manager = ScriptManager.new(debug)
@@ -1234,8 +1270,12 @@ def make_map_edits
 end
 
 def get_script(script_name)
-  echo("Force downloading #{script_name}")
-  $manager.get_script(format_name(script_name), true)
+  filename = format_name(script_name)
+  if $manager.get_script(filename, true)
+    echo("#{filename} has been updated.")
+  else
+    echo("#{filename} could not be found in the repository.")
+  end
 end
 
 def force_refresh_scripts
