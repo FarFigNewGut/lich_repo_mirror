@@ -1,0 +1,498 @@
+=begin
+  gritapply.lic: Automates warrior grit (WPS) applications on weapons and armor.
+
+  Handles supply pack purchasing, suffusion, surge, and iterative grit application.
+  Must be run with the target item in your right hand.
+
+        author: Rinkidinkicus (via Claude)
+          game: Gemstone
+          tags: warrior, grit, wps, crafting
+       version: 1.1.0
+
+  Usage:
+    ;gritapply <count> <type>
+    ;gritapply help
+    ;gritapply set workshop=<room number>
+    ;gritapply settings
+
+  Types: crit, damage, sighting
+
+  Version Control:
+    Major_change.feature_addition.bugfix
+  v1.1.0 (2026-03-22)
+    - added help command
+    - added configurable workshop room number via ;gritapply set workshop=<room>
+    - added ;gritapply settings to view current settings
+  v1.0.0 (2026-03-22)
+    - initial version
+=end
+
+#
+# --- HELP & SETTINGS -------------------------------------------------------------
+#
+
+arg1 = Script.current.vars[1].to_s.downcase.strip
+
+if arg1 == "help" || arg1.empty?
+  respond ""
+  respond "  ;gritapply -- Warrior Grit (WPS) Application Script"
+  respond "  ---------------------------------------------------"
+  respond ""
+  respond "  USAGE:"
+  respond "    ;gritapply <count> <type>"
+  respond ""
+  respond "  EXAMPLES:"
+  respond "    ;gritapply 5 crit       Apply 5 critical weighting services"
+  respond "    ;gritapply 3 damage     Apply 3 damage weighting services"
+  respond "    ;gritapply 1 sighting   Apply 1 sighting service"
+  respond ""
+  respond "  TYPES:"
+  respond "    crit      - Critical weighting"
+  respond "    damage    - Damage weighting"
+  respond "    sighting  - Sighting"
+  respond ""
+  respond "  SETUP:"
+  respond "    ;gritapply set workshop=<room#>   Set warrior workshop Lich room ID"
+  respond "    ;gritapply settings               View current settings"
+  respond ""
+  respond "  REQUIREMENTS:"
+  respond "    - Hold the target weapon or armor in your RIGHT hand"
+  respond "    - Must have enough total grit (25,000 per application)"
+  respond "    - Must have enough suffused grit if suffusion is needed"
+  respond "    - Character must have full health, full spirit, no injuries"
+  respond "    - Workshop room must be set before first use"
+  respond ""
+  respond "  HOW IT WORKS:"
+  respond "    1. Checks grit pool and stows the item"
+  respond "    2. Counts existing supply packs in inventory"
+  respond "    3. If needed: goes to bank, withdraws silver note, buys packs"
+  respond "    4. At the workshop: prepares item and supply pack in hands"
+  respond "    5. Checks health/spirit/injuries"
+  respond "    6. For each application:"
+  respond "       - Checks suffuse estimate"
+  respond "       - If suffusion needed: checks pool, surges (if known), applies"
+  respond "       - Runs FEAT WPS ASSESS then FEAT WPS APPLY"
+  respond "    7. Returns home, assesses item, registers it"
+  respond ""
+  respond "  NOTES:"
+  respond "    - Surge of Strength is used automatically if known"
+  respond "    - If surge is on cooldown, the script waits for it"
+  respond "    - If an application fails, the script stops and reports"
+  respond "    - If killed mid-run, items in hand are stowed automatically"
+  respond ""
+  exit
+end
+
+# Handle settings commands
+if arg1 == "set"
+  setting_arg = Script.current.vars[0].to_s.sub(/^set\s+/i, '').strip
+
+  if setting_arg =~ /^workshop\s*=\s*(\d+)$/i
+    room_id = $1.to_i
+    CharSettings['workshop_room'] = room_id
+    echo "Workshop room set to: #{room_id}"
+    echo "This setting is saved per character."
+    exit
+  else
+    echo "Unknown setting. Usage: ;gritapply set workshop=<room number>"
+    exit
+  end
+end
+
+if arg1 == "settings"
+  workshop = CharSettings['workshop_room']
+  respond ""
+  respond "  ;gritapply -- Current Settings (#{Char.name})"
+  respond "  ---------------------------------------------------"
+  respond "  Workshop room: #{workshop ? workshop : '(not set -- use ;gritapply set workshop=<room#>)'}"
+  respond ""
+  exit
+end
+
+#
+# --- VALIDATION ------------------------------------------------------------------
+#
+
+# Check workshop is configured
+workshop_room = CharSettings['workshop_room']
+unless workshop_room
+  echo "Workshop room is not set! Run: ;gritapply set workshop=<room number>"
+  echo "  Example: ;gritapply set workshop=23682"
+  exit
+end
+
+# Parse arguments
+count = Script.current.vars[1].to_i
+type  = Script.current.vars[2].to_s.downcase.strip
+
+if count < 1
+  echo "Usage: ;gritapply <count> <type>"
+  echo "  Run ;gritapply help for full instructions."
+  exit
+end
+
+unless %w[crit damage sighting].include?(type)
+  echo "Invalid type '#{type}'. Must be crit, damage, or sighting."
+  echo "  Run ;gritapply help for full instructions."
+  exit
+end
+
+# Check right hand has a weapon or armor
+item = GameObj.right_hand
+if item.nil? || item.name =~ /^Empty$/i
+  echo "You must be holding the target item in your right hand."
+  exit
+end
+
+unless item.type =~ /weapon|armor/i
+  echo "The item in your right hand (#{item.name}) does not appear to be a weapon or armor."
+  echo "Exiting."
+  exit
+end
+
+item_noun = item.noun
+item_name = item.name
+start_room = Room.current.id
+
+echo "-----------------------------------------"
+echo "Grit Apply: #{count}x #{type} on #{item_name}"
+echo "Workshop: room #{workshop_room}"
+echo "-----------------------------------------"
+
+# Safety cleanup if script is killed mid-run
+before_dying {
+  fput "stow left" if checkleft
+  fput "stow right" if checkright
+}
+
+#
+# --- HELPER: RETURN TO START -----------------------------------------------------
+#
+
+def go_home(start_room)
+  fput "stow left" if checkleft
+  fput "stow right" if checkright
+  Script.run("go2", start_room.to_s)
+end
+
+#
+# --- HELPER: PARSE RESOURCE ------------------------------------------------------
+#
+
+def parse_resource
+  lines = Lich::Util.issue_command("resource", /^Health:/, timeout: 5)
+  result = { total_grit: 0, suffused_grit: 0 }
+
+  lines.each do |line|
+    if line =~ /([\d,]+)\/([\d,]+)\s*\(Total\)/
+      result[:total_grit] = $1.delete(',').to_i
+    end
+    if line =~ /Suffused Grit:\s*([\d,]+)/
+      result[:suffused_grit] = $1.delete(',').to_i
+    end
+  end
+
+  result
+end
+
+#
+# --- HELPER: COUNT SUPPLY PACKS IN INVENTORY -------------------------------------
+#
+
+def count_supply_packs
+  lines = Lich::Util.issue_command("inventory full", /^You are currently/, timeout: 10)
+  lines.count { |line| line =~ /supply pack/i }
+end
+
+#
+# --- HELPER: PARSE SUFFUSE ESTIMATE ----------------------------------------------
+#
+
+def parse_suffuse_estimate(type)
+  lines = Lich::Util.issue_command("suffuse est #{type}", /estimate|does not require/i, timeout: 5)
+  text = lines.join(" ")
+
+  if text =~ /need at least (\d+) suffused energy/i
+    return $1.to_i
+  elsif text =~ /does not require any additional suffused energy/i
+    return 0
+  else
+    return nil  # unexpected output
+  end
+end
+
+#
+# --- HELPER: CHECK HEALTH/SPIRIT/INJURIES ----------------------------------------
+#
+
+def check_readiness
+  problems = []
+
+  unless Char.health >= Char.max_health
+    problems << "Health is not full (#{Char.health}/#{Char.max_health})"
+  end
+
+  unless Char.spirit >= Char.max_spirit
+    problems << "Spirit is not full (#{Char.spirit}/#{Char.max_spirit})"
+  end
+
+  body_parts = [:head, :neck, :chest, :abs, :back, :larm, :rarm, :lhand, :rhand, :lleg, :rleg, :nerves]
+
+  wound_parts = body_parts.select { |part| Wounds.send(part) > 0 }
+  scar_parts  = body_parts.select { |part| Scars.send(part) > 0 }
+
+  if wound_parts.any?
+    problems << "Wounds on: #{wound_parts.join(', ')}"
+  end
+  if scar_parts.any?
+    problems << "Scars on: #{scar_parts.join(', ')}"
+  end
+
+  problems
+end
+
+#
+# --- STEP 1: CHECK GRIT ---------------------------------------------------------
+#
+
+resources = parse_resource
+grit_needed = count * 25_000
+
+if resources[:total_grit] < grit_needed
+  echo "Not enough grit! Need #{grit_needed} total, but you only have #{resources[:total_grit]}."
+  exit
+end
+
+suffused_grit_pool = resources[:suffused_grit]
+echo "Grit OK: #{resources[:total_grit]} available (need #{grit_needed})."
+echo "Suffused Grit: #{suffused_grit_pool}"
+
+#
+# --- STEP 2: STOW ITEM & COUNT EXISTING PACKS -----------------------------------
+#
+
+fput "stow right"
+pause 0.3
+
+existing_packs = count_supply_packs
+packs_to_buy = [count - existing_packs, 0].max
+
+echo "Supply packs in inventory: #{existing_packs}. Need to buy: #{packs_to_buy}."
+
+#
+# --- STEP 3: BANK & PURCHASE ----------------------------------------------------
+#
+
+if packs_to_buy > 0
+  silver_needed = packs_to_buy * 25_000
+
+  # Go to bank and withdraw a note
+  Script.run("go2", "bank")
+  fput "withdraw #{silver_needed} note"
+  pause 1
+
+  # Go to warrior workshop
+  Script.run("go2", workshop_room.to_s)
+
+  # Buy packs one at a time
+  packs_to_buy.times do |i|
+    fput "buy service pack"
+    matchtimeout 10, "Is that acceptable"
+    fput "buy confirm"
+    matchtimeout 10, "hands you"
+    pause 0.3
+    fput "stow my supply pack"
+    pause 0.3
+    echo "Bought supply pack #{i + 1}/#{packs_to_buy}"
+  end
+
+  # Stow leftover note if still holding one
+  fput "stow left" if checkleft
+  fput "stow right" if checkright
+else
+  # Still need to get to the workshop
+  Script.run("go2", workshop_room.to_s)
+end
+
+#
+# --- STEP 4: PREPARE HANDS ------------------------------------------------------
+#
+
+fput "get my #{item_noun}"
+pause 0.3
+fput "get my supply pack"
+pause 0.3
+
+# Verify hands are correct
+unless checkright(item_noun)
+  echo "ERROR: #{item_noun} is not in your right hand. Something went wrong."
+  go_home(start_room)
+  exit
+end
+
+unless checkleft
+  echo "ERROR: No supply pack in left hand. Something went wrong."
+  go_home(start_room)
+  exit
+end
+
+#
+# --- STEP 5: CHECK READINESS ----------------------------------------------------
+#
+
+problems = check_readiness
+if problems.any?
+  echo "Cannot proceed -- character is not ready:"
+  problems.each { |p| echo "  - #{p}" }
+  echo "Returning to starting room..."
+  go_home(start_room)
+  echo "Character is not ready. Please fix the following and try again:"
+  problems.each { |p| echo "  - #{p}" }
+  exit
+end
+
+#
+# --- STEP 6: MAIN APPLICATION LOOP ----------------------------------------------
+#
+
+has_surge = CMan.known?("Surge of Strength")
+successes = 0
+
+count.times do |i|
+  echo "-- Application #{i + 1} of #{count} --"
+
+  #
+  # SUFFUSE ESTIMATE
+  #
+  suffusion_needed = parse_suffuse_estimate(type)
+
+  if suffusion_needed.nil?
+    echo "ERROR: Could not parse suffuse estimate output. Bailing."
+    go_home(start_room)
+    echo "Completed #{successes} successful applications before error."
+    exit
+  end
+
+  #
+  # SUFFUSE IF NEEDED
+  #
+  if suffusion_needed > 0
+    echo "Suffusion needed: #{suffusion_needed}"
+
+    # Check suffused grit pool
+    # Re-check from RESOURCE to be safe
+    current_resources = parse_resource
+    suffused_grit_pool = current_resources[:suffused_grit]
+
+    if suffused_grit_pool < suffusion_needed
+      echo "Not enough suffused grit! Need #{suffusion_needed}, have #{suffused_grit_pool}."
+      go_home(start_room)
+      echo "Ran out of suffused grit after #{successes} successful applications."
+      exit
+    end
+
+    # SURGE if known
+    if has_surge
+      if Effects::Cooldowns.active?("Surge of Strength")
+        remaining = Effects::Cooldowns.time_left("Surge of Strength")
+        echo "Surge of Strength on cooldown. Waiting #{remaining.ceil} seconds..."
+        wait_until { !Effects::Cooldowns.active?("Surge of Strength") }
+      end
+
+      fput "cman surge"
+      pause 1
+    end
+
+    # Re-estimate after surge (per spec)
+    suffusion_needed = parse_suffuse_estimate(type)
+
+    if suffusion_needed.nil?
+      echo "ERROR: Could not parse suffuse estimate after surge. Bailing."
+      go_home(start_room)
+      echo "Completed #{successes} successful applications before error."
+      exit
+    end
+
+    # Apply suffusion if still needed
+    if suffusion_needed > 0
+      fput "suffuse apply #{suffusion_needed}"
+      waitrt?
+      pause 0.5
+    end
+  else
+    echo "No suffusion needed."
+  end
+
+  #
+  # GRIT APPLICATION: ASSESS then APPLY
+  #
+  fput "feat wps assess #{type} #{item_noun}"
+  waitrt?
+  pause 0.3
+
+  # Capture APPLY result
+  # NOTE: The APPLY output echoes the estimate text which contains the word "fail"
+  # in normal success cases (e.g., "you can only fail if you are horribly unlucky").
+  # So we ONLY match on "Success!" and treat timeout as failure.
+  clear
+  put "feat wps apply"
+  result_line = matchtimeout 20, "Success!", "You have failed", "The attempt fails"
+  waitrt?
+
+  if result_line && result_line =~ /Success!/i
+    successes += 1
+    echo "Application #{i + 1}: SUCCESS (#{successes} total)"
+  else
+    # Failure or timeout
+    echo "Application #{i + 1}: FAILED"
+    go_home(start_room)
+    echo "-----------------------------------------"
+    echo "Completed #{successes} successful application(s)."
+    echo "Application #{i + 1} FAILED. Script exiting."
+    echo "-----------------------------------------"
+    exit
+  end
+
+  #
+  # GET NEXT SUPPLY PACK (if more to do)
+  #
+  if i < count - 1
+    fput "get my supply pack"
+    pause 0.3
+
+    unless checkleft
+      echo "ERROR: Could not get another supply pack. May have run out."
+      go_home(start_room)
+      echo "Completed #{successes} successful applications. No more supply packs available."
+      exit
+    end
+  end
+end
+
+#
+# --- STEP 7: FINISH UP ----------------------------------------------------------
+#
+
+echo "All #{count} applications complete!"
+
+# Stow supply pack if still in left hand, keep item in right
+fput "stow left" if checkleft
+
+go_home(start_room)
+
+# Make sure item is in right hand for assess/register
+unless checkright(item_noun)
+  fput "get my #{item_noun}"
+  pause 0.3
+end
+
+fput "assess #{item_noun}"
+waitrt?
+pause 0.3
+
+fput "register #{item_noun}"
+pause 1
+
+echo "-----------------------------------------"
+echo "Grit Apply complete: #{successes}/#{count} #{type} applications successful."
+echo "-----------------------------------------"
