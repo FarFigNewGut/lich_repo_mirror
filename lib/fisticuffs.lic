@@ -5,23 +5,21 @@
    Spiritual Guide: Combo.lic
               game: Gemstone
               tags: UCS, Unarmed, Combo, Brawling
-           version: 1.32
+           version: 1.33
 
   Improvements:
   Major_change.feature_addition.bugfix
     v0.1 - Initial Release
-    v0.2 -    v1.25 - buncha changes, supports fury, clash and spin kick
-    v1.26 - Followups now only come from normal UCS swings, clear on target changes, and stale target positioning falls back to tierup
-    v1.27 - Added optional Twin Hammerfists setup usage before normal UCS swings
-    v1.28 - Adjusted tiering so only excellent positioning uses tier3; decent and good use tierup unless a followup overrides
-    v1.29 - Twin Hammerfists setup is now only attempted once as an opening action instead of repeating during combat
-    v1.30 - Opening Twin Hammerfists now triggers when live hostiles are present even if GS has not populated an explicit current target yet
-    v1.31 - Opening Twin Hammerfists now always schedules followup combat so a miss does not stall the script
-    v1.32 - Simplified return stance handling to wait out RT and send the stance directly at combat end
-    Known issues: Spin kick isn't always fired. Sometimes it likes to jab too much when it shouldn't, not sure if room move works to stop it yet.  Needs more testing
+    v0.2 -    v1.33 - Beta testing release!
+
+
+
+    Known issues: Spin kick isn't always fired. Sometimes it likes to jab too much when it shouldn't.
 =end
 
 require 'timeout'
+
+CLEAR_ROOM_GRACE_SECONDS = 0.5
 
 CharSettings['fisticuffs_tierup'] ||= 'jab'
 CharSettings['fisticuffs_tier3'] ||= 'punch'
@@ -260,6 +258,14 @@ def unreachable_target_regex
   /You can't reach .* from here\./
 end
 
+def control_loss_regex
+  /You are stunned!|You are still stunned\.|unable to muster the will to attack|entangled in a web/
+end
+
+def control_loss_retry_delay
+  0.25
+end
+
 def choose_attack(position, followup_attack = nil)
   return sanitize_attack(followup_attack) if followup_attack && !followup_attack.to_s.strip.empty?
 
@@ -354,11 +360,12 @@ def run_weapon_skill(skill_name)
   cmd = weapon_skill_command(skill_name)
   $fisticuffs_last_action_source = :weapon_skill
   remember_attack_target!
-  raw = dothistimeout cmd, 4, /^You |#{PSMS::FAILURES_REGEXES}|^\.\.\.wait \d+ sec|^\.\.\.wait \d+ seconds\.|^[Ww]ait \d+ sec|^Roundtime:|#{no_target_regex}|#{unreachable_target_regex}/
+  raw = dothistimeout cmd, 4, /^You |#{PSMS::FAILURES_REGEXES}|^\.\.\.wait \d+ sec|^\.\.\.wait \d+ seconds\.|^[Ww]ait \d+ sec|^Roundtime:|#{no_target_regex}|#{unreachable_target_regex}|#{control_loss_regex}/
   result = normalize_tool_result(raw)
 
   return :no_target if result && result.to_s =~ no_target_regex
   return :unreachable if result && result.to_s =~ unreachable_target_regex
+  return [:wait, control_loss_retry_delay] if result && result.to_s =~ control_loss_regex
   wait_seconds = wait_seconds_from_result(result)
   return [:wait, wait_seconds] if wait_seconds
   return false if result.nil?
@@ -369,11 +376,12 @@ rescue
 end
 
 def run_reaction_skill(cmd)
-  raw = dothistimeout cmd, 4, /^You |^\.\.\.wait \d+ sec|^\.\.\.wait \d+ seconds\.|^[Ww]ait \d+ sec|^Roundtime:|#{no_target_regex}|#{unreachable_target_regex}/
+  raw = dothistimeout cmd, 4, /^You |^\.\.\.wait \d+ sec|^\.\.\.wait \d+ seconds\.|^[Ww]ait \d+ sec|^Roundtime:|#{no_target_regex}|#{unreachable_target_regex}|#{control_loss_regex}/
   result = normalize_tool_result(raw)
 
   return :no_target if result && result.to_s =~ no_target_regex
   return :unreachable if result && result.to_s =~ unreachable_target_regex
+  return [:wait, control_loss_retry_delay] if result && result.to_s =~ control_loss_regex
   return false if result.nil?
   true
 rescue
@@ -478,11 +486,11 @@ end
 
 def perform_next_action(position, single_target_id, pending_followup)
   return [:break, pending_followup, nil, nil] if single_target_done?(single_target_id)
-  return [:break, pending_followup, nil, nil] if no_targets_left?
+  return [:wait, pending_followup, nil, control_loss_retry_delay] if no_targets_left?
 
   clash_result = try_clash
   if clash_result == :no_target
-    return [:break, pending_followup, nil, nil]
+    return [:wait, pending_followup, nil, control_loss_retry_delay]
   elsif clash_result == :unreachable
     unreachable_state, attack_result = handle_unreachable_target(position, pending_followup)
     return [:wait, pending_followup, nil, 0.25] if unreachable_state == :wait
@@ -495,7 +503,7 @@ def perform_next_action(position, single_target_id, pending_followup)
 
   fury_result = try_fury
   if fury_result == :no_target
-    return [:break, pending_followup, nil, nil]
+    return [:wait, pending_followup, nil, control_loss_retry_delay]
   elsif fury_result == :unreachable
     unreachable_state, attack_result = handle_unreachable_target(position, pending_followup)
     return [:wait, pending_followup, nil, 0.25] if unreachable_state == :wait
@@ -731,6 +739,7 @@ pending_followup = nil
 pending_followup_target_id = nil
 active_followup_attack = nil
 last_attack_context = nil
+clear_room_since = nil
 
 $fisticuffs_position = "decent"
 $fisticuffs_position_target_id = current_target_id
@@ -751,8 +760,8 @@ if CharSettings['fisticuffs_use_setup'] && (current_target_alive? || living_targ
   setup_result = try_setup
 
   if setup_result == :no_target
-    reset_sticky_excellent!
-    cleanup_and_exit
+    next_action_at = Time.now + control_loss_retry_delay
+    attack_result = nil
   elsif setup_result == :unreachable
     next_action_at = Time.now + 0.25
     attack_result = nil
@@ -819,15 +828,26 @@ loop do
     if due_action_result == :break
       break
     elsif due_action_result == :acted
+      clear_room_since = nil
       next
     end
 
-    if no_targets_left? && (!last_attack_at || Time.now - last_attack_at > 0.6)
+    if no_targets_left?
+      clear_room_since ||= Time.now
+    else
+      clear_room_since = nil
+    end
+
+    if clear_room_since &&
+       Time.now - clear_room_since >= CLEAR_ROOM_GRACE_SECONDS &&
+       (!last_attack_at || Time.now - last_attack_at > 0.6)
       break
     end
 
     next
   end
+
+  clear_room_since = nil
 
   if CharSettings['fisticuffs_use_spinkick'] &&
      line.to_s =~ /You could use this opportunity to Spin Kick!?/i
@@ -837,7 +857,7 @@ loop do
       last_attack_at = Time.now
       awaiting_position_refresh = true
     end
-    break if spin_result == :no_target
+    next_action_at = Time.now + control_loss_retry_delay if spin_result == :no_target
     if spin_result == :unreachable
       unreachable_state, attack_result = handle_unreachable_target(position, active_followup_attack)
       if attack_result
@@ -918,7 +938,8 @@ loop do
     pending_followup = nil
     pending_followup_target_id = nil
     reset_sticky_excellent!
-    break
+    clear_room_since ||= Time.now
+    next_action_at = Time.now + control_loss_retry_delay
 
   when /^Try standing up first\.$/,
        /You cannot do that while lying down\./
@@ -964,12 +985,15 @@ loop do
       next_action_at = Time.now + 0.25
     end
 
-  when /You are still stunned/,
+  when /You are stunned!/,
+       /You are still stunned/,
        /unable to muster the will to attack/,
        /entangled in a web/
-    echo "Combat halted."
-    reset_sticky_excellent!
-    break
+    awaiting_position_refresh = false
+    pending_followup = nil
+    pending_followup_target_id = nil
+    active_followup_attack = nil
+    next_action_at = Time.now + control_loss_retry_delay
   end
 
   due_action_result = process_due_action.call
