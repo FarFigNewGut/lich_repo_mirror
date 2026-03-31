@@ -1,0 +1,1038 @@
+=begin
+  payroll.lic: Track per-character bank balances from in-game balance readouts.
+
+
+            author: Bhuryn
+              game: GemStone
+              tags: banking, balances, tracker
+           version: 0.25
+
+  Improvements:
+  Major_change.feature_addition.bugfix
+    v0.1 - Initial release
+    v0.1 - Captures bank balance tables from game output and saves them per character
+    v0.1 - Adds live ;payroll list command while running
+    v0.2 - Adds live ;payroll update and ;payroll u to fetch, read, and stow the bankbook
+    v0.3 - Tracks current-bank teller balance and transaction totals from room/title context and saves them into the same payroll data
+    v0.4 - Expands payroll coverage to all known bank locations from go2 targets with abbreviated columns
+    v0.5 - Splits payroll list output into two narrower table blocks for tiled windows
+    v0.6 - Adds per-bank total rows under each table block and a grand total line across all characters and banks
+    v0.7 - Adds shared daily wealth history and ;payroll <days> reporting for starting wealth, biggest swings, and percent change
+    v0.8 - Uses BANK ACCOUNT for updates, parses both bankbook and bank-account formats, and refreshes automatically on startup and shutdown
+    v0.9 - Borrows ledger's structured YAML/settings shape and XML-stripping approach for more reliable parsing and future growth
+    v0.10 - Fixes BANK ACCOUNT updater to use a single dothistimeout regex union instead of invalid extra arguments
+    v0.11 - Adds ;payroll l as a short alias for list
+    v0.12 - Adds a spaced Total Wealth footer beneath payroll list output
+    v0.13 - Adds a persistent split-tables display setting with one-row output as the default
+    v0.14 - Cleans up help text to show command aliases on shared lines
+    v0.15 - Moves payroll storage to SQLite and processes downstream text chunk-by-chunk so startup BANK ACCOUNT refreshes persist reliably
+    v0.16 - Uses Lich's shared data directory for the payroll database and surfaces downstream parser failures for live debugging
+    v0.17 - Removes legacy YAML migration code now that payroll is SQLite-only
+    v0.18 - Captures BANK ACCOUNT updates directly from the command stream so startup and manual refreshes save reliably
+    v0.19 - Replaces BANK ACCOUNT dothistimeout handling with an explicit timed line reader so updates no longer depend on hook timing
+    v0.20 - Normalizes carriage-return-delimited BANK ACCOUNT output before parsing and returns updates to passive downstream capture
+    v0.21 - Finalizes BANK ACCOUNT saves from the end-of-block lines so updates persist even when the Total line is not exposed cleanly
+    v0.22 - Adds ;payroll check to report weekly payroll cost and remaining funded weeks from current tracked wealth
+    v0.23 - Adds payroll analytics reporting with daily movement stats and an ASCII trend chart
+    v0.24 - Expands analytics into an ASCII dashboard with weekly rollups, streaks, volatility, drawdown, and runway metrics
+    v0.25 - Renders dashboard metrics as boxed ASCII cards instead of wrapped text rows
+    
+
+    So this started off as a joke, and I actually find it kind of useful.  Maybe someone else will too.  It's a bit of a simplified wealth tracker.  Highly recommend autostart add --global payroll and when you login and log off it will pull the data from BANK ACCOUNT by character for display.   Check the help.  If you want any other options let me know.  This isn't intended as a ledger replacement, but I may pull data from ledger for analytics at some point because... why not? 
+=end
+
+begin
+  require 'sequel'
+  require 'sqlite3'
+rescue LoadError => error
+  echo "payroll: missing required Ruby gem (#{error.message})"
+  echo 'Please install sequel and sqlite3 to run ;payroll'
+  exit
+end
+
+require 'fileutils'
+require 'thread'
+require 'time'
+require 'date'
+
+PAYROLL_COMMANDS = %w[list l help update u split check analytics a].freeze
+PAYROLL_DB_PATH = if defined?($data_dir) && $data_dir
+                    File.join($data_dir, 'payroll.db3')
+                  else
+                    File.expand_path('../data/payroll.db3', __dir__)
+                  end
+PAYROLL_DEFAULT_SETTINGS = {
+  'auto_update_on_start' => true,
+  'auto_update_on_exit' => true,
+  'split_tables' => false
+}.freeze
+PAYROLL_BOOLEAN_SETTINGS = PAYROLL_DEFAULT_SETTINGS.keys.freeze
+PAYROLL_BANK_COLUMNS = [
+  ['WL', ["Wehnimer's Landing", 'First Elanith Bank', 'First Elanith Secured Bank']],
+  ['Teris', ['Kharam-Dzu', 'Teras Isle', 'The Bank of Kharam-Dzu', 'Great Bank of Kharam-Dzu']],
+  ['IMT', ['Icemule Trace', 'Icemule Trace, Bank', 'Icemule Trace Bank']],
+  ['Sol', ['Vornavis', 'Solhaven', 'Bank of Vornavis', 'Vornavis Bank of Solhaven']],
+  ['RR', ["River's Rest", "River's Rest Bank", 'Bank of Torre County']],
+  ['Zul', ["Kharag 'doth Dzulthu", 'Zul Logoth', 'Bank of Zul Logoth']],
+  ['EN', ['United City-States', "Ta'Illistim", "Ta'Vaalor", 'United Bank of City-States', 'United City-States Bank']],
+  ['FWI', ['Isle of the Four Winds Bank', 'Isle of Four Winds', 'Four Winds Bank', 'Mist Harbor']],
+  ['KF', ["Kraken's Fall", "Kraken's Fall Bank"]],
+  ['Pine', ['Pinefar', 'Pinefar Trading Post', 'Pinefar, Depository']],
+  ['Cys', ['Cysaegir', 'Cysaegir Bank']],
+  ['HW', ['Hinterwilds', "Brindlestoat's, Moneylender", 'Cold River']],
+  ['EH', ['Evermore Hollow', 'Otherworldly Wealth']],
+  ['Sea', ['Seareach', 'Imperial Counting House', "Brisker's Cove"]],
+  ['Flo', ['Flotilla', 'The Drifting Depository', 'Great Piratical Flotilla']],
+  ['Nal', ["Ta'Nalfein", 'Nielira Harbor Bank', 'Nielira Harbor']],
+  ['SG', ["Sailor's Grief", 'The Contempt, Hold', 'The Contempt']]
+].freeze
+PAYROLL_ROOM_BANK_PATTERNS = {
+  'WL' => [/First Elanith Bank/i, /Wehnimer/i],
+  'Teris' => [/Kharam-Dzu/i, /Teras/i],
+  'IMT' => [/Icemule/i],
+  'Sol' => [/Vornavis/i, /Solhaven/i],
+  'RR' => [/River's Rest/i],
+  'Zul' => [/Kharag 'doth Dzulthu/i, /Dzulthu/i],
+  'EN' => [/United City-States/i, /Ta'Illistim/i, /Ta'Vaalor/i, /Elven Nations/i],
+  'FWI' => [/Isle of the Four Winds/i, /Mist Harbor/i],
+  'KF' => [/Kraken's Fall/i],
+  'Pine' => [/Pinefar/i],
+  'Cys' => [/Cysaegir/i],
+  'HW' => [/Hinterwilds/i, /Brindlestoat/i, /Cold River/i],
+  'EH' => [/Evermore Hollow/i, /Otherworldly Wealth/i],
+  'Sea' => [/Seareach/i, /Imperial Counting House/i, /Brisker's Cove/i],
+  'Flo' => [/Flotilla/i, /Drifting Depository/i, /Great Piratical Flotilla/i],
+  'Nal' => [/Ta'Nalfein/i, /Nielira Harbor/i],
+  'SG' => [/Sailor's Grief/i, /The Contempt/i]
+}.freeze
+
+$payroll_command_queue ||= Queue.new
+$payroll_capture_active = false
+$payroll_capture_mode = nil
+$payroll_capture_banks = {}
+$payroll_capture_total = nil
+$payroll_capture_lines = []
+$payroll_hook_ids ||= {}
+$payroll_current_bank_code = nil
+$payroll_db = nil
+def payroll_hook_id(kind)
+  $payroll_hook_ids[kind] ||= "payroll_#{kind}_#{Script.current.object_id}"
+end
+
+def payroll_db
+  return $payroll_db if $payroll_db
+
+  FileUtils.mkdir_p(File.dirname(PAYROLL_DB_PATH))
+  db = Sequel.sqlite(PAYROLL_DB_PATH)
+
+  db.create_table? :settings do
+    String :key, primary_key: true
+    String :value
+  end
+
+  db.create_table? :wealth do
+    String :snapshot_date, null: false
+    String :character_name, null: false
+    Integer :WL, default: 0, null: false
+    Integer :Teris, default: 0, null: false
+    Integer :IMT, default: 0, null: false
+    Integer :Sol, default: 0, null: false
+    Integer :RR, default: 0, null: false
+    Integer :Zul, default: 0, null: false
+    Integer :EN, default: 0, null: false
+    Integer :FWI, default: 0, null: false
+    Integer :KF, default: 0, null: false
+    Integer :Pine, default: 0, null: false
+    Integer :Cys, default: 0, null: false
+    Integer :HW, default: 0, null: false
+    Integer :EH, default: 0, null: false
+    Integer :Sea, default: 0, null: false
+    Integer :Flo, default: 0, null: false
+    Integer :Nal, default: 0, null: false
+    Integer :SG, default: 0, null: false
+    Integer :total, default: 0, null: false
+    String :updated_at, null: false
+    primary_key %i[snapshot_date character_name]
+  end
+
+  begin
+    db.add_index(:wealth, %i[character_name snapshot_date], name: :wealth_character_date_idx)
+  rescue
+    nil
+  end
+
+  $payroll_db = db
+end
+
+def blank_bank_hash
+  PAYROLL_BANK_COLUMNS.to_h { |code, _| [code, 0] }
+end
+
+def today_history_key
+  Date.today.strftime('%Y%m%d')
+end
+
+def serialize_payroll_setting(value)
+  case value
+  when true then 'true'
+  when false then 'false'
+  else value.to_s
+  end
+end
+
+def parse_payroll_setting(key, value)
+  return value unless PAYROLL_BOOLEAN_SETTINGS.include?(key)
+
+  %w[true on 1 yes y].include?(value.to_s.downcase)
+end
+
+def payroll_settings
+  settings = PAYROLL_DEFAULT_SETTINGS.dup
+  payroll_db[:settings].each do |row|
+    settings[row[:key]] = parse_payroll_setting(row[:key], row[:value])
+  end
+  settings
+end
+
+def upsert_payroll_setting!(key, value)
+  dataset = payroll_db[:settings]
+  payload = { key: key, value: serialize_payroll_setting(value) }
+
+  if dataset.where(key: key).count.positive?
+    dataset.where(key: key).update(value: payload[:value])
+  else
+    dataset.insert(payload)
+  end
+end
+
+def update_payroll_setting(key, value)
+  upsert_payroll_setting!(key, value)
+rescue => error
+  echo "payroll: failed to save setting #{key} (#{error.message})"
+end
+
+def latest_wealth_rows_by_character
+  rows = {}
+  payroll_db[:wealth].order(:character_name, :snapshot_date).each do |row|
+    rows[row[:character_name]] = row
+  end
+  rows
+end
+
+def latest_wealth_row_for(character_name)
+  latest_wealth_rows_by_character[character_name]
+end
+
+def bank_hash_from_row(row)
+  banks = blank_bank_hash
+  return banks unless row
+
+  PAYROLL_BANK_COLUMNS.each do |code, _|
+    banks[code] = row[code.to_sym].to_i
+  end
+  banks
+end
+
+def upsert_wealth_row!(snapshot_date:, character_name:, banks:, total:, updated_at: Time.now.iso8601)
+  dataset = payroll_db[:wealth]
+  row = {
+    snapshot_date: snapshot_date,
+    character_name: character_name,
+    total: total.to_i,
+    updated_at: updated_at.to_s
+  }
+
+  PAYROLL_BANK_COLUMNS.each do |code, _|
+    row[code.to_sym] = banks[code].to_i
+  end
+
+  lookup = dataset.where(snapshot_date: snapshot_date, character_name: character_name)
+  update_values = row.reject { |key, _| %i[snapshot_date character_name].include?(key) }
+
+  if lookup.count.positive?
+    lookup.update(update_values)
+  else
+    dataset.insert(row)
+  end
+end
+
+def strip_payroll_xml(text)
+  clean = text.to_s.dup
+  clean.gsub!(/<pushStream id=["'](?:spellfront|inv|bounty|society)["'][^>]*\/>.*?<popStream[^>]*>/m, '')
+  clean.gsub!(/<stream id="Spells">.*?<\/stream>/m, '')
+  clean.gsub!(/<(compDef|inv|component|right|left|spell|prompt)[^>]*>.*?<\/\1>/m, '')
+  clean.gsub!(/<[^>]+>/, '')
+  clean.gsub!('&gt;', '>')
+  clean.gsub!('&lt;', '<')
+  clean.gsub!(/\e\[[\d;]*m/, '')
+  clean
+end
+
+def canonical_bank_code(bank_name)
+  normalized = bank_name.to_s.strip.downcase
+
+  PAYROLL_BANK_COLUMNS.each do |code, names|
+    return code if names.any? { |name| name.downcase == normalized }
+  end
+
+  nil
+end
+
+def bank_code_from_room_title(room_title)
+  title = room_title.to_s.strip
+  return nil if title.empty?
+
+  PAYROLL_ROOM_BANK_PATTERNS.each do |code, patterns|
+    return code if patterns.any? { |pattern| title =~ pattern }
+  end
+
+  nil
+end
+
+def format_compact_silver(value)
+  amount = value.to_i
+  return amount.to_s if amount.abs < 1_000
+
+  units = [
+    ['B', 1_000_000_000.0],
+    ['M', 1_000_000.0],
+    ['K', 1_000.0]
+  ]
+
+  unit, divisor = units.find { |_, size| amount.abs >= size }
+  formatted = (amount / divisor).round(1)
+  "#{formatted.to_s.sub(/\.0$/, '')}#{unit}"
+end
+
+def format_signed_compact_silver(value)
+  amount = value.to_i
+  prefix = amount.negative? ? '-' : '+'
+  "#{prefix}#{format_compact_silver(amount.abs)}"
+end
+
+def build_payroll_rows
+  latest_wealth_rows_by_character.keys.sort.map do |char_name|
+    row_data = latest_wealth_rows_by_character[char_name]
+    row = { 'Char' => char_name }
+
+    PAYROLL_BANK_COLUMNS.each do |code, _|
+      row[code] = format_compact_silver(row_data[code.to_sym].to_i)
+    end
+
+    row['Total'] = format_compact_silver(row_data[:total].to_i)
+    row
+  end
+end
+
+def build_payroll_totals_row(headers)
+  total_row = { 'Char' => 'Totals' }
+  latest_rows = latest_wealth_rows_by_character.values
+
+  headers.each do |header|
+    next if header == 'Char'
+
+    total_value =
+      if header == 'Total'
+        latest_rows.sum { |row| row[:total].to_i }
+      else
+        latest_rows.sum { |row| row[header.to_sym].to_i }
+      end
+
+    total_row[header] = format_compact_silver(total_value)
+  end
+
+  total_row
+end
+
+def render_payroll_block(rows, headers, totals_row = nil)
+  widths = headers.to_h { |header| [header, header.length] }
+
+  rows.each do |row|
+    headers.each do |header|
+      widths[header] = [widths[header], row[header].to_s.length].max
+    end
+  end
+
+  if totals_row
+    headers.each do |header|
+      widths[header] = [widths[header], totals_row[header].to_s.length].max
+    end
+  end
+
+  separator = '+' + headers.map { |header| '-' * (widths[header] + 2) }.join('+') + '+'
+  header_line = '| ' + headers.map { |header| header.ljust(widths[header]) }.join(' | ') + ' |'
+
+  respond separator
+  respond header_line
+  respond separator
+
+  rows.each do |row|
+    line = '| ' + headers.map do |header|
+      value = row[header].to_s
+      header == 'Char' ? value.ljust(widths[header]) : value.rjust(widths[header])
+    end.join(' | ') + ' |'
+    respond line
+  end
+  respond separator
+
+  return unless totals_row
+
+  total_line = '| ' + headers.map do |header|
+    value = totals_row[header].to_s
+    header == 'Char' ? value.ljust(widths[header]) : value.rjust(widths[header])
+  end.join(' | ') + ' |'
+  respond total_line
+  respond separator
+end
+
+def render_payroll_table
+  rows = build_payroll_rows
+  if rows.empty?
+    respond 'No payroll data saved yet.'
+    return
+  end
+
+  settings = payroll_settings
+  bank_headers = PAYROLL_BANK_COLUMNS.map(&:first)
+
+  if settings['split_tables']
+    split_index = (bank_headers.length / 2.0).ceil
+    first_headers = ['Char'] + bank_headers.first(split_index)
+    second_headers = ['Char'] + bank_headers.drop(split_index) + ['Total']
+
+    render_payroll_block(rows, first_headers, build_payroll_totals_row(first_headers))
+    respond ''
+    render_payroll_block(rows, second_headers, build_payroll_totals_row(second_headers))
+  else
+    headers = ['Char'] + bank_headers + ['Total']
+    render_payroll_block(rows, headers, build_payroll_totals_row(headers))
+  end
+
+  respond ''
+  respond "** Total Wealth: #{format_compact_silver(latest_wealth_rows_by_character.values.sum { |row| row[:total].to_i })}"
+end
+
+def render_payroll_check
+  rows = latest_wealth_rows_by_character.values
+  if rows.empty?
+    respond 'No payroll data saved yet.'
+    return
+  end
+
+  character_count = rows.length
+  total_wealth = rows.sum { |row| row[:total].to_i }
+  weekly_cost = character_count * 250_000
+  funded_weeks = weekly_cost.zero? ? 0.0 : (total_wealth.to_f / weekly_cost)
+
+  respond "Current Payroll Cost: #{format_compact_silver(weekly_cost)} per week"
+  respond format('You have %.1f weeks remaining', funded_weeks)
+end
+
+def persist_current_capture!
+  banks = blank_bank_hash.merge($payroll_capture_banks.transform_values(&:to_i))
+  total = $payroll_capture_total.to_i
+  total = banks.values.sum if total.zero? && banks.values.any?(&:positive?)
+
+  upsert_wealth_row!(
+    snapshot_date: today_history_key,
+    character_name: Char.name,
+    banks: banks,
+    total: total
+  )
+end
+
+def wealth_total_for_date(date)
+  cutoff = date.strftime('%Y%m%d')
+  latest_by_character = {}
+
+  payroll_db[:wealth].where(Sequel.lit('snapshot_date <= ?', cutoff)).order(:character_name, :snapshot_date).each do |row|
+    latest_by_character[row[:character_name]] = row
+  end
+
+  latest_by_character.values.sum { |row| row[:total].to_i }
+end
+
+def render_payroll_history_report(days_back)
+  if days_back <= 0
+    respond 'Usage: ;payroll <days>'
+    return
+  end
+
+  start_date = Date.today - days_back
+  end_date = Date.today
+  series = (start_date..end_date).map { |date| [date, wealth_total_for_date(date)] }
+
+  starting_total = series.first.last
+  current_total = series.last.last
+  deltas = series.each_cons(2).map { |previous_day, current_day| [current_day.first, current_day.last - previous_day.last] }
+  largest_increase = deltas.max_by { |(_, delta)| delta } || [start_date, 0]
+  largest_decrease = deltas.min_by { |(_, delta)| delta } || [start_date, 0]
+
+  change_pct =
+    if starting_total.zero?
+      current_total.zero? ? 0.0 : 100.0
+    else
+      ((current_total - starting_total) / starting_total.to_f) * 100.0
+    end
+
+  respond "Starting Wealth (#{start_date.strftime('%Y%m%d')}): #{format_compact_silver(starting_total)}"
+  respond "Largest Increase: #{format_compact_silver(largest_increase.last)} (#{largest_increase.first.strftime('%Y%m%d')})"
+  respond "Largest Decrease: #{format_compact_silver(largest_decrease.last)} (#{largest_decrease.first.strftime('%Y%m%d')})"
+  respond ''
+  respond "Today: #{format_compact_silver(current_total)}"
+  respond format('Change: %+.2f%%', change_pct)
+end
+
+def payroll_series(days_back)
+  start_date = Date.today - days_back
+  end_date = Date.today
+  (start_date..end_date).map { |date| [date, wealth_total_for_date(date)] }
+end
+
+def payroll_daily_deltas(series)
+  series.each_cons(2).map { |previous_day, current_day| [current_day.first, current_day.last - previous_day.last] }
+end
+
+def payroll_weekly_deltas(series)
+  grouped = series.group_by { |date, _| [date.cwyear, date.cweek] }
+
+  grouped.sort_by { |((year, week), _)| [year, week] }.map do |((year, week), rows)|
+    ["#{year}-W#{week.to_s.rjust(2, '0')}", rows.last.last - rows.first.last]
+  end
+end
+
+def payroll_longest_streak(deltas)
+  best_positive = 0
+  best_negative = 0
+  current_positive = 0
+  current_negative = 0
+
+  deltas.each do |(_, delta)|
+    if delta.positive?
+      current_positive += 1
+      current_negative = 0
+    elsif delta.negative?
+      current_negative += 1
+      current_positive = 0
+    else
+      current_positive = 0
+      current_negative = 0
+    end
+
+    best_positive = [best_positive, current_positive].max
+    best_negative = [best_negative, current_negative].max
+  end
+
+  [best_positive, best_negative]
+end
+
+def payroll_max_drawdown(series)
+  peak = nil
+  max_drawdown = 0
+
+  series.each do |(_, total)|
+    peak = total if peak.nil? || total > peak
+    drawdown = total - peak
+    max_drawdown = [max_drawdown, drawdown].min
+  end
+
+  max_drawdown
+end
+
+def payroll_dashboard_border(width = 78)
+  '+' + ('-' * width) + '+'
+end
+
+def payroll_dashboard_line(text = '', width = 78)
+  "| #{text.to_s[0, width - 2].ljust(width - 2)} |"
+end
+
+def render_payroll_dashboard_panel(title, lines, width: 78)
+  respond payroll_dashboard_border(width)
+  respond payroll_dashboard_line(title, width)
+  respond payroll_dashboard_border(width)
+  lines.each { |line| respond payroll_dashboard_line(line, width) }
+  respond payroll_dashboard_border(width)
+end
+
+def payroll_dashboard_card(title, lines, width: 24)
+  inner_width = width - 4
+  card_lines = []
+  card_lines << '+' + ('-' * (width - 2)) + '+'
+  card_lines << "| #{title.to_s[0, inner_width].ljust(inner_width)} |"
+  card_lines << '+' + ('-' * (width - 2)) + '+'
+  Array(lines).each do |line|
+    card_lines << "| #{line.to_s[0, inner_width].ljust(inner_width)} |"
+  end
+  card_lines << '+' + ('-' * (width - 2)) + '+'
+  card_lines
+end
+
+def render_payroll_dashboard_grid(card_rows, card_width: 24, gap: '  ')
+  card_rows.each do |row|
+    cards = row.map { |card| payroll_dashboard_card(card[:title], card[:lines], width: card_width) }
+    row_height = cards.map(&:length).max
+
+    padded_cards = cards.map do |card|
+      next card if card.length == row_height
+
+      body = card[0...-1]
+      missing = row_height - card.length
+      missing.times { body << "| #{' ' * (card_width - 4)} |" }
+      body << card.last
+      body
+    end
+
+    row_height.times do |index|
+      respond padded_cards.map { |card| card[index] }.join(gap)
+    end
+  end
+end
+
+def sampled_series(series, max_points = 14)
+  return series if series.length <= max_points
+  return [series.first] if max_points <= 1
+
+  indexes = (0...max_points).map do |index|
+    ((index * (series.length - 1).to_f) / (max_points - 1)).round
+  end.uniq
+
+  indexes.map { |index| series[index] }
+end
+
+def render_payroll_trend_chart(series, width: 28, max_points: 14)
+  chart_series = sampled_series(series, max_points)
+  values = chart_series.map(&:last)
+  min_value = values.min.to_i
+  max_value = values.max.to_i
+  span = max_value - min_value
+
+  respond 'Trend:'
+
+  chart_series.each_with_index do |(date, total), index|
+    filled =
+      if span.zero?
+        width / 2
+      else
+        (((total - min_value).to_f / span) * width).round
+      end
+
+    filled = [[filled, 1].max, width].min
+    delta = index.zero? ? 0 : total - chart_series[index - 1].last
+    bar = '#' * filled
+    respond format('%s | %-*s | %8s | %8s',
+                   date.strftime('%m-%d'),
+                   width,
+                   bar,
+                   format_compact_silver(total),
+                   index.zero? ? 'start' : format_signed_compact_silver(delta))
+  end
+end
+
+def render_payroll_delta_chart(label, delta_series, width: 10, max_points: 8)
+  chart_series = sampled_series(delta_series, max_points)
+  max_abs = chart_series.map { |(_, delta)| delta.abs }.max.to_i
+  max_abs = 1 if max_abs.zero?
+
+  respond label
+
+  chart_series.each do |(bucket_label, delta)|
+    size = ((delta.abs.to_f / max_abs) * width).round
+    size = [[size, 1].max, width].min unless delta.zero?
+    negative_bar = delta.negative? ? ('<' * size).rjust(width) : ' ' * width
+    positive_bar = delta.positive? ? ('#' * size).ljust(width) : ' ' * width
+    respond format('%8s |%s|%s| %9s', bucket_label[-8, 8], negative_bar, positive_bar, format_signed_compact_silver(delta))
+  end
+end
+
+def render_payroll_analytics(days_back = 30)
+  if days_back <= 0
+    respond 'Usage: ;payroll analytics [days]'
+    return
+  end
+
+  series = payroll_series(days_back)
+
+  if series.empty?
+    respond 'No payroll data saved yet.'
+    return
+  end
+
+  start_date = series.first.first
+  starting_total = series.first.last
+  current_total = series.last.last
+  net_change = current_total - starting_total
+  values = series.map(&:last)
+  average_total = values.sum / values.length.to_f
+  deltas = payroll_daily_deltas(series)
+  weekly_deltas = payroll_weekly_deltas(series)
+  average_daily_change = deltas.empty? ? 0.0 : deltas.sum { |(_, delta)| delta } / deltas.length.to_f
+  average_weekly_change = average_daily_change * 7.0
+  average_daily_move = deltas.empty? ? 0.0 : deltas.sum { |(_, delta)| delta.abs } / deltas.length.to_f
+  highest_day = series.max_by(&:last)
+  lowest_day = series.min_by(&:last)
+  largest_increase = deltas.max_by { |(_, delta)| delta } || [start_date, 0]
+  largest_decrease = deltas.min_by { |(_, delta)| delta } || [start_date, 0]
+  best_week = weekly_deltas.max_by { |(_, delta)| delta } || ['n/a', 0]
+  worst_week = weekly_deltas.min_by { |(_, delta)| delta } || ['n/a', 0]
+  gain_days = deltas.count { |(_, delta)| delta.positive? }
+  loss_days = deltas.count { |(_, delta)| delta.negative? }
+  flat_days = deltas.count { |(_, delta)| delta.zero? }
+  positive_streak, negative_streak = payroll_longest_streak(deltas)
+  wealth_range = values.max.to_i - values.min.to_i
+  max_drawdown = payroll_max_drawdown(series)
+  row_count = latest_wealth_rows_by_character.values.length
+  weekly_payroll_cost = row_count * 250_000
+  funded_weeks = weekly_payroll_cost.zero? ? 0.0 : (current_total.to_f / weekly_payroll_cost)
+  win_rate = deltas.empty? ? 0.0 : (gain_days * 100.0 / deltas.length)
+
+  change_pct =
+    if starting_total.zero?
+      current_total.zero? ? 0.0 : 100.0
+    else
+      (net_change / starting_total.to_f) * 100.0
+    end
+
+  render_payroll_dashboard_panel(
+    "Payroll Analytics Dashboard (#{days_back} days)",
+    [
+      "Window #{start_date.strftime('%Y%m%d')} -> #{Date.today.strftime('%Y%m%d')}",
+      "Current #{format_compact_silver(current_total)} | Net #{format_signed_compact_silver(net_change)} (#{format('%+.2f%%', change_pct)})"
+    ]
+  )
+
+  render_payroll_dashboard_grid(
+    [
+      [
+        {
+          title: 'P/L Cadence',
+          lines: [
+            "Avg Day  #{format_signed_compact_silver(average_daily_change.round)}",
+            "Avg Week #{format_signed_compact_silver(average_weekly_change.round)}",
+            "Daily Move #{format_compact_silver(average_daily_move.round)}"
+          ]
+        },
+        {
+          title: 'Extremes',
+          lines: [
+            "Best ^ #{format_signed_compact_silver(largest_increase.last)}",
+            largest_increase.first.strftime('%Y%m%d'),
+            "Worst v #{format_signed_compact_silver(largest_decrease.last)}",
+            largest_decrease.first.strftime('%Y%m%d')
+          ]
+        },
+        {
+          title: 'Weekly',
+          lines: [
+            "Best #{format_signed_compact_silver(best_week.last)}",
+            best_week.first.to_s,
+            "Worst #{format_signed_compact_silver(worst_week.last)}",
+            worst_week.first.to_s
+          ]
+        }
+      ],
+      [
+        {
+          title: 'Range',
+          lines: [
+            "High  #{format_compact_silver(highest_day.last)}",
+            "Low   #{format_compact_silver(lowest_day.last)}",
+            "Span  #{format_compact_silver(wealth_range)}"
+          ]
+        },
+        {
+          title: 'Flow',
+          lines: [
+            "Up    #{gain_days}",
+            "Down  #{loss_days}",
+            "Flat  #{flat_days}",
+            "Win   #{format('%.1f%%', win_rate)}"
+          ]
+        },
+        {
+          title: 'Streaks',
+          lines: [
+            "Green +#{positive_streak}",
+            "Red   -#{negative_streak}",
+            "Avg   #{format_compact_silver(average_total.round)}"
+          ]
+        }
+      ],
+      [
+        {
+          title: 'Risk',
+          lines: [
+            "Drawdown #{format_signed_compact_silver(max_drawdown)}",
+            "Start    #{format_compact_silver(starting_total)}",
+            "Current  #{format_compact_silver(current_total)}"
+          ]
+        },
+        {
+          title: 'Runway',
+          lines: [
+            "Payroll #{format_compact_silver(weekly_payroll_cost)}/wk",
+            "Weeks   #{format('%.1f', funded_weeks)}",
+            "Chars   #{row_count}"
+          ]
+        },
+        {
+          title: 'Window',
+          lines: [
+            start_date.strftime('%Y%m%d'),
+            Date.today.strftime('%Y%m%d'),
+            "#{days_back} day lookback"
+          ]
+        }
+      ]
+    ]
+  )
+
+  respond ''
+  render_payroll_trend_chart(series)
+  respond ''
+  render_payroll_delta_chart('Weekly P/L:', weekly_deltas)
+end
+
+def reset_payroll_capture!
+  $payroll_capture_active = false
+  $payroll_capture_mode = nil
+  $payroll_capture_banks = {}
+  $payroll_capture_total = nil
+  $payroll_capture_lines = []
+end
+
+def finalize_payroll_capture!
+  return unless $payroll_capture_active
+  return if $payroll_capture_banks.empty? && $payroll_capture_total.to_i.zero?
+
+  persist_current_capture!
+  respond "Saved payroll balances for #{Char.name}."
+  reset_payroll_capture!
+end
+
+def process_payroll_line(line)
+  text = line.to_s.rstrip
+  return if text.empty?
+
+  if text =~ /^\[(.+?) - \d+\]/
+    room_title = Regexp.last_match(1).strip
+    bank_code = bank_code_from_room_title(room_title)
+    $payroll_current_bank_code = bank_code if bank_code
+  end
+
+  if text =~ /^You study your current bank balances\.\.\./
+    $payroll_capture_active = true
+    $payroll_capture_mode = :bankbook
+    $payroll_capture_banks = {}
+    $payroll_capture_total = nil
+    $payroll_capture_lines = [text]
+    return
+  end
+
+  if text =~ /^You currently have the following amounts on deposit:\s*$/
+    $payroll_capture_active = true
+    $payroll_capture_mode = :account
+    $payroll_capture_banks = {}
+    $payroll_capture_total = nil
+    $payroll_capture_lines = [text]
+    return
+  end
+
+  return unless $payroll_capture_active
+  $payroll_capture_lines << text
+
+  if text =~ /^\s*(.+?):\s+([0-9,]+)\s+silvers\s*$/
+    bank_name = Regexp.last_match(1).strip
+    amount = Regexp.last_match(2).delete(',').to_i
+    bank_code = canonical_bank_code(bank_name)
+    $payroll_capture_banks[bank_code] = amount if bank_code
+    return
+  end
+
+  if $payroll_capture_mode == :account && text =~ /^\s*(.+?):\s+([0-9,]+)\s*$/
+    bank_name = Regexp.last_match(1).strip
+    return if bank_name == 'Total'
+
+    amount = Regexp.last_match(2).delete(',').to_i
+    bank_code = canonical_bank_code(bank_name)
+    $payroll_capture_banks[bank_code] = amount if bank_code
+    return
+  end
+
+  if text =~ /^Your total silvers:\s+([0-9,]+)\s*$/
+    $payroll_capture_total = Regexp.last_match(1).delete(',').to_i
+    finalize_payroll_capture!
+    return
+  end
+
+  if $payroll_capture_mode == :account && text =~ /^\s*Total:\s+([0-9,]+)\s*$/
+    $payroll_capture_total = Regexp.last_match(1).delete(',').to_i
+    return
+  end
+
+  if $payroll_capture_mode == :account && (
+    text =~ /^You currently have \d+ inter-town bank transfer options available\./ ||
+    text =~ /^You currently have \d+ urchin bank runner use(?:s)? remaining\./
+  )
+    finalize_payroll_capture!
+    return
+  end
+
+  if $payroll_current_bank_code && text =~ /Your balance is currently at\s+([0-9,]+)\s+silvers\./i
+    persist_bank_balance!($payroll_current_bank_code, Regexp.last_match(1).delete(',').to_i)
+    return
+  end
+
+  if $payroll_current_bank_code && text =~ /This brings your total to\s+([0-9,]+)\s+silvers\./i
+    persist_bank_balance!($payroll_current_bank_code, Regexp.last_match(1).delete(',').to_i)
+  end
+end
+
+def process_payroll_text(text)
+  normalized = strip_payroll_xml(text).gsub("\r\n", "\n").gsub("\r", "\n")
+  normalized.split("\n").each do |line|
+    process_payroll_line(line)
+  end
+end
+
+def persist_bank_balance!(bank_code, amount)
+  return if bank_code.to_s.empty?
+
+  existing = latest_wealth_row_for(Char.name)
+  banks = bank_hash_from_row(existing)
+  banks[bank_code] = amount.to_i
+
+  upsert_wealth_row!(
+    snapshot_date: today_history_key,
+    character_name: Char.name,
+    banks: banks,
+    total: banks.values.sum
+  )
+rescue => error
+  echo "payroll: failed to update #{bank_code} balance (#{error.message})"
+end
+
+def setup_payroll_hooks
+  if defined?(DownstreamHook)
+    downstream_proc = proc do |server_string|
+      begin
+        process_payroll_text(server_string)
+      rescue => error
+        echo "payroll: downstream parse failed (#{error.message})"
+      end
+      server_string
+    end
+    DownstreamHook.add(payroll_hook_id(:downstream), downstream_proc)
+  end
+
+  if defined?(UpstreamHook)
+    upstream_proc = proc do |client_string|
+      if client_string =~ /^(?:<c>)?;payroll(?:\s+(.*))?$/i
+        $payroll_command_queue.push(($1 || '').strip)
+        nil
+      else
+        client_string
+      end
+    end
+    UpstreamHook.add(payroll_hook_id(:upstream), upstream_proc)
+  end
+end
+
+def remove_payroll_hooks
+  DownstreamHook.remove(payroll_hook_id(:downstream)) if defined?(DownstreamHook)
+  UpstreamHook.remove(payroll_hook_id(:upstream)) if defined?(UpstreamHook)
+rescue
+  nil
+end
+
+def show_payroll_help
+  respond ';payroll        - Start passive bank balance tracking'
+  respond ';payroll list / l      - Show saved bank balances by character'
+  respond ';payroll check  - Show weekly payroll cost and funded weeks remaining'
+  respond ';payroll analytics / a [days] - Show wealth analytics and an ASCII trend chart'
+  respond ';payroll split <on|off> - Toggle split-table display mode'
+  respond ';payroll 30     - Show wealth change summary over the last 30 days'
+  respond ';payroll update / u    - Run BANK ACCOUNT and save the results'
+  respond ';payroll help   - Show this help'
+end
+
+def run_payroll_update
+  waitrt?
+  fput 'bank account'
+rescue => error
+  respond "payroll update failed: #{error.message}"
+end
+
+def process_payroll_command(command_str)
+  raw_command = command_str.to_s.strip
+  normalized_command = raw_command.downcase
+  parts = normalized_command.split(/\s+/, 2)
+  command = parts[0].to_s
+  arg = parts[1].to_s.strip
+
+  case command
+  when '', 'help'
+    show_payroll_help
+  when 'list', 'l'
+    render_payroll_table
+  when 'check'
+    render_payroll_check
+  when 'analytics', 'a'
+    if arg.empty? || arg =~ /^\d+$/
+      days_back = arg.empty? ? 30 : arg.to_i
+      render_payroll_analytics(days_back)
+    else
+      respond 'Usage: ;payroll analytics [days]'
+    end
+  when 'update', 'u'
+    run_payroll_update
+  else
+    if normalized_command =~ /^split(?:\s+(on|off))?$/
+      value = Regexp.last_match(1)
+      if value.nil?
+        current_value = payroll_settings['split_tables'] ? 'on' : 'off'
+        respond 'Usage: ;payroll split <on|off>'
+        respond "Current: #{current_value}"
+      else
+        enabled = (value == 'on')
+        update_payroll_setting('split_tables', enabled)
+        respond "Split tables #{enabled ? 'enabled' : 'disabled'}."
+      end
+    elsif normalized_command =~ /^\d+$/
+      render_payroll_history_report(normalized_command.to_i)
+    else
+      respond "Unknown payroll command: #{command_str}"
+    end
+  end
+end
+
+payroll_db
+
+args = Script.current.vars[1..-1] || []
+command = args.first.to_s.downcase
+
+if command =~ /^\d+$/ || %w[list l help check analytics a].include?(command) || command == 'split'
+  process_payroll_command(args.join(' '))
+  exit
+end
+
+setup_payroll_hooks
+before_dying do
+  run_payroll_update if payroll_settings['auto_update_on_exit']
+  remove_payroll_hooks
+end
+
+respond 'Payroll tracking active.'
+
+run_payroll_update if payroll_settings['auto_update_on_start'] && !%w[update u].include?(command)
+
+process_payroll_command(command) if %w[update u].include?(command)
+
+loop do
+  until $payroll_command_queue.empty?
+    command_str = $payroll_command_queue.pop(true) rescue nil
+    process_payroll_command(command_str) if command_str
+  end
+
+  sleep 0.2
+end
