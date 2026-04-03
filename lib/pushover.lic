@@ -1,0 +1,534 @@
+=begin
+  Pushover Notification Script for Lich5
+
+  Monitors game text AND Lich status conditions, sending Pushover
+  notifications when matches are found. Runs in the background.
+
+  Setup:
+    ;vars set pushover_app_token=YOUR_APP_TOKEN
+    ;vars set pushover_user_key=YOUR_USER_KEY
+
+  Usage:
+    ;pushover                                - start monitoring
+    ;pushover test                           - send a test notification
+    ;pushover cooldown <seconds>             - set min seconds between notifications (default 60)
+    ;pushover list                           - list all watches and status checks
+
+  Text watches (regex matched against game lines):
+    ;pushover add <name> <pattern>                    - add a text watch (priority -1)
+    ;pushover add <name> <priority> <pattern>         - add with specific priority
+    ;pushover remove <name>                           - remove a text watch
+
+  Status checks (polled Lich API conditions):
+    ;pushover status add <name> <condition>            - add a status check (priority -1)
+    ;pushover status add <name> <condition> <priority> - add with specific priority
+    ;pushover status remove <name>                     - remove a status check
+
+  Pushover priorities: -2 (no alert), -1 (quiet/low), 0 (normal), 1 (high), 2 (emergency)
+
+  Available status conditions:
+    dead             - you are dead
+    not_standing     - knocked down / sitting / kneeling / prone
+    stunned          - you are stunned
+    health_low       - health below 30%
+    health_critical  - health below 10%
+    mana_low         - mana below 20%
+    spirit_low       - spirit below 2
+    group_dead       - a group member is dead
+    group_down       - a group member is not standing
+    mind_fried       - mind is fried
+    bounty_done      - bounty task is complete (text: "You have succeeded")
+    no_scripts       - no other scripts running (your hunt script crashed, etc.)
+    script_dead      - sends notification when this pushover script dies/is killed
+    disconnect       - no game text received for 30s (possible disconnect)
+
+  Examples:
+    ;pushover add whisper "whispers to you"
+    ;pushover add thought 0 "thinking to you"
+    ;pushover status add fallen not_standing
+    ;pushover status add dc disconnect 0
+    ;pushover status add dying health_critical 1
+    ;pushover status add party_down group_down
+    ;pushover status add crashed no_scripts 0
+
+  Notes:
+    - Text patterns are Ruby regexes matched case-insensitively
+    - Status checks are polled every 2 seconds in a background thread
+    - Each watch/check has its own independent cooldown timer
+    - Runs as a background script until killed with ;kill pushover
+    - get does NOT steal lines from other scripts (each script gets its own copy)
+=end
+
+require "net/https"
+
+# --- Configuration ---
+
+# --- Help (available before token validation so new users can see setup) ---
+
+if script.vars[1] == "help"
+  echo "==============================================="
+  echo "  Pushover Notification Script for Lich5"
+  echo "==============================================="
+  echo ""
+  echo "FIRST-TIME SETUP:"
+  echo "  1. Create a Pushover account at https://pushover.net"
+  echo "  2. Create an application in Pushover to get an API token"
+  echo "  3. Set your credentials in Lich:"
+  echo "       ;vars set pushover_app_token=YOUR_APP_TOKEN"
+  echo "       ;vars set pushover_user_key=YOUR_USER_KEY"
+  echo "  4. Test it:  ;pushover test"
+  echo ""
+  echo "COMMANDS:"
+  echo "  ;pushover                     - start monitoring (runs in background)"
+  echo "  ;pushover help                - this help text"
+  echo "  ;pushover test                - send a test notification"
+  echo "  ;pushover list                - show all watches, status checks, and config"
+  echo "  ;pushover cooldown <seconds>  - min seconds between repeat notifications (default 60)"
+  echo ""
+  echo "TEXT WATCHES (regex matched against game lines):"
+  echo "  ;pushover add <name> <pattern>            - add (default priority -1)"
+  echo "  ;pushover add <name> <priority> <pattern> - add with specific priority"
+  echo "  ;pushover remove <name>                   - remove"
+  echo ""
+  echo "  Examples:"
+  echo "    ;pushover add whisper whispers to you"
+  echo "    ;pushover add thought 0 thinking to you"
+  echo "    ;pushover add death seems to lose an argument"
+  echo ""
+  echo "STATUS CHECKS (polled Lich API conditions every 2s):"
+  echo "  ;pushover status add <name> <condition>            - add (default priority -1)"
+  echo "  ;pushover status add <name> <condition> <priority> - add with specific priority"
+  echo "  ;pushover status remove <name>                     - remove"
+  echo ""
+  echo "  Available conditions:"
+  echo "    dead             - you are dead"
+  echo "    not_standing     - knocked down / sitting / kneeling / prone"
+  echo "    stunned          - you are stunned"
+  echo "    health_low       - health below 30%"
+  echo "    health_critical  - health below 10%"
+  echo "    mana_low         - mana below 20%"
+  echo "    spirit_low       - spirit below 2"
+  echo "    group_dead       - a group member is dead"
+  echo "    group_down       - a group member is not standing"
+  echo "    mind_fried       - mind is fried"
+  echo "    no_scripts       - no other scripts running (hunt script crashed?)"
+  echo "    script_dead      - notifies when this pushover script dies/is killed"
+  echo "    disconnect       - no game text received for 30s (possible disconnect)"
+  echo "    test             - always triggers (for testing)"
+  echo ""
+  echo "  Examples:"
+  echo "    ;pushover status add fallen not_standing"
+  echo "    ;pushover status add dc disconnect 0"
+  echo "    ;pushover status add dying health_critical 1"
+  echo "    ;pushover status add crashed no_scripts 0"
+  echo ""
+  echo "PRIORITY LEVELS (Pushover):"
+  echo "  -2  no alert/notification"
+  echo "  -1  quiet (default) - no sound/vibration"
+  echo "   0  normal"
+  echo "   1  high - bypasses quiet hours"
+  echo "   2  emergency - repeats until acknowledged"
+  echo ""
+  echo "QUICK START:"
+  echo "  ;vars set pushover_app_token=YOUR_TOKEN"
+  echo "  ;vars set pushover_user_key=YOUR_KEY"
+  echo "  ;pushover test"
+  echo "  ;pushover status add fallen not_standing"
+  echo "  ;pushover add whisper whispers to you"
+  echo "  ;pushover"
+  echo "==============================================="
+  exit
+end
+
+# --- Configuration ---
+
+PUSHOVER_APP_TOKEN = UserVars.pushover_app_token
+PUSHOVER_USER_KEY  = UserVars.pushover_user_key
+
+if PUSHOVER_APP_TOKEN.nil? || PUSHOVER_APP_TOKEN.empty?
+  echo "ERROR: No Pushover app token set."
+  echo "  ;vars set pushover_app_token=YOUR_APP_TOKEN"
+  echo "  ;pushover help    - for full setup instructions"
+  exit
+end
+
+if PUSHOVER_USER_KEY.nil? || PUSHOVER_USER_KEY.empty?
+  echo "ERROR: No Pushover user key set."
+  echo "  ;vars set pushover_user_key=YOUR_USER_KEY"
+  echo "  ;pushover help    - for full setup instructions"
+  exit
+end
+
+# Initialize persistent storage
+UserVars.pushover ||= {}
+UserVars.pushover["watches"] ||= {}
+UserVars.pushover["statuses"] ||= {}
+UserVars.pushover["cooldown"] ||= 60
+UserVars.save
+
+# Track last notification time per watch/check name (resets on script start)
+$pushover_last_notified = {}
+
+# Track last game line received (for disconnect detection)
+$pushover_last_line_at = Time.now
+$pushover_disconnected = false
+DISCONNECT_TIMEOUT = 30
+
+# --- Pushover API ---
+
+def send_pushover(title, message, priority: 0)
+  begin
+    url = URI.parse("https://api.pushover.net/1/messages.json")
+    req = Net::HTTP::Post.new(url.path)
+    req.set_form_data({
+      :token    => PUSHOVER_APP_TOKEN,
+      :user     => PUSHOVER_USER_KEY,
+      :title    => title,
+      :message  => message,
+      :priority => priority,
+    })
+    res = Net::HTTP.new(url.host, url.port)
+    res.use_ssl = true
+    res.verify_mode = OpenSSL::SSL::VERIFY_PEER
+    response = res.start { |http| http.request(req) }
+
+    if response.code == "200"
+      echo "Pushover sent: #{title}"
+    else
+      echo "Pushover error (#{response.code}): #{response.body}"
+    end
+  rescue => e
+    echo "Pushover exception: #{e.message}"
+  end
+end
+
+# Send notification if cooldown has elapsed for this name
+def notify_if_ready(name, title, message, cooldown, priority: 0)
+  now = Time.now
+  if $pushover_last_notified[name].nil? || (now - $pushover_last_notified[name]) >= cooldown
+    $pushover_last_notified[name] = now
+    send_pushover(title, message, priority: priority)
+  end
+end
+
+# --- Status condition evaluators ---
+# Each returns [triggered?, description_string] so the notification has context
+
+STATUS_CONDITIONS = {
+  "dead" => proc {
+    [dead?, "You are dead!"]
+  },
+  "not_standing" => proc {
+    result = !standing?
+    [result, result ? "You are not standing (status: #{checkstanding})" : nil]
+  },
+  "stunned" => proc {
+    result = stunned?
+    [result, "You are stunned!"]
+  },
+  "health_low" => proc {
+    pct = percenthealth
+    [pct < 30, "Health is low: #{checkhealth}/#{maxhealth} (#{pct}%)"]
+  },
+  "health_critical" => proc {
+    pct = percenthealth
+    [pct < 10, "Health is CRITICAL: #{checkhealth}/#{maxhealth} (#{pct}%)"]
+  },
+  "mana_low" => proc {
+    pct = percentmana
+    [pct < 20, "Mana is low: #{checkmana}/#{maxmana} (#{pct}%)"]
+  },
+  "spirit_low" => proc {
+    sp = checkspirit
+    [sp < 2, "Spirit is dangerously low: #{sp}"]
+  },
+  "group_dead" => proc {
+    dead_members = Lich::Gemstone::Group.members.select { |m| m.status =~ /dead/ }
+    if dead_members.any?
+      names = dead_members.map { |m| m.noun }.join(", ")
+      [true, "Group member(s) dead: #{names}"]
+    else
+      [false, nil]
+    end
+  },
+  "group_down" => proc {
+    down_members = Lich::Gemstone::Group.members.select { |m| m.status =~ /sitting|lying|prone|kneel/ && m.status !~ /dead/ }
+    if down_members.any?
+      names = down_members.map { |m| m.noun }.join(", ")
+      [true, "Group member(s) down: #{names}"]
+    else
+      [false, nil]
+    end
+  },
+  "mind_fried" => proc {
+    [checkmind == "fried", "Mind is fried!"]
+  },
+  "no_scripts" => proc {
+    others = Script.list.reject { |s| s.name == "pushover" }
+    [others.empty?, "No other scripts are running!"]
+  },
+  "script_dead" => proc {
+    [false, nil]  # never triggers via polling; fires in before_dying hook
+  },
+  "disconnect" => proc {
+    elapsed = Time.now - $pushover_last_line_at
+    if $pushover_disconnected
+      [true, "Connection to the game has been lost!"]
+    elsif elapsed >= DISCONNECT_TIMEOUT
+      [true, "No game data received for #{elapsed.to_i}s — possible disconnect!"]
+    else
+      [false, nil]
+    end
+  },
+  "test" => proc {
+    [true, "Test status check fired. Character: #{Char.name}, Room: #{Room.current.id rescue 'unknown'}"]
+  },
+}
+
+# --- Config helpers (handle both old string format and new hash format) ---
+
+def parse_watch_config(cfg)
+  if cfg.is_a?(Hash)
+    [cfg["pattern"], cfg["priority"] || -1]
+  else
+    [cfg.to_s, -1]
+  end
+end
+
+def parse_status_config(cfg)
+  if cfg.is_a?(Hash)
+    [cfg["condition"], cfg["priority"] || -1]
+  else
+    [cfg.to_s, -1]
+  end
+end
+
+# --- Command handling ---
+
+command = script.vars[1]
+
+case command
+when "add"
+  name = script.vars[2]
+  rest = script.vars[3..-1] || []
+  # Check if first arg after name is a priority number (-2 to 2)
+  if rest[0] =~ /^-?[012]$/ && rest.length > 1
+    priority = rest[0].to_i
+    pattern = rest[1..-1].join(" ")
+  else
+    priority = -1
+    pattern = rest.join(" ")
+  end
+  if name.nil? || pattern.nil? || pattern.empty?
+    echo "Usage: ;pushover add <name> [priority] <pattern>"
+    echo "  priority: -2 (no alert), -1 (quiet, default), 0 (normal), 1 (high), 2 (emergency)"
+    exit
+  end
+  UserVars.pushover["watches"][name] = { "pattern" => pattern, "priority" => priority }
+  UserVars.save
+  echo "Added text watch '#{name}' (priority #{priority}): #{pattern}"
+  exit
+
+when "remove"
+  name = script.vars[2]
+  if name.nil?
+    echo "Usage: ;pushover remove <name>"
+    exit
+  end
+  if UserVars.pushover["watches"].delete(name)
+    UserVars.save
+    echo "Removed text watch '#{name}'"
+  else
+    echo "No text watch named '#{name}' found"
+  end
+  exit
+
+when "status"
+  subcmd = script.vars[2]
+  case subcmd
+  when "add"
+    name = script.vars[3]
+    condition = script.vars[4]
+    priority_arg = script.vars[5]
+    if name.nil? || condition.nil?
+      echo "Usage: ;pushover status add <name> <condition> [priority]"
+      echo "  priority: -2 (no alert), -1 (quiet, default), 0 (normal), 1 (high), 2 (emergency)"
+      echo "Available conditions: #{STATUS_CONDITIONS.keys.join(', ')}"
+      exit
+    end
+    unless STATUS_CONDITIONS.key?(condition)
+      echo "Unknown condition '#{condition}'. Available: #{STATUS_CONDITIONS.keys.join(', ')}"
+      exit
+    end
+    priority = (priority_arg =~ /^-?[012]$/) ? priority_arg.to_i : -1
+    UserVars.pushover["statuses"][name] = { "condition" => condition, "priority" => priority }
+    UserVars.save
+    echo "Added status check '#{name}' (priority #{priority}): #{condition}"
+  when "remove"
+    name = script.vars[3]
+    if name.nil?
+      echo "Usage: ;pushover status remove <name>"
+      exit
+    end
+    if UserVars.pushover["statuses"].delete(name)
+      UserVars.save
+      echo "Removed status check '#{name}'"
+    else
+      echo "No status check named '#{name}' found"
+    end
+  else
+    echo "Usage: ;pushover status add|remove <name> [<condition>]"
+    echo "Available conditions: #{STATUS_CONDITIONS.keys.join(', ')}"
+  end
+  exit
+
+when "list"
+  watches = UserVars.pushover["watches"]
+  statuses = UserVars.pushover["statuses"]
+  echo "=== Pushover Configuration (cooldown: #{UserVars.pushover["cooldown"]}s) ==="
+  if watches.empty?
+    echo "  Text watches: (none)"
+  else
+    echo "  Text watches:"
+    watches.each do |name, cfg|
+      pattern, pri = parse_watch_config(cfg)
+      echo "    #{name}: #{pattern} (priority #{pri})"
+    end
+  end
+  if statuses.empty?
+    echo "  Status checks: (none)"
+  else
+    echo "  Status checks:"
+    statuses.each do |name, cfg|
+      condition, pri = parse_status_config(cfg)
+      echo "    #{name}: #{condition} (priority #{pri})"
+    end
+  end
+  echo "Available status conditions: #{STATUS_CONDITIONS.keys.join(', ')}"
+  exit
+
+when "test"
+  echo "Sending test notification..."
+  send_pushover("GS4 [#{Char.name}] - Test", "Pushover notifications are working! Character: #{Char.name}")
+  exit
+
+when "cooldown"
+  seconds = script.vars[2].to_i
+  if seconds <= 0
+    echo "Usage: ;pushover cooldown <seconds>  (must be > 0)"
+    exit
+  end
+  UserVars.pushover["cooldown"] = seconds
+  UserVars.save
+  echo "Cooldown set to #{seconds} seconds"
+  exit
+
+end
+
+# --- Main monitoring ---
+
+watches = UserVars.pushover["watches"]
+statuses = UserVars.pushover["statuses"]
+
+if watches.empty? && statuses.empty?
+  echo "No watches or status checks configured."
+  echo "  ;pushover add <name> <regex>            - text watch"
+  echo "  ;pushover status add <name> <condition>  - status check"
+  echo "  ;pushover list                           - see available conditions"
+  exit
+end
+
+cooldown = UserVars.pushover["cooldown"]
+
+echo "Pushover monitor started (cooldown #{cooldown}s):"
+watches.each { |name, cfg| p, pri = parse_watch_config(cfg); echo "  [text]   #{name}: #{p} (pri #{pri})" }
+statuses.each { |name, cfg| c, pri = parse_status_config(cfg); echo "  [status] #{name}: #{c} (pri #{pri})" }
+
+# Reload config periodically
+reload_interval = 30
+last_reload = Time.now
+
+# --- Status polling thread ---
+status_thread = Thread.new {
+  loop {
+    begin
+      current_statuses = UserVars.pushover["statuses"]
+      cd = UserVars.pushover["cooldown"]
+
+      current_statuses.each do |name, cfg|
+        condition, pri = parse_status_config(cfg)
+        evaluator = STATUS_CONDITIONS[condition]
+        next if evaluator.nil?
+
+        triggered, description = evaluator.call
+        if triggered && description
+          notify_if_ready(
+            "status:#{name}",
+            "GS4 [#{Char.name}] - #{name}",
+            description,
+            cd,
+            priority: pri
+          )
+        end
+      end
+    rescue => e
+      echo "Status check error: #{e.message}"
+    end
+    sleep 2
+  }
+}
+
+before_dying {
+  status_thread.kill
+
+  # Send notification if script_dead status check is configured
+  current_statuses = UserVars.pushover["statuses"] rescue {}
+  current_statuses.each do |name, cfg|
+    condition, pri = parse_status_config(cfg)
+    if condition == "script_dead"
+      send_pushover(
+        "GS4 [#{Char.name}] - #{name}",
+        "Pushover monitor script has died!",
+        priority: pri
+      )
+    end
+  end
+}
+
+# --- Text monitoring loop (main thread) ---
+loop {
+  line = get
+  $pushover_last_line_at = Time.now
+
+  # Detect explicit disconnect message from game
+  if line =~ /^Connection to the game has been lost/
+    $pushover_disconnected = true
+  end
+
+  # Periodic config reload
+  if Time.now - last_reload > reload_interval
+    watches = UserVars.pushover["watches"]
+    cooldown = UserVars.pushover["cooldown"]
+    last_reload = Time.now
+  end
+
+  next if line.nil?
+
+  watches.each do |name, cfg|
+    begin
+      pattern, pri = parse_watch_config(cfg)
+      if line =~ /#{pattern}/i
+        body = line.length > 512 ? line[0..511] + "..." : line
+        notify_if_ready(
+          "text:#{name}",
+          "GS4 [#{Char.name}] - #{name}",
+          body,
+          cooldown,
+          priority: pri
+        )
+      end
+    rescue RegexpError => e
+      echo "Bad regex for '#{name}': #{e.message}"
+    end
+  end
+}
