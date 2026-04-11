@@ -1,0 +1,524 @@
+# frozen_string_literal: true
+
+=begin
+  Lumnis Donate
+
+  Automates Temple of Lumnis donations.
+
+  Usage:
+    ;lumnisdonate <count> [unit]
+
+  Units:
+    week|weeks|w
+    month|months|m
+    quarter|quarters|q
+    year|years|y
+
+  Examples:
+    ;lumnisdonate 4
+    ;lumnisdonate 4 weeks
+    ;lumnisdonate 1 month
+    ;lumnisdonate 1 quarter
+    ;lumnisdonate 1 year
+
+  Author: Phocosoen, Codex
+  Version: 1.0.0
+  Tags: lumnis, donate, automation, silver, utility
+=end
+
+BASE_DONATION_COST = 250_000
+MIST_HARBOR_BANK = "3672"
+WEEK_SECONDS = 7 * 24 * 60 * 60
+DEFAULT_SCHEDULE_WDAY = 0 # Sunday
+DEFAULT_SCHEDULE_HOUR = 0
+DEFAULT_SCHEDULE_MIN = 0
+WEEKDAY_MAP = {
+  "sunday" => 0,
+  "monday" => 1,
+  "tuesday" => 2,
+  "wednesday" => 3,
+  "thursday" => 4,
+  "friday" => 5,
+  "saturday" => 6
+}.freeze
+
+def commaize(num)
+  num.to_i.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
+end
+
+def usage
+  echo "Usage: ;lumnisdonate <count> [week|month|quarter|year]"
+  echo "Valid units: week|weeks|w, month|months|m, quarter|quarters|q, year|years|y"
+  echo "Examples:"
+  echo "  ;lumnisdonate 4"
+  echo "  ;lumnisdonate 4 weeks"
+  echo "  ;lumnisdonate 1 month"
+  echo "  ;lumnisdonate 1 quarter"
+  echo "  ;lumnisdonate 1 year"
+  exit
+end
+
+def donation_cost_per_use
+  level = Char.level.to_i
+  return level * 1_000 if level.positive? && level < 20
+  BASE_DONATION_COST
+end
+
+def premium_account?
+  sub = Account.subscription.to_s.upcase
+  type = Account.type.to_s.upcase
+  user_premium = begin
+    UserVars.respond_to?(:premium) && !!UserVars.premium
+  rescue
+    false
+  end
+  sub.include?("PREMIUM") || type.include?("PREMIUM") || user_premium
+end
+
+def go_to_bank
+  if premium_account?
+    Script.run("go2", MIST_HARBOR_BANK)
+  else
+    Script.run("go2", "bank")
+  end
+end
+
+def go_to_lumnis_donate_room
+  Script.run("go2", "lumnis donate")
+  sleep 0.2 while running?("go2")
+
+  return if Room.current.tags.to_a.any? { |tag| tag.to_s =~ /\Alumnis ?donate\z/i }
+
+  Script.run("go2", "lumnisdonate")
+  sleep 0.2 while running?("go2")
+end
+
+def nth_weekday_of_month(year, month, wday, nth)
+  first = Time.utc(year, month, 1)
+  delta = (wday - first.wday) % 7
+  1 + delta + (7 * (nth - 1))
+end
+
+def et_dst_start_utc(year)
+  # Second Sunday in March at 02:00 EST == 07:00 UTC
+  day = nth_weekday_of_month(year, 3, 0, 2)
+  Time.utc(year, 3, day, 7, 0, 0)
+end
+
+def et_dst_end_utc(year)
+  # First Sunday in November at 02:00 EDT == 06:00 UTC
+  day = nth_weekday_of_month(year, 11, 0, 1)
+  Time.utc(year, 11, day, 6, 0, 0)
+end
+
+def et_offset_hours_for_utc(utc_time)
+  year = utc_time.year
+  start_utc = et_dst_start_utc(year)
+  end_utc = et_dst_end_utc(year)
+  (utc_time >= start_utc && utc_time < end_utc) ? -4 : -5
+end
+
+def et_offset_string(hours)
+  format("%+03d:00", hours.to_i)
+end
+
+def to_et(time_obj)
+  utc = time_obj.getutc
+  offset = et_offset_hours_for_utc(utc)
+  utc.getlocal(et_offset_string(offset))
+end
+
+def now_et
+  to_et(Time.now)
+end
+
+def et_time(year, month, day, hour = 0, min = 0, sec = 0)
+  # Resolve with DST-aware offset for that ET wall-clock time.
+  t = Time.new(year, month, day, hour, min, sec, "-05:00")
+  2.times do
+    offset = et_offset_hours_for_utc(t.getutc)
+    t = Time.new(year, month, day, hour, min, sec, et_offset_string(offset))
+  end
+  t
+end
+
+def month_start_plus(months_to_add, ref_time = now_et)
+  month_index = (ref_time.month - 1) + months_to_add
+  year = ref_time.year + (month_index / 12)
+  month = (month_index % 12) + 1
+  et_time(year, month, 1, 0, 0, 0)
+end
+
+def quarter_boundary_start(count, ref_time = now_et)
+  current_quarter_start_month = (((ref_time.month - 1) / 3) * 3) + 1
+  month_index = (current_quarter_start_month - 1) + (3 * count)
+  year = ref_time.year + (month_index / 12)
+  month = (month_index % 12) + 1
+  et_time(year, month, 1, 0, 0, 0)
+end
+
+def period_boundary_start(unit, count, ref_time = now_et)
+  case unit
+  when "month", "months", "m"
+    month_start_plus(count, ref_time)
+  when "quarter", "quarters", "q"
+    quarter_boundary_start(count, ref_time)
+  when "year", "years", "y"
+    et_time(ref_time.year + count, 1, 1, 0, 0, 0)
+  else
+    nil
+  end
+end
+
+def next_cycle_start(schedule_wday, schedule_hour, schedule_min, ref_time = now_et)
+  candidate = et_time(ref_time.year, ref_time.month, ref_time.day, schedule_hour, schedule_min, 0)
+  day_delta = (schedule_wday - candidate.wday) % 7
+  candidate += day_delta * 24 * 60 * 60
+  candidate += WEEK_SECONDS if candidate <= ref_time
+  candidate
+end
+
+def cycle_count_until(next_start, boundary_start)
+  return 0 if next_start.nil? || boundary_start.nil? || next_start >= boundary_start
+  (((boundary_start - next_start) / WEEK_SECONDS.to_f).ceil).to_i
+end
+
+def coverage_through_from_donations(next_start, donation_count)
+  return nil if next_start.nil? || donation_count.to_i <= 0
+  next_start + (donation_count.to_i * WEEK_SECONDS)
+end
+
+def format_local_time(time_obj)
+  return nil if time_obj.nil?
+  time_obj.getlocal.strftime("%B %-d, %Y %H:%M %Z")
+end
+
+def format_eastern_time(time_obj)
+  return nil if time_obj.nil?
+  t = to_et(time_obj)
+  t.strftime("%B %-d, %Y %H:%M ET")
+end
+
+def parse_args
+  vars = Script.current.vars
+  count_arg = vars[1].to_s.strip
+  unit_arg = vars[2].to_s.strip.downcase
+
+  usage if count_arg.empty? || count_arg =~ /^help$/i
+
+  if count_arg =~ /^\d+$/
+    count = count_arg.to_i
+    unit = unit_arg.empty? ? "week" : unit_arg
+  else
+    count = 1
+    unit = count_arg.downcase
+  end
+
+  usage if count <= 0
+
+  usage unless %w[week weeks w month months m quarter quarters q year years y].include?(unit)
+
+  [count, unit]
+end
+
+def year_unit?(unit)
+  %w[year years y].include?(unit.to_s.downcase)
+end
+
+def boundary_label(boundary_time)
+  return nil if boundary_time.nil?
+  boundary_time.strftime("%B %-d, %Y")
+end
+
+def week_unit?(unit)
+  %w[week weeks w].include?(unit.to_s.downcase)
+end
+
+def require_unpause_confirmation!(count, unit, target_weeks, needed_weeks, total_silver, boundary_time, recent_donations)
+  return if count.to_i == 1 && week_unit?(unit) && target_weeks.to_i == 1
+
+  script_name = Script.current.name
+
+  echo "============================================================"
+  echo "                 LUMNIS DONATION CONFIRMATION"
+  echo "Requested: #{count} #{unit}"
+  echo "Target donation window: #{target_weeks} week(s)"
+  unless week_unit?(unit)
+    echo "Recent donations on account: #{recent_donations}"
+    echo "Additional donations needed: #{needed_weeks}"
+    label = boundary_label(boundary_time)
+    echo "Coverage boundary: #{label}" unless label.nil?
+  end
+  echo "Total silver required now: #{commaize(total_silver)}"
+  echo "Script is now paused for manual confirmation."
+  echo "Type: ;unpause #{script_name}"
+  echo "============================================================"
+
+  pause_script
+  sleep 0.2 while Script.paused?(script_name)
+end
+
+def withdraw_silvers(amount)
+  result = dothistimeout "withdraw #{amount} silvers", 4,
+                         /The teller carefully records the transaction|The teller scribbles the transaction into a book and hands you|Very well, a withdrawal of|hands you [\d,]+ silvers|You don't seem to have that much|can't carry that much|would be too much for you to carry/i
+  case result
+  when /don't seem to have that much/i
+    echo "Failed: insufficient bank balance for #{commaize(amount)} silvers."
+    exit
+  when /can't carry that much|too much for you to carry/i
+    echo "Failed: carrying capacity exceeded when withdrawing #{commaize(amount)} silvers."
+    exit
+  else
+    true
+  end
+end
+
+def parse_silver_amount(text)
+  return nil if text.nil?
+  text.gsub(",", "").to_i
+end
+
+def fetch_lumnis_snapshot
+  data = {
+    donations: 0,
+    schedule_wday: DEFAULT_SCHEDULE_WDAY,
+    schedule_hour: DEFAULT_SCHEDULE_HOUR,
+    schedule_min: DEFAULT_SCHEDULE_MIN,
+    used_default_schedule: true,
+    next_start_et: nil
+  }
+  lines = Lich::Util.quiet_command_xml("lumnis info", /Your Gift of Lumnis|Because your account is free|You have made|You have not made/i, /<prompt/, true, 6, true)
+  Array(lines).each do |line|
+    next if line.nil?
+    if line =~ /Your Gift of Lumnis is scheduled to start on (\w+)s? at (\d{2}):(\d{2}), in-game time\./i
+      weekday = Regexp.last_match(1).downcase.sub(/s\z/, "")
+      wday = WEEKDAY_MAP[weekday]
+      if wday
+        data[:schedule_wday] = wday
+        data[:schedule_hour] = Regexp.last_match(2).to_i
+        data[:schedule_min] = Regexp.last_match(3).to_i
+        data[:used_default_schedule] = false
+      end
+    elsif line =~ /scheduled to refresh in (?:(\d+) days?, )?(?:(\d+) hours? and )?(\d+) minutes?/i
+      days = Regexp.last_match(1).to_i
+      hours = Regexp.last_match(2).to_i
+      mins = Regexp.last_match(3).to_i
+      data[:next_start_et] = now_et + (days * 86_400) + (hours * 3_600) + (mins * 60)
+    elsif line =~ /scheduled to refresh in (?:(\d+) days? and )?(\d+) minutes?/i
+      days = Regexp.last_match(1).to_i
+      mins = Regexp.last_match(2).to_i
+      data[:next_start_et] = now_et + (days * 86_400) + (mins * 60)
+    elsif line =~ /You have made (\d+) recent donation/i
+      data[:donations] = Regexp.last_match(1).to_i
+    elsif line =~ /You have not made any recent donations/i
+      data[:donations] = 0
+    end
+  end
+
+  data
+end
+
+def parse_bank_silver_from_line(line)
+  return nil if line.nil?
+
+  patterns = [
+    /account balance(?: up)? to\s+([\d,]+)\.?/i,
+    /balance(?: of)?\s+([\d,]+)\s+silvers?/i,
+    /you (?:currently )?have\s+([\d,]+)\s+silvers?/i,
+    /([\d,]+)\s+silvers?.*account/i,
+    /^\s*[^:]+:\s*([\d,]+)\s*$/i
+  ]
+
+  patterns.each do |rx|
+    m = line.match(rx)
+    return parse_silver_amount(m[1]) if m
+  end
+
+  nil
+end
+
+def read_liquid_silver_snapshot_from_wealth
+  state = {
+    with_you: 0,
+    hand: 0,
+    accessible: 0
+  }
+
+  lines = Lich::Util.quiet_command_xml("wealth", /You have .* silver with you|You have no silver with you|stored within your coin hand|carrying a total of .* silver/i, /<prompt/, true, 5, true)
+  Array(lines).each do |line|
+    next if line.nil?
+    if line =~ /You have ([\d,]+) silver with you\./i
+      state[:with_you] = parse_silver_amount(Regexp.last_match(1))
+    elsif line =~ /You have no silver with you\./i
+      state[:with_you] = 0
+    elsif line =~ /You are carrying ([\d,]+) silver stored within your coin hand\./i
+      state[:hand] = parse_silver_amount(Regexp.last_match(1))
+    elsif line =~ /You are carrying a total of ([\d,]+) silver\./i
+      # Fallback for characters without a coin hand.
+      state[:with_you] = [state[:with_you], parse_silver_amount(Regexp.last_match(1))].max
+    end
+  end
+
+  state[:accessible] = state[:with_you].to_i + state[:hand].to_i
+  state
+end
+
+def ensure_liquid_silver_on_person!(needed)
+  snapshot = read_liquid_silver_snapshot_from_wealth
+  return if snapshot[:with_you].to_i >= needed
+
+  pull = [needed - snapshot[:with_you].to_i, snapshot[:hand].to_i].min
+  if pull.positive?
+    result = dothistimeout "get #{pull} my hand", 5,
+                           /You (?:remove|retrieve|get)|You don't have that much|What were you referring to|You have no coin hand/i
+    if result =~ /don't have that much|What were you referring to|no coin hand/i
+      echo "Failed to retrieve #{commaize(pull)} silver from coin hand: #{result.strip}"
+      exit
+    end
+  end
+
+  updated = read_liquid_silver_snapshot_from_wealth
+  return if updated[:with_you].to_i >= needed
+
+  echo "Failed: only #{commaize(updated[:with_you])} silver on-person after coin hand retrieval; need #{commaize(needed)}."
+  exit
+end
+
+def read_bank_balance
+  balances = []
+
+  bank_result = dothistimeout "bank account", 4, /^\s*Total:\s*[\d,]+/i
+  if bank_result =~ /^\s*Total:\s*([\d,]+)/i
+    return parse_silver_amount(Regexp.last_match(1))
+  end
+  return 0 if bank_result =~ /You currently have no open bank accounts/i
+
+  # Fallback to line scanning if command output arrives fragmented.
+  timeout_at = Time.now + 3
+  while Time.now < timeout_at
+    line = get?
+    next if line.nil?
+    return 0 if line =~ /You currently have no open bank accounts/i
+    amt = parse_bank_silver_from_line(line)
+    balances << amt if amt && amt > 0
+  end
+
+  return balances.max unless balances.empty?
+
+  # Fallback parser path
+  fput "wealth"
+  timeout_at = Time.now + 6
+  while Time.now < timeout_at
+    line = get?
+    next if line.nil?
+    amt = parse_bank_silver_from_line(line)
+    balances << amt if amt && amt > 0
+  end
+
+  balances.max
+end
+
+def ensure_enough_bank_silver!(needed)
+  available = read_bank_balance
+  if available.nil?
+    echo "Failed: could not verify bank balance from BANK ACCOUNT/WEALTH."
+    exit
+  end
+
+  if available < needed
+    echo "Failed: bank balance #{commaize(available)} is below required #{commaize(needed)} silvers."
+    exit
+  end
+
+  echo "Verified bank balance: #{commaize(available)} silvers (need #{commaize(needed)})."
+end
+
+def donate_times(times)
+  success = 0
+
+  times.times do |i|
+    before = fetch_lumnis_snapshot[:donations].to_i
+    lines = Lich::Util.quiet_command_xml("lumnis donate confirm", /./, /<prompt/, true, 8, true)
+    after = fetch_lumnis_snapshot[:donations].to_i
+
+    if after > before
+      success += 1
+      echo "Donation #{i + 1}/#{times} succeeded (donations #{before} -> #{after})."
+    else
+      summary = Array(lines).map(&:to_s).find { |l| l =~ /donat|eligible|wait|insufficient|cannot|already/i }.to_s.strip
+      echo "Donation #{i + 1}/#{times} failed (donations remained #{after}). #{summary}"
+      break
+    end
+  end
+
+  success
+end
+
+count, unit = parse_args
+donation_cost = donation_cost_per_use
+snapshot = fetch_lumnis_snapshot
+recent_donations = snapshot[:donations].to_i
+ref_time = now_et
+next_start = snapshot[:next_start_et] || next_cycle_start(snapshot[:schedule_wday], snapshot[:schedule_hour], snapshot[:schedule_min], ref_time)
+
+target_weeks =
+  if week_unit?(unit)
+    count
+  else
+    boundary = period_boundary_start(unit, count, ref_time)
+    cycle_count_until(next_start, boundary)
+  end
+
+boundary = week_unit?(unit) ? (next_start + (count * WEEK_SECONDS)) : period_boundary_start(unit, count, ref_time)
+
+needed_weeks =
+  [target_weeks - recent_donations, 0].max
+total_silver = needed_weeks * donation_cost
+
+if needed_weeks <= 0
+  coverage_through = coverage_through_from_donations(next_start, recent_donations)
+  coverage_local = format_local_time(coverage_through)
+  coverage_et = format_eastern_time(coverage_through)
+  echo "You currently have #{recent_donations} recent donation(s)."
+  unless coverage_local.nil? || coverage_et.nil?
+    echo "Coverage from current donations is projected through #{coverage_local} (local) / #{coverage_et} (ET)."
+  end
+  if snapshot[:used_default_schedule]
+    echo "Schedule line not found in LUMNIS INFO. Using default: Sundays at 00:00 ET."
+  end
+  echo "No additional donations required for requested #{count} #{unit} window."
+  exit
+end
+
+echo "Requested: #{count} #{unit} => target #{target_weeks} week(s)"
+echo "Recent donations before: #{recent_donations}"
+label = boundary_label(boundary)
+echo "Coverage boundary: #{label}" unless label.nil?
+if snapshot[:used_default_schedule]
+  echo "Schedule line not found in LUMNIS INFO. Using default: Sundays at 00:00 ET."
+end
+echo "Additional donations needed: #{needed_weeks}"
+echo "Donation cost per use at level #{Char.level}: #{commaize(donation_cost)} silvers"
+echo "Total donation target now: #{needed_weeks} x #{commaize(donation_cost)} = #{commaize(total_silver)} silvers"
+
+require_unpause_confirmation!(count, unit, target_weeks, needed_weeks, total_silver, boundary, recent_donations)
+
+liquid_silver = read_liquid_silver_snapshot_from_wealth
+on_hand_accessible = liquid_silver[:accessible].to_i
+shortfall = [total_silver - on_hand_accessible, 0].max
+
+if shortfall.positive?
+  go_to_bank
+  ensure_enough_bank_silver!(shortfall)
+  withdraw_silvers(shortfall)
+else
+  echo "Sufficient liquid silver already available (on-person + coin hand): #{commaize(on_hand_accessible)}."
+end
+
+ensure_liquid_silver_on_person!(total_silver)
+go_to_lumnis_donate_room
+successful = donate_times(needed_weeks)
+
+after_snapshot = fetch_lumnis_snapshot
+echo "Recent donations after: #{after_snapshot[:donations]}"
+echo "Done. Successful donations: #{successful}/#{needed_weeks}"
