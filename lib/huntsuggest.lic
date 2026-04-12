@@ -1,0 +1,395 @@
+# HuntSuggest is a Lich utility for GemStone IV designed for use with the huntpro script.
+# It reads a Google Sheet of hunting areas, recommends huntpro-compatible hunting options,
+# and prints clickable ;huntpro commands using the sheet's Area Name key.
+#
+# This script is intended as a lightweight helper for players who use huntpro and want:
+# - quick hunt suggestions by level
+# - hunt suggestions by town/location area
+# - clickable command output
+# - readable hunt info before starting
+#
+# huntpro commands are built from:
+#   ;huntpro <style_number> <area_name>
+#
+# Example:
+#   ;huntpro 9 wlredpixie
+#
+# Usage:
+#   ;huntsuggest
+#   ;huntsuggest <level>
+#   ;huntsuggest <town>
+#
+# Examples:
+#   ;huntsuggest 25
+#   ;huntsuggest landing
+#   ;huntsuggest solhaven
+#   ;huntsuggest icemule
+#
+# Style Numbers for huntpro:
+#   1 = UAC Jab
+#   2 = UAC Grapple / Stealth UAC
+#   3 = Melee
+#   4 = Melee Ambush / Stealth
+#   5 = Ranged
+#   6 = Ranged / Stealth
+#   7 = Ranged Kneeling
+#   8 = Ranged Kneeling / Stealth
+#   9 = Casting
+#
+# Data Source:
+#   Google Sheet hunt table with columns including:
+#   Creature Level, Area Name, Creature Names, Bounty Location, Type, Town,
+#   Spawn Rate, Silver Farm, Skin Name, Estimated Skin Value, Bounty Status
+#
+# Notes:
+# - built for use with the huntpro script
+# - huntpro command generation uses Area Name, not Bounty Location
+# - output is text/clickable-link based
+# - intended for GemStone IV with Lich
+# - requires internet access to fetch the sheet CSV
+#
+#         author: Necrodeus
+#           game: GemStone IV
+#           tags: hunting, huntpro, recommendations, clickable, utility
+#        version: 1.0.1
+#
+# Changelog
+#   v1.0.1 - 4/12/2026
+#     - Added explicit huntpro usage wording to header/help
+#     - Kept command generation based on Area Name keys
+#   v1.0.0 - 4/12/2026
+#     - Initial release
+#     - Reads hunt data from Google Sheets
+#     - Recommends top 3 hunts by level or town filter
+#     - Outputs clickable ;huntpro commands
+#     - Uses Area Name for huntpro command generation
+
+require 'csv'
+require 'open-uri'
+require 'uri'
+require 'cgi'
+
+module HuntSuggest
+  SHEET_URL = 'https://docs.google.com/spreadsheets/d/1KR5-3WQCKL8aU1pH-buY03W5Fj1iIr5K10gC6Do4raE/export?format=csv&gid=603710211'
+  LIMIT = 3
+
+  STYLE_OPTIONS = {
+    1 => 'UAC Jab',
+    2 => 'UAC Grapple / Stealth UAC',
+    3 => 'Melee',
+    4 => 'Melee Ambush / Stealth',
+    5 => 'Ranged',
+    6 => 'Ranged / Stealth',
+    7 => 'Ranged Kneeling',
+    8 => 'Ranged Kneeling / Stealth',
+    9 => 'Casting'
+  }.freeze
+
+  DEFAULT_STYLE = 9
+  QUICK_STYLES = [9, 3, 1].freeze
+
+  Hunt = Struct.new(
+    :level,
+    :area_name,
+    :creature_names,
+    :bounty_location,
+    :creature_type,
+    :town,
+    :spawn_rate,
+    :silver_farm,
+    :skin_name,
+    :estimated_skin_value,
+    :bounty_status,
+    keyword_init: true
+  )
+
+  module_function
+
+  def run(script)
+    enable_status_tags
+
+    arg = normalize_text(script.vars[1])
+
+    case arg.downcase
+    when ''
+      show_suggestions(detect_level, nil)
+    when 'help'
+      print_help
+    when 'styles'
+      print_styles
+    else
+      if integer_text?(arg)
+        show_suggestions(arg.to_i, nil)
+      else
+        show_suggestions(detect_level, arg)
+      end
+    end
+  rescue StandardError => e
+    safe_echo("huntsuggest error: #{e.class}: #{e.message}")
+  end
+
+  def enable_status_tags
+    return if @status_tags_enabled
+
+    begin
+      status_tags('on')
+    rescue StandardError
+      nil
+    end
+
+    @status_tags_enabled = true
+  end
+
+  def show_suggestions(level, town_filter)
+    suggestions = fetch_suggestions(level, town_filter)
+
+    send_line('')
+    send_line('=== Hunt Suggestions ===')
+    send_line('Built for use with: huntpro')
+    send_line("Level: #{level}")
+    send_line("Town Filter: #{town_filter || 'Any'}")
+    send_line('')
+
+    suggestions.each_with_index do |hunt, index|
+      print_hunt(index + 1, hunt)
+    end
+
+    send_line(
+      "Help: #{click(';huntsuggest help', ';huntsuggest help')}  " \
+      "Styles: #{click(';huntsuggest styles', ';huntsuggest styles')}"
+    )
+  end
+
+  def print_help
+    safe_echo('=== huntsuggest help ===')
+    safe_echo('Built for use with the huntpro script.')
+    safe_echo('Suggests huntpro areas from a Google Sheet using Area Name keys.')
+    safe_echo(' ')
+    safe_echo('Usage:')
+    safe_echo('  ;huntsuggest')
+    safe_echo('  ;huntsuggest <level>')
+    safe_echo('  ;huntsuggest <town>')
+    safe_echo(' ')
+    safe_echo('Examples:')
+    safe_echo('  ;huntsuggest 25')
+    safe_echo('  ;huntsuggest landing')
+    safe_echo('  ;huntsuggest solhaven')
+    safe_echo(' ')
+    safe_echo('huntpro command format:')
+    safe_echo('  ;huntpro <style_number> <area_name>')
+    safe_echo('  Example: ;huntpro 9 wlredpixie')
+  end
+
+  def print_styles
+    safe_echo('=== Hunt Styles for huntpro ===')
+    STYLE_OPTIONS.each do |number, name|
+      safe_echo("  #{number} = #{name}")
+    end
+  end
+
+  def fetch_suggestions(level, town_filter)
+    hunts = load_hunts
+    suggestions = suggest_hunts(hunts, level, town_filter, LIMIT)
+    raise 'no suggestions found' if suggestions.empty?
+
+    suggestions
+  end
+
+  def detect_level
+    level = begin
+      Char.level
+    rescue StandardError
+      nil
+    end
+
+    level ||= begin
+      XMLData.level
+    rescue StandardError
+      nil
+    end
+
+    raise 'could not determine your level, use ;huntsuggest <level>' unless level
+
+    level.to_i
+  end
+
+  def load_hunts
+    csv_text = URI.open(SHEET_URL, &:read)
+    rows = CSV.parse(csv_text, headers: true)
+    hunts = rows.map { |row| build_hunt(row) }.compact
+    raise 'no valid rows found in sheet' if hunts.empty?
+
+    hunts
+  end
+
+  def build_hunt(row)
+    level = integer_from(read_value(row, 'Creature Level', 'Level'))
+    area_name = read_value(row, 'Area Name')
+    return nil unless level
+    return nil if blank_text?(area_name)
+
+    Hunt.new(
+      level: level,
+      area_name: area_name,
+      creature_names: read_value(row, 'Creature Names'),
+      bounty_location: read_value(row, 'Bounty Location'),
+      creature_type: read_value(row, 'Type', 'Creature Type'),
+      town: read_value(row, 'Town'),
+      spawn_rate: read_value(row, 'Spawn Rate'),
+      silver_farm: read_value(row, 'Silver Farm'),
+      skin_name: read_value(row, 'Skin Name'),
+      estimated_skin_value: read_value(row, 'Estimated Skin Value'),
+      bounty_status: read_value(row, 'Bounty Status')
+    )
+  end
+
+  def read_value(row, *names)
+    headers = row.headers.compact.map(&:to_s)
+
+    names.each do |wanted|
+      found = headers.find { |header| normalize_header(header) == normalize_header(wanted) }
+      return normalize_text(row[found]) if found
+    end
+
+    ''
+  end
+
+  def suggest_hunts(hunts, target_level, town_filter, limit)
+    filtered = hunts.select do |hunt|
+      next false unless hunt.level
+
+      if town_filter
+        normalize_text(hunt.town).downcase.include?(town_filter.downcase)
+      else
+        true
+      end
+    end
+
+    ranked = filtered.sort_by do |hunt|
+      [
+        town_filter ? 0 : (hunt.level - target_level).abs,
+        town_filter ? normalize_text(hunt.town) : (hunt.level == target_level ? 0 : 1),
+        -hunt_bounty_score(hunt),
+        -hunt_spawn_score(hunt),
+        normalize_text(hunt.town),
+        hunt_area_key(hunt)
+      ]
+    end
+
+    deduped = []
+    seen = {}
+
+    ranked.each do |hunt|
+      key = hunt_area_key(hunt).downcase
+      next if seen[key]
+
+      seen[key] = true
+      deduped << hunt
+      break if deduped.length >= limit
+    end
+
+    deduped
+  end
+
+  def print_hunt(index, hunt)
+    default_cmd = huntpro_command(hunt, DEFAULT_STYLE)
+
+    send_line("[#{index}] #{present_text(hunt.creature_names)}")
+    send_line("  Level: #{present_text(hunt.level)}")
+    send_line("  Area Name: #{present_text(hunt_area_key(hunt))}")
+    send_line("  Location: #{present_text(hunt.bounty_location)}")
+    send_line("  Town: #{present_text(hunt.town)}")
+    send_line("  Type: #{present_text(hunt.creature_type)}")
+    send_line("  Spawn: #{present_text(hunt.spawn_rate)}")
+    send_line("  Skin: #{present_text(hunt.skin_name)}")
+    send_line("  Bounty: #{present_text(hunt.bounty_status)}")
+    send_line("  Easy: #{click(default_cmd, default_cmd)}")
+    send_line("  Quick: #{quick_links(hunt)}")
+    send_line('')
+  end
+
+  def quick_links(hunt)
+    QUICK_STYLES.map do |style|
+      click(";huntpro #{style} #{hunt_area_key(hunt)}", huntpro_command(hunt, style))
+    end.join('  ')
+  end
+
+  def huntpro_command(hunt, style_number)
+    ";huntpro #{style_number} #{hunt_area_key(hunt)}"
+  end
+
+  def hunt_area_key(hunt)
+    normalize_text(hunt.area_name)
+  end
+
+  def hunt_spawn_score(hunt)
+    text = normalize_text(hunt.spawn_rate).downcase
+    return 5 if text.include?('very high')
+    return 4 if text.include?('high')
+    return 3 if text.include?('medium')
+    return 2 if text.include?('low')
+    return 1 if text.include?('very low')
+
+    0
+  end
+
+  def hunt_bounty_score(hunt)
+    text = normalize_text(hunt.bounty_status).downcase
+    return 3 if text.include?('complete')
+    return 1 if text.include?('partial')
+
+    0
+  end
+
+  def click(label, command)
+    %(<d cmd="#{xml_escape(command)}">#{xml_escape(label)}</d>)
+  end
+
+  def send_line(text)
+    puts %(<output class="mono" />#{text})
+  rescue StandardError
+    safe_echo(strip_tags(text))
+  end
+
+  def strip_tags(text)
+    text.to_s.gsub(/<[^>]+>/, '')
+  end
+
+  def xml_escape(value)
+    CGI.escapeHTML(value.to_s)
+  end
+
+  def normalize_header(value)
+    value.to_s.downcase.gsub(/[^a-z0-9]+/, '')
+  end
+
+  def integer_from(value)
+    match = value.to_s.match(/\d+/)
+    match ? match[0].to_i : nil
+  end
+
+  def integer_text?(value)
+    value.to_s.match?(/^\d+$/)
+  end
+
+  def present_text(value)
+    text = normalize_text(value)
+    text.empty? ? 'N/A' : text
+  end
+
+  def normalize_text(value)
+    value.to_s.gsub(/\s+/, ' ').strip
+  end
+
+  def blank_text?(value)
+    normalize_text(value).empty?
+  end
+
+  def safe_echo(message)
+    echo message
+  rescue StandardError
+    puts message
+  end
+end
+
+HuntSuggest.run(script)

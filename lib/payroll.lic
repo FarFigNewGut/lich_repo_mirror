@@ -5,7 +5,7 @@
             author: Bhuryn
               game: GemStone
               tags: banking, balances, tracker
-           version: 0.26
+           version: 0.27
 
   Improvements:
   Major_change.feature_addition.bugfix
@@ -35,8 +35,9 @@
     v0.22 - Adds ;payroll check to report weekly payroll cost and remaining funded weeks from current tracked wealth
     v0.23 - Adds payroll analytics reporting with daily movement stats and an ASCII trend chart
     v0.24 - Expands analytics into an ASCII dashboard with weekly rollups, streaks, volatility, drawdown, and runway metrics
-    v0.26 - Adds a confirmed character-record removal flow with ;payroll remove <character> followed by ;payroll confirm
     v0.25 - Renders dashboard metrics as boxed ASCII cards instead of wrapped text rows
+    v0.26 - Adds a confirmed character-record removal flow with ;payroll remove <character> followed by ;payroll confirm
+    v0.27 - Captures LUMNIS INFO schedule and donation status for payroll timing checks
     
 
     So this started off as a joke, and I actually find it kind of useful.  Maybe someone else will too.  It's a bit of a simplified wealth tracker.  Highly recommend autostart add --global payroll and when you login and log off it will pull the data from BANK ACCOUNT by character for display.   Check the help.  If you want any other options let me know.  This isn't intended as a ledger replacement, but I may pull data from ledger for analytics at some point because... why not? 
@@ -116,6 +117,8 @@ $payroll_capture_lines = []
 $payroll_hook_ids ||= {}
 $payroll_current_bank_code = nil
 $payroll_pending_delete_character = nil
+$payroll_lumnis_capture_active = false
+$payroll_lumnis_info = {}
 $payroll_db = nil
 def payroll_hook_id(kind)
   $payroll_hook_ids[kind] ||= "payroll_#{kind}_#{Script.current.object_id}"
@@ -155,6 +158,17 @@ def payroll_db
     Integer :total, default: 0, null: false
     String :updated_at, null: false
     primary_key %i[snapshot_date character_name]
+  end
+
+  db.create_table? :lumnis do
+    String :character_name, primary_key: true
+    String :start_day
+    String :start_time
+    String :payroll_start
+    String :last_schedule_used_at
+    String :recent_donations_text
+    Integer :recent_donations_count
+    String :updated_at, null: false
   end
 
   begin
@@ -223,6 +237,18 @@ end
 
 def latest_wealth_row_for(character_name)
   latest_wealth_rows_by_character[character_name]
+end
+
+def latest_lumnis_rows_by_character
+  rows = {}
+  payroll_db[:lumnis].order(:character_name).each do |row|
+    rows[row[:character_name]] = row
+  end
+  rows
+end
+
+def latest_lumnis_row_for(character_name)
+  latest_lumnis_rows_by_character[character_name]
 end
 
 def payroll_character_names
@@ -323,6 +349,44 @@ def format_signed_compact_silver(value)
   "#{prefix}#{format_compact_silver(amount.abs)}"
 end
 
+def nth_weekday_of_month(year, month, weekday, occurrence)
+  date = Date.new(year, month, 1)
+  delta = (weekday - date.wday) % 7
+  date + delta + ((occurrence - 1) * 7)
+end
+
+def eastern_utc_offset_for(date = Date.today)
+  dst_start = nth_weekday_of_month(date.year, 3, 0, 2)
+  dst_end = nth_weekday_of_month(date.year, 11, 0, 1)
+  date >= dst_start && date < dst_end ? (-4 * 3600) : (-5 * 3600)
+end
+
+def format_local_payroll_start(day_name, time_text)
+  return nil if day_name.to_s.empty? || time_text.to_s.empty?
+
+  weekdays = %w[Sunday Monday Tuesday Wednesday Thursday Friday Saturday]
+  source_day = day_name.to_s.sub(/s\z/, '')
+  day_index = weekdays.index(source_day)
+  return nil if day_index.nil?
+
+  hour_text, minute_text = time_text.to_s.split(':', 2)
+  return nil if hour_text.nil? || minute_text.nil?
+
+  total_minutes = (day_index * 1440) + (hour_text.to_i * 60) + minute_text.to_i
+  # LUMNIS INFO reports schedule time in Eastern Time. Convert it to the local machine offset for display.
+  offset_minutes = (Time.now.utc_offset - eastern_utc_offset_for(Date.today)) / 60
+  local_total_minutes = (total_minutes + offset_minutes) % (7 * 1440)
+  local_day = weekdays[local_total_minutes / 1440]
+  local_minutes_of_day = local_total_minutes % 1440
+  local_hour = local_minutes_of_day / 60
+  local_minute = local_minutes_of_day % 60
+  meridian = local_hour >= 12 ? 'PM' : 'AM'
+  display_hour = local_hour % 12
+  display_hour = 12 if display_hour.zero?
+
+  format('%s at %d:%02d %s', local_day, display_hour, local_minute, meridian)
+end
+
 def build_payroll_rows
   latest_wealth_rows_by_character.keys.sort.map do |char_name|
     row_data = latest_wealth_rows_by_character[char_name]
@@ -358,6 +422,7 @@ def build_payroll_totals_row(headers)
 end
 
 def render_payroll_block(rows, headers, totals_row = nil)
+  left_aligned_headers = ['Char', 'Name', 'Payroll Start']
   widths = headers.to_h { |header| [header, header.length] }
 
   rows.each do |row|
@@ -382,7 +447,7 @@ def render_payroll_block(rows, headers, totals_row = nil)
   rows.each do |row|
     line = '| ' + headers.map do |header|
       value = row[header].to_s
-      header == 'Char' ? value.ljust(widths[header]) : value.rjust(widths[header])
+      left_aligned_headers.include?(header) ? value.ljust(widths[header]) : value.rjust(widths[header])
     end.join(' | ') + ' |'
     respond line
   end
@@ -392,7 +457,7 @@ def render_payroll_block(rows, headers, totals_row = nil)
 
   total_line = '| ' + headers.map do |header|
     value = totals_row[header].to_s
-    header == 'Char' ? value.ljust(widths[header]) : value.rjust(widths[header])
+    left_aligned_headers.include?(header) ? value.ljust(widths[header]) : value.rjust(widths[header])
   end.join(' | ') + ' |'
   respond total_line
   respond separator
@@ -426,17 +491,50 @@ def render_payroll_table
 end
 
 def render_payroll_check
-  rows = latest_wealth_rows_by_character.values
-  if rows.empty?
+  lumnis_rows = latest_lumnis_rows_by_character
+  wealth_rows = latest_wealth_rows_by_character.values
+
+  if lumnis_rows.empty? && wealth_rows.empty?
     respond 'No payroll data saved yet.'
     return
   end
 
-  character_count = rows.length
-  total_wealth = rows.sum { |row| row[:total].to_i }
+  payroll_rows = (payroll_character_names + lumnis_rows.keys).uniq.sort.map do |character_name|
+    lumnis_row = lumnis_rows[character_name]
+    donation_text = lumnis_row ? lumnis_row[:recent_donations_text].to_s : ''
+    donations_count = lumnis_row ? lumnis_row[:recent_donations_count] : nil
+    payroll_start = lumnis_row ? lumnis_row[:payroll_start].to_s : ''
+    paid_for =
+      if !donations_count.nil? && donations_count.to_i.positive?
+        (donations_count.to_i + 1).to_s
+      elsif donation_text =~ /not made any recent donations/i
+        'Due!'
+      else
+        'Unknown'
+      end
+
+    {
+      'Name' => character_name,
+      'Payroll Start' => payroll_start.empty? ? 'Not scheduled' : payroll_start,
+      'Currently Paid For (weeks)' => paid_for
+    }
+  end
+
+  unless payroll_rows.empty?
+    payroll_rows.each do |row|
+      row['Payroll Start'] = 'Not scheduled' if row['Payroll Start'].to_s.empty?
+    end
+    render_payroll_block(payroll_rows, ['Name', 'Payroll Start', 'Currently Paid For (weeks)'])
+  end
+
+  return if wealth_rows.empty?
+
+  character_count = wealth_rows.length
+  total_wealth = wealth_rows.sum { |row| row[:total].to_i }
   weekly_cost = character_count * 250_000
   funded_weeks = weekly_cost.zero? ? 0.0 : (total_wealth.to_f / weekly_cost)
 
+  respond ''
   respond "Current Payroll Cost: #{format_compact_silver(weekly_cost)} per week"
   respond format('You have %.1f weeks remaining', funded_weeks)
 end
@@ -844,6 +942,51 @@ def reset_payroll_capture!
   $payroll_capture_lines = []
 end
 
+def reset_payroll_lumnis_capture!
+  $payroll_lumnis_capture_active = false
+  $payroll_lumnis_info = {}
+end
+
+def persist_lumnis_info!(character_name:, start_day:, start_time:, payroll_start:, last_schedule_used_at:, recent_donations_text:, recent_donations_count:)
+  dataset = payroll_db[:lumnis]
+  row = {
+    character_name: character_name,
+    start_day: start_day,
+    start_time: start_time,
+    payroll_start: payroll_start,
+    last_schedule_used_at: last_schedule_used_at,
+    recent_donations_text: recent_donations_text,
+    recent_donations_count: recent_donations_count,
+    updated_at: Time.now.iso8601
+  }
+
+  lookup = dataset.where(character_name: character_name)
+  update_values = row.reject { |key, _| key == :character_name }
+
+  if lookup.count.positive?
+    lookup.update(update_values)
+  else
+    dataset.insert(row)
+  end
+end
+
+def finalize_payroll_lumnis_capture!
+  return unless $payroll_lumnis_capture_active
+  return if $payroll_lumnis_info[:recent_donations_text].to_s.empty?
+
+  persist_lumnis_info!(
+    character_name: Char.name,
+    start_day: $payroll_lumnis_info[:start_day],
+    start_time: $payroll_lumnis_info[:start_time],
+    payroll_start: $payroll_lumnis_info[:payroll_start],
+    last_schedule_used_at: $payroll_lumnis_info[:last_schedule_used_at],
+    recent_donations_text: $payroll_lumnis_info[:recent_donations_text],
+    recent_donations_count: $payroll_lumnis_info[:recent_donations_count]
+  )
+  respond "Saved payroll lumnis info for #{Char.name}."
+  reset_payroll_lumnis_capture!
+end
+
 def finalize_payroll_capture!
   return unless $payroll_capture_active
   return if $payroll_capture_banks.empty? && $payroll_capture_total.to_i.zero?
@@ -881,53 +1024,101 @@ def process_payroll_line(line)
     return
   end
 
-  return unless $payroll_capture_active
-  $payroll_capture_lines << text
-
-  if text =~ /^\s*(.+?):\s+([0-9,]+)\s+silvers\s*$/
-    bank_name = Regexp.last_match(1).strip
-    amount = Regexp.last_match(2).delete(',').to_i
-    bank_code = canonical_bank_code(bank_name)
-    $payroll_capture_banks[bank_code] = amount if bank_code
+  if text =~ /^(?:You have [0-9,]+ points of .*Gift of Lumnis|Your Gift of Lumnis (?:has expired|will restart)|Because your account is free, you do not have access to the weekly Gift of Lumnis\.)/
+    $payroll_lumnis_capture_active = true
+    $payroll_lumnis_info = {}
+    if text =~ /Because your account is free, you do not have access to the weekly Gift of Lumnis\./
+      $payroll_lumnis_info[:recent_donations_text] = 'Gift of Lumnis unavailable on this account.'
+      $payroll_lumnis_info[:recent_donations_count] = nil
+      finalize_payroll_lumnis_capture!
+    end
     return
   end
 
-  if $payroll_capture_mode == :account && text =~ /^\s*(.+?):\s+([0-9,]+)\s*$/
-    bank_name = Regexp.last_match(1).strip
-    return if bank_name == 'Total'
+  if $payroll_capture_active
+    $payroll_capture_lines << text
 
-    amount = Regexp.last_match(2).delete(',').to_i
-    bank_code = canonical_bank_code(bank_name)
-    $payroll_capture_banks[bank_code] = amount if bank_code
-    return
+    if text =~ /^\s*(.+?):\s+([0-9,]+)\s+silvers\s*$/
+      bank_name = Regexp.last_match(1).strip
+      amount = Regexp.last_match(2).delete(',').to_i
+      bank_code = canonical_bank_code(bank_name)
+      $payroll_capture_banks[bank_code] = amount if bank_code
+      return
+    end
+
+    if $payroll_capture_mode == :account && text =~ /^\s*(.+?):\s+([0-9,]+)\s*$/
+      bank_name = Regexp.last_match(1).strip
+      return if bank_name == 'Total'
+
+      amount = Regexp.last_match(2).delete(',').to_i
+      bank_code = canonical_bank_code(bank_name)
+      $payroll_capture_banks[bank_code] = amount if bank_code
+      return
+    end
+
+    if text =~ /^Your total silvers:\s+([0-9,]+)\s*$/
+      $payroll_capture_total = Regexp.last_match(1).delete(',').to_i
+      finalize_payroll_capture!
+      return
+    end
+
+    if $payroll_capture_mode == :account && text =~ /^\s*Total:\s+([0-9,]+)\s*$/
+      $payroll_capture_total = Regexp.last_match(1).delete(',').to_i
+      return
+    end
+
+    if $payroll_capture_mode == :account && (
+      text =~ /^You currently have \d+ inter-town bank transfer options available\./ ||
+      text =~ /^You currently have \d+ urchin bank runner use(?:s)? remaining\./
+    )
+      finalize_payroll_capture!
+      return
+    end
+
+    if $payroll_current_bank_code && text =~ /Your balance is currently at\s+([0-9,]+)\s+silvers\./i
+      persist_bank_balance!($payroll_current_bank_code, Regexp.last_match(1).delete(',').to_i)
+      return
+    end
+
+    if $payroll_current_bank_code && text =~ /This brings your total to\s+([0-9,]+)\s+silvers\./i
+      persist_bank_balance!($payroll_current_bank_code, Regexp.last_match(1).delete(',').to_i)
+    end
   end
 
-  if text =~ /^Your total silvers:\s+([0-9,]+)\s*$/
-    $payroll_capture_total = Regexp.last_match(1).delete(',').to_i
-    finalize_payroll_capture!
-    return
-  end
+  if $payroll_lumnis_capture_active
+    if text =~ /^Your Gift of Lumnis is scheduled to start on (\w+)s at (\d\d:\d\d), in-game time\.$/
+      start_day = Regexp.last_match(1)
+      start_time = Regexp.last_match(2)
+      $payroll_lumnis_info[:start_day] = start_day
+      $payroll_lumnis_info[:start_time] = start_time
+      $payroll_lumnis_info[:payroll_start] = format_local_payroll_start(start_day, start_time)
+      return
+    end
 
-  if $payroll_capture_mode == :account && text =~ /^\s*Total:\s+([0-9,]+)\s*$/
-    $payroll_capture_total = Regexp.last_match(1).delete(',').to_i
-    return
-  end
+    if text =~ /^You have not selected a Gift of Lumnis schedule\.$/
+      $payroll_lumnis_info[:start_day] = nil
+      $payroll_lumnis_info[:start_time] = nil
+      $payroll_lumnis_info[:payroll_start] = nil
+      return
+    end
 
-  if $payroll_capture_mode == :account && (
-    text =~ /^You currently have \d+ inter-town bank transfer options available\./ ||
-    text =~ /^You currently have \d+ urchin bank runner use(?:s)? remaining\./
-  )
-    finalize_payroll_capture!
-    return
-  end
+    if text =~ /^You last used a Lumnis scheduling option on ([^.]+)\./
+      $payroll_lumnis_info[:last_schedule_used_at] = Regexp.last_match(1).strip
+      return
+    end
 
-  if $payroll_current_bank_code && text =~ /Your balance is currently at\s+([0-9,]+)\s+silvers\./i
-    persist_bank_balance!($payroll_current_bank_code, Regexp.last_match(1).delete(',').to_i)
-    return
-  end
+    if text =~ /^You have made ([0-9,]+) recent donations to the Temple of Lumnis\.$/
+      $payroll_lumnis_info[:recent_donations_text] = text
+      $payroll_lumnis_info[:recent_donations_count] = Regexp.last_match(1).delete(',').to_i
+      finalize_payroll_lumnis_capture!
+      return
+    end
 
-  if $payroll_current_bank_code && text =~ /This brings your total to\s+([0-9,]+)\s+silvers\./i
-    persist_bank_balance!($payroll_current_bank_code, Regexp.last_match(1).delete(',').to_i)
+    if text =~ /^You have not made any recent donations to the Temple of Lumnis\.$/
+      $payroll_lumnis_info[:recent_donations_text] = text
+      $payroll_lumnis_info[:recent_donations_count] = 0
+      finalize_payroll_lumnis_capture!
+    end
   end
 end
 
@@ -991,17 +1182,25 @@ end
 def show_payroll_help
   respond ';payroll        - Start passive bank balance tracking'
   respond ';payroll list / l      - Show saved bank balances by character'
-  respond ';payroll check  - Show weekly payroll cost and funded weeks remaining'
+  respond ';payroll check  - Show payroll start times, paid weeks, and funded weeks remaining'
   respond ';payroll analytics / a [days] - Show wealth analytics and an ASCII trend chart'
   respond ';payroll split <on|off> - Toggle split-table display mode'
   respond ';payroll 30     - Show wealth change summary over the last 30 days'
-  respond ';payroll update / u    - Run BANK ACCOUNT and save the results'
+  respond ';payroll update / u    - Run BANK ACCOUNT and LUMNIS INFO and save the results'
   respond ';payroll help   - Show this help'
 end
 
-def run_payroll_update
+def run_payroll_lumnis_update
+  waitrt?
+  fput 'lumnis info'
+rescue => error
+  respond "payroll lumnis update failed: #{error.message}"
+end
+
+def run_payroll_update(include_lumnis: true)
   waitrt?
   fput 'bank account'
+  run_payroll_lumnis_update if include_lumnis
 rescue => error
   respond "payroll update failed: #{error.message}"
 end
@@ -1070,7 +1269,7 @@ end
 
 setup_payroll_hooks
 before_dying do
-  run_payroll_update if payroll_settings['auto_update_on_exit']
+  run_payroll_update(include_lumnis: false) if payroll_settings['auto_update_on_exit']
   remove_payroll_hooks
 end
 
