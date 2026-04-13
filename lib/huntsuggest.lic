@@ -1,77 +1,56 @@
-# HuntSuggest is a Lich utility for GemStone IV designed for use with the huntpro script.
-# It reads a Google Sheet of hunting areas, recommends huntpro-compatible hunting options,
-# and prints clickable ;huntpro commands using the sheet's Area Name key.
+# HuntSuggest recommends huntpro hunting areas based on your level by reading a Google Sheet
+# and presenting huntpro-compatible options in a manual GTK GUI or text fallback.
 #
-# This script is intended as a lightweight helper for players who use huntpro and want:
-# - quick hunt suggestions by level
-# - hunt suggestions by town/location area
-# - clickable command output
-# - readable hunt info before starting
-#
-# huntpro commands are built from:
-#   ;huntpro <style_number> <area_name>
-#
-# Example:
-#   ;huntpro 9 wlredpixie
+# Designed for use with the huntpro script.
 #
 # Usage:
 #   ;huntsuggest
 #   ;huntsuggest <level>
 #   ;huntsuggest <town>
-#
-# Examples:
-#   ;huntsuggest 25
-#   ;huntsuggest landing
-#   ;huntsuggest solhaven
-#   ;huntsuggest icemule
-#
-# Style Numbers for huntpro:
-#   1 = UAC Jab
-#   2 = UAC Grapple / Stealth UAC
-#   3 = Melee
-#   4 = Melee Ambush / Stealth
-#   5 = Ranged
-#   6 = Ranged / Stealth
-#   7 = Ranged Kneeling
-#   8 = Ranged Kneeling / Stealth
-#   9 = Casting
-#
-# Data Source:
-#   Google Sheet hunt table with columns including:
-#   Creature Level, Area Name, Creature Names, Bounty Location, Type, Town,
-#   Spawn Rate, Silver Farm, Skin Name, Estimated Skin Value, Bounty Status
-#
-# Notes:
-# - built for use with the huntpro script
-# - huntpro command generation uses Area Name, not Bounty Location
-# - output is text/clickable-link based
-# - intended for GemStone IV with Lich
-# - requires internet access to fetch the sheet CSV
+#   ;huntsuggest <level> <town>
+#   ;huntsuggest <level> <range> <town>
+#   ;huntsuggest help
+#   ;huntsuggest styles
 #
 #         author: Necrodeus
-#           game: GemStone IV
-#           tags: hunting, huntpro, recommendations, clickable, utility
-#        version: 1.0.1
+#           game: gs
+#           tags: hunting, huntpro, recommendations, clickable, utility, gui
+#       required: Lich > 5.0.1
+#        version: 1.8.1
 #
-# Changelog
-#   v1.0.1 - 4/12/2026
-#     - Added explicit huntpro usage wording to header/help
-#     - Kept command generation based on Area Name keys
-#   v1.0.0 - 4/12/2026
-#     - Initial release
-#     - Reads hunt data from Google Sheets
-#     - Recommends top 3 hunts by level or town filter
-#     - Outputs clickable ;huntpro commands
-#     - Uses Area Name for huntpro command generation
+# changelog:
+#   1.8.1 (2026-04-12):
+#     Fixed GTK single-click selection syncing to the right-hand details pane
+#     Removed background close thread; GUI close now stops cleanly
+#   1.8.0 (2026-04-12):
+#     Switched from trying to inject ;huntpro into the game to starting huntpro directly via Lich
+#     Fixed GUI selection state and enabled buttons/details reliably
+#     Kept backup clickable output in game window
+#   1.7.0 (2026-04-12):
+#     Full-file rebuild
+#     Fixed selection state by tracking selected hunt directly
 
 require 'csv'
 require 'open-uri'
 require 'uri'
 require 'cgi'
+require 'yaml'
+require 'fileutils'
 
-module HuntSuggest
+begin
+  require 'gtk3'
+rescue LoadError
+  nil
+end
+
+module HuntSuggestCore
+  BASE_DATA_DIR = defined?(DATA_DIR) ? DATA_DIR : File.join(Dir.home, '.lich')
+
   SHEET_URL = 'https://docs.google.com/spreadsheets/d/1KR5-3WQCKL8aU1pH-buY03W5Fj1iIr5K10gC6Do4raE/export?format=csv&gid=603710211'
-  LIMIT = 3
+  DEFAULT_STYLE = 9
+  DEFAULT_RANGE = 5
+  TEXT_LIMIT = 12
+  SETTINGS_FILE = File.join(BASE_DATA_DIR, 'huntsuggest_settings.yaml')
 
   STYLE_OPTIONS = {
     1 => 'UAC Jab',
@@ -85,8 +64,30 @@ module HuntSuggest
     9 => 'Casting'
   }.freeze
 
-  DEFAULT_STYLE = 9
-  QUICK_STYLES = [9, 3, 1].freeze
+  QUICK_STYLES = {
+    'Cast' => 9,
+    'Melee' => 3,
+    'UAC' => 1
+  }.freeze
+
+  QUICK_TYPES = [
+    ['Undead', 'undead'],
+    ['Living', 'living'],
+    ['Construct', 'construct'],
+    ['Any', '']
+  ].freeze
+
+  TOWN_AREA_ALIASES = {
+    'wehnimer'   => ['wehnimer', "wehnimer's", 'landing', 'wl', 'wehnimers'],
+    'solhaven'   => ['solhaven', 'sol', 'haven'],
+    'icemule'    => ['icemule', 'icemule trace', 'imt'],
+    'illistim'   => ['illistim', "ta'illistim", 'ti'],
+    'tafaendryl' => ['tafaendryl', 'tf', 'faendryl'],
+    'teras'      => ['teras', 'kharam-dzu', 'kharam', 'teras isle'],
+    'riverrest'  => ['riverrest', 'rr'],
+    'mistharbor' => ['mistharbor', 'mist harbor', 'mist'],
+    'zul'        => ['zul logoth', 'zul', 'logoth']
+  }.freeze
 
   Hunt = Struct.new(
     :level,
@@ -100,33 +101,12 @@ module HuntSuggest
     :skin_name,
     :estimated_skin_value,
     :bounty_status,
+    :anchor_room_id,
+    :go2_target,
     keyword_init: true
   )
 
   module_function
-
-  def run(script)
-    enable_status_tags
-
-    arg = normalize_text(script.vars[1])
-
-    case arg.downcase
-    when ''
-      show_suggestions(detect_level, nil)
-    when 'help'
-      print_help
-    when 'styles'
-      print_styles
-    else
-      if integer_text?(arg)
-        show_suggestions(arg.to_i, nil)
-      else
-        show_suggestions(detect_level, arg)
-      end
-    end
-  rescue StandardError => e
-    safe_echo("huntsuggest error: #{e.class}: #{e.message}")
-  end
 
   def enable_status_tags
     return if @status_tags_enabled
@@ -140,59 +120,99 @@ module HuntSuggest
     @status_tags_enabled = true
   end
 
-  def show_suggestions(level, town_filter)
-    suggestions = fetch_suggestions(level, town_filter)
-
-    send_line('')
-    send_line('=== Hunt Suggestions ===')
-    send_line('Built for use with: huntpro')
-    send_line("Level: #{level}")
-    send_line("Town Filter: #{town_filter || 'Any'}")
-    send_line('')
-
-    suggestions.each_with_index do |hunt, index|
-      print_hunt(index + 1, hunt)
-    end
-
-    send_line(
-      "Help: #{click(';huntsuggest help', ';huntsuggest help')}  " \
-      "Styles: #{click(';huntsuggest styles', ';huntsuggest styles')}"
-    )
+  def default_settings
+    {
+      'style' => DEFAULT_STYLE,
+      'range' => DEFAULT_RANGE,
+      'town_filter' => '',
+      'type_filter' => '',
+      'creature_filter' => '',
+      'local_only' => false,
+      'favorites' => [],
+      'blacklist' => []
+    }
   end
 
-  def print_help
-    safe_echo('=== huntsuggest help ===')
-    safe_echo('Built for use with the huntpro script.')
-    safe_echo('Suggests huntpro areas from a Google Sheet using Area Name keys.')
-    safe_echo(' ')
-    safe_echo('Usage:')
-    safe_echo('  ;huntsuggest')
-    safe_echo('  ;huntsuggest <level>')
-    safe_echo('  ;huntsuggest <town>')
-    safe_echo(' ')
-    safe_echo('Examples:')
-    safe_echo('  ;huntsuggest 25')
-    safe_echo('  ;huntsuggest landing')
-    safe_echo('  ;huntsuggest solhaven')
-    safe_echo(' ')
-    safe_echo('huntpro command format:')
-    safe_echo('  ;huntpro <style_number> <area_name>')
-    safe_echo('  Example: ;huntpro 9 wlredpixie')
+  def normalize_settings_hash(data)
+    settings = default_settings.merge(data.is_a?(Hash) ? data : {})
+    settings['style'] = settings['style'].to_i
+    settings['style'] = DEFAULT_STYLE unless STYLE_OPTIONS.key?(settings['style'])
+    settings['range'] = settings['range'].to_i
+    settings['range'] = DEFAULT_RANGE if settings['range'] <= 0
+    settings['town_filter'] = normalize_text(settings['town_filter'])
+    settings['type_filter'] = normalize_text(settings['type_filter'])
+    settings['creature_filter'] = normalize_text(settings['creature_filter'])
+    settings['local_only'] = !!settings['local_only']
+    settings['favorites'] = Array(settings['favorites']).map { |v| normalize_text(v) }.reject(&:empty?).uniq
+    settings['blacklist'] = Array(settings['blacklist']).map { |v| normalize_text(v) }.reject(&:empty?).uniq
+    settings
   end
 
-  def print_styles
-    safe_echo('=== Hunt Styles for huntpro ===')
-    STYLE_OPTIONS.each do |number, name|
-      safe_echo("  #{number} = #{name}")
-    end
+  def load_settings
+    return default_settings unless File.exist?(SETTINGS_FILE)
+
+    data = YAML.load_file(SETTINGS_FILE)
+    normalize_settings_hash(data)
+  rescue StandardError
+    default_settings
   end
 
-  def fetch_suggestions(level, town_filter)
-    hunts = load_hunts
-    suggestions = suggest_hunts(hunts, level, town_filter, LIMIT)
-    raise 'no suggestions found' if suggestions.empty?
+  def save_settings(settings)
+    normalized = normalize_settings_hash(settings)
+    FileUtils.mkdir_p(File.dirname(SETTINGS_FILE))
+    File.write(SETTINGS_FILE, normalized.to_yaml)
+  rescue StandardError => e
+    safe_echo("huntsuggest: could not save settings: #{e.message}")
+  end
 
-    suggestions
+  def favorite?(hunt, settings)
+    settings['favorites'].include?(hunt_area_key(hunt))
+  end
+
+  def blacklisted?(hunt, settings)
+    settings['blacklist'].include?(hunt_area_key(hunt))
+  end
+
+  def add_favorite(settings, hunt)
+    area = hunt_area_key(hunt)
+    settings['favorites'] |= [area]
+    settings['blacklist'].delete(area)
+    settings
+  end
+
+  def add_blacklist(settings, hunt)
+    area = hunt_area_key(hunt)
+    settings['blacklist'] |= [area]
+    settings['favorites'].delete(area)
+    settings
+  end
+
+  def remove_area_flags(settings, hunt)
+    area = hunt_area_key(hunt)
+    settings['favorites'].delete(area)
+    settings['blacklist'].delete(area)
+    settings
+  end
+
+  def parse_query_args(args, settings = nil)
+    settings ||= load_settings
+    parts = Array(args).map { |v| normalize_text(v) }.reject(&:empty?)
+
+    level = detect_level
+    level_range = settings['range']
+    town_filter = settings['town_filter']
+    style = settings['style']
+    type_filter = settings['type_filter']
+    creature_filter = settings['creature_filter']
+    local_only = settings['local_only']
+
+    level = parts.shift.to_i if integer_text?(parts[0])
+    level_range = parts.shift.to_i if integer_text?(parts[0])
+
+    trailing = normalize_text(parts.join(' '))
+    town_filter = trailing unless trailing.empty?
+
+    [level, level_range, town_filter, style, type_filter, creature_filter, local_only]
   end
 
   def detect_level
@@ -211,6 +231,91 @@ module HuntSuggest
     raise 'could not determine your level, use ;huntsuggest <level>' unless level
 
     level.to_i
+  end
+
+  def current_location_context
+    {
+      area_text: current_area_text,
+      room_id: current_room_id,
+      town_key: normalize_town_key(current_area_text)
+    }
+  end
+
+  def current_area_text
+    area = begin
+      checkarea
+    rescue StandardError
+      nil
+    end
+    area = normalize_text(area)
+    return area unless area.empty?
+
+    title = begin
+      Room.current.title.to_s
+    rescue StandardError
+      ''
+    end
+
+    normalize_text(title)
+  end
+
+  def current_room_id
+    value = begin
+      XMLData.room_id
+    rescue StandardError
+      nil
+    end
+    integer_from(value.to_s)
+  end
+
+  def normalize_town_key(text)
+    value = normalize_text(text).downcase
+    return nil if value.empty?
+
+    TOWN_AREA_ALIASES.each do |canonical, aliases|
+      return canonical if aliases.any? { |alias_text| value.include?(alias_text) }
+    end
+
+    nil
+  end
+
+  def hunt_town_key(hunt)
+    normalize_town_key(hunt.town)
+  end
+
+  def haystacks_for(hunt)
+    [
+      normalize_text(hunt.town).downcase,
+      normalize_text(hunt.bounty_location).downcase,
+      normalize_text(hunt.area_name).downcase,
+      normalize_text(hunt.creature_names).downcase,
+      normalize_text(hunt.creature_type).downcase
+    ]
+  end
+
+  def local_area_match?(hunt, current_context)
+    current_area = normalize_text(current_context[:area_text]).downcase
+    return false if current_area.empty?
+
+    haystacks_for(hunt).any? do |text|
+      next false if text.empty?
+      current_area.include?(text) || text.include?(current_area)
+    end
+  end
+
+  def local_town_match?(hunt, current_context)
+    current_town = current_context[:town_key]
+    return false if current_town.nil?
+
+    hunt_town_key(hunt) == current_town
+  end
+
+  def local_flags_text(hunt, current_context, settings = nil)
+    flags = []
+    flags << 'FAV' if settings && favorite?(hunt, settings)
+    flags << 'LOCAL-AREA' if local_area_match?(hunt, current_context)
+    flags << 'LOCAL-TOWN' if local_town_match?(hunt, current_context)
+    flags.empty? ? '' : "[#{flags.join(', ')}]"
   end
 
   def load_hunts
@@ -239,7 +344,9 @@ module HuntSuggest
       silver_farm: read_value(row, 'Silver Farm'),
       skin_name: read_value(row, 'Skin Name'),
       estimated_skin_value: read_value(row, 'Estimated Skin Value'),
-      bounty_status: read_value(row, 'Bounty Status')
+      bounty_status: read_value(row, 'Bounty Status'),
+      anchor_room_id: integer_from(read_value(row, 'Anchor Room ID', 'Room ID', 'AnchorRoomID')),
+      go2_target: read_value(row, 'Go2 Target', 'GO2 Target', 'go2')
     )
   end
 
@@ -254,21 +361,53 @@ module HuntSuggest
     ''
   end
 
-  def suggest_hunts(hunts, target_level, town_filter, limit)
+  def filter_hunts(hunts_arg = nil, level:, level_range:, town_filter:, type_filter:, creature_filter:, local_only:, current_context:, settings:, hunts: nil)
+    hunts = hunts_arg || hunts
+    raise ArgumentError, 'hunts is required' unless hunts
+
     filtered = hunts.select do |hunt|
       next false unless hunt.level
+      next false if blacklisted?(hunt, settings)
 
-      if town_filter
-        normalize_text(hunt.town).downcase.include?(town_filter.downcase)
-      else
-        true
-      end
+      in_range = (hunt.level - level).abs <= level_range
+
+      town_ok =
+        if town_filter && !town_filter.empty?
+          haystacks_for(hunt).any? { |text| text.include?(town_filter.downcase) }
+        else
+          true
+        end
+
+      type_ok =
+        if type_filter && !type_filter.empty?
+          normalize_text(hunt.creature_type).downcase.include?(type_filter.downcase)
+        else
+          true
+        end
+
+      creature_ok =
+        if creature_filter && !creature_filter.empty?
+          normalize_text(hunt.creature_names).downcase.include?(creature_filter.downcase)
+        else
+          true
+        end
+
+      local_ok =
+        if local_only
+          local_area_match?(hunt, current_context) || local_town_match?(hunt, current_context)
+        else
+          true
+        end
+
+      in_range && town_ok && type_ok && creature_ok && local_ok
     end
 
     ranked = filtered.sort_by do |hunt|
       [
-        town_filter ? 0 : (hunt.level - target_level).abs,
-        town_filter ? normalize_text(hunt.town) : (hunt.level == target_level ? 0 : 1),
+        favorite?(hunt, settings) ? 0 : 1,
+        local_area_match?(hunt, current_context) ? 0 : 1,
+        local_town_match?(hunt, current_context) ? 0 : 1,
+        (hunt.level - level).abs,
         -hunt_bounty_score(hunt),
         -hunt_spawn_score(hunt),
         normalize_text(hunt.town),
@@ -276,42 +415,18 @@ module HuntSuggest
       ]
     end
 
-    deduped = []
-    seen = {}
+    dedupe_hunts(ranked)
+  end
 
-    ranked.each do |hunt|
+  def dedupe_hunts(hunts)
+    seen = {}
+    hunts.each_with_object([]) do |hunt, result|
       key = hunt_area_key(hunt).downcase
       next if seen[key]
 
       seen[key] = true
-      deduped << hunt
-      break if deduped.length >= limit
+      result << hunt
     end
-
-    deduped
-  end
-
-  def print_hunt(index, hunt)
-    default_cmd = huntpro_command(hunt, DEFAULT_STYLE)
-
-    send_line("[#{index}] #{present_text(hunt.creature_names)}")
-    send_line("  Level: #{present_text(hunt.level)}")
-    send_line("  Area Name: #{present_text(hunt_area_key(hunt))}")
-    send_line("  Location: #{present_text(hunt.bounty_location)}")
-    send_line("  Town: #{present_text(hunt.town)}")
-    send_line("  Type: #{present_text(hunt.creature_type)}")
-    send_line("  Spawn: #{present_text(hunt.spawn_rate)}")
-    send_line("  Skin: #{present_text(hunt.skin_name)}")
-    send_line("  Bounty: #{present_text(hunt.bounty_status)}")
-    send_line("  Easy: #{click(default_cmd, default_cmd)}")
-    send_line("  Quick: #{quick_links(hunt)}")
-    send_line('')
-  end
-
-  def quick_links(hunt)
-    QUICK_STYLES.map do |style|
-      click(";huntpro #{style} #{hunt_area_key(hunt)}", huntpro_command(hunt, style))
-    end.join('  ')
   end
 
   def huntpro_command(hunt, style_number)
@@ -329,7 +444,6 @@ module HuntSuggest
     return 3 if text.include?('medium')
     return 2 if text.include?('low')
     return 1 if text.include?('very low')
-
     0
   end
 
@@ -337,12 +451,61 @@ module HuntSuggest
     text = normalize_text(hunt.bounty_status).downcase
     return 3 if text.include?('complete')
     return 1 if text.include?('partial')
-
     0
   end
 
   def click(label, command)
     %(<d cmd="#{xml_escape(command)}">#{xml_escape(label)}</d>)
+  end
+
+  def emit_backup_clickable(command, prefix = 'Command')
+    safe_echo("#{prefix}: #{command}")
+    send_line("#{prefix}: #{click(command, command)}")
+  end
+
+  def start_huntpro(style_number, area_name)
+    style = style_number.to_i
+    area = normalize_text(area_name)
+    raise 'blank huntpro area name' if area.empty?
+
+    command = ";huntpro #{style} #{area}"
+    safe_echo("huntsuggest: starting #{command}")
+    emit_backup_clickable(command, 'Backup')
+
+    args = [style.to_s, area]
+
+    begin
+      start_script('huntpro', args)
+      return true
+    rescue StandardError
+      nil
+    end
+
+    begin
+      Script.start('huntpro', args)
+      return true
+    rescue StandardError
+      nil
+    end
+
+    begin
+      Script.run('huntpro', *args)
+      return true
+    rescue StandardError
+      nil
+    end
+
+    begin
+      fput(command)
+      return true
+    rescue StandardError
+      nil
+    end
+
+    false
+  rescue StandardError => e
+    safe_echo("huntsuggest: failed to start huntpro: #{e.message}")
+    false
   end
 
   def send_line(text)
@@ -389,6 +552,701 @@ module HuntSuggest
     echo message
   rescue StandardError
     puts message
+  end
+end
+
+module HuntSuggest
+  module_function
+
+  def run(script)
+    HuntSuggestCore.enable_status_tags
+
+    settings = HuntSuggestCore.load_settings
+    args = Array(script.vars[1..]).map { |v| HuntSuggestCore.normalize_text(v) }.reject(&:empty?)
+    first = args.first.to_s.downcase
+
+    case first
+    when 'help'
+      print_help
+    when 'styles'
+      print_styles
+    else
+      level, level_range, town_filter, style, type_filter, creature_filter, local_only =
+        HuntSuggestCore.parse_query_args(args, settings)
+
+      hunts = HuntSuggestCore.load_hunts
+      current_context = HuntSuggestCore.current_location_context
+
+      if gui_available?
+        begin
+          HuntSuggestGUI::Window.new(
+            hunts: hunts,
+            level: level,
+            level_range: level_range,
+            town_filter: town_filter,
+            style: style,
+            type_filter: type_filter,
+            creature_filter: creature_filter,
+            local_only: local_only,
+            current_context: current_context,
+            settings: settings
+          )
+        rescue StandardError => e
+          HuntSuggestCore.safe_echo("huntsuggest: gui failed, falling back to text: #{e.class}: #{e.message}")
+          show_text_suggestions(
+            hunts, level, level_range, town_filter, type_filter,
+            creature_filter, local_only, current_context, settings, style
+          )
+        end
+      else
+        show_text_suggestions(
+          hunts, level, level_range, town_filter, type_filter,
+          creature_filter, local_only, current_context, settings, style
+        )
+      end
+    end
+  rescue StandardError => e
+    HuntSuggestCore.safe_echo("huntsuggest error: #{e.class}: #{e.message}")
+  end
+
+  def gui_available?
+    defined?(Gtk) &&
+      Gtk.const_defined?(:Window) &&
+      Gtk.const_defined?(:Box) &&
+      Gtk.const_defined?(:TreeView)
+  end
+
+  def print_help
+    HuntSuggestCore.safe_echo('=== huntsuggest help ===')
+    HuntSuggestCore.safe_echo('Built for use with the huntpro script.')
+    HuntSuggestCore.safe_echo('Manual GTK GUI, saved settings, favorites, blacklist.')
+    HuntSuggestCore.safe_echo('Starts huntpro directly through Lich.')
+  end
+
+  def print_styles
+    HuntSuggestCore.safe_echo('=== Hunt Styles for huntpro ===')
+    HuntSuggestCore::STYLE_OPTIONS.each do |number, name|
+      HuntSuggestCore.safe_echo("  #{number} = #{name}")
+    end
+  end
+
+  def show_text_suggestions(hunts, level, level_range, town_filter, type_filter, creature_filter, local_only, current_context, settings, style)
+    results = HuntSuggestCore.filter_hunts(
+      hunts,
+      level: level,
+      level_range: level_range,
+      town_filter: town_filter,
+      type_filter: type_filter,
+      creature_filter: creature_filter,
+      local_only: local_only,
+      current_context: current_context,
+      settings: settings
+    ).first(HuntSuggestCore::TEXT_LIMIT)
+
+    raise 'no suggestions found' if results.empty?
+
+    HuntSuggestCore.send_line('')
+    HuntSuggestCore.send_line('=== Hunt Suggestions ===')
+    HuntSuggestCore.send_line("Current Area: #{HuntSuggestCore.present_text(current_context[:area_text])}")
+    HuntSuggestCore.send_line("Level: #{level}")
+    HuntSuggestCore.send_line("Range: +/- #{level_range}")
+    HuntSuggestCore.send_line("Town Filter: #{town_filter || 'Auto-local'}")
+    HuntSuggestCore.send_line("Type Filter: #{type_filter.empty? ? 'Any' : type_filter}")
+    HuntSuggestCore.send_line("Creature Filter: #{creature_filter.empty? ? 'Any' : creature_filter}")
+    HuntSuggestCore.send_line("Local Only: #{local_only ? 'Yes' : 'No'}")
+    HuntSuggestCore.send_line("Style: #{style}")
+    HuntSuggestCore.send_line('')
+
+    results.each_with_index do |hunt, index|
+      HuntSuggestCore.send_line("[#{index + 1}] #{HuntSuggestCore.present_text(hunt.creature_names)} #{HuntSuggestCore.local_flags_text(hunt, current_context, settings)}".strip)
+      HuntSuggestCore.send_line("  Level: #{HuntSuggestCore.present_text(hunt.level)}")
+      HuntSuggestCore.send_line("  Area Name: #{HuntSuggestCore.present_text(HuntSuggestCore.hunt_area_key(hunt))}")
+      HuntSuggestCore.send_line("  Town: #{HuntSuggestCore.present_text(hunt.town)}")
+      HuntSuggestCore.send_line("  Type: #{HuntSuggestCore.present_text(hunt.creature_type)}")
+      HuntSuggestCore.send_line("  Spawn: #{HuntSuggestCore.present_text(hunt.spawn_rate)}")
+      quick = HuntSuggestCore::QUICK_STYLES.map do |label, style_num|
+        cmd = HuntSuggestCore.huntpro_command(hunt, style_num)
+        HuntSuggestCore.click("#{label}: #{cmd}", cmd)
+      end.join('  ')
+      HuntSuggestCore.send_line("  Quick: #{quick}")
+      HuntSuggestCore.send_line('')
+    end
+  end
+end
+
+if defined?(Gtk)
+  module HuntSuggestGUI
+    class Window
+      INDEX_COL = 0
+      CREATURE_COL = 1
+      LEVEL_COL = 2
+      AREA_COL = 3
+      TOWN_COL = 4
+      TYPE_COL = 5
+      SPAWN_COL = 6
+      BOUNTY_COL = 7
+      LOCAL_COL = 8
+
+      QUICK_TOWNS = [
+        ['WL', 'landing'],
+        ['Sol', 'solhaven'],
+        ['IMT', 'icemule'],
+        ['Mist', 'mist harbor'],
+        ['RR', 'riverrest'],
+        ['Teras', 'teras'],
+        ['Clear', nil]
+      ].freeze
+
+      def initialize(hunts:, level:, level_range:, town_filter:, style:, type_filter:, creature_filter:, local_only:, current_context:, settings:)
+        @running = true
+        @all_hunts = hunts
+        @current_results = []
+        @selected_hunt = nil
+        @default_level = level
+        @default_level_range = level_range
+        @default_town_filter = town_filter
+        @default_style = style
+        @default_type_filter = type_filter
+        @default_creature_filter = creature_filter
+        @default_local_only = local_only
+        @current_context = current_context
+        @settings = settings
+
+        if Gtk.respond_to?(:queue)
+          Gtk.queue { build_ui }
+          wait_while { @running }
+        else
+          build_ui
+          wait_while { @running }
+        end
+      end
+
+      def build_ui
+        @window = Gtk::Window.new('HuntSuggest')
+        @window.set_default_size(1320, 860)
+        @window.border_width = 8
+        @window.signal_connect('delete-event') do
+          request_close
+          false
+        end
+        @window.signal_connect('destroy') do
+          finish_close
+        end
+
+        outer = Gtk::Box.new(:vertical, 8)
+
+        current_area_label = Gtk::Label.new("Current Area: #{HuntSuggestCore.present_text(@current_context[:area_text])}")
+        current_area_label.xalign = 0.0
+        outer.pack_start(current_area_label, false, true, 0)
+
+        filter_frame = Gtk::Frame.new('Filters')
+        filter_box = Gtk::Box.new(:vertical, 6)
+        filter_box.margin = 8
+
+        filter_grid = Gtk::Grid.new
+        filter_grid.row_spacing = 6
+        filter_grid.column_spacing = 8
+
+        filter_grid.attach(label('Target Level'), 0, 0, 1, 1)
+
+        @level_entry = Gtk::Entry.new
+        @level_entry.text = @default_level.to_s
+        @level_entry.width_chars = 6
+        filter_grid.attach(@level_entry, 1, 0, 1, 1)
+
+        filter_grid.attach(label('Level Range (+/-)'), 2, 0, 1, 1)
+
+        @range_entry = Gtk::Entry.new
+        @range_entry.text = @default_level_range.to_s
+        @range_entry.width_chars = 6
+        filter_grid.attach(@range_entry, 3, 0, 1, 1)
+
+        filter_grid.attach(label('Town Filter'), 4, 0, 1, 1)
+
+        @town_entry = Gtk::Entry.new
+        @town_entry.text = @default_town_filter.to_s
+        filter_grid.attach(@town_entry, 5, 0, 1, 1)
+
+        filter_grid.attach(label('Type Filter'), 6, 0, 1, 1)
+
+        @type_entry = Gtk::Entry.new
+        @type_entry.text = @default_type_filter.to_s
+        filter_grid.attach(@type_entry, 7, 0, 1, 1)
+
+        filter_grid.attach(label('Creature Filter'), 8, 0, 1, 1)
+
+        @creature_entry = Gtk::Entry.new
+        @creature_entry.text = @default_creature_filter.to_s
+        filter_grid.attach(@creature_entry, 9, 0, 1, 1)
+
+        filter_grid.attach(label('Style'), 10, 0, 1, 1)
+
+        @style_combo = Gtk::ComboBoxText.new
+        HuntSuggestCore::STYLE_OPTIONS.each do |number, name|
+          @style_combo.append_text("#{number} - #{name}")
+        end
+        @style_combo.active = HuntSuggestCore::STYLE_OPTIONS.keys.sort.index(@default_style) || 0
+        @style_combo.signal_connect('changed') do
+          persist_settings
+          populate_details_from_selection
+        end
+        filter_grid.attach(@style_combo, 11, 0, 1, 1)
+
+        apply_button = make_button('Apply')
+        apply_button.signal_connect('clicked') { refresh_results }
+        filter_grid.attach(apply_button, 12, 0, 1, 1)
+
+        filter_box.pack_start(filter_grid, false, true, 0)
+
+        quick_row = Gtk::Box.new(:horizontal, 6)
+        quick_row.pack_start(label('Quick Towns:'), false, false, 0)
+
+        QUICK_TOWNS.each do |button_label, town_value|
+          button = make_button(button_label)
+          button.signal_connect('clicked') { apply_town_filter(town_value) }
+          quick_row.pack_start(button, false, false, 0)
+        end
+
+        local_button = make_button('Local')
+        local_button.signal_connect('clicked') { apply_local_filter }
+        quick_row.pack_start(local_button, false, false, 0)
+
+        @local_only_check = make_check_button('Local Only')
+        @local_only_check.active = @default_local_only
+        @local_only_check.signal_connect('toggled') do
+          persist_settings
+          refresh_results
+        end
+        quick_row.pack_start(@local_only_check, false, false, 0)
+
+        filter_box.pack_start(quick_row, false, true, 0)
+
+        type_row = Gtk::Box.new(:horizontal, 6)
+        type_row.pack_start(label('Quick Types:'), false, false, 0)
+
+        HuntSuggestCore::QUICK_TYPES.each do |button_label, type_value|
+          button = make_button(button_label)
+          button.signal_connect('clicked') { apply_type_filter(type_value) }
+          type_row.pack_start(button, false, false, 0)
+        end
+
+        filter_box.pack_start(type_row, false, true, 0)
+
+        filter_frame.add(filter_box)
+        outer.pack_start(filter_frame, false, true, 0)
+
+        paned = Gtk::Paned.new(:horizontal)
+
+        left_scroll = Gtk::ScrolledWindow.new
+        left_scroll.set_policy(:automatic, :automatic)
+
+        @results_store = Gtk::ListStore.new(Integer, String, Integer, String, String, String, String, String, String)
+        @results_view = Gtk::TreeView.new(@results_store)
+        @results_view.headers_visible = true
+        @results_view.activate_on_single_click = false
+        @results_view.enable_grid_lines = :both if @results_view.respond_to?(:enable_grid_lines=)
+
+        add_text_column(@results_view, 'Creature', CREATURE_COL)
+        add_text_column(@results_view, 'Lvl', LEVEL_COL)
+        add_text_column(@results_view, 'Area Name', AREA_COL)
+        add_text_column(@results_view, 'Town', TOWN_COL)
+        add_text_column(@results_view, 'Type', TYPE_COL)
+        add_text_column(@results_view, 'Spawn', SPAWN_COL)
+        add_text_column(@results_view, 'Bounty', BOUNTY_COL)
+        add_text_column(@results_view, 'Flags', LOCAL_COL)
+
+        @results_view.selection.mode = :single if @results_view.selection.respond_to?(:mode=)
+        @results_view.selection.signal_connect('changed') { sync_selection_from_tree }
+        @results_view.signal_connect('cursor-changed') { sync_selection_from_tree }
+        @results_view.signal_connect('row-activated') do |_view, path, _column|
+          begin
+            model = @results_view.model
+            iter = model.get_iter(path)
+            idx = iter[INDEX_COL].to_i
+            @selected_hunt = @current_results[idx]
+            populate_details_from_selection
+          rescue StandardError
+            nil
+          end
+          send_selected_hunt
+        end
+
+        left_scroll.add(@results_view)
+        paned.pack1(left_scroll, true, false)
+
+        right_box = Gtk::Box.new(:vertical, 8)
+
+        detail_frame = Gtk::Frame.new('Selected Hunt Details')
+        detail_scroll = Gtk::ScrolledWindow.new
+        detail_scroll.set_policy(:automatic, :automatic)
+
+        @details = Gtk::TextView.new
+        @details.editable = false
+        @details.cursor_visible = false
+        @details.wrap_mode = :word
+        @details.monospace = true if @details.respond_to?(:monospace=)
+        detail_scroll.add(@details)
+        detail_frame.add(detail_scroll)
+        right_box.pack_start(detail_frame, true, true, 0)
+
+        @command_preview = Gtk::Entry.new
+        @command_preview.editable = false
+        right_box.pack_start(@command_preview, false, true, 0)
+
+        style_row = Gtk::Box.new(:horizontal, 6)
+        HuntSuggestCore::QUICK_STYLES.each do |label_text, style_num|
+          button = make_button(label_text)
+          button.signal_connect('clicked') { quick_send(style_num) }
+          style_row.pack_start(button, false, false, 0)
+        end
+        right_box.pack_start(style_row, false, true, 0)
+
+        flag_row = Gtk::Box.new(:horizontal, 6)
+
+        @favorite_button = make_button('Favorite')
+        @favorite_button.signal_connect('clicked') { favorite_selected }
+        flag_row.pack_start(@favorite_button, false, false, 0)
+
+        @blacklist_button = make_button('Blacklist')
+        @blacklist_button.signal_connect('clicked') { blacklist_selected }
+        flag_row.pack_start(@blacklist_button, false, false, 0)
+
+        @clear_flags_button = make_button('Clear Flags')
+        @clear_flags_button.signal_connect('clicked') { clear_selected_flags }
+        flag_row.pack_start(@clear_flags_button, false, false, 0)
+
+        right_box.pack_start(flag_row, false, true, 0)
+
+        button_row = Gtk::Box.new(:horizontal, 6)
+
+        @copy_button = make_button('Copy Command')
+        @copy_button.signal_connect('clicked') { copy_command }
+        button_row.pack_start(@copy_button, false, false, 0)
+
+        @echo_button = make_button('Echo Command')
+        @echo_button.signal_connect('clicked') { echo_command }
+        button_row.pack_start(@echo_button, false, false, 0)
+
+        @send_button = make_button('Send Command')
+        @send_button.signal_connect('clicked') { send_command }
+        button_row.pack_start(@send_button, false, false, 0)
+
+        @send_close_button = make_button('Send + Close')
+        @send_close_button.signal_connect('clicked') do
+          next unless send_selected_hunt
+          queue_close
+        end
+        button_row.pack_start(@send_close_button, false, false, 0)
+
+        right_box.pack_start(button_row, false, true, 0)
+
+        @status_label = Gtk::Label.new('Select a hunt to see details. Double-click a row to send.')
+        @status_label.xalign = 0.0
+        right_box.pack_start(@status_label, false, true, 0)
+
+        paned.pack2(right_box, false, false)
+        outer.pack_start(paned, true, true, 0)
+
+        footer = Gtk::Box.new(:horizontal, 6)
+
+        refresh_button = make_button('Refresh')
+        refresh_button.signal_connect('clicked') { refresh_results }
+        footer.pack_end(refresh_button, false, false, 0)
+
+        close_button = make_button('Close')
+        close_button.signal_connect('clicked') { request_close }
+        footer.pack_end(close_button, false, false, 0)
+
+        outer.pack_start(footer, false, true, 0)
+
+        @window.add(outer)
+        clear_selection_panel
+        refresh_results
+        @window.show_all
+      end
+
+      def make_button(text)
+        button = Gtk::Button.new
+        button.label = text
+        button
+      end
+
+      def make_check_button(text)
+        button = Gtk::CheckButton.new
+        button.label = text
+        button
+      end
+
+      def label(text)
+        lbl = Gtk::Label.new(text)
+        lbl.xalign = 0.0
+        lbl
+      end
+
+      def add_text_column(view, title, index)
+        renderer = Gtk::CellRendererText.new
+        column = Gtk::TreeViewColumn.new(title)
+        column.resizable = true
+        column.pack_start(renderer, true)
+        column.add_attribute(renderer, 'text', index)
+        view.append_column(column)
+      end
+
+      def request_close
+        persist_settings
+        finish_close
+        begin
+          @window.destroy if @window && !@window.destroyed?
+        rescue StandardError
+          nil
+        end
+      end
+
+      def finish_close
+        return unless @running
+        @running = false
+      end
+
+      def queue_close
+        if defined?(GLib::Timeout)
+          GLib::Timeout.add(150) do
+            request_close
+            false
+          end
+        else
+          request_close
+        end
+      end
+
+      def selected_style
+        text = @style_combo.active_text.to_s
+        match = text.match(/^(\d+)/)
+        match ? match[1].to_i : HuntSuggestCore::DEFAULT_STYLE
+      end
+
+      def persist_settings
+        @settings['style'] = selected_style
+        @settings['range'] = integer_or_default(@range_entry.text, HuntSuggestCore::DEFAULT_RANGE)
+        @settings['town_filter'] = HuntSuggestCore.normalize_text(@town_entry.text)
+        @settings['type_filter'] = HuntSuggestCore.normalize_text(@type_entry.text)
+        @settings['creature_filter'] = HuntSuggestCore.normalize_text(@creature_entry.text)
+        @settings['local_only'] = !!@local_only_check.active?
+        HuntSuggestCore.save_settings(@settings)
+      end
+
+      def integer_or_default(value, fallback)
+        text = value.to_s.strip
+        return fallback unless text.match?(/^\d+$/)
+        text.to_i
+      end
+
+      def apply_town_filter(town_value)
+        @town_entry.text = town_value.to_s
+        refresh_results
+      end
+
+      def apply_local_filter
+        local_town = @current_context[:town_key]
+        @town_entry.text =
+          case local_town
+          when 'wehnimer' then 'landing'
+          when 'mistharbor' then 'mist harbor'
+          else local_town.to_s
+          end
+        refresh_results
+      end
+
+      def apply_type_filter(type_value)
+        @type_entry.text = type_value.to_s
+        refresh_results
+      end
+
+      def refresh_results
+        level = integer_or_default(@level_entry.text, @default_level)
+        level_range = integer_or_default(@range_entry.text, HuntSuggestCore::DEFAULT_RANGE)
+        town_filter = HuntSuggestCore.normalize_text(@town_entry.text)
+        town_filter = nil if town_filter.empty?
+        type_filter = HuntSuggestCore.normalize_text(@type_entry.text)
+        creature_filter = HuntSuggestCore.normalize_text(@creature_entry.text)
+        local_only = !!@local_only_check.active?
+
+        @current_results = HuntSuggestCore.filter_hunts(
+          @all_hunts,
+          level: level,
+          level_range: level_range,
+          town_filter: town_filter,
+          type_filter: type_filter,
+          creature_filter: creature_filter,
+          local_only: local_only,
+          current_context: @current_context,
+          settings: @settings
+        )
+
+        persist_settings
+        @results_store.clear
+
+        @current_results.each_with_index do |hunt, index|
+          iter = @results_store.append
+          iter[INDEX_COL] = index
+          iter[CREATURE_COL] = HuntSuggestCore.present_text(hunt.creature_names)
+          iter[LEVEL_COL] = hunt.level.to_i
+          iter[AREA_COL] = HuntSuggestCore.present_text(hunt.area_name)
+          iter[TOWN_COL] = HuntSuggestCore.present_text(hunt.town)
+          iter[TYPE_COL] = HuntSuggestCore.present_text(hunt.creature_type)
+          iter[SPAWN_COL] = HuntSuggestCore.present_text(hunt.spawn_rate)
+          iter[BOUNTY_COL] = HuntSuggestCore.present_text(hunt.bounty_status)
+          iter[LOCAL_COL] = HuntSuggestCore.local_flags_text(hunt, @current_context, @settings)
+        end
+
+        @status_label.text = "#{@current_results.length} hunt#{@current_results.length == 1 ? '' : 's'} found."
+
+        if @current_results.any?
+          @selected_hunt = @current_results[0]
+          begin
+            first_path = Gtk::TreePath.new([0])
+            @results_view.selection.select_path(first_path)
+            @results_view.set_cursor(first_path, nil, false)
+          rescue StandardError
+            nil
+          end
+          populate_details_from_selection
+        else
+          @selected_hunt = nil
+          clear_selection_panel
+        end
+      end
+
+      def sync_selection_from_tree
+        iter = @results_view.selection.selected
+        return unless iter
+
+        idx = iter[INDEX_COL].to_i
+        hunt = @current_results[idx]
+        return unless hunt
+
+        @selected_hunt = hunt
+        populate_details_from_selection
+      rescue StandardError
+        nil
+      end
+
+      def current_command(style_override = nil)
+        return nil unless @selected_hunt
+        HuntSuggestCore.huntpro_command(@selected_hunt, style_override || selected_style)
+      end
+
+      def populate_details_from_selection
+        hunt = @selected_hunt
+        return clear_selection_panel unless hunt
+
+        local_text = HuntSuggestCore.local_flags_text(hunt, @current_context, @settings).sub(/^\[/, '').sub(/\]$/, '')
+        local_text = 'No' if local_text.empty?
+
+        details = [
+          "Creature: #{HuntSuggestCore.present_text(hunt.creature_names)}",
+          "Level: #{HuntSuggestCore.present_text(hunt.level)}",
+          "Area Name: #{HuntSuggestCore.present_text(hunt.area_name)}",
+          "Bounty Location: #{HuntSuggestCore.present_text(hunt.bounty_location)}",
+          "Town: #{HuntSuggestCore.present_text(hunt.town)}",
+          "Type: #{HuntSuggestCore.present_text(hunt.creature_type)}",
+          "Spawn Rate: #{HuntSuggestCore.present_text(hunt.spawn_rate)}",
+          "Silver Farm: #{HuntSuggestCore.present_text(hunt.silver_farm)}",
+          "Skin: #{HuntSuggestCore.present_text(hunt.skin_name)}",
+          "Skin Value: #{HuntSuggestCore.present_text(hunt.estimated_skin_value)}",
+          "Bounty Status: #{HuntSuggestCore.present_text(hunt.bounty_status)}",
+          "Local Match: #{local_text}"
+        ].join("\n")
+
+        @details.buffer.text = details
+        @command_preview.text = current_command.to_s
+        @copy_button.sensitive = true
+        @echo_button.sensitive = true
+        @send_button.sensitive = true
+        @send_close_button.sensitive = true
+        @favorite_button.sensitive = true
+        @blacklist_button.sensitive = true
+        @clear_flags_button.sensitive = true
+        @status_label.text = "Selected #{HuntSuggestCore.present_text(hunt.creature_names)}"
+      end
+
+      def clear_selection_panel
+        @details.buffer.text = ''
+        @command_preview.text = ''
+        @copy_button.sensitive = false
+        @echo_button.sensitive = false
+        @send_button.sensitive = false
+        @send_close_button.sensitive = false
+        @favorite_button.sensitive = false
+        @blacklist_button.sensitive = false
+        @clear_flags_button.sensitive = false
+      end
+
+      def copy_command
+        command = current_command
+        return unless command
+
+        clipboard = Gtk::Clipboard.get(Gdk::Selection::CLIPBOARD)
+        clipboard.set_text(command)
+        HuntSuggestCore.safe_echo("huntsuggest: copied #{command}")
+      rescue StandardError => e
+        HuntSuggestCore.safe_echo("huntsuggest: copy failed: #{e.message}")
+      end
+
+      def echo_command
+        command = current_command
+        return unless command
+        HuntSuggestCore.safe_echo("huntsuggest: #{command}")
+        HuntSuggestCore.emit_backup_clickable(command, 'Backup')
+      end
+
+      def send_command
+        send_selected_hunt
+      end
+
+      def quick_send(style_num)
+        hunt = @selected_hunt
+        return unless hunt
+        command = HuntSuggestCore.huntpro_command(hunt, style_num)
+        @status_label.text = "Starting #{command}"
+        HuntSuggestCore.start_huntpro(style_num, hunt.area_name)
+      end
+
+      def send_selected_hunt
+        hunt = @selected_hunt
+        return false unless hunt
+        style_num = selected_style
+        command = HuntSuggestCore.huntpro_command(hunt, style_num)
+        @status_label.text = "Starting #{command}"
+        HuntSuggestCore.start_huntpro(style_num, hunt.area_name)
+      end
+
+      def favorite_selected
+        hunt = @selected_hunt
+        return unless hunt
+        HuntSuggestCore.add_favorite(@settings, hunt)
+        persist_settings
+        refresh_results
+        HuntSuggestCore.safe_echo("huntsuggest: favorited #{HuntSuggestCore.hunt_area_key(hunt)}")
+      end
+
+      def blacklist_selected
+        hunt = @selected_hunt
+        return unless hunt
+        HuntSuggestCore.add_blacklist(@settings, hunt)
+        persist_settings
+        refresh_results
+        HuntSuggestCore.safe_echo("huntsuggest: blacklisted #{HuntSuggestCore.hunt_area_key(hunt)}")
+      end
+
+      def clear_selected_flags
+        hunt = @selected_hunt
+        return unless hunt
+        HuntSuggestCore.remove_area_flags(@settings, hunt)
+        persist_settings
+        refresh_results
+        HuntSuggestCore.safe_echo("huntsuggest: cleared flags for #{HuntSuggestCore.hunt_area_key(hunt)}")
+      end
+    end
   end
 end
 
