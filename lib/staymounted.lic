@@ -1,0 +1,243 @@
+# frozen_string_literal: true
+
+=begin
+  Stay Mounted
+
+  Keeps your selected mount summoned and attempts to keep you mounted.
+
+  Usage:
+    ;staymounted <mount>
+    ;kill staymounted
+
+  Examples:
+    ;staymounted unicorn
+    ;staymounted yierka
+    ;staymounted horse
+		etc
+
+  Notes:
+  - Mount argument can be a common/uncommon/rare noun for that mount family.
+  - Script determines the summoning item noun for the selected family.
+  - If summon item is in inventory and "Mount Summoned" is not active: waves the summon item.
+  - If summon item is in inventory, "Mount Summoned" is active, and mount is visible in room: mounts.
+  - If summon item is not in inventory and "Mount Summoned" is not active: assumes you are already riding.
+  - Summon/mount attempts are throttled to reduce command spam.
+  - Frees right hand before mount attempts.
+
+  Author: Codex
+  Version: 1.0.2
+  Tags: mount, utility, automation, ride, summon
+=end
+
+module StayMounted
+  module_function
+
+  VERSION = '1.0.2'
+  POLL_SECONDS = 3
+
+  # Map mount nouns (common/uncommon/rare) to the correct summoning-item noun.
+  MOUNT_FAMILIES = {
+    horse: {
+      summon_item: 'reins',
+      nouns: [
+        'horse', 'bronco', 'cob', 'charger', 'crowbait', 'draft horse', 'filly', 'gelding', 'hack', 'jade',
+        'mare', 'mustang', 'pony', 'stallion', 'nightmare steed'
+      ]
+    },
+    tortoise: {
+      summon_item: 'leads',
+      nouns: [
+        'tortoise', 'cryptodira', 'megalochelys atlas'
+      ]
+    },
+    deer: {
+      summon_item: 'strap',
+      nouns: [
+        'buck', 'deer', 'doe', 'stag', 'antelope', 'caribou', 'elk', 'gazelle', 'muntjac', 'moose', 'reindeer',
+        'hart', 'hind'
+      ]
+    },
+    lizard: {
+      summon_item: 'harness',
+      nouns: [
+        'lizard', 'tegu', 'monitor', "sai'ri monster", 'wastesdragon', 'yierka'
+      ]
+    },
+    unicorn: {
+      summon_item: 'reins',
+      nouns: [
+        'unicorn'
+      ]
+    },
+    rolton: {
+      summon_item: 'leash',
+      nouns: [
+        'rolton', 'ewe', 'ram', 'sheep', 'tup', 'citka', 'dorper', 'goat', "kish'dal", 'piebald koza', 'maedat',
+        'rakka', 'risthil'
+      ]
+    },
+    beetle: {
+      summon_item: 'whistle',
+      nouns: [
+        'scarab', 'beetle', 'rhinoceros beetle'
+      ]
+    },
+    spider: {
+      summon_item: 'device',
+      nouns: [
+        'spider', 'birdeater', 'huntsman', 'tarantula', 'orbweaver'
+      ]
+    },
+    bear: {
+      summon_item: 'medallion',
+      nouns: [
+        'brown bear', 'black bear', 'sun bear', 'polar bear', 'spectacled bear', 'moon bear', 'wyrese brown bear',
+        'southron brown bear', 'bear'
+      ]
+    },
+    scorpion: {
+      summon_item: 'rattle',
+      nouns: [
+        'giant albino cave scorpion', 'giant wastes scorpion', 'sandfinger', 'black jungle scorpion',
+        'greater painted whiptail', 'vecdrae scythir', 'scorpion'
+      ]
+    }
+  }.freeze
+
+  def run
+    config = resolve_config
+    unless config
+      echo "[staymounted] Unknown mount. Example: ;staymounted unicorn"
+      echo "[staymounted] Try one of: #{MOUNT_FAMILIES.keys.join(', ')}"
+      exit
+    end
+
+    @target_terms = config[:nouns]
+    @summon_item_noun = config[:summon_item]
+
+    echo "[staymounted #{VERSION}] active: mount=#{@target_terms.first} item=#{@summon_item_noun}"
+
+    loop do
+      begin
+        tick
+      rescue StandardError => e
+        echo "[staymounted] error: #{e.class} #{e.message}"
+      end
+
+      sleep POLL_SECONDS
+    end
+  end
+
+  def resolve_config
+    input = Script.current.vars[1..]&.join(' ')&.downcase.to_s.strip
+    return nil if input.empty?
+
+    MOUNT_FAMILIES.each_value do |cfg|
+      return cfg if cfg[:nouns].any? { |n| input == n || input.include?(n) || n.include?(input) }
+    end
+
+    nil
+  end
+
+  def tick
+    return if dead?
+
+    summon_item_in_inventory = summon_item_present?
+    summoned = mount_summoned?
+
+    # User-provided heuristic: no item + no Mount Summoned => currently riding.
+    return if !summon_item_in_inventory && !summoned
+
+    if summon_item_in_inventory && !summoned
+      try_summon
+      return
+    end
+
+    if summon_item_in_inventory && summoned
+      mount = mount_in_room
+      try_mount(mount) if mount && action_ready?
+      return
+    end
+  end
+
+  def action_ready?
+    checkrt.to_i.zero?
+  rescue StandardError
+    true
+  end
+
+  def outside_room?
+    Room.current&.outside?
+  rescue StandardError
+    outside?
+  end
+
+  def mount_summoned?
+    Effects::Spells.active?('Mount Summoned')
+  rescue StandardError
+    false
+  end
+
+  def summon_item_present?
+    GameObj.inv.any? do |obj|
+      obj.noun.to_s =~ /\b#{Regexp.escape(@summon_item_noun)}\b/i ||
+        obj.name.to_s =~ /\b#{Regexp.escape(@summon_item_noun)}\b/i
+    end
+  end
+
+  def mount_in_room
+    room_objs = GameObj.npcs.to_a + GameObj.room_desc.to_a + GameObj.loot.to_a
+    room_objs.find do |obj|
+      text = "#{obj.name} #{obj.noun}".downcase
+      @target_terms.any? { |term| text =~ /\b#{Regexp.escape(term)}\b/ }
+    end
+  end
+
+  def try_summon
+    return unless throttle?(:summon, 10)
+
+    fput "wave my #{@summon_item_noun}"
+  end
+
+  def try_mount(mount)
+    return unless throttle?(:mount, 10)
+    return unless ensure_right_hand_free
+
+    if mount&.id
+      fput "mount ##{mount.id}"
+    else
+      # Fallback to a generic mount noun from the chosen family.
+      fput "mount #{@target_terms.first}"
+    end
+  end
+
+  def ensure_right_hand_free
+    return true if right_hand_empty?
+
+    empty_right_hand
+    waitrt?
+
+    unless right_hand_empty?
+      fput 'stow right'
+      waitrt?
+    end
+
+    right_hand_empty?
+  end
+
+  def right_hand_empty?
+    GameObj.right_hand.nil? || GameObj.right_hand.name.to_s == 'Empty'
+  end
+
+  def throttle?(key, seconds)
+    @last_action ||= {}
+    now = Time.now.to_f
+    last = @last_action[key] || 0.0
+    return false if (now - last) < seconds
+
+    @last_action[key] = now
+    true
+  end
+end
+
+StayMounted.run
