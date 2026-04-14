@@ -7,6 +7,7 @@
 
   Usage:
     ;staymounted <mount>
+    ;staymounted setup
     ;kill staymounted
 
   Examples:
@@ -21,19 +22,29 @@
   - If summon item is in inventory and "Mount Summoned" is not active: waves the summon item.
   - If summon item is in inventory, "Mount Summoned" is active, and mount is visible in room: mounts.
   - If summon item is not in inventory and "Mount Summoned" is not active: assumes you are already riding.
+  - While mounted in offensive stance, script can use MOUNT TRAMPLE (3+ targets, chance-based) and MOUNT CHARGE.
+  - Mount combat toggles are configurable in ;staymounted setup.
+  - For mount attacks, pauses hunt3_v2/bigshot if running.
+  - After MOUNT TRAMPLE, keeps those scripts paused until you are remounted.
   - Summon/mount attempts are throttled to reduce command spam.
   - Frees right hand before mount attempts.
 
   Author: Codex
-  Version: 1.0.2
+  Version: 1.2.1
   Tags: mount, utility, automation, ride, summon
 =end
 
 module StayMounted
   module_function
 
-  VERSION = '1.0.2'
+  VERSION = '1.2.1'
   POLL_SECONDS = 3
+  TRAMPLE_CHANCE = 0.45
+  MANAGED_COMBAT_SCRIPTS = %w[hunt3_v2 bigshot].freeze
+  DEFAULT_SETTINGS = {
+    use_mount_charge: true,
+    use_mount_trample: true
+  }.freeze
 
   # Map mount nouns (common/uncommon/rare) to the correct summoning-item noun.
   MOUNT_FAMILIES = {
@@ -105,6 +116,13 @@ module StayMounted
   }.freeze
 
   def run
+    @settings = load_settings
+
+    if setup_mode?
+      launch_settings_ui
+      exit
+    end
+
     config = resolve_config
     unless config
       echo "[staymounted] Unknown mount. Example: ;staymounted unicorn"
@@ -115,7 +133,13 @@ module StayMounted
     @target_terms = config[:nouns]
     @summon_item_noun = config[:summon_item]
 
+    unless summon_item_present?
+      echo "Missing summon item: #{@summon_item_noun} not found in inventory. Exiting."
+      exit
+    end
+
     echo "[staymounted #{VERSION}] active: mount=#{@target_terms.first} item=#{@summon_item_noun}"
+    echo "[staymounted] settings: trample=#{@settings[:use_mount_trample]} charge=#{@settings[:use_mount_charge]}"
 
     loop do
       begin
@@ -128,9 +152,14 @@ module StayMounted
     end
   end
 
+  def setup_mode?
+    Script.current.vars[1].to_s =~ /\Asetup\z/i
+  end
+
   def resolve_config
     input = Script.current.vars[1..]&.join(' ')&.downcase.to_s.strip
     return nil if input.empty?
+    return nil if setup_mode?
 
     MOUNT_FAMILIES.each_value do |cfg|
       return cfg if cfg[:nouns].any? { |n| input == n || input.include?(n) || n.include?(input) }
@@ -144,9 +173,15 @@ module StayMounted
 
     summon_item_in_inventory = summon_item_present?
     summoned = mount_summoned?
+    mounted = !summon_item_in_inventory && !summoned
+
+    process_script_unpause(mounted)
 
     # User-provided heuristic: no item + no Mount Summoned => currently riding.
-    return if !summon_item_in_inventory && !summoned
+    if mounted
+      try_mounted_combat
+      return
+    end
 
     if summon_item_in_inventory && !summoned
       try_summon
@@ -164,12 +199,6 @@ module StayMounted
     checkrt.to_i.zero?
   rescue StandardError
     true
-  end
-
-  def outside_room?
-    Room.current&.outside?
-  rescue StandardError
-    outside?
   end
 
   def mount_summoned?
@@ -201,7 +230,7 @@ module StayMounted
 
   def try_mount(mount)
     return unless throttle?(:mount, 10)
-    return unless ensure_right_hand_free
+    return unless ensure_mount_hand_free
 
     if mount&.id
       fput "mount ##{mount.id}"
@@ -209,6 +238,180 @@ module StayMounted
       # Fallback to a generic mount noun from the chosen family.
       fput "mount #{@target_terms.first}"
     end
+  end
+
+  def try_mounted_combat
+    return unless action_ready?
+    return unless standing?
+    return unless checkstance =~ /offensive/
+    return unless charge_loadout_ready?
+
+    targets = living_targets
+    return if targets.empty?
+
+    if targets.length >= 3 && mount_trample_ready? && trample_roll? && throttle?(:trample, 8)
+      execute_mount_attack(wait_for_remount: true) { fput "mount trample" }
+      return
+    end
+
+    target = targets.first
+    return unless target
+    return unless mount_charge_ready?
+    return unless throttle?(:charge, 8)
+
+    execute_mount_attack(wait_for_remount: false) { fput "mount charge ##{target.id}" }
+  end
+
+  def living_targets
+    (GameObj.targets || []).reject { |t| t.status.to_s =~ /dead|gone/ }
+  end
+
+  def mount_charge_ready?
+    return false unless @settings[:use_mount_charge]
+
+    !cooldown_active_name?("Mount Charge")
+  end
+
+  def mount_trample_ready?
+    return false unless @settings[:use_mount_trample]
+
+    !cooldown_active_name?("Mount Trample")
+  end
+
+  def trample_roll?
+    rand < TRAMPLE_CHANCE
+  end
+
+  def cooldown_active_name?(name)
+    return true if Effects::Cooldowns.active?(name)
+
+    needle = name.to_s.downcase
+    (Effects::Cooldowns.to_h || {}).keys.any? { |k| k.to_s.downcase.include?(needle) }
+  end
+
+  def charge_loadout_ready?
+    needs_shield = shield_required_for_user?
+    has_weapon = weapon_in_hand?
+    has_shield = !needs_shield || shield_in_hand?
+    return true if has_weapon && has_shield
+
+    ready_weapon_for_mount
+    ready_shield_for_mount if needs_shield
+    refresh_inventory_for_loadout
+
+    has_weapon = weapon_in_hand?
+    has_shield = !needs_shield || shield_in_hand?
+    has_weapon && has_shield
+  end
+
+  def weapon_in_hand?
+    hand = GameObj.right_hand
+    return false if hand.nil? || hand.name.to_s == "Empty"
+    return false if hand.noun.to_s =~ /shield|buckler|targe|scutum|greatshield|heater|aegis|mantlet|pavis/i
+
+    true
+  end
+
+  def shield_in_hand?
+    hand = GameObj.left_hand
+    return false if hand.nil? || hand.name.to_s == "Empty"
+
+    hand.noun.to_s =~ /shield|buckler|targe|scutum|greatshield|heater|aegis|mantlet|pavis/i
+  end
+
+  def refresh_inventory_for_loadout
+    @last_inventory_refresh ||= Time.at(0)
+    return if (Time.now - @last_inventory_refresh) < 5
+
+    @last_inventory_refresh = Time.now
+    fput "inventory"
+    waitrt?
+  end
+
+  def ready_weapon_for_mount
+    @last_ready_weapon ||= Time.at(0)
+    return if (Time.now - @last_ready_weapon) < 5
+
+    @last_ready_weapon = Time.now
+    fput "ready weapon"
+    waitrt?
+  end
+
+  def ready_shield_for_mount
+    @last_ready_shield ||= Time.at(0)
+    return if (Time.now - @last_ready_shield) < 5
+
+    @last_ready_shield = Time.now
+    fput "ready shield"
+    waitrt?
+  end
+
+  def shield_required_for_user?
+    return false unless defined?(ReadyList)
+
+    ReadyList.check(silent: true, quiet: true) if ReadyList.respond_to?(:check) && (!ReadyList.respond_to?(:checked?) || !ReadyList.checked?)
+    return false unless ReadyList.respond_to?(:ready_list)
+
+    shield = ReadyList.ready_list[:shield]
+    !(shield.nil? || shield.to_s.strip.empty?)
+  rescue StandardError
+    false
+  end
+
+  def execute_mount_attack(wait_for_remount:)
+    pause_managed_combat_scripts
+    yield
+
+    if wait_for_remount
+      @wait_for_remount_unpause = true
+    else
+      @pending_unpause_at = Time.now + 1.5
+    end
+  end
+
+  def pause_managed_combat_scripts
+    @paused_scripts ||= []
+    MANAGED_COMBAT_SCRIPTS.each do |script_name|
+      next unless running?(script_name)
+
+      pause_script script_name
+      @paused_scripts << script_name unless @paused_scripts.include?(script_name)
+    end
+  end
+
+  def process_script_unpause(mounted)
+    if @wait_for_remount_unpause
+      if mounted
+        unpause_managed_combat_scripts
+        @wait_for_remount_unpause = false
+      end
+      return
+    end
+
+    return unless @pending_unpause_at
+    return if Time.now < @pending_unpause_at
+
+    unpause_managed_combat_scripts
+    @pending_unpause_at = nil
+  end
+
+  def unpause_managed_combat_scripts
+    @paused_scripts ||= []
+    @paused_scripts.each do |script_name|
+      unpause_script script_name if running?(script_name)
+    end
+    @paused_scripts.clear
+  end
+
+  def ensure_mount_hand_free
+    # Mounting only needs one free hand; avoid unnecessary stowing.
+    return true if any_hand_empty?
+
+    # If user runs a shield profile, prefer freeing right to keep left shield intact.
+    return ensure_right_hand_free if shield_required_for_user?
+
+    # Non-shield profile: free right by default.
+    ensure_right_hand_free
   end
 
   def ensure_right_hand_free
@@ -225,8 +428,16 @@ module StayMounted
     right_hand_empty?
   end
 
+  def any_hand_empty?
+    right_hand_empty? || left_hand_empty?
+  end
+
   def right_hand_empty?
     GameObj.right_hand.nil? || GameObj.right_hand.name.to_s == 'Empty'
+  end
+
+  def left_hand_empty?
+    GameObj.left_hand.nil? || GameObj.left_hand.name.to_s == 'Empty'
   end
 
   def throttle?(key, seconds)
@@ -237,6 +448,109 @@ module StayMounted
 
     @last_action[key] = now
     true
+  end
+
+  def load_settings
+    Settings.load
+    Settings[Char.name] ||= {}
+
+    charge = Settings[Char.name]['staymounted_use_mount_charge']
+    trample = Settings[Char.name]['staymounted_use_mount_trample']
+
+    settings = DEFAULT_SETTINGS.merge(
+      use_mount_charge: parse_setting_bool(charge, DEFAULT_SETTINGS[:use_mount_charge]),
+      use_mount_trample: parse_setting_bool(trample, DEFAULT_SETTINGS[:use_mount_trample])
+    )
+
+    Settings[Char.name]['staymounted_use_mount_charge'] = settings[:use_mount_charge]
+    Settings[Char.name]['staymounted_use_mount_trample'] = settings[:use_mount_trample]
+    Settings.save
+    settings
+  rescue StandardError
+    DEFAULT_SETTINGS.dup
+  end
+
+  def parse_setting_bool(value, default)
+    return default if value.nil?
+    return value if value == true || value == false
+
+    case value.to_s.strip.downcase
+    when 'true', 't', '1', 'yes', 'y', 'on'
+      true
+    when 'false', 'f', '0', 'no', 'n', 'off'
+      false
+    else
+      default
+    end
+  end
+
+  def launch_settings_ui
+    Settings.load
+    Settings[Char.name] ||= Hash.new
+    use_mount_charge = Settings[Char.name]['staymounted_use_mount_charge']
+    use_mount_trample = Settings[Char.name]['staymounted_use_mount_trample']
+
+    use_mount_charge = DEFAULT_SETTINGS[:use_mount_charge] if use_mount_charge.nil?
+    use_mount_trample = DEFAULT_SETTINGS[:use_mount_trample] if use_mount_trample.nil?
+
+    window = window_action = nil
+    trample_check = charge_check = nil
+    save_message = nil
+
+    Gtk.queue {
+      Gtk::Button.new("Save")
+
+      trample_check = Gtk::CheckButton.new("Use Mount Trample")
+      charge_check = Gtk::CheckButton.new("Use Mount Charge")
+
+      trample_check.active = use_mount_trample
+      charge_check.active = use_mount_charge
+
+      save_btn = Gtk::Button.new("Save")
+
+      main_box = Gtk::VBox.new(false, 0)
+      main_box.add(Gtk::HSeparator.new)
+      main_box.add(Gtk::Label.new("StayMounted Combat Settings"))
+      main_box.add(trample_check)
+      main_box.add(charge_check)
+      main_box.add(Gtk::HSeparator.new)
+      main_box.add(save_btn)
+
+      window = Gtk::Window.new
+      window.title = 'StayMounted Setup'
+      window.border_width = 5
+      if window.respond_to?(:set_default_size)
+        window.set_default_size(420, 240)
+      end
+      if window.respond_to?(:set_window_position)
+        window.set_window_position(:center)
+      end
+      window.add(main_box)
+
+      save_btn.signal_connect('clicked') {
+        Gtk.queue {
+          use_mount_trample = trample_check.active?
+          use_mount_charge = charge_check.active?
+          save_message = "settings saved: trample=#{use_mount_trample} charge=#{use_mount_charge}"
+          window_action = :save
+        }
+      }
+
+      window.signal_connect('delete_event') { window_action = :cancel }
+      window.show_all
+    }
+
+    before_dying { Gtk.queue { window.destroy if window } }
+    wait_while { window_action.nil? }
+    undo_before_dying
+    Gtk.queue { window.destroy if window }
+
+    Settings[Char.name]['staymounted_use_mount_charge'] = use_mount_charge
+    Settings[Char.name]['staymounted_use_mount_trample'] = use_mount_trample
+    Settings.save
+    echo save_message if window_action == :save && save_message
+  rescue StandardError => e
+    echo "[staymounted] setup UI error: #{e.class} #{e.message}"
   end
 end
 
