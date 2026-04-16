@@ -7,8 +7,8 @@
 
   Usage:
     ;staymounted <mount>
+    ;staymounted
     ;staymounted setup
-    ;kill staymounted
 
   Examples:
     ;staymounted unicorn
@@ -18,6 +18,7 @@
 
   Notes:
   - Mount argument can be a common/uncommon/rare noun for that mount family.
+  - If no mount argument is supplied, script uses the mount family selected in ;staymounted setup.
   - Script determines the summoning item noun for the selected family.
   - If summon item is in inventory and "Mount Summoned" is not active: waves the summon item.
   - If summon item is in inventory, "Mount Summoned" is active, and mount is visible in room: mounts.
@@ -31,18 +32,20 @@
   - Defers mount/summon/hand actions during ecleanse disarm recovery events.
 
   Author: Codex
-  Version: 1.2.2
+  Version: 1.3.10
   Tags: mount, utility, automation, ride, summon
 =end
 
 module StayMounted
   module_function
 
-  VERSION = '1.2.2'
+  VERSION = '1.3.10'
   POLL_SECONDS = 3
+  REMOUNT_POLL_SECONDS = 1
   TRAMPLE_CHANCE = 0.45
   MANAGED_COMBAT_SCRIPTS = %w[hunt3_v2 bigshot].freeze
   DEFAULT_SETTINGS = {
+    selected_mount_family: nil,
     use_mount_charge: true,
     use_mount_trample: true
   }.freeze
@@ -126,30 +129,33 @@ module StayMounted
 
     config = resolve_config
     unless config
-      echo "[staymounted] Unknown mount. Example: ;staymounted unicorn"
-      echo "[staymounted] Try one of: #{MOUNT_FAMILIES.keys.join(', ')}"
+      echo "Unknown mount. Example: ;staymounted unicorn"
+      echo "Try one of: #{MOUNT_FAMILIES.keys.join(', ')}"
       exit
     end
 
+    @selected_mount_family = config[:family]
     @target_terms = config[:nouns]
     @summon_item_noun = config[:summon_item]
 
-    unless summon_item_present?
-      echo "Missing summon item: #{@summon_item_noun} not found in inventory. Exiting."
+    startup_mounted = currently_mounted_via_look?
+
+    unless summon_item_present? || startup_mounted
+      echo "Missing summon item: #{@summon_item_noun} not found in inventory and you do not appear mounted. Exiting."
       exit
     end
 
-    echo "[staymounted #{VERSION}] active: mount=#{@target_terms.first} item=#{@summon_item_noun}"
-    echo "[staymounted] settings: trample=#{@settings[:use_mount_trample]} charge=#{@settings[:use_mount_charge]}"
+    echo "#{VERSION} active: family=#{@selected_mount_family} mount=#{@target_terms.first} item=#{@summon_item_noun}"
+    echo "settings: trample=#{@settings[:use_mount_trample]} charge=#{@settings[:use_mount_charge]}"
 
     loop do
       begin
         tick
       rescue StandardError => e
-        echo "[staymounted] error: #{e.class} #{e.message}"
+        echo "error: #{e.class} #{e.message}"
       end
 
-      sleep POLL_SECONDS
+      sleep next_poll_seconds
     end
   end
 
@@ -159,14 +165,26 @@ module StayMounted
 
   def resolve_config
     input = Script.current.vars[1..]&.join(' ')&.downcase.to_s.strip
-    return nil if input.empty?
+    return config_for_saved_mount if input.empty?
     return nil if setup_mode?
 
-    MOUNT_FAMILIES.each_value do |cfg|
-      return cfg if cfg[:nouns].any? { |n| input == n || input.include?(n) || n.include?(input) }
+    MOUNT_FAMILIES.each do |family, cfg|
+      if cfg[:nouns].any? { |n| input == n || input.include?(n) || n.include?(input) }
+        return cfg.merge(family: family)
+      end
     end
 
     nil
+  end
+
+  def config_for_saved_mount
+    family = @settings[:selected_mount_family]
+    return nil unless family
+
+    cfg = MOUNT_FAMILIES[family]
+    return nil unless cfg
+
+    cfg.merge(family: family)
   end
 
   def tick
@@ -192,9 +210,19 @@ module StayMounted
 
     if summon_item_in_inventory && summoned
       mount = mount_in_room
-      try_mount(mount) if mount && action_ready?
+      try_mount(mount) if action_ready? && mount_present_for_mounting?(mount)
       return
     end
+  end
+
+  def next_poll_seconds
+    remount_ready? ? REMOUNT_POLL_SECONDS : POLL_SECONDS
+  end
+
+  def remount_ready?
+    summon_item_present? && mount_summoned? && action_ready? && !disarm_recovery_in_progress?
+  rescue StandardError
+    false
   end
 
   def action_ready?
@@ -216,12 +244,48 @@ module StayMounted
     end
   end
 
+  def currently_mounted_via_look?
+    @target_terms.each do |term|
+      lines = look_lines_for_term(term)
+      return true if Array(lines).any? { |line| line =~ /^You are currently riding\b/i }
+    end
+
+    false
+  rescue StandardError
+    false
+  end
+
   def mount_in_room
     room_objs = GameObj.npcs.to_a + GameObj.room_desc.to_a + GameObj.loot.to_a
     room_objs.find do |obj|
       text = "#{obj.name} #{obj.noun}".downcase
       @target_terms.any? { |term| text =~ /\b#{Regexp.escape(term)}\b/ }
     end
+  end
+
+  def mount_present_for_mounting?(mount = nil)
+    return true if mount
+
+    @target_terms.any? do |term|
+      look_lines_for_term(term).any? { |line| line =~ /^You see\b/i }
+    end
+  rescue StandardError
+    false
+  end
+
+  def look_lines_for_term(term)
+    return [] unless defined?(Lich::Util) && Lich::Util.respond_to?(:issue_command)
+
+    Lich::Util.issue_command(
+      "look #{term}",
+      /You see |I could not find what you were referring to\.|What were you referring to\?/,
+      /<prompt/,
+      include_end: false,
+      timeout: 2,
+      silent: true,
+      usexml: true,
+      quiet: true
+    )
   end
 
   def try_summon
@@ -231,7 +295,7 @@ module StayMounted
   end
 
   def try_mount(mount)
-    return unless throttle?(:mount, 10)
+    return unless throttle?(:mount, mount_throttle_seconds)
     return unless ensure_mount_hand_free
 
     if mount&.id
@@ -240,6 +304,10 @@ module StayMounted
       # Fallback to a generic mount noun from the chosen family.
       fput "mount #{@target_terms.first}"
     end
+  end
+
+  def mount_throttle_seconds
+    remount_ready? ? 3 : 10
   end
 
   def try_mounted_combat
@@ -480,14 +548,17 @@ module StayMounted
     Settings.load
     Settings[Char.name] ||= {}
 
+    selected_mount_family = normalize_mount_family_setting(Settings[Char.name]['staymounted_selected_mount_family'])
     charge = Settings[Char.name]['staymounted_use_mount_charge']
     trample = Settings[Char.name]['staymounted_use_mount_trample']
 
     settings = DEFAULT_SETTINGS.merge(
+      selected_mount_family: selected_mount_family,
       use_mount_charge: parse_setting_bool(charge, DEFAULT_SETTINGS[:use_mount_charge]),
       use_mount_trample: parse_setting_bool(trample, DEFAULT_SETTINGS[:use_mount_trample])
     )
 
+    Settings[Char.name]['staymounted_selected_mount_family'] = settings[:selected_mount_family]&.to_s
     Settings[Char.name]['staymounted_use_mount_charge'] = settings[:use_mount_charge]
     Settings[Char.name]['staymounted_use_mount_trample'] = settings[:use_mount_trample]
     Settings.save
@@ -510,17 +581,28 @@ module StayMounted
     end
   end
 
+  def normalize_mount_family_setting(value)
+    family = value.to_s.strip.downcase
+    return nil if family.empty?
+
+    family = family.to_sym
+    MOUNT_FAMILIES.key?(family) ? family : nil
+  end
+
   def launch_settings_ui
     Settings.load
     Settings[Char.name] ||= Hash.new
+    selected_mount_family = normalize_mount_family_setting(Settings[Char.name]['staymounted_selected_mount_family'])
     use_mount_charge = Settings[Char.name]['staymounted_use_mount_charge']
     use_mount_trample = Settings[Char.name]['staymounted_use_mount_trample']
 
+    selected_mount_family = DEFAULT_SETTINGS[:selected_mount_family] if selected_mount_family.nil?
     use_mount_charge = DEFAULT_SETTINGS[:use_mount_charge] if use_mount_charge.nil?
     use_mount_trample = DEFAULT_SETTINGS[:use_mount_trample] if use_mount_trample.nil?
 
     window = window_action = nil
     trample_check = charge_check = nil
+    mount_checks = {}
     save_message = nil
 
     Gtk.queue {
@@ -540,6 +622,24 @@ module StayMounted
       main_box.add(trample_check)
       main_box.add(charge_check)
       main_box.add(Gtk::HSeparator.new)
+      main_box.add(Gtk::Label.new("Mount Family (check one to use with bare ;staymounted)"))
+      MOUNT_FAMILIES.each_key do |family|
+        label = family.to_s.split('_').map(&:capitalize).join(' ')
+        check = Gtk::CheckButton.new(label)
+        check.active = (family == selected_mount_family)
+        check.signal_connect('toggled') {
+          next unless check.active?
+
+          mount_checks.each_value do |other_check|
+            next if other_check.equal?(check)
+
+            other_check.active = false if other_check.active?
+          end
+        }
+        mount_checks[family] = check
+        main_box.add(check)
+      end
+      main_box.add(Gtk::HSeparator.new)
       main_box.add(save_btn)
 
       window = Gtk::Window.new
@@ -551,19 +651,24 @@ module StayMounted
       if window.respond_to?(:set_window_position)
         window.set_window_position(:center)
       end
+      if window.respond_to?(:set_keep_above)
+        window.set_keep_above(true)
+      end
       window.add(main_box)
 
       save_btn.signal_connect('clicked') {
         Gtk.queue {
+          selected_mount_family = mount_checks.find { |_family, check| check.active? }&.first
           use_mount_trample = trample_check.active?
           use_mount_charge = charge_check.active?
-          save_message = "settings saved: trample=#{use_mount_trample} charge=#{use_mount_charge}"
+          save_message = "settings saved: family=#{selected_mount_family || 'none'} trample=#{use_mount_trample} charge=#{use_mount_charge}"
           window_action = :save
         }
       }
 
       window.signal_connect('delete_event') { window_action = :cancel }
       window.show_all
+      window.present if window.respond_to?(:present)
     }
 
     before_dying { Gtk.queue { window.destroy if window } }
@@ -571,12 +676,13 @@ module StayMounted
     undo_before_dying
     Gtk.queue { window.destroy if window }
 
+    Settings[Char.name]['staymounted_selected_mount_family'] = selected_mount_family&.to_s
     Settings[Char.name]['staymounted_use_mount_charge'] = use_mount_charge
     Settings[Char.name]['staymounted_use_mount_trample'] = use_mount_trample
     Settings.save
     echo save_message if window_action == :save && save_message
   rescue StandardError => e
-    echo "[staymounted] setup UI error: #{e.class} #{e.message}"
+    echo "setup UI error: #{e.class} #{e.message}"
   end
 end
 
