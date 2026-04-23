@@ -1,0 +1,807 @@
+=begin
+
+  Author: Starsworn
+  
+  star-book.lic: Spellbook invocation helper for GemStone IV
+
+  Scans your saved spellbook grimoire (once), navigates silently to the
+  correct page and slot via TURN/PONDER, then uses INVOKE and CAST to
+  fire spells with a single short command.
+
+  Alias suggestion (paste this once to create the alias for "tome", which will then call this script): 
+  
+  ;alias add --global tome=;star-book \?
+
+  Setup (run once):
+    ;star-book green tome, tome reliquary
+      -- saves the held spellbook named "green tome" and the container
+         named "tome reliquary"
+    ;star-book reset
+      -- clears saved settings so you can run setup again
+
+  Usage:
+    tome 405              -- invoke spell 405, then CAST (self)
+    tome 405 Khorgar      -- invoke spell 405, then CAST Khorgar
+    tome 405 prep         -- invoke spell 405, don't cast
+    tome 405 hold         -- invoke spell 405, CAST self, keep book in hand
+    tome page 5           -- cast every spell on page 5 at self, in order
+    tome list             -- echo the scanned spellbook contents
+    tome scan             -- rescan and save the spellbook layout
+    tome help             -- this message
+
+  Notes:
+  - By default the script gets the book, casts, then stows it.
+  - "hold" keeps the book in hand after casting.
+  - The book must already be in hand OR in the saved container.
+  - Spell lookup works by number (405) or partial name (e.g. "firestorm").
+  - All game output from navigation is hidden (quiet capture).
+
+  v1.0 - Initial release
+=end
+
+require 'cgi'
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+SBOOK_ID_SETTING        = 'star_book_book_id'.freeze
+SBOOK_NAME_SETTING      = 'star_book_book_name'.freeze
+SBOOK_NOUN_SETTING      = 'star_book_book_noun'.freeze
+SBOOK_CONT_ID_SETTING   = 'star_book_container_id'.freeze
+SBOOK_CONT_NAME_SETTING = 'star_book_container_name'.freeze
+SBOOK_CONT_NOUN_SETTING = 'star_book_container_noun'.freeze
+SBOOK_CACHE_SETTING          = 'star_book_page_cache'.freeze
+
+SBOOK_PAGE_START_PATTERN  = /You glance down at your .* and carefully study page \d+\.\.\./
+SBOOK_PAGE_NUMBER_PATTERN = /carefully study page (\d+)\.\.\./
+SBOOK_SLOT_PATTERN        = /^(\d+)\.\s+(?:The (.+?) \((\d+)\) spell with (\d+) charges remaining\.|This section is blank\.)$/
+SBOOK_PONDER_PATTERN      = /You ponder over your .*, shifting your attention to the \d+(?:st|nd|rd|th) section on the page/
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+module StarTome
+  module_function
+
+  def script_args
+    # Script.current.vars[0] is the full raw argument string; [1..] are the
+    # space-split tokens. Always use the split tokens only.
+    vars = Script.current.vars.to_a
+    return [] if vars.empty?
+    tokens = vars[1..] || []
+    tokens.map { |v| v.to_s.strip }.reject(&:empty?)
+  end
+
+  def fail_with(message)
+    raise RuntimeError, message
+  end
+
+  def held_items
+    [GameObj.right_hand, GameObj.left_hand].select { |item| item && item.id }
+  end
+
+  def inventory_items
+    GameObj.inv.to_a.select { |item| item && item.id }
+  end
+
+  def carried_items
+    (inventory_items + held_items).uniq { |item| item.id.to_s }
+  end
+
+  def normalize_lines(lines)
+    Array(lines)
+      .map { |line| CGI.unescapeHTML(line.to_s.gsub(/<[^>]+>/, '')).strip }
+      .reject(&:empty?)
+  end
+
+  # Issue a command and capture output quietly until <prompt, waiting for
+  # start_pattern to appear first.
+  def quiet_capture(command, start_pattern, timeout: 6)
+    waitrt?
+    lines = Lich::Util.issue_command(
+      command,
+      start_pattern,
+      /<prompt/,
+      include_end: false,
+      timeout: timeout,
+      usexml: true,
+      quiet: true,
+      use_fput: false
+    )
+    normalize_lines(lines)
+  end
+
+  def known_container_for_item(item_id)
+    id_text = item_id.to_s
+    GameObj.containers.find do |_cid, contents|
+      contents.any? { |item| item.id.to_s == id_text }
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Settings
+  # ---------------------------------------------------------------------------
+  def save_book!(item)
+    CharSettings[SBOOK_ID_SETTING]   = item.id.to_s
+    CharSettings[SBOOK_NAME_SETTING] = item.name.to_s
+    CharSettings[SBOOK_NOUN_SETTING] = item.noun.to_s
+  end
+
+  def save_container!(item)
+    CharSettings[SBOOK_CONT_ID_SETTING]   = item.id.to_s
+    CharSettings[SBOOK_CONT_NAME_SETTING] = item.name.to_s
+    CharSettings[SBOOK_CONT_NOUN_SETTING] = item.noun.to_s
+  end
+
+  def reset_settings!
+    [
+      SBOOK_ID_SETTING, SBOOK_NAME_SETTING, SBOOK_NOUN_SETTING,
+      SBOOK_CONT_ID_SETTING, SBOOK_CONT_NAME_SETTING, SBOOK_CONT_NOUN_SETTING,
+      SBOOK_CACHE_SETTING
+    ].each { |key| CharSettings[key] = nil }
+  end
+
+  def saved_book_id
+    v = CharSettings[SBOOK_ID_SETTING]
+    v.nil? ? nil : v.to_s
+  end
+
+  def saved_book_name
+    CharSettings[SBOOK_NAME_SETTING].to_s
+  end
+
+  def saved_book_noun
+    CharSettings[SBOOK_NOUN_SETTING].to_s
+  end
+
+  def saved_container_id
+    v = CharSettings[SBOOK_CONT_ID_SETTING]
+    v.nil? ? nil : v.to_s
+  end
+
+  def saved_container_name
+    CharSettings[SBOOK_CONT_NAME_SETTING].to_s
+  end
+
+  def saved_container_noun
+    CharSettings[SBOOK_CONT_NOUN_SETTING].to_s
+  end
+
+  # ---------------------------------------------------------------------------
+  # Book and container resolution
+  # ---------------------------------------------------------------------------
+
+  # Returns the held GameObj for the saved book, or nil.
+  def held_book
+    phrase = saved_book_name.to_s.strip
+    return nil if phrase.empty?
+
+    sid = saved_book_id
+    if sid
+      item = held_items.find { |h| h.id.to_s == sid }
+      return item if item
+    end
+
+    matches = held_items.select { |h| item_matches_phrase?(h, phrase) }
+    if matches.length == 1
+      save_book!(matches.first)
+      return matches.first
+    end
+
+    nil
+  end
+
+  # Returns the book ref string ("#id") for commands.
+  def book_ref(item)
+    "##{item.id}"
+  end
+
+  # Resolves the saved container from inventory/held items.
+  # Tries by saved id first, then by name phrase (adjective-aware).
+  def resolve_container
+    phrase = saved_container_name.to_s.strip
+    return nil if phrase.empty?
+
+    sid = saved_container_id
+    if sid
+      item = carried_items.find { |i| i.id.to_s == sid }
+      return item if item
+    end
+
+    matches = carried_items.select { |i| item_matches_phrase?(i, phrase) }
+    if matches.length == 1
+      save_container!(matches.first)
+      return matches.first
+    end
+
+    nil
+  end
+
+  # Match a GameObj against a saved name phrase, supporting adjectives.
+  # "green tome" matches an item whose name includes "green" and noun is "tome".
+  def item_matches_phrase?(item, phrase)
+    return false unless item && phrase
+
+    words   = phrase.downcase.split
+    noun    = words.last
+    adjs    = words[0..-2]
+
+    item_noun = item.noun.to_s.downcase
+    item_name = item.name.to_s.downcase
+    item_adj  = item.respond_to?(:adjective) ? item.adjective.to_s.downcase : ''
+
+    return false unless item_noun == noun || item_name.end_with?(noun)
+
+    adjs.all? do |adj|
+      item_name.include?(adj) || item_adj.include?(adj)
+    end
+  end
+
+  # Gets the book into hand from the saved container or inventory.
+  # Uses the saved name phrase (supports adjectives) then falls back to id.
+  def get_book
+    book_phrase = saved_book_name.strip
+    fail_with('No spellbook configured. Run: ;star-book <book name>[, <container name>]') if book_phrase.empty?
+
+    # Already held? Match by saved id first, then by name phrase.
+    item = held_book
+    return item if item
+
+    # Try to find it in GameObj containers by name phrase.
+    container_obj = resolve_container
+    get_success_pattern = /You (?:pick up|remove|pull|reach|grab|retrieve|carefully remove)/i
+    get_fail_pattern    = /You (?:need|are already|can't)|Get what|What were you referring to|You have to empty your hands/i
+
+    # Try by saved id if we have one.
+    bid = saved_book_id
+    if bid
+      pair = known_container_for_item(bid)
+      cid_str = pair ? pair[0].to_s : (container_obj ? container_obj.id.to_s : nil)
+      command = cid_str ? "get ##{bid} from ##{cid_str}" : "get ##{bid}"
+      dothistimeout(command, 6, Regexp.union(get_success_pattern, get_fail_pattern))
+      20.times { item = held_items.find { |h| h.id.to_s == bid }; break if item; sleep 0.1 }
+    end
+
+    # Fallback: GET by the full name phrase (adjective + noun).
+    unless item
+      phrase_words = book_phrase.downcase
+      if container_obj
+        cmd = "get #{phrase_words} from ##{container_obj.id}"
+      else
+        cmd = "get #{phrase_words}"
+      end
+      dothistimeout(cmd, 6, Regexp.union(get_success_pattern, get_fail_pattern))
+      20.times do
+        item = held_items.find { |h| item_matches_phrase?(h, book_phrase) }
+        break if item
+        sleep 0.1
+      end
+      save_book!(item) if item
+    end
+
+    fail_with("Could not get '#{book_phrase}'. Is it in the saved container or your inventory?") unless item
+    item
+  end
+
+  # Stows the book back into the saved container (or just stows it if no
+  # container is saved).
+  def stow_book(item)
+    bid = item.id.to_s
+    container = resolve_container
+    if container
+      result = dothistimeout("put ##{bid} in ##{container.id}", 5,
+        /You (?:put|slip|tuck|drop)|Put what|What were you referring to|You (?:can't|cannot|need|must|have to)/i)
+      20.times do
+        pair = known_container_for_item(bid)
+        break if pair && pair[0].to_s == container.id.to_s
+        sleep 0.1
+      end
+    else
+      dothistimeout("stow ##{bid}", 5, /You (?:put|slip|tuck|stow|drop)|Stow what/i)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Page scanning (mirrors librarian's modality, but hidden)
+  # ---------------------------------------------------------------------------
+
+  def parse_page_data(lines)
+    page_match = nil
+    lines.each do |line|
+      page_match = SBOOK_PAGE_NUMBER_PATTERN.match(line)
+      break if page_match
+    end
+    fail_with('Could not read spellbook page number from output.') unless page_match
+
+    page_number = page_match[1].to_i
+    slots = []
+    lines.each do |line|
+      normalized = line.dup
+      selected = false
+      selected = true if normalized.sub!(/\A(?:>|&gt;)\s*/, '')
+
+      match = SBOOK_SLOT_PATTERN.match(normalized)
+      next unless match
+
+      slot = {
+        page: page_number,
+        slot: match[1].to_i,
+        selected: selected,
+        blank: match[2].nil?
+      }
+      unless slot[:blank]
+        slot[:name]    = match[2]
+        slot[:number]  = match[3].to_i
+        slot[:charges] = match[4].to_i
+      end
+      slots << slot
+    end
+
+    fail_with("Could not parse spell slots on page #{page_number}.") if slots.empty?
+
+    {
+      page: page_number,
+      slots: slots,
+      selected_slot: slots.find { |s| s[:selected] }&.dig(:slot)
+    }
+  end
+
+  def read_page(ref)
+    parse_page_data(quiet_capture("read #{ref}", SBOOK_PAGE_START_PATTERN))
+  end
+
+  # Advance one page and parse the slot data from the TURN output directly.
+  # TURN already prints the full page listing -- no extra READ needed.
+  def turn_next_page(ref)
+    lines = quiet_capture("turn #{ref}", SBOOK_PAGE_START_PATTERN)
+    parse_page_data(lines)
+  end
+
+  # Full scan -- visits every page silently via READ+TURN, returns structured hash.
+  # This is the ONLY time the script reads all pages.  Results are cached in
+  # CharSettings and reused on every subsequent cast.  Run ;star-book scan to refresh
+  # if you add, swap, or use up a spell slot.
+  def scan_book(item)
+    ref = book_ref(item)
+    first_page = read_page(ref)
+    page_map = { first_page[:page] => first_page }
+
+    loop do
+      page_data = turn_next_page(ref)
+      break if page_data[:page] == first_page[:page]
+      fail_with("Page #{page_data[:page]} encountered twice during scan.") if page_map.key?(page_data[:page])
+      page_map[page_data[:page]] = page_data
+    end
+
+    all_slots = page_map.keys.sort.flat_map { |p| page_map[p][:slots] }
+
+    spells_by_number = Hash.new { |h, k| h[k] = [] }
+    spells_by_name   = Hash.new { |h, k| h[k] = [] }
+    all_slots.each do |slot|
+      next if slot[:blank]
+      spells_by_number[slot[:number]] << slot
+      spells_by_name[slot[:name].downcase] << slot
+    end
+
+    {
+      page_map: page_map,
+      page_numbers: page_map.keys.sort,
+      all_slots: all_slots,
+      spells_by_number: spells_by_number,
+      spells_by_name: spells_by_name,
+      first_page_number: first_page[:page]
+    }
+  end
+
+  # Persist cache as a simple serialized string using CharSettings.
+  # We store: "page:slot:name:number:charges" lines joined by pipe.
+  def save_cache!(state)
+    lines = state[:all_slots].map do |s|
+      if s[:blank]
+        "#{s[:page]}:#{s[:slot]}:blank:0:0"
+      else
+        name_safe = s[:name].to_s.gsub(':', '-')
+        "#{s[:page]}:#{s[:slot]}:#{name_safe}:#{s[:number]}:#{s[:charges]}"
+      end
+    end
+    CharSettings[SBOOK_CACHE_SETTING] = lines.join('|')
+  end
+
+  def load_cache
+    raw = CharSettings[SBOOK_CACHE_SETTING]
+    return nil if raw.nil? || raw.to_s.strip.empty?
+
+    all_slots = raw.split('|').map do |line|
+      parts = line.split(':')
+      next nil unless parts.length == 5
+      page, slot, name_part, number, charges = parts
+      blank = name_part == 'blank'
+      s = { page: page.to_i, slot: slot.to_i, selected: false, blank: blank }
+      unless blank
+        s[:name]    = name_part
+        s[:number]  = number.to_i
+        s[:charges] = charges.to_i
+      end
+      s
+    end.compact
+
+    return nil if all_slots.empty?
+
+    spells_by_number = Hash.new { |h, k| h[k] = [] }
+    spells_by_name   = Hash.new { |h, k| h[k] = [] }
+    all_slots.each do |slot|
+      next if slot[:blank]
+      spells_by_number[slot[:number]] << slot
+      spells_by_name[slot[:name].downcase] << slot
+    end
+
+    page_map = {}
+    all_slots.group_by { |s| s[:page] }.each do |page_num, slots|
+      page_map[page_num] = { page: page_num, slots: slots, selected_slot: nil }
+    end
+
+    {
+      page_map: page_map,
+      page_numbers: page_map.keys.sort,
+      all_slots: all_slots,
+      spells_by_number: spells_by_number,
+      spells_by_name: spells_by_name,
+      first_page_number: page_map.keys.min
+    }
+  end
+
+  # Returns cached state if available; otherwise does a full scan and saves it.
+  # Navigation during casting uses the cache exclusively -- no live READs.
+  def get_or_scan(item)
+    cached = load_cache
+    return cached if cached
+
+    echo('No spell layout cached yet. Scanning spellbook now...')
+    state = scan_book(item)
+    save_cache!(state)
+    count = state[:all_slots].reject { |s| s[:blank] }.length
+    echo("Scan complete: #{count} spell(s) across #{state[:page_numbers].length} page(s) cached.")
+    echo("Run ;#{Script.current.name} scan any time a spell slot changes (added, swapped, or used up).")
+    state
+  end
+
+  # ---------------------------------------------------------------------------
+  # Spell lookup
+  # ---------------------------------------------------------------------------
+
+  def find_spell_slot(state, query)
+    stripped = query.to_s.strip
+    fail_with("Empty spell query.") if stripped.empty?
+
+    matches =
+      if stripped.match?(/^\d+$/)
+        state[:spells_by_number][stripped.to_i].sort_by { |s| [s[:page], s[:slot]] }
+      else
+        downcased = stripped.downcase
+        state[:all_slots]
+          .reject { |s| s[:blank] }
+          .select { |s| s[:name].downcase.include?(downcased) }
+          .sort_by { |s| [s[:page], s[:slot]] }
+      end
+
+    # Deduplicate by page+slot in case the cache was built with any repeated entries.
+    matches = matches.uniq { |s| [s[:page], s[:slot]] }
+
+    fail_with("Spell '#{query}' not found in spellbook. Run ;#{Script.current.name} scan if the book has changed.") if matches.empty?
+
+    # Single result: use it silently.
+    return matches.first if matches.length == 1
+
+    # Multiple distinct slots: prefer exact name match, else list and use first.
+    unless stripped.match?(/^\d+$/)
+      exact = matches.select { |s| s[:name].downcase == stripped.downcase }
+      return exact.first if exact.length == 1
+    end
+
+    echo("Multiple slots match '#{query}' -- using page #{matches.first[:page]}, slot #{matches.first[:slot]} (#{matches.first[:name]} #{matches.first[:number]}).")
+    echo("Use the spell number for an exact match, or ;#{Script.current.name} list to see all slots.")
+    matches.first
+  end
+
+  # ---------------------------------------------------------------------------
+  # Navigation (TURN + PONDER, using cache for page/slot, one live read)
+  # ---------------------------------------------------------------------------
+
+  # Navigate to the cached target slot.
+  # - TURN outputs the full page listing; we parse it directly (no extra READ).
+  # - One READ only if we are already on the correct page and need selected slot.
+  # - fput ensures each command completes before the next fires.
+  def navigate_to_slot(item, target, state)
+    ref = book_ref(item)
+
+    # Turn to the target page. If already there, TURN returns "You are already
+    # on that page." without a page listing, so fall back to a silent READ.
+    turn_lines = quiet_capture("turn #{ref} to #{target[:page]}", /You (?:turn|are already)|carefully study page/, timeout: 6)
+    page_data =
+      if turn_lines.any? { |l| l =~ /carefully study page/ }
+        parse_page_data(turn_lines)
+      else
+        read_page(ref)
+      end
+
+    selected      = page_data[:selected_slot]
+    slots_on_page = page_data[:slots].map { |s| s[:slot] }.max
+
+    fail_with("Could not read selected slot on page #{target[:page]}.") unless selected
+    fail_with("Could not read slot count on page #{target[:page]}.") unless slots_on_page
+
+    ponders_needed = (target[:slot] - selected) % slots_on_page
+    ponders_needed.times do
+      quiet_capture("ponder #{ref}", /You ponder|^$/, timeout: 4)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Invocation
+  # ---------------------------------------------------------------------------
+
+  def invoke_and_cast(item, target_slot, cast_target, prep_only, state)
+    spell_label  = "#{target_slot[:name]} (#{target_slot[:number]})"
+    spell_number = target_slot[:number]
+
+    navigate_to_slot(item, target_slot, state)
+
+    # INVOKE -- let output flow through so the player sees rolls etc.
+    waitrt?
+    fput "invoke #{spell_number}"
+
+    return if prep_only
+
+    cast_cmd =
+      if cast_target.nil? || cast_target.strip.empty?
+        'cast'
+      else
+        "cast #{cast_target.strip}"
+      end
+
+    waitrt?
+    fput cast_cmd
+  end
+
+  # ---------------------------------------------------------------------------
+  # Page casting (cast all spells on a page at self)
+  # ---------------------------------------------------------------------------
+
+  def cast_page(item, page_number, state)
+    ref = book_ref(item)
+
+    page_data = state[:page_map][page_number]
+    fail_with("Page #{page_number} not found in cached layout. Run ;#{Script.current.name} scan.") unless page_data
+
+    spells_on_page = page_data[:slots].reject { |s| s[:blank] }.sort_by { |s| s[:slot] }
+    fail_with("No spells found on page #{page_number}.") if spells_on_page.empty?
+
+    echo("Casting #{spells_on_page.length} spell(s) from page #{page_number}...")
+
+    spells_on_page.each do |target_slot|
+      echo("  -> #{target_slot[:name]} (#{target_slot[:number]})...")
+      begin
+        invoke_and_cast(item, target_slot, nil, false, state)
+        waitrt?
+      rescue RuntimeError => e
+        echo("  Error on #{target_slot[:name]} (#{target_slot[:number]}): #{e.message}")
+      end
+    end
+
+    echo("Page #{page_number} casting complete.")
+  end
+
+  # ---------------------------------------------------------------------------
+  # Command handlers
+  # ---------------------------------------------------------------------------
+
+  # Setup: just save the name strings the user typed.  No need to hold the
+  # item -- we will look it up by name/noun/adjective when we need it.
+  # Format: ;star-book green tome, tome reliquary
+  def handle_setup(raw_arg)
+    parts = raw_arg.split(',', 2).map(&:strip)
+    book_phrase    = parts[0].to_s.strip
+    container_phrase = parts[1].to_s.strip
+
+    fail_with('Usage: ;star-book <book name>[, <container name>]') if book_phrase.empty?
+
+    # Derive the noun (last word) and any adjective words for the GET command.
+    # We store the full phrase so we can do GET <phrase> later.
+    CharSettings[SBOOK_NAME_SETTING]      = book_phrase
+    CharSettings[SBOOK_NOUN_SETTING]      = book_phrase.split.last.downcase
+    CharSettings[SBOOK_ID_SETTING]        = nil  # will be filled on first get
+    CharSettings[SBOOK_CACHE_SETTING]          = nil  # force fresh scan
+
+    echo("Spellbook set to: #{book_phrase}")
+
+    unless container_phrase.empty?
+      CharSettings[SBOOK_CONT_NAME_SETTING] = container_phrase
+      CharSettings[SBOOK_CONT_NOUN_SETTING] = container_phrase.split.last.downcase
+      CharSettings[SBOOK_CONT_ID_SETTING]   = nil
+      echo("Container set to: #{container_phrase}")
+    end
+
+    echo("Setup saved. Run ;#{Script.current.name} 405 (or any spell) to use it.")
+    echo("Run ;star-book reset if you need to change the book or container.")
+    echo('')
+    echo('Tip: add a short alias so you can type e.g. "tome 1315" directly:')
+    echo("  ;alias add tome=;eq Script.run('star-book','\\?')")
+  end
+
+  def handle_reset
+    reset_settings!
+    echo('Settings cleared. Run: ;star-book <book name>[, <container name>]')
+    echo('  e.g. ;star-book green tome, tome reliquary')
+  end
+
+  def handle_scan
+    item = get_book
+    echo('Scanning spellbook...')
+    state = scan_book(item)
+    save_cache!(state)
+    count = state[:all_slots].reject { |s| s[:blank] }.length
+    echo("Scan complete: #{count} spell(s) across #{state[:page_numbers].length} page(s) cached.")
+    echo("Run ;#{Script.current.name} scan again any time a spell slot changes (added, swapped, or used up).")
+  end
+
+  # ---------------------------------------------------------------------------
+  # Scroll rendering (matches star-daily.lic style)
+  # ---------------------------------------------------------------------------
+  SCROLL_W = 54
+
+  def scroll_line(str)
+    Lich::Messaging.mono(str)
+  end
+
+  def scroll_top
+    scroll_line("")
+    scroll_line("             " + ("_" * (SCROLL_W - 2)))
+    scroll_line("           =(" + "__    ___" + (" " * (SCROLL_W - 18)) + "__     _" + ")=")
+  end
+
+  def scroll_bottom
+    scroll_line("           |" + "__    ___" + (" " * (SCROLL_W - 17)) + "__    __|")
+    scroll_line("           =(" + ("_" * (SCROLL_W - 2)) + ")=")
+    scroll_line("")
+  end
+
+  def scroll_blank
+    scroll_line("           |" + (" " * SCROLL_W) + "|")
+  end
+
+  def scroll_center(text)
+    pad  = SCROLL_W - text.length
+    lpad = [pad / 2, 0].max
+    rpad = [pad - lpad, 0].max
+    scroll_line("           |" + (" " * lpad) + text + (" " * rpad) + "|")
+  end
+
+  def scroll_divider
+    scroll_line("           |" + ("-" * SCROLL_W) + "|")
+  end
+
+  def scroll_row(text)
+    scroll_line("           | " + text.ljust(SCROLL_W - 2) + " |")
+  end
+
+  def handle_list
+    state = load_cache
+    unless state
+      echo('No spell layout cached yet. Run ;tome scan first.')
+      return
+    end
+
+    scroll_top
+    scroll_blank
+    scroll_center("~ #{saved_book_name} ~")
+    scroll_blank
+
+    state[:page_numbers].each do |page_num|
+      page_slots = state[:all_slots].select { |s| s[:page] == page_num && !s[:blank] }.sort_by { |s| s[:slot] }
+      next if page_slots.empty?
+      scroll_divider
+      scroll_center("-- Page #{page_num} --")
+      scroll_divider
+      page_slots.each do |s|
+        scroll_row(format("slot %d   %-22s  %4d   %2d charges", s[:slot], s[:name], s[:number], s[:charges]))
+      end
+    end
+
+    scroll_blank
+    scroll_bottom
+  end
+
+  def handle_cast_spell(spell_query, cast_target, prep_only, hold_book)
+    item = get_book
+    state = get_or_scan(item)
+    target_slot = find_spell_slot(state, spell_query)
+
+    invoke_and_cast(item, target_slot, cast_target, prep_only, state)
+
+    unless hold_book
+      stow_book(item)
+    end
+  end
+
+  def handle_page_cast(page_number_text, hold_book)
+    fail_with("Usage: ;#{Script.current.name} page <number>") unless page_number_text.to_s.match?(/^\d+$/)
+
+    page_number = page_number_text.to_i
+    item = get_book
+    state = get_or_scan(item)
+    cast_page(item, page_number, state)
+
+    unless hold_book
+      stow_book(item)
+    end
+  end
+
+  def show_help
+    sn = Script.current.name
+    respond "#{sn} -- spellbook invocation helper\n\nFirst-time setup:\n  ;star-book [book name][, container name]\n  e.g.: ;star-book green tome, tome reliquary\n\nUsage (alias as e.g. tome):\n  ;#{sn} [spell# or name]               -- invoke and CAST self\n  ;#{sn} [spell# or name] [target]      -- invoke and CAST target\n  ;#{sn} [spell# or name] prep          -- invoke only, no cast\n  ;#{sn} [spell# or name] hold          -- cast self, keep book in hand\n  ;#{sn} [spell# or name] [target] hold -- cast target, keep book in hand\n  ;#{sn} page [#]                       -- cast all spells on page at self\n  ;#{sn} page [#] hold                  -- same, keep book in hand\n  ;#{sn} scan                           -- rescan and cache book layout\n  ;#{sn} list                           -- display cached spell list\n  ;#{sn} reset                          -- clear saved book/container settings\n  ;#{sn} help                           -- this message"
+  end
+
+  # ---------------------------------------------------------------------------
+  # Main entry point
+  # ---------------------------------------------------------------------------
+
+  def run
+    args = script_args
+    command = args[0].to_s.strip.downcase
+
+    case command
+    when '', 'help', '--help', '-h'
+      show_help
+      return
+    when 'reset'
+      handle_reset
+      return
+    when 'scan'
+      handle_scan
+      return
+    when 'list'
+      handle_list
+      return
+    when 'page'
+      page_arg = args[1].to_s.strip
+      hold_book = args.any? { |a| a.to_s.strip.downcase == 'hold' }
+      handle_page_cast(page_arg, hold_book)
+      return
+    end
+
+    spell_query = command  # first arg (already lowercased -- that's fine for lookup)
+    remaining = args[1..-1] || []
+
+    prep_only = remaining.any? { |a| a.to_s.strip.downcase == 'prep' }
+    hold_book = remaining.any? { |a| a.to_s.strip.downcase == 'hold' }
+
+    # Anything that is not "prep" or "hold" in the remaining args is a target
+    target_parts = remaining.reject { |a| %w[prep hold].include?(a.to_s.strip.downcase) }
+    cast_target = target_parts.empty? ? nil : target_parts.join(' ')
+
+    handle_cast_spell(spell_query, cast_target, prep_only, hold_book)
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Script entry
+# ---------------------------------------------------------------------------
+begin
+  args = StarTome.script_args
+  first_arg = args[0].to_s.strip.downcase
+  setup_keywords = %w[reset scan list page help --help -h]
+
+  if StarTome.saved_book_name.to_s.strip.empty? && !setup_keywords.include?(first_arg)
+    # No book configured yet.
+    raw = args.join(' ').strip
+    if raw.empty?
+      respond "#{Script.current.name}: No spellbook configured.\nRun: ;star-book [book name][, container name]\n  e.g. ;star-book green tome, tome reliquary"
+    else
+      StarTome.handle_setup(raw)
+    end
+  else
+    StarTome.run
+  end
+rescue RuntimeError => e
+  echo(e.message)
+end
