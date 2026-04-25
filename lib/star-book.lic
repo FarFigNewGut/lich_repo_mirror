@@ -1,21 +1,19 @@
 =begin
 
   Author: Starsworn
-  
+
   star-book.lic: Spellbook invocation helper for GemStone IV
 
-  Scans your saved spellbook grimoire (once), navigates silently to the
-  correct page and slot via TURN/PONDER, then uses INVOKE and CAST to
-  fire spells with a single short command.
+  Scans your spellbook once, caches the page layout, then navigates
+  silently to the correct page via TURN and fires INVOKE + CAST.
 
-  Alias suggestion (paste this once to create the alias for "tome", which will then call this script): 
-  
-  ;alias add --global tome=;star-book \?
+  Alias suggestion (paste once to create the "tome" alias):
+
+    ;alias add --global tome=;star-book \?
 
   Setup (run once):
     ;star-book green tome, tome reliquary
-      -- saves the held spellbook named "green tome" and the container
-         named "tome reliquary"
+      -- saves the spellbook named "green tome" and container "tome reliquary"
     ;star-book reset
       -- clears saved settings so you can run setup again
 
@@ -25,18 +23,23 @@
     tome 405 prep         -- invoke spell 405, don't cast
     tome 405 hold         -- invoke spell 405, CAST self, keep book in hand
     tome page 5           -- cast every spell on page 5 at self, in order
-    tome list             -- echo the scanned spellbook contents
+    tome list             -- display the cached spellbook contents
     tome scan             -- rescan and save the spellbook layout
     tome help             -- this message
 
   Notes:
   - By default the script gets the book, casts, then stows it.
   - "hold" keeps the book in hand after casting.
-  - The book must already be in hand OR in the saved container.
   - Spell lookup works by number (405) or partial name (e.g. "firestorm").
-  - All game output from navigation is hidden (quiet capture).
+  - Navigation is silent: TURN to the right page, then INVOKE spell#.
+  - Cache persists across sessions. Run "tome scan" if slots change.
 
-  v1.0 - Initial release
+           author: Starsworn
+             game: GemStone
+             tags: spellbook, tome, invoke, cast, utility
+          version: 1.1
+
+  v1.1 - Removed PONDER navigation; INVOKE only requires the correct page.
 =end
 
 require 'cgi'
@@ -55,7 +58,6 @@ SBOOK_CACHE_SETTING          = 'star_book_page_cache'.freeze
 SBOOK_PAGE_START_PATTERN  = /You glance down at your .* and carefully study page \d+\.\.\./
 SBOOK_PAGE_NUMBER_PATTERN = /carefully study page (\d+)\.\.\./
 SBOOK_SLOT_PATTERN        = /^(\d+)\.\s+(?:The (.+?) \((\d+)\) spell with (\d+) charges remaining\.|This section is blank\.)$/
-SBOOK_PONDER_PATTERN      = /You ponder over your .*, shifting your attention to the \d+(?:st|nd|rd|th) section on the page/
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -280,6 +282,10 @@ module StarTome
     end
 
     fail_with("Could not get '#{book_phrase}'. Is it in the saved container or your inventory?") unless item
+
+    # Open the book if it isn't already open.
+    dothistimeout("open ##{item.id}", 4, /You (?:release|open|ease)|already open|That is already/i)
+
     item
   end
 
@@ -316,17 +322,12 @@ module StarTome
     page_number = page_match[1].to_i
     slots = []
     lines.each do |line|
-      normalized = line.dup
-      selected = false
-      selected = true if normalized.sub!(/\A(?:>|&gt;)\s*/, '')
-
-      match = SBOOK_SLOT_PATTERN.match(normalized)
+      match = SBOOK_SLOT_PATTERN.match(line.sub(/\A(?:>|&gt;)\s*/, ''))
       next unless match
 
       slot = {
         page: page_number,
         slot: match[1].to_i,
-        selected: selected,
         blank: match[2].nil?
       }
       unless slot[:blank]
@@ -342,7 +343,7 @@ module StarTome
     {
       page: page_number,
       slots: slots,
-      selected_slot: slots.find { |s| s[:selected] }&.dig(:slot)
+      selected_slot: nil
     }
   end
 
@@ -351,9 +352,10 @@ module StarTome
   end
 
   # Advance one page and parse the slot data from the TURN output directly.
-  # TURN already prints the full page listing -- no extra READ needed.
+  # Returns nil if the book has only one page (turn refused).
   def turn_next_page(ref)
-    lines = quiet_capture("turn #{ref}", SBOOK_PAGE_START_PATTERN)
+    lines = quiet_capture("turn #{ref}", /#{SBOOK_PAGE_START_PATTERN.source}|only page/i, timeout: 6)
+    return nil if lines.any? { |l| l =~ /only page/i }
     parse_page_data(lines)
   end
 
@@ -368,6 +370,7 @@ module StarTome
 
     loop do
       page_data = turn_next_page(ref)
+      break if page_data.nil?
       break if page_data[:page] == first_page[:page]
       fail_with("Page #{page_data[:page]} encountered twice during scan.") if page_map.key?(page_data[:page])
       page_map[page_data[:page]] = page_data
@@ -504,36 +507,12 @@ module StarTome
   end
 
   # ---------------------------------------------------------------------------
-  # Navigation (TURN + PONDER, using cache for page/slot, one live read)
+  # Navigation (TURN only -- INVOKE just needs the right page, not slot)
   # ---------------------------------------------------------------------------
 
-  # Navigate to the cached target slot.
-  # - TURN outputs the full page listing; we parse it directly (no extra READ).
-  # - One READ only if we are already on the correct page and need selected slot.
-  # - fput ensures each command completes before the next fires.
-  def navigate_to_slot(item, target, state)
+  def navigate_to_page(item, target)
     ref = book_ref(item)
-
-    # Turn to the target page. If already there, TURN returns "You are already
-    # on that page." without a page listing, so fall back to a silent READ.
-    turn_lines = quiet_capture("turn #{ref} to #{target[:page]}", /You (?:turn|are already)|carefully study page/, timeout: 6)
-    page_data =
-      if turn_lines.any? { |l| l =~ /carefully study page/ }
-        parse_page_data(turn_lines)
-      else
-        read_page(ref)
-      end
-
-    selected      = page_data[:selected_slot]
-    slots_on_page = page_data[:slots].map { |s| s[:slot] }.max
-
-    fail_with("Could not read selected slot on page #{target[:page]}.") unless selected
-    fail_with("Could not read slot count on page #{target[:page]}.") unless slots_on_page
-
-    ponders_needed = (target[:slot] - selected) % slots_on_page
-    ponders_needed.times do
-      quiet_capture("ponder #{ref}", /You ponder|^$/, timeout: 4)
-    end
+    quiet_capture("turn #{ref} to #{target[:page]}", /You (?:turn|are already)|carefully study page/, timeout: 6)
   end
 
   # ---------------------------------------------------------------------------
@@ -541,12 +520,11 @@ module StarTome
   # ---------------------------------------------------------------------------
 
   def invoke_and_cast(item, target_slot, cast_target, prep_only, state)
-    spell_label  = "#{target_slot[:name]} (#{target_slot[:number]})"
     spell_number = target_slot[:number]
 
-    navigate_to_slot(item, target_slot, state)
+    navigate_to_page(item, target_slot)
 
-    # INVOKE -- let output flow through so the player sees rolls etc.
+    # INVOKE <spell_number> -- book must be on the correct page.
     waitrt?
     fput "invoke #{spell_number}"
 
@@ -738,7 +716,7 @@ module StarTome
 
   def show_help
     sn = Script.current.name
-    respond "#{sn} -- spellbook invocation helper\n\nFirst-time setup:\n  ;star-book [book name][, container name]\n  e.g.: ;star-book green tome, tome reliquary\n\nUsage (alias as e.g. tome):\n  ;#{sn} [spell# or name]               -- invoke and CAST self\n  ;#{sn} [spell# or name] [target]      -- invoke and CAST target\n  ;#{sn} [spell# or name] prep          -- invoke only, no cast\n  ;#{sn} [spell# or name] hold          -- cast self, keep book in hand\n  ;#{sn} [spell# or name] [target] hold -- cast target, keep book in hand\n  ;#{sn} page [#]                       -- cast all spells on page at self\n  ;#{sn} page [#] hold                  -- same, keep book in hand\n  ;#{sn} scan                           -- rescan and cache book layout\n  ;#{sn} list                           -- display cached spell list\n  ;#{sn} reset                          -- clear saved book/container settings\n  ;#{sn} help                           -- this message"
+    respond "#{sn} -- spellbook invocation helper\n\nFirst-time setup:\n  ;star-book [book name][, container name]\n  e.g.: ;star-book green tome, tome reliquary\n\nAlias suggestion:\n  ;alias add --global tome=;star-book \\?\n\nUsage (alias as e.g. tome):\n  ;#{sn} [spell# or name]               -- invoke and CAST self\n  ;#{sn} [spell# or name] [target]      -- invoke and CAST target\n  ;#{sn} [spell# or name] prep          -- invoke only, no cast\n  ;#{sn} [spell# or name] hold          -- cast self, keep book in hand\n  ;#{sn} [spell# or name] [target] hold -- cast target, keep book in hand\n  ;#{sn} page [#]                       -- cast all spells on page at self\n  ;#{sn} page [#] hold                  -- same, keep book in hand\n  ;#{sn} scan                           -- rescan and cache book layout\n  ;#{sn} list                           -- display cached spell list\n  ;#{sn} reset                          -- clear saved book/container settings\n  ;#{sn} help                           -- this message"
   end
 
   # ---------------------------------------------------------------------------
