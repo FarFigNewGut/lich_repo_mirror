@@ -32,23 +32,29 @@
   - Defers mount/summon/hand actions during ecleanse disarm recovery events.
 
   Author: Codex
-  Version: 1.3.11
+  Version: 1.3.19
+  Recently changed:
+    - Added option in ;staymounted setup to toggle spell casting for MOUNT CHARGE.
+    - Added fill_hands after empty_hands.
   Tags: mount, utility, automation, ride, summon
 =end
 
 module StayMounted
   module_function
 
-  VERSION = '1.3.11'
+  VERSION = '1.3.19'
   POLL_SECONDS = 3
   REMOUNT_POLL_SECONDS = 1
   SUMMON_MOUNT_WAIT_SECONDS = 2
   TRAMPLE_CHANCE = 0.45
+  MOUNT_CHARGE_COOLDOWN_WAIT_SECONDS = 5
   MANAGED_COMBAT_SCRIPTS = %w[hunt3_v2 bigshot].freeze
   DEFAULT_SETTINGS = {
     selected_mount_family: nil,
     use_mount_charge: true,
-    use_mount_trample: true
+    use_mount_trample: true,
+    prep_spell_for_mount_charge: false,
+    mount_charge_prep_spell: nil
   }.freeze
 
   # Map mount nouns (common/uncommon/rare) to the correct summoning-item noun.
@@ -147,7 +153,7 @@ module StayMounted
     end
 
     echo "#{VERSION} active: family=#{@selected_mount_family} mount=#{@target_terms.first} item=#{@summon_item_noun}"
-    echo "settings: trample=#{@settings[:use_mount_trample]} charge=#{@settings[:use_mount_charge]}"
+    echo "settings: trample=#{@settings[:use_mount_trample]} charge=#{@settings[:use_mount_charge]} prep_charge_spell=#{@settings[:prep_spell_for_mount_charge]} spell=#{@settings[:mount_charge_prep_spell] || 'none'}"
 
     loop do
       begin
@@ -320,7 +326,10 @@ module StayMounted
 
   def try_mount(mount)
     return unless throttle?(:mount, mount_throttle_seconds)
+    return unless ensure_standing_for_mount
     return unless ensure_mount_hand_free
+
+    pause_managed_combat_scripts
 
     if mount&.id
       fput "mount ##{mount.id}"
@@ -328,6 +337,18 @@ module StayMounted
       # Fallback to a generic mount noun from the chosen family.
       fput "mount #{@target_terms.first}"
     end
+
+    @wait_for_remount_unpause = true
+  end
+
+  def ensure_standing_for_mount
+    return true if standing?
+
+    fput "stand"
+    waitrt?
+    standing?
+  rescue StandardError
+    false
   end
 
   def mount_throttle_seconds
@@ -337,8 +358,8 @@ module StayMounted
   def try_mounted_combat
     return unless action_ready?
     return unless standing?
-    return unless checkstance =~ /offensive/
     return unless charge_loadout_ready?
+    return unless ensure_offensive_for_mount_combat
 
     targets = living_targets
     return if targets.empty?
@@ -353,7 +374,17 @@ module StayMounted
     return unless mount_charge_ready?
     return unless throttle?(:charge, 8)
 
-    execute_mount_attack(wait_for_remount: false) { fput "mount charge ##{target.id}" }
+    execute_mount_charge(target)
+  end
+
+  def ensure_offensive_for_mount_combat
+    return true if checkstance =~ /offensive/
+
+    fput 'stance offensive'
+    waitrt?
+    checkstance =~ /offensive/
+  rescue StandardError
+    false
   end
 
   def living_targets
@@ -463,6 +494,60 @@ module StayMounted
     end
   end
 
+  def execute_mount_charge(target)
+    spell_number = mount_charge_prep_spell_number
+
+    execute_mount_attack(wait_for_remount: false) do
+      prep_mount_charge_spell(spell_number) if use_prep_spell_for_mount_charge?
+      fput "mount charge ##{target.id}"
+      clear_mount_charge_spell(spell_number) if use_prep_spell_for_mount_charge?
+    end
+  end
+
+  def use_prep_spell_for_mount_charge?
+    @settings[:prep_spell_for_mount_charge] && !mount_charge_prep_spell_number.nil?
+  end
+
+  def mount_charge_prep_spell_number
+    value = @settings[:mount_charge_prep_spell]
+    return nil if value.nil?
+
+    number = value.to_i
+    number.positive? ? number : nil
+  end
+
+  def prep_mount_charge_spell(spell_number)
+    return if spell_number.nil?
+
+    fput "prep #{spell_number}"
+    waitrt?
+  rescue StandardError
+    nil
+  end
+
+  def clear_mount_charge_spell(spell_number)
+    return if spell_number.nil?
+
+    waitrt? if checkrt.to_i.positive?
+    wait_for_mount_charge_cooldown
+    fput 'release'
+    waitrt? if checkrt.to_i.positive?
+  rescue StandardError
+    nil
+  end
+
+  def wait_for_mount_charge_cooldown
+    deadline = Time.now + MOUNT_CHARGE_COOLDOWN_WAIT_SECONDS
+
+    until cooldown_active_name?('Mount Charge')
+      break if Time.now >= deadline
+
+      sleep 0.2
+    end
+  rescue StandardError
+    nil
+  end
+
   def pause_managed_combat_scripts
     @paused_scripts ||= []
     MANAGED_COMBAT_SCRIPTS.each do |script_name|
@@ -476,8 +561,14 @@ module StayMounted
   def process_script_unpause(mounted)
     if @wait_for_remount_unpause
       if mounted
-        unpause_managed_combat_scripts
-        @wait_for_remount_unpause = false
+        restore_hands_after_mount
+        ready_weapon_for_mount unless weapon_in_hand?
+        ready_shield_for_mount if shield_required_for_user? && !shield_in_hand?
+
+        if weapon_in_hand? && (!shield_required_for_user? || shield_in_hand?)
+          unpause_managed_combat_scripts
+          @wait_for_remount_unpause = false
+        end
       end
       return
     end
@@ -511,6 +602,7 @@ module StayMounted
   def ensure_right_hand_free
     return true if right_hand_empty?
 
+    @needs_fill_hands_after_mount = true
     empty_right_hand
     waitrt?
 
@@ -520,6 +612,16 @@ module StayMounted
     end
 
     right_hand_empty?
+  end
+
+  def restore_hands_after_mount
+    return unless @needs_fill_hands_after_mount
+
+    fill_right_hand
+    fill_hands unless weapon_in_hand?
+    @needs_fill_hands_after_mount = false
+  rescue StandardError
+    false
   end
 
   def any_hand_empty?
@@ -575,16 +677,22 @@ module StayMounted
     selected_mount_family = normalize_mount_family_setting(Settings[Char.name]['staymounted_selected_mount_family'])
     charge = Settings[Char.name]['staymounted_use_mount_charge']
     trample = Settings[Char.name]['staymounted_use_mount_trample']
+    prep_charge_spell = Settings[Char.name]['staymounted_prep_spell_for_mount_charge']
+    mount_charge_spell = normalize_spell_number_setting(Settings[Char.name]['staymounted_mount_charge_prep_spell'])
 
     settings = DEFAULT_SETTINGS.merge(
       selected_mount_family: selected_mount_family,
       use_mount_charge: parse_setting_bool(charge, DEFAULT_SETTINGS[:use_mount_charge]),
-      use_mount_trample: parse_setting_bool(trample, DEFAULT_SETTINGS[:use_mount_trample])
+      use_mount_trample: parse_setting_bool(trample, DEFAULT_SETTINGS[:use_mount_trample]),
+      prep_spell_for_mount_charge: parse_setting_bool(prep_charge_spell, DEFAULT_SETTINGS[:prep_spell_for_mount_charge]),
+      mount_charge_prep_spell: mount_charge_spell
     )
 
     Settings[Char.name]['staymounted_selected_mount_family'] = settings[:selected_mount_family]&.to_s
     Settings[Char.name]['staymounted_use_mount_charge'] = settings[:use_mount_charge]
     Settings[Char.name]['staymounted_use_mount_trample'] = settings[:use_mount_trample]
+    Settings[Char.name]['staymounted_prep_spell_for_mount_charge'] = settings[:prep_spell_for_mount_charge]
+    Settings[Char.name]['staymounted_mount_charge_prep_spell'] = settings[:mount_charge_prep_spell]
     Settings.save
     settings
   rescue StandardError
@@ -613,19 +721,32 @@ module StayMounted
     MOUNT_FAMILIES.key?(family) ? family : nil
   end
 
+  def normalize_spell_number_setting(value)
+    text = value.to_s.strip
+    return nil if text.empty?
+
+    number = text.to_i
+    number.positive? ? number : nil
+  end
+
   def launch_settings_ui
     Settings.load
     Settings[Char.name] ||= Hash.new
     selected_mount_family = normalize_mount_family_setting(Settings[Char.name]['staymounted_selected_mount_family'])
     use_mount_charge = Settings[Char.name]['staymounted_use_mount_charge']
     use_mount_trample = Settings[Char.name]['staymounted_use_mount_trample']
+    prep_spell_for_mount_charge = Settings[Char.name]['staymounted_prep_spell_for_mount_charge']
+    mount_charge_prep_spell = normalize_spell_number_setting(Settings[Char.name]['staymounted_mount_charge_prep_spell'])
 
     selected_mount_family = DEFAULT_SETTINGS[:selected_mount_family] if selected_mount_family.nil?
     use_mount_charge = DEFAULT_SETTINGS[:use_mount_charge] if use_mount_charge.nil?
     use_mount_trample = DEFAULT_SETTINGS[:use_mount_trample] if use_mount_trample.nil?
+    prep_spell_for_mount_charge = DEFAULT_SETTINGS[:prep_spell_for_mount_charge] if prep_spell_for_mount_charge.nil?
+    mount_charge_prep_spell = DEFAULT_SETTINGS[:mount_charge_prep_spell] if mount_charge_prep_spell.nil?
 
     window = window_action = nil
-    trample_check = charge_check = nil
+    trample_check = charge_check = prep_spell_check = nil
+    spell_entry = nil
     mount_checks = {}
     save_message = nil
 
@@ -634,9 +755,21 @@ module StayMounted
 
       trample_check = Gtk::CheckButton.new("Use Mount Trample")
       charge_check = Gtk::CheckButton.new("Use Mount Charge")
+      prep_spell_check = Gtk::CheckButton.new("Prep spell before Mount Charge")
+      spell_entry = Gtk::Entry.new
 
       trample_check.active = use_mount_trample
       charge_check.active = use_mount_charge
+      prep_spell_check.active = parse_setting_bool(prep_spell_for_mount_charge, DEFAULT_SETTINGS[:prep_spell_for_mount_charge])
+      spell_entry.text = mount_charge_prep_spell.to_s
+      spell_entry.width_chars = 8 if spell_entry.respond_to?(:width_chars=)
+      spell_entry.sensitive = prep_spell_check.active?
+
+      prep_spell_check.signal_connect('toggled') {
+        Gtk.queue {
+          spell_entry.sensitive = prep_spell_check.active? if spell_entry
+        }
+      }
 
       save_btn = Gtk::Button.new("Save")
 
@@ -645,6 +778,9 @@ module StayMounted
       main_box.add(Gtk::Label.new("StayMounted Combat Settings"))
       main_box.add(trample_check)
       main_box.add(charge_check)
+      main_box.add(prep_spell_check)
+      main_box.add(Gtk::Label.new("Spell number to prep/release for Mount Charge"))
+      main_box.add(spell_entry)
       main_box.add(Gtk::HSeparator.new)
       main_box.add(Gtk::Label.new("Mount Family (check one to use with bare ;staymounted)"))
       MOUNT_FAMILIES.each_key do |family|
@@ -685,7 +821,9 @@ module StayMounted
           selected_mount_family = mount_checks.find { |_family, check| check.active? }&.first
           use_mount_trample = trample_check.active?
           use_mount_charge = charge_check.active?
-          save_message = "settings saved: family=#{selected_mount_family || 'none'} trample=#{use_mount_trample} charge=#{use_mount_charge}"
+          prep_spell_for_mount_charge = prep_spell_check.active?
+          mount_charge_prep_spell = normalize_spell_number_setting(spell_entry.text)
+          save_message = "settings saved: family=#{selected_mount_family || 'none'} trample=#{use_mount_trample} charge=#{use_mount_charge} prep_charge_spell=#{prep_spell_for_mount_charge} spell=#{mount_charge_prep_spell || 'none'}"
           window_action = :save
         }
       }
@@ -703,6 +841,8 @@ module StayMounted
     Settings[Char.name]['staymounted_selected_mount_family'] = selected_mount_family&.to_s
     Settings[Char.name]['staymounted_use_mount_charge'] = use_mount_charge
     Settings[Char.name]['staymounted_use_mount_trample'] = use_mount_trample
+    Settings[Char.name]['staymounted_prep_spell_for_mount_charge'] = prep_spell_for_mount_charge
+    Settings[Char.name]['staymounted_mount_charge_prep_spell'] = mount_charge_prep_spell
     Settings.save
     echo save_message if window_action == :save && save_message
   rescue StandardError => e
