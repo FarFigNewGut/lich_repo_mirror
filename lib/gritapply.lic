@@ -7,7 +7,7 @@
         author: Rinkidinkicus (via Claude)
           game: Gemstone
           tags: warrior, grit, wps, crafting
-       version: 1.1.0
+       version: 1.3.0
 
   Usage:
     ;gritapply <count> <type>
@@ -19,6 +19,23 @@
 
   Version Control:
     Major_change.feature_addition.bugfix
+  v1.3.0 (2026-05-01)
+    - fix: only cast Surge of Strength if not currently active. The buff has
+      a duration that typically spans multiple applications, so checking
+      Effects::Buffs.active? before casting avoids unnecessary waits on the
+      cooldown when the buff is still up from a prior iteration.
+  v1.2.0 (2026-05-01)
+    - fix: parse_suffuse_estimate regex now anchors on the actual data line
+      ("need at least N suffused energy" / "does not require...") instead of
+      the flavor "examine" line, which can be replaced by the game's
+      "[Something went wrong. Please try again.]" glitch when suffuse est
+      is issued shortly after cman surge. Previous regex only matched the
+      trailing NOTE line in that case, missing the data.
+    - added waitrt? after cman surge to let roundtime clear before
+      re-estimating (likely root cause of the glitch above).
+    - go_home no longer stows the right hand; the item stays in hand on
+      normal completion and on controlled bail-outs. before_dying still
+      stows everything on hard kill.
   v1.1.0 (2026-03-22)
     - added help command
     - added configurable workshop room number via ;gritapply set workshop=<room>
@@ -73,11 +90,14 @@ if arg1 == "help" || arg1.empty?
   respond "       - If suffusion needed: checks pool, surges (if known), applies"
   respond "       - Runs FEAT WPS ASSESS then FEAT WPS APPLY"
   respond "    7. Returns home, assesses item, registers it"
+  respond "       (item is left in hand, not stowed)"
   respond ""
   respond "  NOTES:"
   respond "    - Surge of Strength is used automatically if known"
+  respond "    - Surge is only cast if the buff is not already active"
   respond "    - If surge is on cooldown, the script waits for it"
   respond "    - If an application fails, the script stops and reports"
+  respond "    - On normal completion or bail-out, item stays in right hand"
   respond "    - If killed mid-run, items in hand are stowed automatically"
   respond ""
   exit
@@ -159,7 +179,9 @@ echo "Grit Apply: #{count}x #{type} on #{item_name}"
 echo "Workshop: room #{workshop_room}"
 echo "-----------------------------------------"
 
-# Safety cleanup if script is killed mid-run
+# Safety cleanup if script is killed mid-run.
+# This stows BOTH hands -- on hard kill, a clean state is safest. On normal
+# completion or controlled bail-out, go_home leaves the item in hand.
 before_dying {
   fput "stow left" if checkleft
   fput "stow right" if checkright
@@ -168,10 +190,13 @@ before_dying {
 #
 # --- HELPER: RETURN TO START -----------------------------------------------------
 #
+# Stows the supply pack from the left hand but PRESERVES the item in the right
+# hand. The user wants to keep the item out at the end of the script, whether
+# completion was successful or a controlled bail-out occurred.
+#
 
 def go_home(start_room)
   fput "stow left" if checkleft
-  fput "stow right" if checkright
   Script.run("go2", start_room.to_s)
 end
 
@@ -207,9 +232,25 @@ end
 #
 # --- HELPER: PARSE SUFFUSE ESTIMATE ----------------------------------------------
 #
+# IMPORTANT: The start regex must anchor on the actual data line, not on flavor
+# text. The previous version used /estimate|does not require/i, which matched
+# the "You examine X for sighting, and estimate..." flavor line. After cman
+# surge, the game sometimes replaces that flavor line with
+# "[Something went wrong.  Please try again.]" -- presumably a transient glitch
+# from issuing suffuse est while surge action is still resolving. When that
+# happens, /estimate/ no longer matches until the trailing NOTE line, so the
+# data line ("You will need at least N suffused energy") is never captured.
+#
+# Anchoring on /need at least \d+ suffused energy|does not require/ matches the
+# data line directly and is robust to that glitch.
+#
 
 def parse_suffuse_estimate(type)
-  lines = Lich::Util.issue_command("suffuse est #{type}", /estimate|does not require/i, timeout: 5)
+  lines = Lich::Util.issue_command(
+    "suffuse est #{type}",
+    /need at least \d+ suffused energy|does not require any additional suffused energy/i,
+    timeout: 5
+  )
   text = lines.join(" ")
 
   if text =~ /need at least (\d+) suffused energy/i
@@ -391,16 +432,24 @@ count.times do |i|
       exit
     end
 
-    # SURGE if known
+    # SURGE if known and not already active.
+    # Surge of Strength has a buff duration that typically lasts long enough
+    # to cover multiple applications, so we only cast if the buff is not
+    # currently up. If it is active, skip the cast entirely.
     if has_surge
-      if Effects::Cooldowns.active?("Surge of Strength")
-        remaining = Effects::Cooldowns.time_left("Surge of Strength")
-        echo "Surge of Strength on cooldown. Waiting #{remaining.ceil} seconds..."
-        wait_until { !Effects::Cooldowns.active?("Surge of Strength") }
-      end
+      if Effects::Buffs.active?("Surge of Strength")
+        echo "Surge of Strength is already active -- skipping cast."
+      else
+        if Effects::Cooldowns.active?("Surge of Strength")
+          remaining = Effects::Cooldowns.time_left("Surge of Strength")
+          echo "Surge of Strength on cooldown. Waiting #{remaining.ceil} seconds..."
+          wait_until { !Effects::Cooldowns.active?("Surge of Strength") }
+        end
 
-      fput "cman surge"
-      pause 1
+        fput "cman surge"
+        waitrt?         # let any RT from surge clear before re-estimating
+        pause 0.5       # small buffer for game state to settle
+      end
     end
 
     # Re-estimate after surge (per spec)
@@ -475,12 +524,13 @@ end
 
 echo "All #{count} applications complete!"
 
-# Stow supply pack if still in left hand, keep item in right
+# Stow supply pack from left hand; leave the item in the right hand.
 fput "stow left" if checkleft
 
+# Travel home -- go_home preserves the right hand.
 go_home(start_room)
 
-# Make sure item is in right hand for assess/register
+# Make sure item is still in right hand for assess/register
 unless checkright(item_noun)
   fput "get my #{item_noun}"
   pause 0.3
@@ -495,4 +545,5 @@ pause 1
 
 echo "-----------------------------------------"
 echo "Grit Apply complete: #{successes}/#{count} #{type} applications successful."
+echo "Item left in right hand."
 echo "-----------------------------------------"

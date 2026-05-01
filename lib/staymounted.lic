@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'timeout'
+
 =begin
   Stay Mounted
 
@@ -22,22 +24,21 @@
   - Script determines the summoning item noun for the selected family.
   - If summon item is in inventory and "Mount Summoned" is not active: waves the summon item.
   - If summon item is in inventory, "Mount Summoned" is active, and mount is visible in room: mounts.
-  - If summon item is not in inventory and "Mount Summoned" is not active: assumes you are already riding.
+  - If summon item is not in inventory, the script checks for evidence that you are already mounted.
   - While mounted in offensive stance, script can use MOUNT TRAMPLE (3+ targets, chance-based) and MOUNT CHARGE.
   - Mount combat toggles are configurable in ;staymounted setup.
   - For mount attacks, pauses hunt3_v2/bigshot if running.
   - After MOUNT TRAMPLE, keeps those scripts paused until you are remounted.
   - Summon/mount attempts are throttled to reduce command spam.
-  - Frees right hand before mount attempts.
+  - If both hands are occupied, the script stashes the right hand before mounting and restores it afterward.
   - Defers mount/summon/hand actions during ecleanse disarm recovery events.
 
-  Author: Codex
-  Version: 1.3.3
+  Author: Ruseoffools, Codex
+  Version: 1.3.20
   Recently changed:
-	  - Attempted to cleanup stance offensive, ready weapon, ready shield, inventory checks, and logic flow issues.
 	  - If you're bleeding the script will not do anything as injuries prevent you from riding.
     - Added option in ;staymounted setup to toggle spell casting for MOUNT CHARGE.
-    - Added fill_hands after empty_hands.
+    - Mount/remount now uses right-hand stash/equip with a 10-second timeout guard.
   Tags: mount, utility, automation, ride, summon
 =end
 
@@ -50,6 +51,7 @@ module StayMounted
   SUMMON_MOUNT_WAIT_SECONDS = 2
   TRAMPLE_CHANCE = 0.45
   MOUNT_CHARGE_COOLDOWN_WAIT_SECONDS = 5
+  HAND_ACTION_TIMEOUT_SECONDS = 10
   MANAGED_COMBAT_SCRIPTS = %w[hunt3_v2 bigshot].freeze
   DEFAULT_SETTINGS = {
     selected_mount_family: nil,
@@ -123,7 +125,7 @@ module StayMounted
       summon_item: 'rattle',
       nouns: [
         'giant albino cave scorpion', 'giant wastes scorpion', 'sandfinger', 'black jungle scorpion',
-        'greater painted whiptail', 'vecdrae scythir', 'scorpion'
+        'greater painted whiptail', 'vecdrae scythir', 'scorpion', 'scythir'
       ]
     }
   }.freeze
@@ -367,6 +369,7 @@ module StayMounted
   def try_mounted_combat
     return unless action_ready?
     return unless standing?
+    return unless claim_mine_for_mounted_combat?
     return unless mount_trample_ready? || mount_charge_ready?
     targets = living_targets
     return if targets.empty?
@@ -379,7 +382,7 @@ module StayMounted
     if targets.length >= 3 && mount_trample_ready? && trample_roll? && throttle?(:trample, 8)
       execute_mount_attack(wait_for_remount: true) { fput "mount trample" }
     elsif target && mount_charge_ready? && throttle?(:charge, 8)
-      execute_mount_charge(target)
+      execute_mount_charge
     end
 
     fput("stance #{starting_stance}") unless checkstance.eql?(starting_stance)
@@ -397,6 +400,12 @@ module StayMounted
 
   def living_targets
     (GameObj.targets || []).reject { |t| t.status.to_s =~ /dead|gone/ }
+  end
+
+  def claim_mine_for_mounted_combat?
+    defined?(Lich::Claim) && Lich::Claim.mine?
+  rescue StandardError
+    false
   end
 
   def mount_charge_ready?
@@ -423,41 +432,9 @@ module StayMounted
   end
 
   def charge_loadout_ready?
-    needs_shield = shield_required_for_user?
-    has_weapon = weapon_in_hand?
-    has_shield = !needs_shield || shield_in_hand?
-    return true if has_weapon && has_shield
-
-    has_weapon = weapon_in_hand?
-    has_shield = !needs_shield || shield_in_hand?
-    has_weapon && has_shield
-  end
-
-  def weapon_in_hand?
-    hand = GameObj.right_hand
-    return false if hand.nil? || hand.name.to_s == "Empty"
-    return false if hand.noun.to_s =~ /shield|buckler|targe|scutum|greatshield|heater|aegis|mantlet|pavis/i
-
     true
-  end
-
-  def shield_in_hand?
-    hand = GameObj.left_hand
-    return false if hand.nil? || hand.name.to_s == "Empty"
-
-    hand.noun.to_s =~ /shield|buckler|targe|scutum|greatshield|heater|aegis|mantlet|pavis/i
-  end
-
-  def shield_required_for_user?
-    return false unless defined?(ReadyList)
-
-    ReadyList.check(silent: true, quiet: true) if ReadyList.respond_to?(:check) && (!ReadyList.respond_to?(:checked?) || !ReadyList.checked?)
-    return false unless ReadyList.respond_to?(:ready_list)
-
-    shield = ReadyList.ready_list[:shield]
-    !(shield.nil? || shield.to_s.strip.empty?)
   rescue StandardError
-    false
+    true
   end
 
   def execute_mount_attack(wait_for_remount:)
@@ -471,12 +448,12 @@ module StayMounted
     end
   end
 
-  def execute_mount_charge(target)
+  def execute_mount_charge
     spell_number = mount_charge_prep_spell_number
 
     execute_mount_attack(wait_for_remount: false) do
       prep_mount_charge_spell(spell_number) if use_prep_spell_for_mount_charge?
-      fput "mount charge"
+      fput 'mount charge'
       clear_mount_charge_spell(spell_number) if use_prep_spell_for_mount_charge?
     end
   end
@@ -539,13 +516,8 @@ module StayMounted
     if @wait_for_remount_unpause
       if mounted
         restore_hands_after_mount
-        ready_weapon_for_mount unless weapon_in_hand?
-        ready_shield_for_mount if shield_required_for_user? && !shield_in_hand?
-
-        if weapon_in_hand? && (!shield_required_for_user? || shield_in_hand?)
-          unpause_managed_combat_scripts
-          @wait_for_remount_unpause = false
-        end
+        unpause_managed_combat_scripts
+        @wait_for_remount_unpause = false
       end
       return
     end
@@ -569,10 +541,6 @@ module StayMounted
     # Mounting only needs one free hand; avoid unnecessary stowing.
     return true if any_hand_empty?
 
-    # If user runs a shield profile, prefer freeing right to keep left shield intact.
-    return ensure_right_hand_free if shield_required_for_user?
-
-    # Non-shield profile: free right by default.
     ensure_right_hand_free
   end
 
@@ -580,11 +548,9 @@ module StayMounted
     return true if right_hand_empty?
 
     @needs_fill_hands_after_mount = true
-    empty_right_hand
-    waitrt?
-
-    unless right_hand_empty?
-      fput 'stow right'
+    return false unless with_hand_action_timeout('empty_right_hand') do
+      waitrt?
+      Lich::Stash::stash_hands(right: true)
       waitrt?
     end
 
@@ -594,9 +560,22 @@ module StayMounted
   def restore_hands_after_mount
     return unless @needs_fill_hands_after_mount
 
-    fill_right_hand
-    fill_hands unless weapon_in_hand?
+    return false unless with_hand_action_timeout('fill_right_hand') do
+      waitrt?
+      Lich::Stash::equip_hands(right: true)
+      waitrt?
+    end
     @needs_fill_hands_after_mount = false
+  rescue StandardError
+    false
+  end
+
+  def with_hand_action_timeout(action_name)
+    Timeout.timeout(HAND_ACTION_TIMEOUT_SECONDS) { yield }
+    true
+  rescue Timeout::Error
+    echo "#{action_name} timed out after #{HAND_ACTION_TIMEOUT_SECONDS}s; continuing"
+    false
   rescue StandardError
     false
   end

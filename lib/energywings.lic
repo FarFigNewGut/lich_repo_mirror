@@ -11,6 +11,10 @@
   approximately twice per second. It also listens for enemy spell prep
   messaging in real time and reacts with a wing pin defensive ability.
 
+  Usage:
+    ;energywings
+    ;energywings setup
+
   Features:
   - Only activates while inside your own Lich claim or the Dueling Sands.
   - Automatically detects which wings to use based on the worn wing pin:
@@ -22,18 +26,27 @@
       * Light: pull my wing pin  (Prismatic Aegis)
 
   Dark wings mode combat abilities:
+    - Shadow Mantle: defensive tap ability when not on cooldown.
     - Shadow Barb: single target when prone or stunned.
     - Barbed Sweep: multiple targets (3+) when prone or stunned.
     - Rain of Thorns: AOE when 6+ targets are present.
     - Carrion Guard: defensive AOE when bleeding and 6+ targets are present.
 
   Light wings mode combat abilities:
+    - Luminous Flight: defensive tap ability when not on cooldown.
     - Radiant Pulse: single target when prone or stunned.
     - Blast of Brilliance: multiple targets (3+) when prone or stunned.
     - Blinding Reprisal: AOE when 6+ targets are present.
     - Wings of Warding: defensive AOE when bleeding and 6+ targets are present.
 
   Changelog:
+    1.5.2 (2026-05-01)
+      - Added optional AOE trigger mode to fire only after a fresh Mount Trample use.
+    1.5.1 (2026-05-01)
+      - Added optional defensive tap handling for Shadow Mantle / Luminous Flight.
+    1.5.0 (2026-05-01)
+      - Added `;energywings setup` with persisted per-character settings.
+      - Exposed combat toggles, target thresholds, paused scripts, and precast commands in a GTK UI.
     1.4.6 (2026-02-25)
       - Updated to fix issue with automatic game disconnect if this script is set to autostart and you die or are dead.
     1.4.5 (2026-02-19)
@@ -66,21 +79,65 @@
       - GameObj.npcs changed to GameObj.targets. Should fix issue with
         using wing actions in town.
 
-  Author: ChatGPT
+  Author: Ruseoffools, Codex
   Tags: combat, automation, wing pin, lich, cooldowns, aoe, claim, dueling sands, energywings
-  Version: 1.4.5
+  Version: 1.5.2
 =end
 
 # UTF-8 safe. Uses only ASCII characters in strings and comments.
 
+require 'thread'
+
 module EnergyWings
 module_function
 
-SCRIPTS_TO_PAUSE = %w[bigshot hunt3].freeze unless defined?(SCRIPTS_TO_PAUSE)
+VERSION = '1.5.2'
+ABILITY_MAX_ATTEMPTS = 2
+MOUNT_TRAMPLE_TRIGGER_WINDOW_SECONDS = 8
+DEFAULT_SCRIPTS_TO_PAUSE = %w[bigshot hunt3].freeze unless defined?(DEFAULT_SCRIPTS_TO_PAUSE)
+DEFAULT_PRECAST_FOR_ABILITY = {
+  'Shadow Barb' => 'incant 118',
+  'Barbed Sweep' => 'incant 110',
+  'Rain of Thorns' => "invoke 1714 tat\ncast",
+  'Carrion Guard' => '',
+  'Shadow Mantle' => '',
+  'Crawling Shadow' => '',
+  'Luminous Flight' => '',
+  'Radiant Pulse' => '',
+  'Blast of Brilliance' => '',
+  'Blinding Reprisal' => '',
+  'Wings of Warding' => '',
+  'Prismatic Aegis' => ''
+}.freeze unless defined?(DEFAULT_PRECAST_FOR_ABILITY)
+DEFAULT_SETTINGS = {
+  use_prep_reaction: true,
+  use_defensive_tap: true,
+  use_single_target: true,
+  use_multi_target: true,
+  use_aoe: true,
+  use_aoe_after_mount_trample: false,
+  use_guard_aoe: true,
+  multi_target_threshold: 3,
+  aoe_target_threshold: 6,
+  guard_target_threshold: 6,
+  pause_bigshot: DEFAULT_SCRIPTS_TO_PAUSE.include?('bigshot'),
+  additional_pause_scripts: 'hunt3'
+}.freeze unless defined?(DEFAULT_SETTINGS)
 
 # ----------------------------
 # Helpers
 # ----------------------------
+
+def setup_mode?
+  Script.current.vars[1].to_s =~ /\Asetup\z/i
+end
+
+def scripts_to_pause
+  scripts = []
+  scripts << 'bigshot' if @settings[:pause_bigshot]
+  scripts.concat(parse_script_list_setting(@settings[:additional_pause_scripts]))
+  scripts.map(&:strip).reject(&:empty?).uniq
+end
 
 def in_allowed_room?
   Lich::Claim.mine? || Room.current.location =~ /Dueling Sands/
@@ -104,6 +161,41 @@ end
 
 def ability_ready?(name)
   !Effects::Cooldowns.active?(name)
+end
+
+def cooldown_active_name?(name)
+  return true if Effects::Cooldowns.active?(name)
+
+  needle = name.to_s.downcase
+  (Effects::Cooldowns.to_h || {}).keys.any? { |key| key.to_s.downcase.include?(needle) }
+rescue StandardError
+  false
+end
+
+def update_mount_trample_trigger_state
+  active_now = cooldown_active_name?('Mount Trample')
+  @mount_trample_cooldown_active = false if @mount_trample_cooldown_active.nil?
+
+  if active_now && !@mount_trample_cooldown_active
+    @pending_mount_trample_aoe_until = Time.now + MOUNT_TRAMPLE_TRIGGER_WINDOW_SECONDS
+  end
+
+  @mount_trample_cooldown_active = active_now
+
+  if @pending_mount_trample_aoe_until && Time.now > @pending_mount_trample_aoe_until
+    @pending_mount_trample_aoe_until = nil
+  end
+rescue StandardError
+  nil
+end
+
+def mount_trample_aoe_triggered?
+  update_mount_trample_trigger_state
+  @pending_mount_trample_aoe_until && Time.now <= @pending_mount_trample_aoe_until
+end
+
+def consume_mount_trample_aoe_trigger
+  @pending_mount_trample_aoe_until = nil
 end
 
 # ----------------------------
@@ -302,14 +394,43 @@ CREATURE_SPELL_PREPS_WING_PIN = Regexp.union(
 # ----------------------------
 
 def with_paused_scripts
-  SCRIPTS_TO_PAUSE.each { |script| Script.pause(script) if Script.running?(script) }
+  pause_mutex = (@pause_mutex ||= Mutex.new)
+  pause_mutex.synchronize do
+    @pause_depth ||= 0
+    @paused_scripts_by_energywings ||= []
+
+    if @pause_depth.zero?
+      @paused_scripts_by_energywings = scripts_to_pause.select do |script|
+        next false unless Script.running?(script)
+        next false if Script.paused?(script)
+
+        Script.pause(script)
+      end
+    end
+
+    @pause_depth += 1
+  end
+
   yield
 ensure
-  SCRIPTS_TO_PAUSE.each { |script| Script.unpause(script) if Script.running?(script) }
+  scripts_to_resume = []
+  pause_mutex = (@pause_mutex ||= Mutex.new)
+  pause_mutex.synchronize do
+    @pause_depth = [@pause_depth.to_i - 1, 0].max
+    if @pause_depth.zero?
+      scripts_to_resume = Array(@paused_scripts_by_energywings)
+      @paused_scripts_by_energywings = []
+    end
+  end
+
+  scripts_to_resume.each do |script|
+    Script.unpause(script) if Script.paused?(script)
+  end
 end
 
 def react_to_enemy_prep(mode)
   return unless in_allowed_room?
+  return unless @settings[:use_prep_reaction]
   return if hidden?
   return if checkstunned
   npc = living_npc
@@ -345,36 +466,18 @@ end
 # Combat abilities (your original logic)
 # ----------------------------
 
-# Optional: commands to run before each wing ability fires.
-# Each value can be:
-#   nil                => do nothing
-#   "some command"     => run one command
-#   ["cmd1", "cmd2"]   => run multiple commands in order
-#
-# You can change these to whatever you want.
-PRECAST_FOR_ABILITY = {
-  # Dark
-  "Shadow Barb"     => ["incant 118"],
-  "Barbed Sweep"    => ["incant 110"],
-  "Rain of Thorns"  => ["invoke 1714 tat", "cast"],
-  "Carrion Guard"   => nil,
-  "Crawling Shadow" => nil,
+def precast_commands_for(ability_name)
+  raw = @settings[:precasts][ability_name]
+  return [] if raw.nil? || raw.to_s.strip.empty?
 
-  # Light
-  "Radiant Pulse"        => nil,
-  "Blast of Brilliance"  => nil,
-  "Blinding Reprisal"    => nil,
-  "Wings of Warding"     => nil,
-  "Prismatic Aegis"      => nil,
-}.freeze unless defined?(PRECAST_FOR_ABILITY)
+  raw.to_s.split(/[\r\n;]+/).map(&:strip).reject(&:empty?)
+end
 
 def run_precast_for(ability_name)
   return if hidden?
 
-  cmds = PRECAST_FOR_ABILITY[ability_name]
-  return if cmds.nil?
-
-  cmds = [cmds] if cmds.is_a?(String)
+  cmds = precast_commands_for(ability_name)
+  return if cmds.empty?
 
   cmds.each do |cmd|
     next if cmd.nil? || cmd.strip.empty?
@@ -407,65 +510,318 @@ def fire_wing_ability(command, ability_name)
   end
 end
 
+def activate_wing_ability(command, ability_name, npc)
+  attempts = 0
+
+  while attempts < ABILITY_MAX_ATTEMPTS
+    break if hidden?
+    break if npc.status =~ /dead|gone/
+    break if Effects::Cooldowns.active?(ability_name)
+
+    fire_wing_ability(command, ability_name)
+    attempts += 1
+    sleep 0.2
+  end
+
+  Effects::Cooldowns.active?(ability_name)
+rescue StandardError
+  false
+end
+
 
 def do_combat_actions(mode, npc)
   return if hidden?
+  update_mount_trample_trigger_state
+  target_count = GameObj.targets.count
 
   if mode == "dark"
+    tap    = "Shadow Mantle"
     single = "Shadow Barb"
     multi  = "Barbed Sweep"
     aoe    = "Rain of Thorns"
     guard  = "Carrion Guard"
   else
+    tap    = "Luminous Flight"
     single = "Radiant Pulse"
     multi  = "Blast of Brilliance"
     aoe    = "Blinding Reprisal"
     guard  = "Wings of Warding"
   end
 
-  # Single target when prone/stunned
-  if ability_ready?(single)
-    until Effects::Cooldowns.active?(single)
-      break if npc.status =~ /dead|gone/
+  # Defensive tap ability when available
+  if @settings[:use_defensive_tap] && ability_ready?(tap)
+    echo "#{tap} {!}".upcase.center(45) if activate_wing_ability('tap my wing pin', tap, npc)
+  end
 
-      fire_wing_ability("turn my wing pin", single)
-    end
-    echo "#{single} {!}".upcase.center(45)
+  # Single target when prone/stunned
+  if @settings[:use_single_target] && ability_ready?(single)
+    echo "#{single} {!}".upcase.center(45) if activate_wing_ability('turn my wing pin', single, npc)
   end
 
   # Multi-target (3+) when prone/stunned
-  if GameObj.targets.count > 2 && ability_ready?(multi)
-    until Effects::Cooldowns.active?(multi)
-      break if npc.status =~ /dead|gone/
-
-      fire_wing_ability("knock my wing pin", multi)
-    end
-    echo "#{multi} {!}".upcase.center(45)
+  if @settings[:use_multi_target] && target_count >= @settings[:multi_target_threshold] && ability_ready?(multi)
+    echo "#{multi} {!}".upcase.center(45) if activate_wing_ability('knock my wing pin', multi, npc)
   end
 
-  # AOE (6+ targets)
-  if GameObj.targets.count > 5 && ability_ready?(aoe)
-    until Effects::Cooldowns.active?(aoe)
-      break if npc.status =~ /dead|gone/
+  # AOE
+  aoe_allowed = if @settings[:use_aoe_after_mount_trample]
+                  mount_trample_aoe_triggered?
+                else
+                  target_count >= @settings[:aoe_target_threshold]
+                end
 
-      fire_wing_ability("fold my wing pin", aoe)
+  if @settings[:use_aoe] && aoe_allowed && ability_ready?(aoe)
+    if activate_wing_ability('fold my wing pin', aoe, npc)
+      consume_mount_trample_aoe_trigger if @settings[:use_aoe_after_mount_trample]
+      echo "#{aoe} {!}".upcase.center(45)
     end
-    echo "#{aoe} {!}".upcase.center(45)
   end
 
   # Defensive AOE (6+ targets, bleeding)
-  if bleeding? && ability_ready?(guard)
-    until Effects::Cooldowns.active?(guard)
-      break if npc.status =~ /dead|gone/
-
-      fire_wing_ability("push my wing pin", guard)
-    end
-    echo "#{guard} {!}".upcase.center(45)
+  if @settings[:use_guard_aoe] && bleeding? && target_count >= @settings[:guard_target_threshold] && ability_ready?(guard)
+    echo "#{guard} {!}".upcase.center(45) if activate_wing_ability('push my wing pin', guard, npc)
   end
 
 end
 
+def load_settings
+  Settings.load
+  Settings[Char.name] ||= {}
+
+  settings = DEFAULT_SETTINGS.merge(
+    use_prep_reaction: parse_setting_bool(Settings[Char.name]['energywings_use_prep_reaction'], DEFAULT_SETTINGS[:use_prep_reaction]),
+    use_defensive_tap: parse_setting_bool(Settings[Char.name]['energywings_use_defensive_tap'], DEFAULT_SETTINGS[:use_defensive_tap]),
+    use_single_target: parse_setting_bool(Settings[Char.name]['energywings_use_single_target'], DEFAULT_SETTINGS[:use_single_target]),
+    use_multi_target: parse_setting_bool(Settings[Char.name]['energywings_use_multi_target'], DEFAULT_SETTINGS[:use_multi_target]),
+    use_aoe: parse_setting_bool(Settings[Char.name]['energywings_use_aoe'], DEFAULT_SETTINGS[:use_aoe]),
+    use_aoe_after_mount_trample: parse_setting_bool(Settings[Char.name]['energywings_use_aoe_after_mount_trample'], DEFAULT_SETTINGS[:use_aoe_after_mount_trample]),
+    use_guard_aoe: parse_setting_bool(Settings[Char.name]['energywings_use_guard_aoe'], DEFAULT_SETTINGS[:use_guard_aoe]),
+    multi_target_threshold: normalize_threshold_setting(Settings[Char.name]['energywings_multi_target_threshold'], DEFAULT_SETTINGS[:multi_target_threshold], minimum: 2),
+    aoe_target_threshold: normalize_threshold_setting(Settings[Char.name]['energywings_aoe_target_threshold'], DEFAULT_SETTINGS[:aoe_target_threshold], minimum: 2),
+    guard_target_threshold: normalize_threshold_setting(Settings[Char.name]['energywings_guard_target_threshold'], DEFAULT_SETTINGS[:guard_target_threshold], minimum: 1),
+    pause_bigshot: parse_setting_bool(Settings[Char.name]['energywings_pause_bigshot'], DEFAULT_SETTINGS[:pause_bigshot]),
+    additional_pause_scripts: normalize_script_list_setting(Settings[Char.name]['energywings_additional_pause_scripts'], DEFAULT_SETTINGS[:additional_pause_scripts]),
+    precasts: load_precast_settings
+  )
+
+  persist_settings(settings)
+  settings
+rescue StandardError
+  DEFAULT_SETTINGS.merge(precasts: DEFAULT_PRECAST_FOR_ABILITY.dup)
+end
+
+def load_precast_settings
+  DEFAULT_PRECAST_FOR_ABILITY.each_with_object({}) do |(ability_name, default_value), precasts|
+    precasts[ability_name] = normalize_precast_setting(Settings[Char.name][precast_setting_key(ability_name)], default_value)
+  end
+end
+
+def persist_settings(settings)
+  Settings[Char.name]['energywings_use_prep_reaction'] = settings[:use_prep_reaction]
+  Settings[Char.name]['energywings_use_defensive_tap'] = settings[:use_defensive_tap]
+  Settings[Char.name]['energywings_use_single_target'] = settings[:use_single_target]
+  Settings[Char.name]['energywings_use_multi_target'] = settings[:use_multi_target]
+  Settings[Char.name]['energywings_use_aoe'] = settings[:use_aoe]
+  Settings[Char.name]['energywings_use_aoe_after_mount_trample'] = settings[:use_aoe_after_mount_trample]
+  Settings[Char.name]['energywings_use_guard_aoe'] = settings[:use_guard_aoe]
+  Settings[Char.name]['energywings_multi_target_threshold'] = settings[:multi_target_threshold]
+  Settings[Char.name]['energywings_aoe_target_threshold'] = settings[:aoe_target_threshold]
+  Settings[Char.name]['energywings_guard_target_threshold'] = settings[:guard_target_threshold]
+  Settings[Char.name]['energywings_pause_bigshot'] = settings[:pause_bigshot]
+  Settings[Char.name]['energywings_additional_pause_scripts'] = normalize_script_list_setting(settings[:additional_pause_scripts], DEFAULT_SETTINGS[:additional_pause_scripts])
+  settings[:precasts].each do |ability_name, value|
+    Settings[Char.name][precast_setting_key(ability_name)] = normalize_precast_setting(value, DEFAULT_PRECAST_FOR_ABILITY[ability_name])
+  end
+  Settings.save
+end
+
+def parse_setting_bool(value, default)
+  return default if value.nil?
+  return value if value == true || value == false
+
+  case value.to_s.strip.downcase
+  when 'true', 't', '1', 'yes', 'y', 'on'
+    true
+  when 'false', 'f', '0', 'no', 'n', 'off'
+    false
+  else
+    default
+  end
+end
+
+def normalize_threshold_setting(value, default, minimum:)
+  text = value.to_s.strip
+  return default if text.empty?
+
+  number = text.to_i
+  number >= minimum ? number : default
+end
+
+def normalize_precast_setting(value, default = '')
+  text = value.nil? ? default.to_s : value.to_s
+  text.split(/\r?\n/).map(&:rstrip).join("\n").strip
+end
+
+def normalize_script_list_setting(value, default = '')
+  parse_script_list_setting(value.nil? ? default : value).join(', ')
+end
+
+def parse_script_list_setting(value)
+  value.to_s.split(/[,\r\n;]+/).map(&:strip).reject(&:empty?)
+end
+
+def precast_setting_key(ability_name)
+  "energywings_precast_#{ability_name.downcase.gsub(/[^a-z0-9]+/, '_').gsub(/\A_|_\z/, '')}"
+end
+
+def launch_settings_ui
+  Settings.load
+  Settings[Char.name] ||= {}
+  settings = load_settings
+
+  window = window_action = nil
+  save_message = nil
+
+  reaction_check = defensive_tap_check = single_check = multi_check = aoe_check = aoe_after_trample_check = guard_check = nil
+  multi_threshold_entry = aoe_threshold_entry = guard_threshold_entry = nil
+  pause_bigshot_check = nil
+  additional_pause_scripts_entry = nil
+  precast_entries = {}
+
+  Gtk.queue {
+    Gtk::Button.new('Save')
+
+    reaction_check = Gtk::CheckButton.new('React to enemy spell prep (Crawling Shadow / Prismatic Aegis)')
+    defensive_tap_check = Gtk::CheckButton.new('Use defensive tap ability (Shadow Mantle / Luminous Flight)')
+    single_check = Gtk::CheckButton.new('Use single-target wing ability (Shadow Barb / Radiant Pulse)')
+    multi_check = Gtk::CheckButton.new('Use multi-target wing ability (Barbed Sweep / Blast of Brilliance)')
+    aoe_check = Gtk::CheckButton.new('Use AOE wing ability (Rain of Thorns / Blinding Reprisal)')
+    aoe_after_trample_check = Gtk::CheckButton.new('Only fire AOE wing ability after Mount Trample')
+    guard_check = Gtk::CheckButton.new('Use defensive AOE (Carrion Guard / Wings of Warding)')
+
+    reaction_check.active = settings[:use_prep_reaction]
+    defensive_tap_check.active = settings[:use_defensive_tap]
+    single_check.active = settings[:use_single_target]
+    multi_check.active = settings[:use_multi_target]
+    aoe_check.active = settings[:use_aoe]
+    aoe_after_trample_check.active = settings[:use_aoe_after_mount_trample]
+    guard_check.active = settings[:use_guard_aoe]
+
+    multi_threshold_entry = Gtk::Entry.new
+    aoe_threshold_entry = Gtk::Entry.new
+    guard_threshold_entry = Gtk::Entry.new
+    [multi_threshold_entry, aoe_threshold_entry, guard_threshold_entry].each do |entry|
+      entry.width_chars = 6 if entry.respond_to?(:width_chars=)
+    end
+    multi_threshold_entry.text = settings[:multi_target_threshold].to_s
+    aoe_threshold_entry.text = settings[:aoe_target_threshold].to_s
+    guard_threshold_entry.text = settings[:guard_target_threshold].to_s
+
+    pause_bigshot_check = Gtk::CheckButton.new('Pause bigshot')
+    additional_pause_scripts_entry = Gtk::Entry.new
+    pause_bigshot_check.active = settings[:pause_bigshot]
+    additional_pause_scripts_entry.text = settings[:additional_pause_scripts].to_s
+    additional_pause_scripts_entry.width_chars = 36 if additional_pause_scripts_entry.respond_to?(:width_chars=)
+
+    content_box = Gtk::VBox.new(false, 0)
+    content_box.border_width = 5 if content_box.respond_to?(:border_width=)
+    content_box.add(Gtk::HSeparator.new)
+    content_box.add(Gtk::Label.new('EnergyWings Settings'))
+    content_box.add(defensive_tap_check)
+    content_box.add(reaction_check)
+    content_box.add(single_check)
+    content_box.add(multi_check)
+    content_box.add(aoe_check)
+    content_box.add(aoe_after_trample_check)
+    content_box.add(guard_check)
+    content_box.add(Gtk::HSeparator.new)
+    content_box.add(Gtk::Label.new('Target thresholds'))
+    content_box.add(Gtk::Label.new('Multi-target threshold'))
+    content_box.add(multi_threshold_entry)
+    content_box.add(Gtk::Label.new('AOE threshold'))
+    content_box.add(aoe_threshold_entry)
+    content_box.add(Gtk::Label.new('Defensive bleeding AOE threshold'))
+    content_box.add(guard_threshold_entry)
+    content_box.add(Gtk::HSeparator.new)
+    content_box.add(Gtk::Label.new('Pause these scripts while wing abilities fire'))
+    content_box.add(pause_bigshot_check)
+    content_box.add(Gtk::Label.new('Additional scripts to pause (comma or semicolon separated)'))
+    content_box.add(additional_pause_scripts_entry)
+    content_box.add(Gtk::HSeparator.new)
+    content_box.add(Gtk::Label.new('Per-ability precasts (semicolon-separated commands; blank disables)'))
+
+    DEFAULT_PRECAST_FOR_ABILITY.each do |ability_name, default_value|
+      content_box.add(Gtk::Label.new("#{ability_name} precast"))
+      entry = Gtk::Entry.new
+      entry.text = settings[:precasts][ability_name].to_s.gsub("\n", '; ')
+      entry.width_chars = 48 if entry.respond_to?(:width_chars=)
+      entry.tooltip_text = "Default: #{default_value.empty? ? 'none' : default_value.gsub("\n", ' ; ')}" if entry.respond_to?(:tooltip_text=)
+      precast_entries[ability_name] = entry
+      content_box.add(entry)
+    end
+
+    save_btn = Gtk::Button.new('Save')
+    content_box.add(Gtk::HSeparator.new)
+    content_box.add(save_btn)
+
+    scroller = Gtk::ScrolledWindow.new
+    scroller.set_policy(Gtk::POLICY_AUTOMATIC, Gtk::POLICY_AUTOMATIC) if scroller.respond_to?(:set_policy)
+    scroller.add_with_viewport(content_box)
+
+    window = Gtk::Window.new
+    window.title = 'EnergyWings Setup'
+    window.border_width = 5
+    window.set_default_size(560, 700) if window.respond_to?(:set_default_size)
+    window.set_window_position(:center) if window.respond_to?(:set_window_position)
+    window.set_keep_above(true) if window.respond_to?(:set_keep_above)
+    window.add(scroller)
+
+    save_btn.signal_connect('clicked') {
+      Gtk.queue {
+        settings[:use_prep_reaction] = reaction_check.active?
+        settings[:use_defensive_tap] = defensive_tap_check.active?
+        settings[:use_single_target] = single_check.active?
+        settings[:use_multi_target] = multi_check.active?
+        settings[:use_aoe] = aoe_check.active?
+        settings[:use_aoe_after_mount_trample] = aoe_after_trample_check.active?
+        settings[:use_guard_aoe] = guard_check.active?
+        settings[:multi_target_threshold] = normalize_threshold_setting(multi_threshold_entry.text, DEFAULT_SETTINGS[:multi_target_threshold], minimum: 2)
+        settings[:aoe_target_threshold] = normalize_threshold_setting(aoe_threshold_entry.text, DEFAULT_SETTINGS[:aoe_target_threshold], minimum: 2)
+        settings[:guard_target_threshold] = normalize_threshold_setting(guard_threshold_entry.text, DEFAULT_SETTINGS[:guard_target_threshold], minimum: 1)
+        settings[:pause_bigshot] = pause_bigshot_check.active?
+        settings[:additional_pause_scripts] = normalize_script_list_setting(additional_pause_scripts_entry.text, DEFAULT_SETTINGS[:additional_pause_scripts])
+        settings[:precasts] = DEFAULT_PRECAST_FOR_ABILITY.each_key.each_with_object({}) do |ability_name, precasts|
+          precasts[ability_name] = normalize_precast_setting(precast_entries[ability_name].text, DEFAULT_PRECAST_FOR_ABILITY[ability_name])
+        end
+        save_message = "settings saved: prep_reaction=#{settings[:use_prep_reaction]} defensive_tap=#{settings[:use_defensive_tap]} single=#{settings[:use_single_target]} multi=#{settings[:use_multi_target]} aoe=#{settings[:use_aoe]} aoe_after_trample=#{settings[:use_aoe_after_mount_trample]} guard=#{settings[:use_guard_aoe]}"
+        window_action = :save
+      }
+    }
+
+    window.signal_connect('delete_event') { window_action = :cancel }
+    window.show_all
+    window.present if window.respond_to?(:present)
+  }
+
+  before_dying { Gtk.queue { window.destroy if window } }
+  wait_while { window_action.nil? }
+  undo_before_dying
+  Gtk.queue { window.destroy if window }
+
+  persist_settings(settings) if window_action == :save
+  echo save_message if window_action == :save && save_message
+rescue StandardError => e
+  echo "setup UI error: #{e.class} #{e.message}"
+end
+
 def run
+  @settings = load_settings
+
+  if setup_mode?
+    launch_settings_ui
+    return
+  end
+
   # ----------------------------
   # Startup: auto-detect mode
   # ----------------------------
@@ -488,22 +844,27 @@ def run
   # Thread A: line-driven prep detection (KSwole style)
   # ----------------------------
   listener = Thread.new do
-    while (line = get)
-      Script.current.kill if checkdead
+    begin
+      while (line = get)
+        Script.current.kill if checkdead
 
-      # Auto-switch if you swap pins while running
-      new_pin = find_wing_pin
-      new_mode = wing_pin_mode(new_pin)
-      if new_pin && new_mode && (new_mode != mode || new_pin.id != pin.id)
-        mode = new_mode
-        pin = new_pin
-        echo "==============================================="
-        echo "  ENERGYWINGS MODE SWITCHED: #{mode.upcase}"
-        echo "  PIN: #{pin.name} ##{pin.id}"
-        echo "==============================================="
+        # Auto-switch if you swap pins while running
+        new_pin = find_wing_pin
+        new_mode = wing_pin_mode(new_pin)
+        if new_pin && new_mode && (new_mode != mode || new_pin.id != pin.id)
+          mode = new_mode
+          pin = new_pin
+          echo "==============================================="
+          echo "  ENERGYWINGS MODE SWITCHED: #{mode.upcase}"
+          echo "  PIN: #{pin.name} ##{pin.id}"
+          echo "==============================================="
+        end
+
+        react_to_enemy_prep(mode) if line =~ CREATURE_SPELL_PREPS_WING_PIN
       end
-
-      react_to_enemy_prep(mode) if line =~ CREATURE_SPELL_PREPS_WING_PIN
+    rescue StandardError => e
+      echo "listener error: #{e.class} #{e.message}"
+      Script.current.kill
     end
   end
 
@@ -511,14 +872,19 @@ def run
   # Thread B: periodic combat loop
   # ----------------------------
   combat = Thread.new do
-    loop do
-      sleep 0.5
-      next unless in_allowed_room?
+    begin
+      loop do
+        sleep 0.5
+        next unless in_allowed_room?
 
-      npc = living_npc
-      next unless npc
+        npc = living_npc
+        next unless npc
 
-      do_combat_actions(mode, npc)
+        do_combat_actions(mode, npc)
+      end
+    rescue StandardError => e
+      echo "combat error: #{e.class} #{e.message}"
+      Script.current.kill
     end
   end
 
