@@ -123,6 +123,7 @@ DEFAULT_SETTINGS = {
   pause_bigshot: DEFAULT_SCRIPTS_TO_PAUSE.include?('bigshot'),
   additional_pause_scripts: 'hunt3'
 }.freeze unless defined?(DEFAULT_SETTINGS)
+PAUSE_OWNER_KEY = 'energywings'
 
 # ----------------------------
 # Helpers
@@ -397,34 +398,70 @@ def with_paused_scripts
   pause_mutex = (@pause_mutex ||= Mutex.new)
   pause_mutex.synchronize do
     @pause_depth ||= 0
-    @paused_scripts_by_energywings ||= []
-
-    if @pause_depth.zero?
-      @paused_scripts_by_energywings = scripts_to_pause.select do |script|
-        next false unless Script.running?(script)
-        next false if Script.paused?(script)
-
-        Script.pause(script)
-      end
-    end
-
+    acquire_shared_script_pauses(PAUSE_OWNER_KEY, scripts_to_pause) if @pause_depth.zero?
     @pause_depth += 1
   end
-
   yield
 ensure
-  scripts_to_resume = []
+  should_release = false
   pause_mutex = (@pause_mutex ||= Mutex.new)
   pause_mutex.synchronize do
     @pause_depth = [@pause_depth.to_i - 1, 0].max
-    if @pause_depth.zero?
-      scripts_to_resume = Array(@paused_scripts_by_energywings)
-      @paused_scripts_by_energywings = []
+    should_release = @pause_depth.zero?
+  end
+  release_shared_script_pauses(PAUSE_OWNER_KEY, scripts_to_pause) if should_release
+end
+
+def shared_pause_registry
+  $lich_shared_pause_registry ||= {}
+end
+
+def shared_pause_mutex
+  $lich_shared_pause_mutex ||= Mutex.new
+end
+
+def acquire_shared_script_pauses(owner_key, script_names)
+  shared_pause_mutex.synchronize do
+    script_names.each do |script_name|
+      next unless Script.running?(script_name)
+
+      entry = (shared_pause_registry[script_name] ||= { owners: {}, paused_by_registry: false })
+      next if entry[:owners][owner_key]
+
+      if entry[:owners].empty?
+        if Script.paused?(script_name)
+          entry[:paused_by_registry] = false
+        else
+          Script.pause(script_name)
+          entry[:paused_by_registry] = true
+        end
+      end
+      entry[:owners][owner_key] = true
+    end
+  end
+end
+
+def release_shared_script_pauses(owner_key, script_names)
+  scripts_to_unpause = []
+
+  shared_pause_mutex.synchronize do
+    script_names.each do |script_name|
+      entry = shared_pause_registry[script_name]
+      next unless entry
+
+      next unless entry[:owners][owner_key]
+
+      entry[:owners].delete(owner_key)
+
+      next unless entry[:owners].empty?
+
+      scripts_to_unpause << script_name if entry[:paused_by_registry]
+      shared_pause_registry.delete(script_name)
     end
   end
 
-  scripts_to_resume.each do |script|
-    Script.unpause(script) if Script.paused?(script)
+  scripts_to_unpause.each do |script_name|
+    Script.unpause(script_name) if Script.paused?(script_name)
   end
 end
 

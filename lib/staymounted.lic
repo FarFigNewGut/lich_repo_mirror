@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'timeout'
+require 'thread'
 
 =begin
   Stay Mounted
@@ -53,6 +54,7 @@ module StayMounted
   MOUNT_CHARGE_COOLDOWN_WAIT_SECONDS = 5
   HAND_ACTION_TIMEOUT_SECONDS = 10
   MANAGED_COMBAT_SCRIPTS = %w[hunt3_v2 bigshot].freeze
+  PAUSE_OWNER_KEY = 'staymounted'
   DEFAULT_SETTINGS = {
     selected_mount_family: nil,
     use_mount_charge: true,
@@ -291,6 +293,14 @@ module StayMounted
     false
   end
 
+  def visible_mount_term
+    @target_terms.find do |term|
+      look_lines_for_term(term).any? { |line| line =~ /^You see\b/i }
+    end
+  rescue StandardError
+    nil
+  end
+
   def look_lines_for_term(term)
     return [] unless defined?(Lich::Util) && Lich::Util.respond_to?(:issue_command)
 
@@ -345,8 +355,8 @@ module StayMounted
     if mount&.id
       fput "mount ##{mount.id}"
     else
-      # Fallback to a generic mount noun from the chosen family.
-      fput "mount #{@target_terms.first}"
+      fallback_term = visible_mount_term || @target_terms.first
+      fput "mount #{fallback_term}"
     end
 
     @wait_for_remount_unpause = true
@@ -376,7 +386,6 @@ module StayMounted
 
     return unless charge_loadout_ready?
     starting_stance = checkstance
-    return unless ensure_offensive_for_mount_combat
     target = targets.first
 
     if targets.length >= 3 && mount_trample_ready? && trample_roll? && throttle?(:trample, 8)
@@ -439,7 +448,10 @@ module StayMounted
 
   def execute_mount_attack(wait_for_remount:)
     pause_managed_combat_scripts
+    return unless ensure_offensive_for_mount_combat
+
     yield
+    waitrt? if checkrt.to_i.positive?
 
     if wait_for_remount
       @wait_for_remount_unpause = true
@@ -503,13 +515,11 @@ module StayMounted
   end
 
   def pause_managed_combat_scripts
-    @paused_scripts ||= []
-    MANAGED_COMBAT_SCRIPTS.each do |script_name|
-      next unless running?(script_name)
-
-      pause_script script_name
-      @paused_scripts << script_name unless @paused_scripts.include?(script_name)
+    @managed_pause_depth ||= 0
+    if @managed_pause_depth.zero?
+      acquire_shared_script_pauses(PAUSE_OWNER_KEY, MANAGED_COMBAT_SCRIPTS)
     end
+    @managed_pause_depth += 1
   end
 
   def process_script_unpause(mounted)
@@ -530,11 +540,63 @@ module StayMounted
   end
 
   def unpause_managed_combat_scripts
-    @paused_scripts ||= []
-    @paused_scripts.each do |script_name|
-      unpause_script script_name if running?(script_name)
+    @managed_pause_depth = [@managed_pause_depth.to_i - 1, 0].max
+    return unless @managed_pause_depth.zero?
+
+    release_shared_script_pauses(PAUSE_OWNER_KEY, MANAGED_COMBAT_SCRIPTS)
+  end
+
+  def shared_pause_registry
+    $lich_shared_pause_registry ||= {}
+  end
+
+  def shared_pause_mutex
+    $lich_shared_pause_mutex ||= Mutex.new
+  end
+
+  def acquire_shared_script_pauses(owner_key, script_names)
+    shared_pause_mutex.synchronize do
+      script_names.each do |script_name|
+        next unless running?(script_name)
+
+        entry = (shared_pause_registry[script_name] ||= { owners: {}, paused_by_registry: false })
+        next if entry[:owners][owner_key]
+
+        if entry[:owners].empty?
+          if Script.paused?(script_name)
+            entry[:paused_by_registry] = false
+          else
+            pause_script(script_name)
+            entry[:paused_by_registry] = true
+          end
+        end
+        entry[:owners][owner_key] = true
+      end
     end
-    @paused_scripts.clear
+  end
+
+  def release_shared_script_pauses(owner_key, script_names)
+    scripts_to_unpause = []
+
+    shared_pause_mutex.synchronize do
+      script_names.each do |script_name|
+        entry = shared_pause_registry[script_name]
+        next unless entry
+
+        next unless entry[:owners][owner_key]
+
+        entry[:owners].delete(owner_key)
+
+        next unless entry[:owners].empty?
+
+        scripts_to_unpause << script_name if entry[:paused_by_registry]
+        shared_pause_registry.delete(script_name)
+      end
+    end
+
+    scripts_to_unpause.each do |script_name|
+      unpause_script(script_name) if Script.paused?(script_name)
+    end
   end
 
   def ensure_mount_hand_free

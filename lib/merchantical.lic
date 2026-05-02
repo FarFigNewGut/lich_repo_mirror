@@ -14,7 +14,7 @@ The following inputs are available:
         Other scripts: Combatical, VolnRestore2, Loresang
         game: gs
         tags: utility, economy, merchant, loresang, sell, pawnshop, shop, item, management
-        version: 1.2.3
+        version: 1.2.5
         required: Lich > 5.0, loresang.lic (for source data)
 
         \Version\
@@ -41,6 +41,7 @@ The following inputs are available:
         1.2.0 3/06/2026 - Added storage and bulk storage operation.
         1.2.3 3/08/2026 - Fix Pinned items lost on new Loresang! Fixed item redundancies
                           Added new sales value feature, replace .docx with rtf export
+        1.2.5 5/01/2026 - Heavy updates to parsing confusion, batch sales, and Banknote sales
         
 
 
@@ -2208,6 +2209,36 @@ module Merchantical
   # App
   # ---------------------------------------------------------------------------
   class App
+    # Terminal response patterns for pawnshop sell commands.
+    # fput returns on the first game line ("You offer to sell...") but the actual sale
+    # confirmation or refusal arrives in a subsequent packet — keep the DownstreamHook
+    # alive until one of these lines is seen.
+    SELL_TERMINAL = /
+      pawnbroker\s+takes          |   # normal sale start
+      hands\s+you\s+[\d,]+        |   # hands you X silver
+      handed?\s+you\s+\d+         |   # handed you X
+      hands\s+it\s+to\s+you       |   # promissory note physically delivered
+      resell\s+it\s+again         |   # 25k offer (needs confirm sell)
+      hands\s+it\s+back           |   # refusal: item returned
+      not\s+interested            |   # refusal
+      can.t\s+say                 |   # refusal
+      interested\s+in\s+that      |   # refusal
+      worthless                   |   # refusal
+      wouldn.t\s+give             |   # refusal
+      find\s+a\s+buyer            |   # refusal
+      no\s+thank                  |   # refusal
+      can.t\s+(accept|use|buy)    |   # refusal
+      don.t\s+want                |   # refusal
+      shakes.*head                |   # refusal
+      what\s+were\s+you\s+referring  # item not in hands or not found
+    /xi
+
+    SELL_REFUSED = /
+      hands\s+it\s+back|not\s+interested|can.t\s+say|interested\s+in\s+that|
+      worthless|wouldn.t\s+give|find\s+a\s+buyer|no\s+thank|
+      can.t\s+(accept|use|buy)|don.t\s+want|shakes.*head
+    /xi
+
     def initialize
       @cmd_queue = Queue.new
       @running   = true
@@ -2426,11 +2457,6 @@ module Merchantical
           GameObj.containers.values.flat_map(&:to_a) : []
         Lich::Messaging.msg("yellow",
           "[Merchantical] GameObj: #{inv_items.count} top-level, #{con_items.count} in-container.")
-        # Show top-level names so name-mismatch is visible
-        if inv_items.any?
-          names = inv_items.map { |gi| gi.name.to_s }.first(8).join(", ")
-          Lich::Messaging.msg("yellow", "[Merchantical] Inv names: #{names}")
-        end
       rescue => e
         Lich::Messaging.msg("yellow", "[Merchantical] GameObj read error: #{e.message}")
       end
@@ -2543,6 +2569,8 @@ module Merchantical
       items_to_sell = @items.select { |i| item_ids.include?(i['id']) }
       regular_items = items_to_sell.reject { |i| i[:in_locker] }.select { |i| i[:found] && i[:gameobj_id] }
       locker_items  = items_to_sell.select  { |i| i[:in_locker] }
+      sold_uids     = []
+      sale_summary  = []
 
       if regular_items.empty? && locker_items.empty?
         Lich::Messaging.msg("yellow", "[Merchantical] Batch sell: nothing validated to sell.")
@@ -2556,41 +2584,69 @@ module Merchantical
       Lich::Messaging.msg("yellow",
         "[Merchantical] Batch sell: #{regular_items.count} regular, #{locker_items.count} locker item(s).")
 
-      # Reusable: send one sell attempt for item already in hand, return [sold, note_offer, refused].
-      # fput handles roundtime; DownstreamHook captures the broker response before fput returns.
-      sell_one = lambda do |item_id, item_uid|
-        lines = []; pawnbroker_refused = [false]
-        hk = "mc_bs_#{Thread.current.object_id}_#{item_uid}"
+      # Run one sell command; keep hook active until a terminal broker response is seen.
+      do_sell_cmd = lambda do |cmd_item_id, hook_suffix|
+        lines = []; refused = [false]; terminal = [false]
+        hk = "mc_sell_#{Thread.current.object_id}_#{hook_suffix}"
         DownstreamHook.add(hk, proc { |s|
           lines << s.to_s
-          if s =~ /hands it back|not interested|can.t say|interested in that|
-                    worthless|wouldn.t give|find a buyer|no\s+thank|
-                    can.t\s+(accept|use|buy)|don.t\s+want|shakes.*head/xi
-            pawnbroker_refused[0] = true
+          if s =~ SELL_REFUSED
+            refused[0]  = true
+            terminal[0] = true
+          elsif s =~ SELL_TERMINAL
+            terminal[0] = true
           end
           s
         })
-        fput "sell ##{item_id}"
+        fput "sell ##{cmd_item_id}"
+        # fput returns on first line; wait up to 8s for the actual terminal response
+        timeout_at = Time.now + 8
+        until terminal[0] || Time.now > timeout_at
+          pause 0.1
+        end
         DownstreamHook.remove(hk) rescue nil
+        [lines, refused[0]]
+      end
 
-        note_offer = lines.any? { |l| l =~ /25[,.]?000\s*silver|note\s+worth\s+25/i }
+      # Reusable: sell one item already in hand, return [sold, note_offer, refused, price_str].
+      # 25k flow: first sell gets an offer + [resell within 30s]; second sell delivers the note.
+      sell_one = lambda do |item_id, item_uid|
+        lines, pawnbroker_refused = do_sell_cmd.call(item_id, item_uid)
+
+        # First sell produces a 25k offer; second sell (within 30s) delivers the promissory note.
+        note_offer = lines.any? { |l| l =~ /25[,.]?000\s*silver|note\s+worth\s+25|resell it again/i }
         if note_offer
-          Lich::Messaging.msg("yellow", "[Merchantical] 25k cap — confirming sale...")
-          lines2 = []; refused2 = [false]
-          hk2 = "mc_bs2_#{Thread.current.object_id}_#{item_uid}"
-          DownstreamHook.add(hk2, proc { |s|
-            lines2 << s.to_s
-            refused2[0] = true if s =~ /hands it back|not interested|can.t say/i
-            s
-          })
-          fput "sell ##{item_id}"
-          DownstreamHook.remove(hk2) rescue nil
-          lines = lines2
-          pawnbroker_refused[0] = refused2[0]
+          Lich::Messaging.msg("yellow", "[Merchantical] 25k cap -- confirming sale...")
+          lines, pawnbroker_refused = do_sell_cmd.call(item_id, "#{item_uid}_2")
         end
 
-        sold = lines.any? { |l| l =~ /pawnbroker takes.*hands you|hands you \d+\s*silver|handed? you \d+/i }
-        [sold, note_offer, pawnbroker_refused[0]]
+        # Extract sale price for summary reporting.
+        price_str = nil
+        lines.each do |l|
+          if m = l.match(/hands you ([\d,]+)\s*silver/i)
+            price_str = m[1].gsub(',', '')
+            break
+          end
+        end
+        price_str = "25,000" if note_offer && price_str.nil?
+
+        # Success: broker handed over coins, OR wrote a promissory note ("hands it to you").
+        sold = lines.any? { |l| l =~ /pawnbroker takes.*hands you|hands you [\d,]+\s*silver|handed? you \d+|hands it to you/i }
+
+        # Stow the promissory note so the next item can be picked up.
+        # Always use name-based commands — no dependency on GameObj hand state timing.
+        if sold && note_offer
+          lootsack  = GameObj.inv.to_a.find { |gi| gi.name.to_s =~ /lootsack|loot\s*sack/i }
+          container = lootsack || GameObj.inv.to_a.find { |gi| gi.type.to_s =~ /container/i && gi.id }
+          if container
+            fput "put my promissory note in ##{container.id}"
+          else
+            fput "stow my promissory note"
+          end
+          waitrt?
+        end
+
+        [sold, note_offer, pawnbroker_refused, price_str]
       end
 
       # Navigate to pawnshop lazily — only when we actually have something to sell there.
@@ -2612,31 +2668,37 @@ module Merchantical
         name         = item['name'].to_s
         item_uid     = item['id'].to_s
 
-        if container_id
-          fput "get ##{item_id} from ##{container_id}"
-        else
-          fput "get ##{item_id}"
-        end
+        get_resp = container_id ?
+          fput("get ##{item_id} from ##{container_id}") :
+          fput("get ##{item_id}")
         waitrt?
 
+        if get_resp.to_s =~ /need.*free hand|don.t see|what were you|can.t pick|could not find/i
+          Lich::Messaging.msg("yellow",
+            "[Merchantical] Batch: #{name} -- could not pick up (hands full or item missing), skipping.")
+          next
+        end
+
         go_to_pawnshop.call
-        sold, note_offer, truly_rejected = sell_one.call(item_id, item_uid)
+        sold, note_offer, truly_rejected, price_str = sell_one.call(item_id, item_uid)
         waitrt?
 
         if sold
+          sold_uids << item_uid
+          sale_summary << { name: name, price: price_str, note: note_offer }
           msg = "[Merchantical] Batch: sold #{name}!"
-          msg += " Check hands for a bank note." if note_offer
+          msg += " (promissory note for 25,000 silvers)" if note_offer
           Lich::Messaging.msg("yellow", msg)
           Gtk.queue { @window&.remove_sold_item_sold(item_uid) } rescue nil
         else
           if truly_rejected
-            Lich::Messaging.msg("yellow", "[Merchantical] Batch: #{name} rejected by vendor — returning.")
+            Lich::Messaging.msg("yellow", "[Merchantical] Batch: #{name} rejected by vendor -- returning.")
             item[:vendor_rejected] = true
             @state['vendor_rejected'] ||= []
             @state['vendor_rejected'] |= [item_uid]
           else
             Lich::Messaging.msg("yellow",
-              "[Merchantical] Batch: #{name} could not be sold (item not found or worn) — returning.")
+              "[Merchantical] Batch: #{name} could not be sold (item not found or worn) -- returning.")
           end
           if container_id
             fput "put ##{item_id} in ##{container_id}"
@@ -2706,7 +2768,7 @@ module Merchantical
 
                 unless target
                   Lich::Messaging.msg("yellow",
-                    "[Merchantical] Batch: could not find #{item['name']} in #{bag_name} — skipping.")
+                    "[Merchantical] Batch: could not find #{item['name']} in #{bag_name} -- skipping.")
                   next
                 end
 
@@ -2739,30 +2801,37 @@ module Merchantical
               name      = item['name'].to_s
               stow_cid  = r[:stow_container_id]
 
-              if stow_cid && !stow_cid.empty?
-                fput "get ##{item_id} from ##{stow_cid}"; waitrt?
-              else
-                fput "get ##{item_id}"; waitrt?
+              get_resp = stow_cid && !stow_cid.empty? ?
+                fput("get ##{item_id} from ##{stow_cid}") :
+                fput("get ##{item_id}")
+              waitrt?
+
+              if get_resp.to_s =~ /need.*free hand|don.t see|what were you|can.t pick|could not find/i
+                Lich::Messaging.msg("yellow",
+                  "[Merchantical] Batch: #{name} -- could not pick up (hands full or item missing), skipping.")
+                next
               end
 
-              sold, note_offer, truly_rejected = sell_one.call(item_id, item_uid)
+              sold, note_offer, truly_rejected, price_str = sell_one.call(item_id, item_uid)
               waitrt?
 
               if sold
+                sold_uids << item_uid
+                sale_summary << { name: name, price: price_str, note: note_offer }
                 msg = "[Merchantical] Batch: sold #{name}!"
-                msg += " Check hands for a bank note." if note_offer
+                msg += " (promissory note for 25,000 silvers)" if note_offer
                 Lich::Messaging.msg("yellow", msg)
                 Gtk.queue { @window&.remove_sold_item_sold(item_uid) } rescue nil
               else
                 if truly_rejected
                   Lich::Messaging.msg("yellow",
-                    "[Merchantical] Batch: #{name} rejected by vendor — stowing.")
+                    "[Merchantical] Batch: #{name} rejected by vendor -- stowing.")
                   item[:vendor_rejected] = true
                   @state['vendor_rejected'] ||= []
                   @state['vendor_rejected'] |= [item_uid]
                 else
                   Lich::Messaging.msg("yellow",
-                    "[Merchantical] Batch: #{name} could not be sold (item not found or worn) — stowing.")
+                    "[Merchantical] Batch: #{name} could not be sold (item not found or worn) -- stowing.")
                 end
                 # Return to stow container (or try wear as last resort)
                 if stow_cid && !stow_cid.empty?
@@ -2776,6 +2845,10 @@ module Merchantical
         end
       end
 
+      # Remove sold items from App.@items immediately so do_validate_items
+      # doesn't re-process them (the GTK-thread remove_sold_item_sold handles Window.@items).
+      @items.reject! { |i| sold_uids.include?(i['id'].to_s) } unless sold_uids.empty?
+
       # Persist any rejections and rebuild UI
       State.save(@state) if items_to_sell.any? { |i| i[:vendor_rejected] }
       Gtk.queue { @window&.schedule_rebuild } rescue nil
@@ -2788,6 +2861,14 @@ module Merchantical
       end
 
       Lich::Messaging.msg("yellow", "[Merchantical] Batch sell complete.")
+      unless sale_summary.empty?
+        lines_out = sale_summary.map { |s|
+          price_display = s[:note] ? "25K note" : "#{s[:price]} silvers"
+          "#{s[:name]} (#{price_display})"
+        }
+        Lich::Messaging.msg("yellow",
+          "[Merchantical] #{sale_summary.count} item(s) sold: #{lines_out.join(', ')}")
+      end
       do_validate_items(skip_locker: true)
     rescue => e
       Lich::Messaging.msg("yellow",
@@ -2947,33 +3028,38 @@ module Merchantical
         waitrt?
       end
 
-      # Helper: send one sell attempt and collect the pawnshop response.
-      # fput handles roundtime; DownstreamHook captures broker lines before fput returns.
+      # Helper: send one sell attempt and wait for the broker's terminal response.
+      # fput returns on the first game line; the confirmation arrives in a later packet.
       do_one_sell = lambda do
-        lines = []
+        lines = []; terminal = [false]
         hk    = "mc_sell_#{Thread.current.object_id}"
         DownstreamHook.add(hk, proc { |s|
           lines << s.to_s
+          terminal[0] = true if s =~ SELL_TERMINAL
           s
         })
         fput "sell ##{item_id}"
+        timeout_at = Time.now + 8
+        until terminal[0] || Time.now > timeout_at
+          pause 0.1
+        end
         DownstreamHook.remove(hk) rescue nil
         lines
       end
 
       sell_response = do_one_sell.call
 
-      # Detect 25k note offer — pawnshop caps at 25,000 and requires a second sell to confirm
-      note_offer = sell_response.any? { |l| l =~ /25[,.]?000\s*silver|note\s+worth\s+25/i }
+      # First sell produces a 25k offer; second sell (within 30s) delivers the promissory note.
+      note_offer = sell_response.any? { |l| l =~ /25[,.]?000\s*silver|note\s+worth\s+25|resell it again/i }
       if note_offer
-        Lich::Messaging.msg("yellow", "[Merchantical] 25,000 silver cap detected — confirming sale for bank note...")
+        Lich::Messaging.msg("yellow", "[Merchantical] 25,000 silver cap detected -- confirming sale for bank note...")
         sell_response = do_one_sell.call
       end
 
-      # Success = broker physically took the item and handed over coin/note
-      sold = sell_response.any? { |l| l =~ /pawnbroker takes.*hands you|hands you \d+\s*silver|handed? you \d+/i }
+      # Success: broker handed over coins, OR wrote a promissory note ("hands it to you").
+      sold = sell_response.any? { |l| l =~ /pawnbroker takes.*hands you|hands you [\d,]+\s*silver|handed? you \d+|hands it to you/i }
 
-      # Anything else after the offer = rejection (item was handed back or broker declined)
+      # Anything else = rejection (item was handed back or broker declined)
       rejected = !sold
 
       origin_room = info[:origin_room].to_s
@@ -3009,6 +3095,18 @@ module Merchantical
         # list the moment the sale is confirmed, not after round-time clears.
         unless item_uid.empty?
           Gtk.queue { @window&.remove_sold_item_sold(item_uid) } rescue nil
+        end
+        # Stow the promissory note into the lootsack so hands are free.
+        # Always use name-based commands — no dependency on GameObj hand state timing.
+        if note_offer
+          lootsack  = GameObj.inv.to_a.find { |gi| gi.name.to_s =~ /lootsack|loot\s*sack/i }
+          container = lootsack || GameObj.inv.to_a.find { |gi| gi.type.to_s =~ /container/i && gi.id }
+          if container
+            fput "put my promissory note in ##{container.id}"
+          else
+            fput "stow my promissory note"
+          end
+          waitrt?
         end
         waitrt?
       end
@@ -3066,7 +3164,7 @@ module Merchantical
 
       unless gameobj_id && !gameobj_id.empty?
         Lich::Messaging.msg("yellow",
-          "[Merchantical] #{name}: no item ID — run Validate Items first.")
+          "[Merchantical] #{name}: no item ID -- run Validate Items first.")
         return
       end
 
@@ -3152,7 +3250,7 @@ module Merchantical
 
       unless stored
         Lich::Messaging.msg("yellow",
-          "[Merchantical] Could not store #{name} — all bags full or inaccessible.")
+          "[Merchantical] Could not store #{name} -- all bags full or inaccessible.")
       end
 
       start_script("go2", [origin_room]) unless origin_room.empty?
@@ -3169,7 +3267,7 @@ module Merchantical
           waitrt?
         else
           Lich::Messaging.msg("yellow",
-            "[Merchantical] #{name} still in hand — no inventory container found to stow it.")
+            "[Merchantical] #{name} still in hand -- no inventory container found to stow it.")
         end
       end
     rescue => e
@@ -3335,7 +3433,7 @@ module Merchantical
       unless remaining.empty?
         names = remaining.map { |i| i['name'] }.join(", ")
         Lich::Messaging.msg("yellow",
-          "[Merchantical] Batch store: all bags full — could not store: #{names}")
+          "[Merchantical] Batch store: all bags full -- could not store: #{names}")
       end
 
       Gtk.queue { @window&.schedule_rebuild } rescue nil
@@ -3544,7 +3642,15 @@ module Merchantical
         end
 
         capture_mutex.synchronize do
-          if text =~ /^as you recall/i
+          if text =~ /\AYou sing a loresong/i
+            # Loresing is starting: close any open capture NOW, before verse lines arrive.
+            # For "permanently unlocked by you" items loresang does recall → loresing, so the
+            # recall data is already in current_capture. Saving here prevents verse lines from
+            # being appended to the recall data. A fresh recall after loresing (if any) will
+            # open a new capture via the "as you recall" branch below.
+            captures << current_capture if current_capture && current_capture[:lines].any?
+            current_capture = nil
+          elsif text =~ /^as you recall/i
             captures << current_capture if current_capture && current_capture[:lines].any?
             current_capture = { noun: last_recall_noun, full_name: last_recall_fullname, lines: [] }
           elsif current_capture
