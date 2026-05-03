@@ -1,20 +1,25 @@
+# encoding: utf-8
 before_dying { 
-  # 1. Save all current settings (Position, Size, Sounds, Icons, etc.)
-  # This ensures that even a ;kill command persists your UI changes.
+  # 1. Save variables (safe because we aren't polling the UI object)
   save_settings
   
-  # 2. Kill background audio processes
-  system("taskkill /f /im powershell.exe /fi \"WINDOWTITLE eq Hidden\" > nul 2>&1")
-  
-  # 3. Clean up the GTK window if it's still open
+  # 2. Platform-specific audio cleanup
+  stop_audio 
+
+  # 3. Safe Window Close
+  # On Mac, if the user clicked X, the window is already gone.
+  # We only need to call destroy if the script was killed via ;kill
   if $minimap_win
     Gtk.queue do
-      $minimap_win.destroy if !$minimap_win.destroyed?
+      begin
+        if !$minimap_win.destroyed?
+          $minimap_win.destroy 
+        end
+      rescue
+        # Silently ignore if the object is already gone to prevent client crash
+      end
     end
   end
-  
-  # 4. Final safety check for the specific audio PID
-  stop_audio 
 }
 
 def stop_audio
@@ -179,7 +184,7 @@ def save_settings
   UserVars.sea_charts[:theme]       = $theme_mode.to_s
   UserVars.sea_charts[:keep_on_top] = $keep_on_top
   UserVars.sea_charts[:ship_icon]   = $ship_icon_file
-  UserVars.sea_charts[:enable_sounds] = $enable_sounds # Save sound preference
+  UserVars.sea_charts[:enable_sounds] = $enable_sounds
   UserVars.sea_charts[:win_x] = $win_x
   UserVars.sea_charts[:win_y] = $win_y
   UserVars.sea_charts[:win_w] = $win_w
@@ -343,37 +348,50 @@ end
 
 def update_images
 	Gtk.queue do
+		# 1. Component Health Check
+		# Prevents crashes if the window was closed or the image failed to load
 		next unless $minimap_win && !$minimap_win.destroyed?
 		next if $map_pixbuf_orig.nil?
 
-		# 1. Scale the Map based on the $scale variable
-		# This changes the map size in memory, but we no longer force the window to match it.
-		map_scaled = $map_pixbuf_orig.scale_simple(($map_pixbuf_orig.width * $scale).round, ($map_pixbuf_orig.height * $scale).round, GdkPixbuf::InterpType::BILINEAR)
+		# 2. Safe Scaling Calculation
+		# We calculate dimensions first to ensure we never pass 0 or negative numbers to the C-library
+		target_w = ($map_pixbuf_orig.width * $scale).round
+		target_h = ($map_pixbuf_orig.height * $scale).round
+		
+		next if target_w <= 0 || target_h <= 0
+
+		# 3. Render Scaled Map
+		# Bilinear interpolation provides a good balance between speed and quality for Mac/Windows
+		map_scaled = $map_pixbuf_orig.scale_simple(target_w, target_h, GdkPixbuf::InterpType::BILINEAR)
 		$map_image.set_from_pixbuf(map_scaled)
 
-		# 2. Update Layout Size (Crucial for Scrollbars)
-		# This tells the ScrolledWindow how much "virtual area" the map occupies.
-		# As this area exceeds the window size, scrollbars will automatically appear.
+		# 4. Update Layout Boundaries (The "Scrollable Area")
+		# This is what forces the scrollbars to appear instead of resizing the window
 		$layout.set_size(map_scaled.width, map_scaled.height)
 
-		# 3. Handle Background
+		# 5. Handle Background (Optional Layer)
 		if $show_background && $bg_pixbuf_orig
-			bg_scaled = $bg_pixbuf_orig.scale_simple(($bg_pixbuf_orig.width * $scale).round, ($bg_pixbuf_orig.height * $scale).round, GdkPixbuf::InterpType::BILINEAR)
-			$bg_image.set_from_pixbuf(bg_scaled)
-			$bg_image.show
+			bg_w = ($bg_pixbuf_orig.width * $scale).round
+			bg_h = ($bg_pixbuf_orig.height * $scale).round
+			if bg_w > 0 && bg_h > 0
+				bg_scaled = $bg_pixbuf_orig.scale_simple(bg_w, bg_h, GdkPixbuf::InterpType::BILINEAR)
+				$bg_image.set_from_pixbuf(bg_scaled)
+				$bg_image.show
+			end
 		else
 			$bg_image.hide
 		end
 
-		# 4. Handle Ship Icon
-		# The ship icon scales relative to the map scale to maintain visual proportions.
+		# 6. Handle Ship Icon Scaling
+		# Ship size stays proportional to your zoom level (default 40px at 100%)
 		ship_size = (40 * $scale).round
-		if $ship_pixbuf_orig
+		if $ship_pixbuf_orig && ship_size > 0
 			ship_scaled = $ship_pixbuf_orig.scale_simple(ship_size, ship_size, GdkPixbuf::InterpType::BILINEAR)
 			$ship_image.set_from_pixbuf(ship_scaled)
 		end
 
-		# 5. Position the ship
+		# 7. Position the Ship
+		# Only draws if coordinates exist (they are cleared when manually switching maps)
 		if $current_cx && $current_cy
 			sx = ($current_cx * $scale).round - (ship_size / 2)
 			sy = ($current_cy * $scale).round - (ship_size / 2)
@@ -383,11 +401,7 @@ def update_images
 			$ship_image.hide
 		end
 		
-		# 6. Window Management
-		# NOTE: We have removed $minimap_win.resize and .set_size_request.
-		# This prevents the window from "expanding into the void."
-		# The window remains at its user-defined (and saved) size.
-		
+		# 8. Status Bar Update
 		$status.text = "Map: #{$current_map_file} | Room: #{$current_room_id} | Scale: #{($scale*100).to_i}%"
 	end
 end
@@ -418,153 +432,180 @@ def find_room_at_coords(map_file, click_x, click_y)
 end
 
 def show_context_menu(event)
-	Gtk.queue do
-		next unless $minimap_win && !$minimap_win.destroyed?
-		menu = Gtk::Menu.new
+  Gtk.queue do
+    next unless $minimap_win && !$minimap_win.destroyed?
+    menu = Gtk::Menu.new
 
-		# 1. Window Theme
-		theme_item = Gtk::MenuItem.new(label: "Window Theme")
-		theme_menu = Gtk::Menu.new
-		theme_item.submenu = theme_menu
-		t_group = nil
-		[:dark, :light].each do |mode|
-			item = Gtk::RadioMenuItem.new(t_group, "#{mode.to_s.capitalize} Mode")
-			t_group = item
-			item.active = ($theme_mode == mode)
-			item.signal_connect("activate") do 
-				if item.active?
-					$theme_mode = mode
-					save_settings; update_theme; update_images
-				end
-			end
-			theme_menu.append(item)
-		end
-		menu.append(theme_item)
+    # 1. Window Theme
+    theme_item = Gtk::MenuItem.new(label: "Window Theme")
+    theme_menu = Gtk::Menu.new
+    theme_item.submenu = theme_menu
+    t_group = nil
+    [:dark, :light].each do |mode|
+      item = Gtk::RadioMenuItem.new(t_group, "#{mode.to_s.capitalize} Mode")
+      t_group = item
+      item.active = ($theme_mode == mode)
+      item.signal_connect("activate") do 
+        if item.active?
+          $theme_mode = mode
+          save_settings; update_theme; update_images
+        end
+      end
+      theme_menu.append(item)
+    end
+    menu.append(theme_item)
 
-		# 2. Ship Icon
-		icon_item = Gtk::MenuItem.new(label: "Ship Icon")
-		icon_menu = Gtk::Menu.new
-		icon_item.submenu = icon_menu
-		i_group = nil
-		icons = {
-			"Default" => "default_icon.png", "Red Dot" => "red_dot_icon.png",
-			"Sloop" => "sloop_icon.png", "Brigantine" => "brigantine_icon.png", 
-			"Carrack" => "carrack_icon.png", "Galleon" => "galleon_icon.png", 
-			"Frigate" => "frigate_icon.png", "Man O' War" => "man_of_war_icon.png"
-		}
-		icons.each do |label, filename|
-			item = Gtk::RadioMenuItem.new(i_group, label)
-			i_group = item
-			item.active = ($ship_icon_file == filename)
-			item.signal_connect("activate") do
-				if item.active?
-					$ship_icon_file = filename
-					save_settings
-					icon_path = File.join(ICON_DIR, $ship_icon_file)
-					$ship_pixbuf_orig = GdkPixbuf::Pixbuf.new(file: icon_path) rescue GdkPixbuf::Pixbuf.new(file: File.join(ICON_DIR, 'default_icon.png'))
-					update_images
-				end
-			end
-			icon_menu.append(item)
-		end
-		menu.append(icon_item)
+    # 2. Ship Icon
+    icon_item = Gtk::MenuItem.new(label: "Ship Icon")
+    icon_menu = Gtk::Menu.new
+    icon_item.submenu = icon_menu
+    i_group = nil
+    icons = {
+      "Default" => "default_icon.png", "Red Dot" => "red_dot_icon.png",
+      "Sloop" => "sloop_icon.png", "Brigantine" => "brigantine_icon.png", 
+      "Carrack" => "carrack_icon.png", "Galleon" => "galleon_icon.png", 
+      "Frigate" => "frigate_icon.png", "Man O' War" => "man_of_war_icon.png"
+    }
+    icons.each do |label, filename|
+      item = Gtk::RadioMenuItem.new(i_group, label)
+      i_group = item
+      item.active = ($ship_icon_file == filename)
+      item.signal_connect("activate") do
+        if item.active?
+          $ship_icon_file = filename
+          save_settings
+          icon_path = File.join(ICON_DIR, $ship_icon_file)
+          $ship_pixbuf_orig = GdkPixbuf::Pixbuf.new(file: icon_path) rescue GdkPixbuf::Pixbuf.new(file: File.join(ICON_DIR, 'default_icon.png'))
+          update_images
+        end
+      end
+      icon_menu.append(item)
+    end
+    menu.append(icon_item)
 
-		# 3. Select Map
+# 3. Select Map (with Radio Button functionality)
 		map_item = Gtk::MenuItem.new(label: "Select Map")
 		map_menu = Gtk::Menu.new
 		map_item.submenu = map_menu
+		
 		if Dir.exist?(PNG_DIR)
-			Dir.children(PNG_DIR).select { |f| f.downcase.end_with?('.png') && !f.include?('_background') }.sort.each do |file|
-				item = Gtk::MenuItem.new(label: file)
+			# t_group maintains the radio button "mutual exclusivity"
+			m_group = nil 
+			
+			Dir.children(PNG_DIR).select { |f| 
+				f.downcase.end_with?('.png') && !f.include?('_background') 
+			}.sort.each do |file|
+				# Create the radio menu item and add it to the group
+				item = Gtk::RadioMenuItem.new(m_group, file)
+				m_group = item
+				
+				# Set it as 'active' if it's the current map
+				item.active = ($current_map_file == file)
+				
 				item.signal_connect("activate") do
-					$current_map_file = file
-					load_map_assets(file); 
-					$current_cx = nil
-					$current_cy = nil
-					update_images
+					if item.active? # Only trigger when turned ON
+						Gtk.queue do
+							$current_map_file = file
+							$current_cx = nil
+							$current_cy = nil
+							# Pass 'true' for manual override to reset scale to .50
+							load_map_assets(file, true) 
+							update_images
+						end
+					end
 				end
 				map_menu.append(item)
 			end
 		end
 		menu.append(map_item)
 
-		# 4. Scale
-		scale_item = Gtk::MenuItem.new(label: "Scale")
-		scale_menu = Gtk::Menu.new
-		s_group = nil
-		[0.5, 0.75, 1.0, 1.5, 2.0].each do |s|
-			item = Gtk::RadioMenuItem.new(s_group, "#{(s*100).to_i}%")
-			s_group = item
-			item.active = ($scale == s)
-			item.signal_connect("activate") do 
-				if item.active?
-					$scale = s; update_images
-				end
-			end
-			scale_menu.append(item)
-		end
-		scale_item.submenu = scale_menu
-		menu.append(scale_item)
+    # 4. Scale
+    scale_item = Gtk::MenuItem.new(label: "Scale")
+    scale_menu = Gtk::Menu.new
+    s_group = nil
+    [0.5, 0.75, 1.0, 1.5, 2.0].each do |s|
+      item = Gtk::RadioMenuItem.new(s_group, "#{(s*100).to_i}%")
+      s_group = item
+      item.active = ($scale == s)
+      item.signal_connect("activate") do 
+        if item.active?
+          $scale = s; update_images
+        end
+      end
+      scale_menu.append(item)
+    end
+    scale_item.submenu = scale_menu
+    menu.append(scale_item)
 
-		menu.append(Gtk::SeparatorMenuItem.new)
+    menu.append(Gtk::SeparatorMenuItem.new)
 
-		# 5. Show Background
-		bg_toggle = Gtk::CheckMenuItem.new(label: "Show Background")
-		bg_toggle.active = $show_background
-		bg_toggle.signal_connect("toggled") { |w| $show_background = w.active?; save_settings; update_images }
-		menu.append(bg_toggle)
+    # 5. Show Background
+    bg_toggle = Gtk::CheckMenuItem.new(label: "Show Background")
+    bg_toggle.active = $show_background
+    bg_toggle.signal_connect("toggled") { |w| $show_background = w.active?; save_settings; update_images }
+    menu.append(bg_toggle)
 
-		# 6. Keep window on top
-		top_item = Gtk::CheckMenuItem.new(label: "Keep window on top")
-		top_item.active = !!$keep_on_top
-		top_item.signal_connect("toggled") { |w|
-			$keep_on_top = w.active?
-			save_settings 
-			Gtk.queue { $minimap_win.set_keep_above($keep_on_top) if $minimap_win }
-		}
-		menu.append(top_item)
+    # 6. Keep window on top
+    top_item = Gtk::CheckMenuItem.new(label: "Keep window on top")
+    top_item.active = !!$keep_on_top
+    top_item.signal_connect("toggled") { |w|
+      $keep_on_top = w.active?
+      save_settings 
+      Gtk.queue { $minimap_win.set_keep_above($keep_on_top) if $minimap_win }
+    }
+    menu.append(top_item)
 
-		# 7. Enable Sounds Toggle
-		sound_toggle = Gtk::CheckMenuItem.new(label: "Enable Sounds")
-		sound_toggle.active = $enable_sounds
-		sound_toggle.signal_connect("toggled") do |w|
-			$enable_sounds = w.active?
-			save_settings
-			if $enable_sounds
-				is_port = PORT_RANGES.any? { |range, _| range.include?($current_room_id.to_i) }
-				play_audio_loop(is_port ? PORT_SOUND : SAILING_SOUND)
-			else
-				stop_audio
-			end
-		end
-		menu.append(sound_toggle)
+    # 7. Enable Sounds Toggle
+    sound_toggle = Gtk::CheckMenuItem.new(label: "Enable Sounds")
+    sound_toggle.active = $enable_sounds
+    sound_toggle.signal_connect("toggled") do |w|
+      $enable_sounds = w.active?
+      save_settings
+      if $enable_sounds
+        is_port = PORT_RANGES.any? { |range, _| range.include?($current_room_id.to_i) }
+        play_audio_loop(is_port ? PORT_SOUND : SAILING_SOUND)
+      else
+        stop_audio
+      end
+    end
+    menu.append(sound_toggle)
 
-		# --- THE MISSING FIXES ---
-		menu.show_all
-		menu.popup_at_pointer(event)
-	end
+    # Required to actually display the menu
+    menu.show_all
+    menu.popup_at_pointer(event)
+  end
 end
 
-def load_map_assets(map_file)
-    # ADD THIS: Hide the ship immediately when a new map is selected
-    Gtk.queue { $ship_image.hide if $ship_image }
-
-    port_img = nil
+def load_map_assets(map_file, manual = false)
+  Gtk.queue { $ship_image.hide if $ship_image }
+  
+  port_img = nil
+  unless manual
     PORT_RANGES.each { |range, filename| (port_img = filename; break) if range.include?($current_room_id.to_i) }
+  end
 
-    if port_img && File.exist?(File.join(PORT_BG_DIR, port_img))
-        $map_pixbuf_orig = GdkPixbuf::Pixbuf.new(file: File.join(PORT_BG_DIR, port_img))
-        $bg_pixbuf_orig = nil
-        $current_map_file = port_img
-    elsif map_file
-        map_path = File.join(PNG_DIR, map_file)
-        if File.exist?(map_path)
-            $map_pixbuf_orig = GdkPixbuf::Pixbuf.new(file: map_path)
-            bg_path = File.join(BG_DIR, map_file.sub('.png', '_background.png'))
-            $bg_pixbuf_orig = File.exist?(bg_path) ? GdkPixbuf::Pixbuf.new(file: bg_path) : nil
-            $current_map_file = map_file
-        end
+  if port_img && File.exist?(File.join(PORT_BG_DIR, port_img))
+    $map_pixbuf_orig = GdkPixbuf::Pixbuf.new(file: File.join(PORT_BG_DIR, port_img))
+    $bg_pixbuf_orig = nil
+    $current_map_file = port_img
+    # Keep ports at their optimized .25 scale
+    $scale = 0.25 
+  elsif map_file
+    map_path = File.join(PNG_DIR, map_file)
+    if File.exist?(map_path)
+      $map_pixbuf_orig = GdkPixbuf::Pixbuf.new(file: map_path)
+      
+      bg_filename = map_file.gsub(/\.png$/i, '_background.png')
+      bg_path = File.join(BG_DIR, bg_filename)
+      $bg_pixbuf_orig = File.exist?(bg_path) ? GdkPixbuf::Pixbuf.new(file: bg_path) : nil
+      
+      $current_map_file = map_file
+      
+      # FIX: If we are manually selecting a map (or it's a standard map),
+      # force the scale back to 0.50 if it was stuck at port-scale (0.25)
+      $scale = 0.50 if $scale == 0.25 || manual
     end
+  end
 end
 
 def load_room!(room_id, force: false)
@@ -708,7 +749,7 @@ end
 		$scroller.add($layout)
 
 		# 6. Anchor Button
-		center_btn = Gtk::Button.new(label: " ⚓ ")
+		center_btn = Gtk::Button.new(label: " Center ")
 		center_btn.set_tooltip_text("Center on Ship")
 		center_btn.set_halign(:end)
 		center_btn.set_valign(:end)

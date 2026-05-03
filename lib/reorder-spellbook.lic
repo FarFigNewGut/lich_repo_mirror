@@ -1,0 +1,1473 @@
+# frozen_string_literal: true
+#
+# reorder-spellbook.lic - v1.0.0
+#
+# GUI tool for reorganizing spells in a Spell Book item (grimoire / tome /
+# book) using the PONDER + TRANSFER mechanics introduced for Rumor Woods 2026.
+#
+# Reads the book by turning through each page, lets you click-to-prime and
+# click-to-swap slots in a Target view, then computes the minimum sequence of
+# TRANSFER swaps and executes them in-game. Per-character layouts are saved
+# so the window opens instantly on the next run.
+#
+# == Usage ==
+#   ;reorder-spellbook                open window using the saved book noun
+#   ;reorder-spellbook <noun>         set/use this book noun (saved per char)
+#   ;reorder-spellbook rescan         open and immediately rescan
+#
+# == In the GUI ==
+#   - Type your book noun (e.g. grimoire, tome, book) and click "Use this noun".
+#   - Click "Rescan book" the first time, or whenever the book changes outside
+#     the script.
+#   - You're editing a TARGET layout: click a slot to prime, click another to
+#     swap. Changed slots are tinted green vs the original scan. Undo rolls
+#     back swaps one at a time; "Reset target to current" clears all edits.
+#   - Toggle "Show current (read-only)" to peek at the unmodified scanned
+#     layout without losing your edits. Clicks are disabled in this view; flip
+#     back to "Show target" to keep editing.
+#   - "Show descriptions" toggles a one-line description under each spell
+#     (edit SPELL_DESCRIPTIONS at the top of this file to customize).
+#   - "Send to game" computes the minimal TRANSFER sequence and executes it.
+#     The book is rescanned automatically afterward.
+#
+# == While running (;send) ==
+#   ;send rsb help                    list commands
+#   ;send rsb noun <noun>             change the active book noun
+#   ;send rsb rescan                  rescan the book
+#
+# == Data ==
+#   data/<game>/<character>/reorder_spellbook.yaml
+#
+#         author: Zedarius
+#         game: Gemstone
+#         tags: utility, spell book, grimoire, tome, rumor woods, transfer
+#         required: Lich >= 5.6.2
+#         version: 1.0.0
+#
+# == Changelog ==
+#   1.0.0 (2026-05-02):
+#     - Initial public release.
+
+require 'gtk3' rescue nil
+require 'yaml'
+require 'set'
+require 'cgi'
+
+# Force a clean module reload on every script invocation. Lich keeps the
+# module alive across runs, so without this iterative edits to constants
+# (regex, VERSION, etc.) would silently never take effect.
+#
+# Wrinkle: Lich evaluates script bodies via `eval(text, _script.binding)` and
+# `_script` lives on `Lich::Common`, so a bare `module Foo` actually creates
+# `Lich::Common::Foo`, not `::Foo`. We clean up wherever the prior copy lived
+# AND anchor the new module at top-level via `module ::Foo`.
+[Object, (Lich::Common rescue nil)].compact.each do |mod|
+  mod.send(:remove_const, :ReorderSpellbook) if mod.const_defined?(:ReorderSpellbook, false)
+end
+
+module ::ReorderSpellbook
+  VERSION         = '1.0.0'.freeze
+  SLOTS_PER_PAGE  = 6
+  SCHEMA_VERSION  = 1
+
+  # Spell number -> short description. The "Show descriptions" toggle reads
+  # from this hash; missing numbers just show no description. Keep entries
+  # ASCII, lowercase, under ~70 chars, prefer combat acronyms (AS, DS, TD,
+  # CS, DF, DB) over spelled-out terms. Drawn from Sorted_effects on gswiki -
+  # not exhaustive; add more as you encounter them in your books.
+  SPELL_DESCRIPTIONS = {
+    # Minor Spirit (101-130)
+    101  => "+10 sp. TD, +10 bolt DS",
+    102  => "+20 DS, -20 phys AS",
+    103  => "+10 DS",
+    104  => "+1 warding vs disease",
+    105  => "+1 warding vs poison",
+    106  => "+30 DS to all in room, + hiding ability",
+    107  => "+15 sp. TD, +25 bolt DS",
+    108  => "Removes stun",
+    109  => "Removes invisibility from all in room",
+    110  => "Maneuver atk, stagger + unbalance",
+    111  => "Fire bolt or signal flare",
+    112  => "Walk on smooth water",
+    113  => "Removes one disease",
+    114  => "Removes one poison",
+    115  => "50% chance for 2nd warding roll vs sp. spells",
+    116  => "Vision of target player's location",
+    117  => "+75 temp. AS",
+    118  => "Targeted/AoE SMR disabler, or bolt",
+    119  => "Strips prepped spell, dispels, or drains mana",
+    
+    # Major Spirit (201-230)
+    201  => "Prevents target from attacking",
+    202  => "+10 phys DS",
+    203  => "Creates food: + mana/spirit regen until enter combat",
+    204  => "Hides target from Locate Person and similar",
+    205  => "Controls room illumination",
+    206  => "+20 First Aid ranks, -25% tend RT",
+    207  => "+ def vs gas effects/maneuvers",
+    208  => "Steals prepped spell from target",
+    209  => "Dispels webs, stops spider web-spinning",
+    210  => "Silences target: no speech, song, or cast",
+    211  => "+15 phys/bolt AS, +3 lvl sheer fear",
+    212  => "- target's sp. TD, AS, DS",
+    213  => "Prevents aggression, negates spell hindrance in room",
+    214  => "Holds target in place, negating parry/evade",
+    215  => "+25 phys/bolt AS, +1 HP/MP regen, +SMR def, +3 lvl sheer fear",
+    216  => "Forces target into offensive stance",
+    217  => "AoE, - sp. TD, AS, DS",
+    219  => "+30 bolt DS, +30 sp. TD",
+    
+    # Cleric (301-330)
+    301  => "Immobilize undead, which lowers def",
+    302  => "HP atk, plasma flares",
+    303  => "+10 phys/ranged/bolt DS",
+    304  => "Allow weapons to deal full dmg to undead",
+    305  => "Prevent corpse decay",
+    306  => "Acid bolt vs corp. undead, impact vs living",
+    307  => "+5 phys/bolt AS, +5 DS, both shared w/ group",
+    308  => "Xfer spirit to target, or link to dead for rez",
+    309  => "SMR attack",
+    310  => "+10 DS, +10 TD, both shared with group",
+    311  => "Blinds and stuns target",
+    312  => "Pure HP dmg, no crits",
+    313  => "+10 Spr. TD, + SMR def",
+    314  => "Negates silver encumbrance",
+    315  => "Removes curse from item",
+    316  => "AoE stun or immobilize",
+    317  => "HP + plasma warding atk",
+    319  => "Flares to negate incoming phys. atk., spell, or maneuver",
+    
+    # Minor Elemental (401-430)
+    401  => "+5 DS, +5 ele. TD",
+    406  => "+10 DS, +10 ele. TD",
+    414  => "+20 DS, +15 ele. TD",
+    
+    # Major Elemental (501-530)
+    501  => "Sleeps target, no effect on undead/constructs",
+    502  => "Elemental warding atk",
+    503  => "+20 DS",
+    504  => "Slows target + up to 3 sec RT",
+    505  => "SMR stun, or EVOKE for air bolt (needs air lore)",
+    506  => "Red. stam cost for Quickstrike actions, 4 min. CD",
+    507  => "+20 DS",
+    508  => "+20 ele. TD",
+    509  => "+15 STR bonus, helps melee, enc., and ranged RT",
+    510  => "Heavy impact bolt",
+    511  => "Summons a disk",
+    512  => "Open cast root: -50 melee AS, -25 ranged AS, -25 DS",
+    513  => "+20 bolt AS",
+    514  => "Warding root: -50 melee AS, -25 ranged AS, -25 DS",
+    516  => "Steals mana from target",
+    518  => "AoE ele. bolt",
+    519  => "Fire DoT, CHANNEL = +power, EVOKE = - power, + target RT",
+    
+    # Ranger (601-630)
+    601  => "+10 DS, + hiding in natural terrain",
+    602  => "+ ele. bolt DS, + climate resist",
+    603  => "- target nature dmg resist",
+    604  => "+ foraging, + skinning",
+    605  => "Absorbs next incoming atk",
+    606  => "+10 STR bonus, helps melee, enc., and ranged RT",
+    607  => "-20 target DS",
+    608  => "Hide, +30 AS for next ranged/bolt, or +18 Spr. CS to next ward",
+    609  => "AoE unhide or targeted fire atk, both blind",
+    610  => "Maneuver atk, prone/root/entangle target",
+    611  => "SMR immobilize, or EVOKE for cold bolt",
+    612  => "Add RT flares, or multi-cycle AoE RT maneuver",
+    613  => "+20 DS, +20 sp. TD, + trap disarm, + sheer fear def, + ranged aiming",
+    615  => "Maneuver atk with many effects based on caster stance",
+    616  => "SMR damage, better outside in vegetation",
+    617  => "+ hiding outdoors",
+    618  => "+20 dodge ranks vs maneuvers",
+    619  => "Mass calm (targets can't attack)",
+    
+    # Sorcerer (701-730)
+    701  => "Major Bleed DoT, stacks. No effect on bloodless",
+    702  => "HP dmg + injury atk",
+    703  => "AoE, target can't cast for 15 sec.",
+    704  => "Many uses, like + SMR def buff, solidify non-corporeal",
+    705  => "Ward atk, better vs. stunned/non-corporeal",
+    706  => "Roots target, speeds up sorc DoT's, must concentrate",
+    707  => "Turn your eye into pet w/ various abilities",
+    708  => "Explode target's limbs, can be aimed",
+    709  => "Multi-phase knockdown + stagger, flying are immune",
+    710  => "AoE or targeted elemental DoT",
+    711  => "-20% HP atk, +3-7 sec. RT",
+    712  => "+25 DS, +20 TD",
+    713  => "Plasma ball, AS-based",
+    715  => "Imparts 1 of 8 curses, see wiki for details",
+    716  => "Disease DoT, can be a reactive defensive buff",
+    717  => "Freeze, flee, or instant kill target. Can be AoE",
+    718  => "DoT",
+    719  => "Explodes target's mana for elemental dmg",
+    
+    # Wizard (901-930)
+    901  => "Lightning bolt",
+    902  => "+15 (3x) temp. enchant to plain weapons",
+    903  => "Water bolt",
+    904  => "Acid bolt",
+    905  => "+5 phys DS, +20 bolt DS",
+    906  => "Fire bolt",
+    907  => "Cold ball, splash targets",
+    908  => "Fire ball, splash targets",
+    909  => "AoE prone/RT/enfeeble, group safe",
+    910  => "Lightning bolt",
+    911  => "+20 dodge ranks, mass spell",
+    912  => "AoE knockdown, stun, stagger, disengage",
+    913  => "+10 DS, +20 ele. TD",
+    914  => "Stacking DoT, impact/unbalance crits",
+    915  => "Target's weapon flares caster's attunement",
+    916  => "Turn invisible",
+    917  => "SMR DoT",
+    918  => "Duplicates a magical item",
+    919  => "+50 DS for 1 min, 3 min CD",
+    
+    # Bard (1001-1030)
+    1001 => "-10% target def",
+    1002 => "Vibrates item out of target's hand",
+    1004 => "~+5% value to target gem, gem can explode",
+    1005 => "Sleep, single target",
+    1008 => "HP dmg + impact/unbalance crit, then stun/disorient",
+    1013 => "Dispels targeted or random spell",
+    1015 => "Open cast: -20 TD, + RT, group safe",
+    1016 => "Taunt target and force offensive stance",
+    
+    # Empath (1101-1130)
+    1101 => "Heals HP, or HP atk, no crits",
+    1102 => "Heal limb",
+    1103 => "Heals nerves",
+    1104 => "Heals head/neck",
+    1105 => "Heals back/chest/abs/eyes",
+    1106 => "Warding atk, target must have bones",
+    1107 => "Cure overexertion, stands from prone",
+    1108 => "Cause RT/flee/immobilize/death. Living only",
+    1110 => "Plasma bolt, then non-crit DoT",
+    1111 => "Heals limb scars, self-cast",
+    1112 => "Heals nerve scars, self-cast",
+    1113 => "Heals head/neck scars, self-cast",
+    1114 => "Heals chest/abs/back/eye scars, self-cast",
+    1115 => "Disintegration warding atk",
+    1116 => "60 sec healing buff, 30 min CD",
+    1118 => "Grows random herb in outdoor room",
+    1119 => "+12 DS, +12 sp. TD",
+    
+    # Minor Mental (1201-1230)
+    1201 => "Removes fear/rage and similar effects",
+    1202 => "+AsG when wearing robes",
+    1203 => "+ target spell prep time",
+    1204 => "+10 phys DS",
+    1205 => "+20 Trading ranks",
+    1206 => "Bolt atk, cast on object to fling at target",
+    1207 => "SMR knockdown",
+    1208 => "+20 mental TD",
+    1209 => "+10 UAF",
+    1210 => "Grapple ward atk, -crit padding debuff",
+    1211 => "Confuse target, they may attack allies",
+    1212 => "Disguise race/prof./gender, customize appearance",
+    1214 => "+ parry, must be unarmed",
+    1215 => "Chance to avoid phys. or bolt atks",
+    1217 => "Remotely watch target briefly",
+    1218 => "Strips prep, drains mana, or dispels effect",
+    1219 => "AoE multi-round inflict RT/prone, group safe",
+    
+    # Major Mental (1301-1319)
+    1315 => "Understand and read - not speak - more languages",
+    1319 => "+30 mental CS to next spell",
+
+    # Savant (1408-1417)
+    1408 => "Puncture bolt atk, possible dispel",
+    1409 => "Teleport item to/from another character",
+    1414 => "Ward atk, random dmg types",
+    1417 => "Open extradimensional locker, 50 lbs storage",
+    
+    # Paladin (1601-1650)
+    1601 => "+5 DS, +5 sp. TD",
+    1602 => "Inflict 3 sec. RT, +2 sec. slow, cancels Celerity",
+    1603 => "Plasma dmg, repeats on next atks. -5 DS/-3 TD/-5 SMR debuff",
+    1604 => "Extends weap/armor blessing, + plasma flares if Paladin/Cleric",
+    1605 => "+10% melee and thrown DF, shared with group",
+    1606 => "+10 AS, + sheer fear resist, +3 lvl sheer fear, + SMR def",
+    1607 => "+15 HP/stam, decaying stam regen, 5 min. CD for stam effects",
+    1608 => "+20 Armor Use ranks",
+    1610 => "+10 DS",
+    1614 => "-10% DS, -5% E/B/P; targeted or AoE",
+    1615 => "Ward atk, forces kneel/stagger. Evoke for +dmg, -disable",
+    1616 => "+4 CON, +HP, self-cast",
+    1618 => "Aura: +10 (heavy) dmg weighting, + deity flare",
+    1619 => "+50 sp. TD for 30 sec, 3.5 min CD",
+    
+    # Arcane
+    1701 => "Protect against dispel",
+    1704 => "Lightning AoE DoT, group safe",
+    1705 => "Moonstone Cube effect: +10 off/def combat maneuvers",
+    1706 => "Aura: fire flares random creatures",
+    1707 => "Steam bolt",
+    1708 => "Restricts target's high-lvl spell casting",
+    1709 => "Cold bolt: impact or cold crit",
+    1710 => "Acid ball, splash up to 8 targets",
+    1711 => "Quartz Orb effect: +10-30 CS, inverse to level",
+    1712 => "Small Statue effect: +25 melee, ranged, bolt DS",
+    1713 => "High dmg cloud, can drift to adj. rooms",
+    1714 => "AoE knockdown + RT, affects adj. rooms, group safe",
+    1715 => "AoE fire DoT, non-grouped only",
+    1716 => "30 sec temporary curse removal",
+    1718 => "+30 AS, force melee atk all targets, group safe, 30 sec CD",
+    1720 => "Become immune vs low-lvl offensive spells",
+    1750 => "Cast ANY scroll spell at least once, incr. by success margin",
+  }.freeze
+
+  # ---------------------------------------------------------------------------
+  # Paths - location of the per-character data file
+  # ---------------------------------------------------------------------------
+  module Paths
+    module_function
+
+    def data_dir
+      @data_dir ||= begin
+        game_dir = File.join(DATA_DIR, XMLData.game)
+        Dir.mkdir(game_dir) unless File.exist?(game_dir)
+        char_dir = File.join(game_dir, Char.name)
+        Dir.mkdir(char_dir) unless File.exist?(char_dir)
+        char_dir
+      end
+    end
+
+    def data_file
+      File.join(data_dir, 'reorder_spellbook.yaml')
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Store - YAML load/save
+  # ---------------------------------------------------------------------------
+  module Store
+    module_function
+
+    def empty
+      { 'version' => SCHEMA_VERSION, 'default_noun' => nil, 'books' => {} }
+    end
+
+    def load
+      return empty unless File.exist?(Paths.data_file)
+      data = YAML.load_file(Paths.data_file)
+      data = empty unless data.is_a?(Hash) && data['version'] == SCHEMA_VERSION
+      data['books'] ||= {}
+      data
+    rescue => e
+      Lich::Messaging.msg('yellow', "[ReorderSpellbook] Load error: #{e.message}") rescue nil
+      empty
+    end
+
+    def save(data)
+      File.write(Paths.data_file, data.to_yaml)
+    rescue => e
+      Lich::Messaging.msg('yellow', "[ReorderSpellbook] Save error: #{e.message}") rescue nil
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Settings - in-memory, file-backed access to the persisted state
+  # ---------------------------------------------------------------------------
+  module Settings
+    module_function
+
+    def state
+      @state ||= Store.load
+    end
+
+    def reload!
+      @state = Store.load
+    end
+
+    def save!
+      Store.save(state)
+    end
+
+    def default_noun
+      state['default_noun']
+    end
+
+    def default_noun=(noun)
+      state['default_noun'] = noun
+      save!
+    end
+
+    def known?(noun)
+      noun && state['books'].is_a?(Hash) && state['books'].key?(noun)
+    end
+
+    def page_count(noun)
+      ((state['books'] || {})[noun] || {})['page_count'].to_i
+    end
+
+    # Returns Array<Array<Spell|nil>>.
+    def layout(noun)
+      info = (state['books'] || {})[noun] || {}
+      (info['layout'] || []).map { |page| page.map { |slot| Spell.from_h(slot) } }
+    end
+
+    def store_layout(noun, layout)
+      state['books'][noun] = {
+        'page_count' => layout.size,
+        'layout'     => layout.map { |page| page.map { |s| s ? s.to_h : nil } },
+      }
+      state['default_noun'] = noun
+      save!
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Spell - one slot's worth of book content (nil = blank slot)
+  # ---------------------------------------------------------------------------
+  Spell = Struct.new(:name, :number, :charges) do
+    def to_h
+      { 'name' => name, 'number' => number, 'charges' => charges }
+    end
+
+    def short
+      "#{name} (#{number})"
+    end
+
+    def self.from_h(h)
+      return nil unless h.is_a?(Hash)
+      Spell.new(h['name'].to_s, h['number'].to_i, h['charges'].to_i)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Markup - Pango markup helpers (named Markup, not Pango, so we don't
+  # shadow the global ::Pango module that the gtk3 gem provides)
+  # ---------------------------------------------------------------------------
+  module Markup
+    module_function
+
+    def escape(s)
+      s.to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;')
+    end
+
+    def wiki_url(spell)
+      return nil unless spell
+      title = "#{spell.name} (#{spell.number})".gsub(' ', '_')
+      encoded = title.gsub(/[^A-Za-z0-9_()]/) { |c| CGI.escape(c) }
+      "https://gswiki.play.net/#{encoded}"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Parser - regexes for game responses
+  # ---------------------------------------------------------------------------
+  module Parser
+    module_function
+
+    PAGE_HEADER_RX     = /carefully study page (\d+)/.freeze
+    SLOT_SPELL_RX      = /^>?(\d+)\.\s+The (.+?)\s+\((\d+)\)\s+spell with (\d+) charges? remaining\./.freeze
+    SLOT_BLANK_RX      = /^>?(\d+)\.\s+This section is blank\./.freeze
+    TURN_RX            = /You turn your .+ from page (\d+) to page (\d+)\./.freeze
+    WRAP_RX            = /Having reached the end of your .+, you flip the book back from page (\d+) to page 1\./.freeze
+    PONDER_RX          = /You ponder over your .+, shifting your attention to the (\d+)/.freeze
+    TRANSFER_PRIME_RX  = /feel ready to copy the runes for/.freeze
+    TRANSFER_DONE_RX   = /each spell has swapped place|to its new section|copy the runes for/.freeze
+    NO_REF_RX          = /What were you referring to/.freeze
+
+    def strip(line)
+      line.to_s
+          .gsub(/<[^>]+>/, '')           # strip XML tags
+          .gsub(/\e\[[0-9;]*[mK]/, '')   # strip ANSI color codes
+          .gsub('&gt;', '>')             # decode entities BEFORE the
+          .gsub('&lt;', '<')             # leading-prompt strip below,
+          .gsub('&amp;', '&')            # so a pondered-slot line like
+          .gsub('&quot;', '"')           # "&gt;1.  The Iron Skin..."
+          .gsub('&apos;', "'")           # becomes ">1.  The Iron Skin..."
+          .gsub(/^>+\s*/, '')            # strip leading > (prompt / ponder marker)
+          .rstrip
+    end
+
+    # Extract page number and SLOTS_PER_PAGE slots from captured lines.
+    # @return [Array(Integer|nil, Array<Spell|nil>)]
+    def parse_page(lines)
+      page = nil
+      slots = Array.new(SLOTS_PER_PAGE, nil)
+      lines.each do |raw|
+        text = strip(raw)
+        if (m = text.match(PAGE_HEADER_RX))
+          page = m[1].to_i
+        elsif (m = text.match(SLOT_SPELL_RX))
+          idx = m[1].to_i
+          next unless idx.between?(1, SLOTS_PER_PAGE)
+          slots[idx - 1] = Spell.new(m[2].strip, m[3].to_i, m[4].to_i)
+        elsif text.match(SLOT_BLANK_RX)
+          # leave nil
+        end
+      end
+      [page, slots]
+    end
+
+    # Returns the last page number if a wrap message is present, else nil.
+    def parse_wrap(lines)
+      lines.each do |raw|
+        text = strip(raw)
+        if (m = text.match(WRAP_RX))
+          return m[1].to_i
+        end
+      end
+      nil
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # GameIO - thin wrapper over Lich::Util.issue_command
+  # ---------------------------------------------------------------------------
+  module GameIO
+    module_function
+
+    PROMPT_RX = /<prompt/.freeze
+
+    def issue(command, start_pattern, timeout: 4)
+      unless defined?(Lich::Util) && Lich::Util.respond_to?(:issue_command)
+        Lich::Messaging.msg('yellow', '[ReorderSpellbook] Lich::Util.issue_command unavailable.') rescue nil
+        return []
+      end
+      lines = Lich::Util.issue_command(
+        command,
+        start_pattern,
+        PROMPT_RX,
+        include_end: false,
+        timeout: timeout,
+        usexml: true
+      )
+      lines || []
+    rescue => e
+      Lich::Messaging.msg('yellow', "[ReorderSpellbook] Game I/O error on '#{command}': #{e.message}") rescue nil
+      []
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Preflight - verify the book is in hand and open before scan/execute.
+  # Issuing OPEN <noun> is idempotent (says "already open" if it was) and its
+  # response distinguishes the "not held" and "bad noun" failure modes that
+  # would otherwise leave us hanging on an unrecognized TURN response.
+  # ---------------------------------------------------------------------------
+  module Preflight
+    module_function
+
+    # OPEN responses vary by book type:
+    #   "You open ..."                                    (generic containers)
+    #   "You release the latch of ..., easing the cover open ..."  (grimoires)
+    #   "You carefully flatten the page in your spell book ..."    (spell books)
+    #   "That is already open" / "It is already open"
+    OPEN_RX = /You open|easing the cover open|release the latch|carefully flatten the page|already open|You'll need to be holding|What were you referring to|don't seem to have/.freeze
+
+    NOT_HOLDING_RX = /You'll need to be holding/.freeze
+    NO_REF_RX      = /What were you referring to|don't seem to have/.freeze
+
+    # Cheap inventory check (no game I/O, no side effects). Used at script
+    # startup to decide whether to open the GUI at all.
+    def in_hand?(noun)
+      return false if noun.to_s.empty?
+      target = noun.to_s.downcase
+      [GameObj.right_hand, GameObj.left_hand].compact.any? do |o|
+        o.noun.to_s.downcase == target
+      end
+    rescue
+      false
+    end
+
+    # Returns [:ok | :not_holding | :no_ref | :unknown, message_or_nil].
+    def check(noun)
+      lines = GameIO.issue("open #{noun}", OPEN_RX, timeout: 3)
+      if lines.empty?
+        return [:unknown, "No response from 'open #{noun}'. Is the noun right?"]
+      end
+      joined = lines.join("\n")
+      if joined =~ NOT_HOLDING_RX
+        return [:not_holding,
+                "Book '#{noun}' is not in your hands. Hold it (or RESERVE CLEAR #{noun}) and try again."]
+      end
+      if joined =~ NO_REF_RX
+        return [:no_ref, "Game does not recognize '#{noun}'. Check the noun."]
+      end
+      [:ok, nil]
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Scanner - reads the book by turning through every page
+  # ---------------------------------------------------------------------------
+  class Scanner
+    # Includes "You are already on that page" so issue_command captures even
+    # the no-op response when a TURN-TO targets the page we're already on.
+    PAGE_START_RX  = /You turn your .+ from page|Having reached the end of your|carefully study page|You are already on that page/.freeze
+    READ_START_RX  = /You glance down at your .+ and carefully study page/.freeze
+    ALREADY_RX     = /You are already on that page/.freeze
+
+    def initialize(noun, status_proc)
+      @noun = noun
+      @status = status_proc
+    end
+
+    # @return [Hash{page_count: Integer, layout: Array<Array<Spell|nil>>}, nil]
+    def scan
+      pf_status, pf_msg = Preflight.check(@noun)
+      unless pf_status == :ok
+        status(pf_msg, '#ff8888')
+        return nil
+      end
+
+      status("Scanning '#{@noun}': turning to page 1...")
+      first = GameIO.issue("turn #{@noun} to 1", PAGE_START_RX, timeout: 5)
+      if first.empty? || first.any? { |l| l =~ Parser::NO_REF_RX }
+        status("Game does not recognize '#{@noun}'. Set the right noun.", '#ff8888')
+        return nil
+      end
+
+      page1, slots1 = Parser.parse_page(first)
+      if page1.nil?
+        # "You are already on that page" omits the READ block; do an explicit READ.
+        read_resp = GameIO.issue("read #{@noun}", READ_START_RX, timeout: 4)
+        page1, slots1 = Parser.parse_page(read_resp)
+      end
+      unless page1 == 1
+        status("Could not parse page 1 (got #{page1.inspect}).", '#ff8888')
+        return nil
+      end
+
+      layout = [slots1]
+      current = 1
+      max_iter = 25 # safety cap on pages
+
+      max_iter.times do
+        status("Scanning '#{@noun}': page #{current + 1}...")
+        resp = GameIO.issue("turn #{@noun}", PAGE_START_RX, timeout: 5)
+        if resp.empty?
+          status("No response while turning past page #{current}.", '#ff8888')
+          return nil
+        end
+
+        if (last_page = Parser.parse_wrap(resp))
+          status("Scan complete: #{last_page} page(s).", '#80e080')
+          return { page_count: last_page, layout: layout }
+        end
+
+        page, slots = Parser.parse_page(resp)
+        if page.nil? || page == current
+          # No advancement (e.g. single-page book that didn't wrap); treat
+          # the page we're on as the last page.
+          status("Scan complete: #{current} page(s).", '#80e080')
+          return { page_count: current, layout: layout }
+        end
+
+        layout[page - 1] = slots
+        current = page
+      end
+
+      status("Scan aborted: more than #{max_iter} pages?", '#ff8888')
+      nil
+    end
+
+    private
+
+    def status(msg, color = '#88bbff')
+      @status&.call(msg, color)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Planner - decompose current -> target into the minimum pairwise swaps
+  # ---------------------------------------------------------------------------
+  module Planner
+    module_function
+
+    # `current` and `target` are Array<Array<Spell|nil>> with identical shape.
+    # Spells in `target` MUST be the same Ruby object_id as in `current`
+    # (since duplicates with identical name/number/charges are still distinct
+    # entries in the book). Blank slots are matched by position when possible
+    # so they don't generate spurious swaps.
+    #
+    # @return [Array<[ [page, slot], [page, slot] ]>] swap pairs (0-indexed)
+    def plan(current, target)
+      raise 'layout shape mismatch' if current.size != target.size
+
+      positions = []
+      current.each_with_index do |page, p|
+        page.each_with_index { |_, s| positions << [p, s] }
+      end
+
+      thing_current_pos = {}
+      thing_target_pos  = {}
+
+      positions.each do |pos|
+        spell = current[pos[0]][pos[1]]
+        key = spell ? [:spell, spell.object_id] : [:blank, pos]
+        thing_current_pos[key] = pos
+      end
+
+      target.each_with_index do |page, p|
+        page.each_with_index do |spell, s|
+          next unless spell
+          thing_target_pos[[:spell, spell.object_id]] = [p, s]
+        end
+      end
+
+      blank_keys = thing_current_pos.keys.select { |k| k.first == :blank }
+      target_blank_positions = positions.select { |pos| target[pos[0]][pos[1]].nil? }
+      remaining_blank_targets = target_blank_positions.dup
+      blank_keys.each do |key|
+        cur_pos = thing_current_pos[key]
+        if remaining_blank_targets.include?(cur_pos)
+          thing_target_pos[key] = cur_pos
+          remaining_blank_targets.delete(cur_pos)
+        end
+      end
+      blank_keys.reject { |k| thing_target_pos.key?(k) }.each_with_index do |k, i|
+        thing_target_pos[k] = remaining_blank_targets[i]
+      end
+
+      q = {}
+      thing_current_pos.each do |key, cur_pos|
+        tgt_pos = thing_target_pos[key]
+        next if cur_pos == tgt_pos
+        q[cur_pos] = tgt_pos
+      end
+
+      visited = Set.new
+      cycles = []
+      q.keys.each do |start|
+        next if visited.include?(start)
+        cycle = [start]
+        visited.add(start)
+        cur = q[start]
+        while cur && cur != start
+          cycle << cur
+          visited.add(cur)
+          cur = q[cur]
+        end
+        cycles << cycle if cycle.size > 1
+      end
+
+      # For cycle [c0, c1, ..., c(k-1)] with Q(c_i) = c_{i+1 mod k}:
+      # swap(c0,c1), swap(c0,c2), ..., swap(c0,c_{k-1}) -> k-1 swaps total.
+      swaps = []
+      cycles.each do |cycle|
+        anchor = cycle[0]
+        (1...cycle.size).each { |i| swaps << [anchor, cycle[i]] }
+      end
+      swaps
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Executor - run a planned swap sequence in-game
+  # ---------------------------------------------------------------------------
+  class Executor
+    TURN_START_RX     = /You turn your .+ from page|Having reached the end of your|carefully study page|You are already on that page/.freeze
+    PONDER_START_RX   = /You ponder over your|nothing happens|There is no spell in section|What were you referring to/.freeze
+    TRANSFER_START_RX = /feel ready to copy|each spell has swapped|to its new section|copy the runes for|There is no spell in section|nothing|cannot|no longer focused/i.freeze
+    NO_SPELL_RX       = /There is no spell in section/.freeze
+
+    def initialize(noun, status_proc, current_layout)
+      @noun = noun
+      @status = status_proc
+      @current_page = nil
+      # Mutable copy of the layout that we update after each successful swap,
+      # used to decide which side of a swap actually holds the spell (TRANSFER
+      # must be primed from the slot that has the spell, not the blank one).
+      @running = current_layout.map(&:dup)
+    end
+
+    # @return [Integer] swaps successfully completed
+    def execute(swaps)
+      pf_status, pf_msg = Preflight.check(@noun)
+      unless pf_status == :ok
+        status(pf_msg, '#ff8888')
+        return 0
+      end
+
+      done = 0
+      swaps.each_with_index do |(a, b), idx|
+        spell_a = @running.dig(a[0], a[1])
+        spell_b = @running.dig(b[0], b[1])
+
+        if spell_a.nil? && spell_b.nil?
+          # Two blanks swapping is a no-op; skip.
+          done += 1
+          next
+        end
+
+        # TRANSFER primes from the pondered slot, which MUST contain a spell.
+        # Pick the spell-bearing slot as the source.
+        src, dst = spell_a ? [a, b] : [b, a]
+
+        status("Swap #{idx + 1}/#{swaps.size}: " \
+               "p#{src[0] + 1}.s#{src[1] + 1} -> p#{dst[0] + 1}.s#{dst[1] + 1}")
+
+        turn_to(src[0] + 1)
+        ponder(src[1] + 1)
+        unless transfer_initiate
+          status("Transfer prime failed at swap #{idx + 1}; aborting.", '#ff8888')
+          return done
+        end
+        turn_to(dst[0] + 1)
+        ponder(dst[1] + 1)
+        unless transfer_finalize
+          status("Transfer finalize failed at swap #{idx + 1}; aborting.", '#ff8888')
+          return done
+        end
+
+        # Commit the swap to the running layout regardless of direction chosen.
+        @running[a[0]][a[1]], @running[b[0]][b[1]] = spell_b, spell_a
+        done += 1
+      end
+      status("Executed #{done}/#{swaps.size} swap(s).", '#80e080')
+      done
+    end
+
+    private
+
+    def status(msg, color = '#d4af37')
+      @status&.call(msg, color)
+    end
+
+    def turn_to(page)
+      return if @current_page == page
+      GameIO.issue("turn #{@noun} to #{page}", TURN_START_RX, timeout: 5)
+      @current_page = page
+    end
+
+    def ponder(slot)
+      GameIO.issue("ponder #{slot} #{@noun}", PONDER_START_RX, timeout: 4)
+    end
+
+    def transfer_initiate
+      lines = GameIO.issue("transfer #{@noun}", TRANSFER_START_RX, timeout: 4)
+      return false if lines.any? { |l| l =~ NO_SPELL_RX }
+      lines.any? { |l| l =~ Parser::TRANSFER_PRIME_RX }
+    end
+
+    def transfer_finalize
+      lines = GameIO.issue("transfer #{@noun}", TRANSFER_START_RX, timeout: 5)
+      lines.any? { |l| l =~ Parser::TRANSFER_DONE_RX }
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # SlotWidget - one button per slot, used in both Current and Target panes
+  # ---------------------------------------------------------------------------
+  class SlotWidget < Gtk::Button
+    attr_reader :page_idx, :slot_idx
+    attr_accessor :spell
+
+    def initialize(page_idx, slot_idx, on_click)
+      super()
+      @page_idx = page_idx
+      @slot_idx = slot_idx
+      @primed = false
+      @differs = false
+      @description_visible = false
+
+      @label = Gtk::Label.new
+      @label.set_use_markup(true)
+      @label.set_xalign(0.0)
+      @label.set_yalign(0.0)
+      @label.set_line_wrap(true)
+      @label.set_line_wrap_mode(:word_char)
+      @label.set_max_width_chars(24)
+      @label.set_justify(:left)
+      add(@label)
+
+      set_relief(Gtk::ReliefStyle::NORMAL)
+      set_size_request(200, 95)
+      signal_connect('clicked') { on_click&.call(self) }
+    end
+
+    def set_spell(spell)
+      @spell = spell
+      refresh
+    end
+
+    def set_primed(p)
+      @primed = p
+      refresh
+    end
+
+    def set_differs(d)
+      @differs = d
+      refresh
+    end
+
+    def set_description_visible(v)
+      @description_visible = v
+      refresh
+    end
+
+    def refresh
+      header = "<b>#{@slot_idx + 1}.</b>"
+      if @spell
+        name_part = ReorderSpellbook::Markup.escape(@spell.name)
+        body = "#{header} #{name_part} (#{@spell.number})\n" \
+               "#{@spell.charges} charge#{@spell.charges == 1 ? '' : 's'}"
+      else
+        body = "#{header} <i>blank</i>"
+      end
+
+      if @description_visible && @spell
+        desc = ReorderSpellbook::SPELL_DESCRIPTIONS[@spell.number].to_s
+        unless desc.empty?
+          body += "\n#{ReorderSpellbook::Markup.escape(desc)}"
+        end
+      end
+
+      # Bump the whole label one Pango size step so spell text reads cleanly.
+      sized = "<span size='large'>#{body}</span>"
+
+      bg = if @primed   then '#ffd54f'
+           elsif @differs then '#cfe9c4'
+           end
+
+      markup = bg ? "<span background='#{bg}' foreground='#000000'>#{sized}</span>" : sized
+      @label.set_markup(markup)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # PaneGrid - container of SlotWidgets for one pane (Current or Target)
+  # ---------------------------------------------------------------------------
+  class PaneGrid < Gtk::Frame
+    attr_reader :widgets
+
+    def initialize(title, on_click_factory)
+      super(title)
+      @on_click_factory = on_click_factory
+      @widgets = []
+      @grid = Gtk::Grid.new
+      @grid.column_spacing = 6
+      @grid.row_spacing    = 4
+      @grid.margin         = 6
+      add(@grid)
+    end
+
+    def rebuild(layout)
+      @grid.children.each { |c| @grid.remove(c) }
+      @widgets = []
+      layout.each_with_index do |page, p|
+        header = Gtk::Label.new
+        header.set_markup("<b>Page #{p + 1}</b>")
+        header.set_xalign(0.5)
+        @grid.attach(header, p, 0, 1, 1)
+
+        col = []
+        page.each_with_index do |spell, s|
+          handler = @on_click_factory&.call(p, s)
+          w = SlotWidget.new(p, s, handler)
+          w.set_spell(spell)
+          @grid.attach(w, p, s + 1, 1, 1)
+          col << w
+        end
+        @widgets << col
+      end
+      show_all
+    end
+
+    def update(layout)
+      layout.each_with_index do |page, p|
+        page.each_with_index { |spell, s| @widgets[p][s].set_spell(spell) }
+      end
+    end
+
+    def widget_at(page, slot)
+      @widgets.dig(page, slot)
+    end
+
+    def each_widget
+      @widgets.each { |col| col.each { |w| yield w } }
+    end
+
+    def set_descriptions_visible(v)
+      each_widget { |w| w.set_description_visible(v) }
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # MainWindow - top-level GTK window with current/target panes and controls
+  # ---------------------------------------------------------------------------
+  class MainWindow < Gtk::Window
+    attr_reader :cmd_queue
+
+    def initialize(cmd_queue, on_close)
+      super('Spell Book - Reorder')
+      @cmd_queue = cmd_queue
+      @on_close  = on_close
+      @noun      = Settings.default_noun.to_s
+      # @current_layout is the SAME object graph the target was deep-dup'd from,
+      # so per-spell object_id stays stable for diff detection. Settings.layout
+      # rebuilds fresh Spell instances on every call, which is why we cache here.
+      @current_layout = []
+      @target_layout  = []
+      @primed = nil
+      @undo_stack = []
+      @descriptions_visible = false
+      @viewing_current = false  # false = editable target view, true = read-only current
+
+      set_default_size(1150, 700)
+      signal_connect('destroy') { @on_close&.call }
+
+      build_ui
+      refresh_from_state
+    end
+
+    def set_status(msg, color = '#88bbff')
+      @status_label.set_markup("<span foreground='#{color}'>#{ReorderSpellbook::Markup.escape(msg)}</span>")
+    rescue
+      # The label may have been destroyed (window closed mid-operation).
+      nil
+    end
+
+    def refresh_from_state
+      @noun = Settings.default_noun.to_s
+      @noun_entry.text = @noun if @noun_entry
+      if @noun.empty?
+        set_status("No book noun set. Type one above (e.g. 'grim') and click 'Use this noun'.", '#ffaa44')
+        @pane.rebuild([])
+        update_page_count_label(0)
+        update_mode_label
+        return
+      end
+      unless Settings.known?(@noun)
+        set_status("Book '#{@noun}' has no saved layout. Click 'Rescan book'.", '#ffaa44')
+        @pane.rebuild([])
+        update_page_count_label(0)
+        update_mode_label
+        return
+      end
+
+      @current_layout = Settings.layout(@noun)
+      @target_layout  = deep_dup(@current_layout)
+      @undo_stack = []
+      @primed = nil
+      rebuild_pane
+      update_page_count_label(Settings.page_count(@noun))
+      set_status("Loaded #{spell_count(@current_layout)} spell(s) across #{@current_layout.size} page(s).", '#80e080')
+      update_undo_state
+      update_selection_label(nil)
+    end
+
+    # Swap the visible layout between target (editable) and current (read-only).
+    def rebuild_pane
+      shown = @viewing_current ? @current_layout : @target_layout
+      @pane.rebuild(shown)
+      # rebuild creates fresh SlotWidgets that default to descriptions-hidden;
+      # re-apply the toggle state so it survives a rescan / view-mode swap.
+      @pane.set_descriptions_visible(@descriptions_visible)
+      mark_diffs
+      update_mode_label
+    end
+
+    private
+
+    def build_ui
+      vbox = Gtk::Box.new(:vertical, 6)
+      vbox.margin = 8
+      add(vbox)
+
+      top = Gtk::Box.new(:horizontal, 6)
+      top.pack_start(Gtk::Label.new('Book noun:'), expand: false, fill: false, padding: 0)
+      @noun_entry = Gtk::Entry.new
+      @noun_entry.text = @noun
+      @noun_entry.set_width_chars(14)
+      top.pack_start(@noun_entry, expand: false, fill: false, padding: 0)
+
+      apply_btn = Gtk::Button.new(label: 'Use this noun')
+      apply_btn.signal_connect('clicked') { on_apply_noun }
+      top.pack_start(apply_btn, expand: false, fill: false, padding: 0)
+
+      rescan_btn = Gtk::Button.new(label: 'Rescan book')
+      rescan_btn.signal_connect('clicked') { on_rescan }
+      top.pack_start(rescan_btn, expand: false, fill: false, padding: 0)
+
+      @page_count_label = Gtk::Label.new
+      @page_count_label.set_xalign(0.0)
+      top.pack_start(@page_count_label, expand: true, fill: true, padding: 12)
+
+      vbox.pack_start(top, expand: false, fill: false, padding: 0)
+
+      @status_label = Gtk::Label.new
+      @status_label.set_xalign(0.0)
+      @status_label.set_use_markup(true)
+      vbox.pack_start(@status_label, expand: false, fill: false, padding: 0)
+
+      @mode_label = Gtk::Label.new
+      @mode_label.set_xalign(0.0)
+      @mode_label.set_use_markup(true)
+      vbox.pack_start(@mode_label, expand: false, fill: false, padding: 0)
+
+      @pane = PaneGrid.new('Spells', proc { |p, s| proc { |w| on_slot_click(p, s, w) } })
+      @scroll = Gtk::ScrolledWindow.new
+      @scroll.set_policy(:automatic, :automatic)
+      @scroll.add(@pane)
+      vbox.pack_start(@scroll, expand: true, fill: true, padding: 0)
+
+      sel = Gtk::Box.new(:horizontal, 6)
+      @selection_label = Gtk::Label.new
+      @selection_label.set_xalign(0.0)
+      @selection_label.set_use_markup(true)
+      sel.pack_start(@selection_label, expand: true, fill: true, padding: 0)
+      @wiki_button = Gtk::LinkButton.new('https://gswiki.play.net', 'Open wiki')
+      @wiki_button.sensitive = false
+      sel.pack_start(@wiki_button, expand: false, fill: false, padding: 0)
+      vbox.pack_start(sel, expand: false, fill: false, padding: 0)
+
+      bottom = Gtk::Box.new(:horizontal, 6)
+
+      reset_btn = Gtk::Button.new(label: 'Reset target to current')
+      reset_btn.signal_connect('clicked') { on_reset }
+      bottom.pack_start(reset_btn, expand: false, fill: false, padding: 0)
+
+      @undo_btn = Gtk::Button.new(label: 'Undo')
+      @undo_btn.signal_connect('clicked') { on_undo }
+      bottom.pack_start(@undo_btn, expand: false, fill: false, padding: 0)
+
+      desc_toggle = Gtk::ToggleButton.new(label: 'Show descriptions')
+      desc_toggle.signal_connect('toggled') do
+        @descriptions_visible = desc_toggle.active?
+        @pane.set_descriptions_visible(@descriptions_visible)
+      end
+      bottom.pack_start(desc_toggle, expand: false, fill: false, padding: 0)
+
+      @view_toggle = Gtk::ToggleButton.new(label: 'Show current (read-only)')
+      @view_toggle.signal_connect('toggled') do
+        @viewing_current = @view_toggle.active?
+        @view_toggle.label = @viewing_current ? 'Show target (editable)' : 'Show current (read-only)'
+        # Clear primed state when switching modes; meaningless across views.
+        @primed = nil
+        update_selection_label(nil)
+        rebuild_pane
+      end
+      bottom.pack_start(@view_toggle, expand: false, fill: false, padding: 0)
+
+      bottom.pack_start(Gtk::Label.new(''), expand: true, fill: true, padding: 0)
+
+      @send_btn = Gtk::Button.new(label: 'Send to game')
+      @send_btn.signal_connect('clicked') { on_send }
+      bottom.pack_start(@send_btn, expand: false, fill: false, padding: 0)
+
+      vbox.pack_start(bottom, expand: false, fill: false, padding: 0)
+
+      update_undo_state
+      update_selection_label(nil)
+      update_mode_label
+    end
+
+    def update_mode_label
+      if @viewing_current
+        @mode_label.set_markup(
+          "<span foreground='#ffaa44'><b>Viewing CURRENT layout (read-only)</b> - " \
+          "toggle 'Show target' to edit.</span>"
+        )
+        @pane.label = 'Spells (current - read-only)'
+      else
+        @mode_label.set_markup(
+          "<b>Editing TARGET layout</b> - click a slot to prime, click another to swap. " \
+          "Green = changed from current."
+        )
+        @pane.label = 'Spells (target - click to prime, click again to swap)'
+      end
+    end
+
+    def deep_dup(layout)
+      layout.map(&:dup)
+    end
+
+    def update_page_count_label(n)
+      @page_count_label.set_markup("<b>#{n}</b> page#{n == 1 ? '' : 's'}")
+    end
+
+    def spell_count(layout)
+      layout.flatten.compact.size
+    end
+
+    def mark_diffs
+      return if @current_layout.nil? || @current_layout.empty?
+      # Diffs only meaningful in target view; current view has nothing to
+      # compare against itself.
+      if @viewing_current
+        @pane.each_widget { |w| w.set_differs(false) }
+        return
+      end
+      @current_layout.each_with_index do |page, p|
+        page.each_with_index do |spell, s|
+          target = @target_layout.dig(p, s)
+          @pane.widget_at(p, s)&.set_differs(spell&.object_id != target&.object_id)
+        end
+      end
+    end
+
+    def on_apply_noun
+      new_noun = @noun_entry.text.to_s.strip.downcase
+      if new_noun.empty?
+        set_status('Enter a non-empty noun.', '#ff8888')
+        return
+      end
+      Settings.default_noun = new_noun
+      @noun = new_noun
+      if Settings.known?(new_noun)
+        refresh_from_state
+      else
+        set_status("Noun set to '#{new_noun}'. Click 'Rescan book' to read its layout.", '#88bbff')
+      end
+    end
+
+    def on_rescan
+      noun = @noun_entry.text.to_s.strip.downcase
+      if noun.empty?
+        set_status('Enter a noun first.', '#ff8888')
+        return
+      end
+      Settings.default_noun = noun
+      @noun = noun
+      set_status("Scanning '#{noun}'...", '#d4af37')
+      @cmd_queue.push({ action: :rescan, noun: noun })
+    end
+
+    def on_slot_click(page, slot, widget)
+      if @viewing_current
+        set_status(
+          "Read-only Current layout. Click 'Show target' to edit.",
+          '#ffaa44'
+        )
+        return
+      end
+
+      if @primed.nil?
+        @primed = [page, slot]
+        widget.set_primed(true)
+        update_selection_label(@target_layout.dig(page, slot))
+      elsif @primed == [page, slot]
+        @primed = nil
+        widget.set_primed(false)
+        update_selection_label(nil)
+      else
+        prev_page, prev_slot = @primed
+        prev = @pane.widget_at(prev_page, prev_slot)
+        prev&.set_primed(false)
+
+        @target_layout[prev_page][prev_slot], @target_layout[page][slot] =
+          @target_layout[page][slot], @target_layout[prev_page][prev_slot]
+        @pane.widget_at(prev_page, prev_slot).set_spell(@target_layout[prev_page][prev_slot])
+        @pane.widget_at(page, slot).set_spell(@target_layout[page][slot])
+        @undo_stack << [[prev_page, prev_slot], [page, slot]]
+        @primed = nil
+        update_selection_label(nil)
+        mark_diffs
+        update_undo_state
+      end
+    end
+
+    def on_reset
+      @target_layout = deep_dup(@current_layout)
+      @undo_stack = []
+      @primed = nil
+      rebuild_pane
+      update_undo_state
+      update_selection_label(nil)
+      set_status('Target reset to current.', '#88bbff')
+    end
+
+    def on_undo
+      return if @undo_stack.empty?
+      a, b = @undo_stack.pop
+      @target_layout[a[0]][a[1]], @target_layout[b[0]][b[1]] =
+        @target_layout[b[0]][b[1]], @target_layout[a[0]][a[1]]
+      # Only refresh visible widgets if target is the active view.
+      unless @viewing_current
+        @pane.widget_at(*a).set_spell(@target_layout[a[0]][a[1]])
+        @pane.widget_at(*b).set_spell(@target_layout[b[0]][b[1]])
+        mark_diffs
+      end
+      update_undo_state
+    end
+
+    def update_undo_state
+      @undo_btn.sensitive = !@undo_stack.empty?
+    end
+
+    def on_send
+      if @current_layout.nil? || @current_layout.empty?
+        set_status('Nothing to send: no scanned layout.', '#ff8888')
+        return
+      end
+      # Plan HERE, in the GUI thread, where @current_layout and @target_layout
+      # share Spell object_ids. If we deferred planning to the worker thread it
+      # would re-load `cur` from Settings.layout (fresh Spell instances) and the
+      # planner would silently drop every spell-to-spell swap.
+      swaps = Planner.plan(@current_layout, @target_layout)
+      if swaps.empty?
+        set_status('Target matches current; nothing to send.', '#88bbff')
+        return
+      end
+      set_status("Queued #{swaps.size} swap(s)...", '#d4af37')
+      @cmd_queue.push({
+        action:  :execute,
+        noun:    @noun,
+        swaps:   swaps,
+        current: deep_dup(@current_layout),
+      })
+    end
+
+    def update_selection_label(spell)
+      if spell
+        text = "Selected: <b>#{ReorderSpellbook::Markup.escape(spell.short)}</b>  -  " \
+               "#{spell.charges} charge#{spell.charges == 1 ? '' : 's'}"
+        @selection_label.set_markup(text)
+        @wiki_button.uri = ReorderSpellbook::Markup.wiki_url(spell)
+        @wiki_button.label = "Open #{spell.short} on wiki"
+        @wiki_button.sensitive = true
+      else
+        @selection_label.set_markup('<i>No slot selected.</i>')
+        @wiki_button.label = 'Open wiki'
+        @wiki_button.sensitive = false
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # App - dispatch ;send, drain queue, run game I/O
+  # ---------------------------------------------------------------------------
+  class App
+    CMD_PREFIX = 'rsb '.freeze
+
+    def initialize
+      Settings.reload!
+      @cmd_queue = Queue.new
+      @running   = true
+      @window    = nil
+
+      arg = Script.current.vars[1].to_s.strip.downcase
+      if !arg.empty? && arg != 'rescan'
+        Settings.default_noun = arg
+      end
+      @initial_rescan = (arg == 'rescan')
+    end
+
+    def run
+      Lich::Messaging.msg('yellow',
+        "[ReorderSpellbook] v#{VERSION} - book noun: #{Settings.default_noun.inspect}")
+
+      unless defined?(Gtk) && Gtk.respond_to?(:queue)
+        Lich::Messaging.msg('yellow', '[ReorderSpellbook] GTK3 not available; cannot run.')
+        return
+      end
+
+      # Refuse to open the GUI if the saved book noun isn't in either hand.
+      # Skip the check if no noun is saved yet (user needs the GUI to set one).
+      noun = Settings.default_noun.to_s
+      if !noun.empty? && !Preflight.in_hand?(noun)
+        Lich::Messaging.msg('yellow',
+          "[ReorderSpellbook] '#{noun}' is not in your hands. Hold it (or RESERVE CLEAR #{noun}) and re-run ;reorder-spellbook.")
+        return
+      end
+
+      Thread.new do
+        Gtk.queue do
+          @window = MainWindow.new(@cmd_queue, -> { @running = false })
+          @window.show_all
+        end
+      end
+
+      if @initial_rescan && !Settings.default_noun.to_s.empty?
+        @cmd_queue.push({ action: :rescan, noun: Settings.default_noun })
+      end
+
+      # Poll instead of blocking on `get`: a blocking get only wakes when the
+      # game sends a line, which can leave GUI-originated tasks (e.g. Rescan)
+      # sitting in the queue for many seconds in a quiet room. Polling at 50ms
+      # keeps queue latency under a tenth of a second at negligible CPU cost.
+      while @running
+        while (line = get?)
+          handle_send(line.to_s.strip)
+        end
+        drain_queue
+        sleep 0.05
+      end
+    ensure
+      Gtk.queue { @window&.destroy rescue nil } rescue nil
+      Settings.save! rescue nil
+      Lich::Messaging.msg('yellow', '[ReorderSpellbook] Stopped.') rescue nil
+    end
+
+    private
+
+    def handle_send(line)
+      return unless line.start_with?(CMD_PREFIX)
+      args = line[CMD_PREFIX.length..].to_s.strip
+      case args
+      when '', 'help'
+        msg_help
+      when 'rescan'
+        if Settings.default_noun.to_s.empty?
+          Lich::Messaging.msg('yellow', '[ReorderSpellbook] No noun set. Use ;send rsb noun <noun> first.')
+        else
+          @cmd_queue.push({ action: :rescan, noun: Settings.default_noun })
+        end
+      when /\Anoun\s+(\S+)\z/i
+        new_noun = $1.downcase
+        Settings.default_noun = new_noun
+        Gtk.queue { @window&.refresh_from_state rescue nil }
+        Lich::Messaging.msg('yellow', "[ReorderSpellbook] Active noun set to '#{new_noun}'.")
+      else
+        Lich::Messaging.msg('yellow', "[ReorderSpellbook] Unknown: #{args}. Try ;send rsb help")
+      end
+    end
+
+    def msg_help
+      [
+        'Commands:',
+        '  ;send rsb help',
+        '  ;send rsb noun <noun>',
+        '  ;send rsb rescan',
+      ].each { |l| Lich::Messaging.msg('yellow', "[ReorderSpellbook] #{l}") }
+    end
+
+    def drain_queue
+      while (task = @cmd_queue.pop(true) rescue nil)
+        case task[:action]
+        when :rescan  then do_rescan(task[:noun])
+        when :execute then do_execute(task[:noun], task[:swaps], task[:current])
+        end
+      end
+    end
+
+    def do_rescan(noun)
+      noun = noun.to_s.strip.downcase
+      return if noun.empty?
+      result = Scanner.new(noun, status_proc).scan
+      return unless result
+      Settings.store_layout(noun, result[:layout])
+      Gtk.queue { @window&.refresh_from_state rescue nil }
+    end
+
+    # Receives the swap list (already planned in the GUI thread) and a snapshot
+    # of the layout the swaps were planned against. We do NOT re-plan here:
+    # Settings.layout would build fresh Spell instances and the Planner would
+    # see no spell-to-spell matches.
+    def do_execute(noun, swaps, current_layout)
+      noun = noun.to_s.strip.downcase
+      return if noun.empty? || swaps.nil? || swaps.empty?
+
+      Executor.new(noun, status_proc, current_layout).execute(swaps)
+
+      Gtk.queue { @window&.set_status('Rescanning to verify...', '#d4af37') rescue nil }
+      result = Scanner.new(noun, status_proc).scan
+      return unless result
+      Settings.store_layout(noun, result[:layout])
+      Gtk.queue { @window&.refresh_from_state rescue nil }
+    end
+
+    def status_proc
+      proc { |msg, color = '#88bbff'|
+        Gtk.queue { @window&.set_status(msg, color) rescue nil }
+      }
+    end
+  end
+end
+
+ReorderSpellbook::App.new.run
