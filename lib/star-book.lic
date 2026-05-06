@@ -56,7 +56,6 @@
   v1.3 - Added multi-spell sequential casting.
   v1.4 - Multi-spell uses comma-delimited groups with optional per-spell targets.
   v1.5 - GTK setup UI; Reserve slot support; charge tracking with live window updates.
-  v1.6 - Specifies <book_noun> to avoid confusion between multiple invocable items.
 =end
 
 require 'rexml/document'
@@ -138,7 +137,17 @@ SCROLL_W = 54
 
 # ---------------------------------------------------------------------------
 module StarTome
+  @window_open = false
+
   module_function
+
+  def window_open?
+    @window_open
+  end
+
+  def window_open=(val)
+    @window_open = val
+  end
 
   def script_args
     vars = Script.current.vars.to_a
@@ -243,18 +252,12 @@ module StarTome
     item = held_book
     return item if item
 
-    get_pat  = /You (?:pick up|remove|pull|reach|grab|retrieve|carefully remove)/i
+    cont    = saved_container_name
+    get_pat = /You (?:pick up|remove|pull|reach|grab|retrieve|carefully remove)/i
     fail_pat = /Get what|What were you referring to|You have to empty/i
-
-    if use_reserve?
-      result = dothistimeout("reserve clear #{phrase}", 6, Regexp.union(get_pat, fail_pat))
-      fail_with("Could not RESERVE CLEAR '#{phrase}'.") unless result.to_s =~ get_pat
-    else
-      cont = saved_container_name
-      cmd  = cont.empty? ? "get #{phrase}" : "get #{phrase} from my #{cont}"
-      result = dothistimeout(cmd, 6, Regexp.union(get_pat, fail_pat))
-      fail_with("Could not get '#{phrase}'. Check the name with ;star-book setup.") unless result.to_s =~ get_pat
-    end
+    cmd     = cont.empty? ? "get #{phrase}" : "get #{phrase} from my #{cont}"
+    result  = dothistimeout(cmd, 6, Regexp.union(get_pat, fail_pat))
+    fail_with("Could not get '#{phrase}'. Check the name with ;star-book setup.") unless result.to_s =~ get_pat
 
     20.times { item = held_book; break if item; sleep 0.1 }
     fail_with("Got something but could not find '#{phrase}' in hand.") unless item
@@ -263,23 +266,15 @@ module StarTome
     item
   end
 
-  def stow_book(_item)
+  def stow_book(item)
+    return unless item
     phrase = saved_book_name
-    if use_reserve?
-      # Turn to the reserved page before reserving so it's on the right page.
-      if saved_reserve_page
-        quiet_capture("turn #{book_noun} to #{saved_reserve_page}",
-          /You (?:turn|are already)|carefully study page/, timeout: 6)
-      end
-      dothistimeout("reserve #{phrase}", 5, /You reserve|Reserve what/i)
+    cont   = saved_container_name
+    if cont.empty?
+      dothistimeout("stow my #{phrase}", 5, /You (?:put|slip|tuck|stow|drop)|Stow what/i)
     else
-      cont = saved_container_name
-      if cont.empty?
-        dothistimeout("stow my #{phrase}", 5, /You (?:put|slip|tuck|stow|drop)|Stow what/i)
-      else
-        dothistimeout("put my #{phrase} in my #{cont}", 5,
-          /You (?:put|slip|tuck|drop)|Put what|You (?:can't|cannot|need|must|have to)/i)
-      end
+      dothistimeout("put my #{phrase} in my #{cont}", 5,
+        /You (?:put|slip|tuck|drop)|Put what|You (?:can't|cannot|need|must|have to)/i)
     end
   end
 
@@ -472,7 +467,7 @@ module StarTome
     end.join('|')
 
     CharSettings[SBOOK_CACHE_SETTING] = updated
-    refresh_window(load_cache)
+    populate_window(load_cache)
   end
 
   # ---------------------------------------------------------------------------
@@ -489,16 +484,24 @@ module StarTome
   # ---------------------------------------------------------------------------
 
   def invoke_and_cast(item, target_slot, cast_target, prep_only, _state)
-    navigate_to_page(item, target_slot)
+    # Only navigate if we actually have the book in hand.
+    navigate_to_page(item, target_slot) if item
+
     fput "invoke #{target_slot[:number]} #{book_noun}"
     return if prep_only
-    fput cast_target.to_s.strip.empty? ? 'cast' : "cast #{cast_target.strip}"
-    decrement_charge(target_slot)
-  end
 
-  # Returns true if the spell is on the reserved page -- no get/stow or TURN needed.
-  def on_reserved_page?(target_slot)
-    use_reserve? && saved_reserve_page && target_slot[:page] == saved_reserve_page
+    cast_cmd = cast_target.to_s.strip.empty? ? 'cast' : "cast #{cast_target.strip}"
+
+    # Attempt cast; retry once if prep was lost (e.g. stunned during invoke).
+    result = dothistimeout(cast_cmd, 12,
+      /You gesture|You (?:cast|hurl|launch|release|chant|intone)|don't have a spell prepared|must prepare/i)
+
+    if result.to_s =~ /don't have a spell prepared|must prepare/i
+      fput "invoke #{target_slot[:number]} #{book_noun}"
+      fput cast_cmd
+    end
+
+    decrement_charge(target_slot)
   end
 
   # Invoke a spell directly from reserve (book stays in reserve slot, no TURN needed).
@@ -722,14 +725,20 @@ module StarTome
   # Spellbook window
   # ---------------------------------------------------------------------------
 
+  # Opens (or re-opens) the window and fills it with current data.
   def refresh_window(state = nil)
     state ||= load_cache
     SBookWindow.create(SBOOK_WINDOW_TITLE, resident: true, clear: true)
+    StarTome.window_open = true
+    populate_window(state)
+  end
 
-    unless state
-      SBookWindow.sendline(SBOOK_WINDOW_TITLE, "No spell data cached. Run ;#{Script.current.name} scan.")
-      return
-    end
+  # Updates window content without opening it (used after each cast).
+  # Only runs if the window has been opened this session.
+  def populate_window(state = nil)
+    return unless StarTome.window_open?
+    state ||= load_cache
+    return unless state
 
     total = state[:all_slots].reject { |s| s[:blank] }.length
     SBookWindow.sendline(SBOOK_WINDOW_TITLE, saved_book_name, bold: true)
@@ -892,7 +901,7 @@ module StarTome
         cast_tgt = parts[1].to_s.strip
         cast_tgt = nil if cast_tgt.empty? || %w[prep hold].include?(cast_tgt.downcase)
         target_slot = StarTome.find_spell_slot(state, spell_q)
-        if StarTome.on_reserved_page?(target_slot)
+        if StarTome.use_reserve?
           StarTome.invoke_reserved(target_slot, cast_tgt, prep_only)
         else
           item ||= StarTome.get_book
@@ -936,7 +945,7 @@ module StarTome
 
     cast_target = target_words.empty? ? nil : target_words.join(' ')
 
-    if StarTome.on_reserved_page?(target_slot)
+    if StarTome.use_reserve?
       StarTome.invoke_reserved(target_slot, cast_target, prep_only)
     else
       item = StarTome.get_book

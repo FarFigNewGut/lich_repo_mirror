@@ -1,22 +1,21 @@
 =begin
   scrollbrowser.lic
   Author: Thunderumpus
-  Version: 2.0
+  Version: 2.3
   Tags: scrolls
 
-  Based off of ;readpawnscrolls
   Scans all tables in the current room for scrolls and displays a clickable
   list of spells found. Click a scroll name to pick it up.
 
   Usage:
-    ;scrollbrowser        -- scan tables in current room and display results
-    ;scrollbrowser list   -- display last cached results without rescanning
-	
-	
-	
-  Author: Thunderumpus
-  Version: 2.0
-  Tags: scrolls
+    ;scrollbrowser                  -- scan using saved spell filter (or all if none saved)
+    ;scrollbrowser 911, 511, 712    -- scan and only show scrolls containing
+                                       any of the listed spell numbers.
+                                       Matching spells are bolded.
+    ;scrollbrowser list             -- display last cached results using saved filter
+    ;scrollbrowser list 911, 511    -- filter last cached results by spell numbers
+    ;scrollbrowser setup            -- open GTK setup GUI to configure default spell filter
+    ;scrollbrowser reset            -- clear saved settings
 =end
 
 module ScrollBrowser
@@ -29,6 +28,183 @@ module ScrollBrowser
   # State -- always fresh per run
   # ----------------------------
   @scroll_data = {}   # scroll_id => { name: String, spells: [[num, name], ...] }
+
+  # ----------------------------
+  # Eloot integration
+  # ----------------------------
+  def self.eloot_yaml_path
+    File.join(DATA_DIR, XMLData.game, Char.name, 'eloot.yaml')
+  end
+
+  def self.load_eloot_keep_scrolls
+    path = eloot_yaml_path
+    return [] unless File.exist?(path)
+
+    data = YAML.load_file(path) rescue nil
+    return [] unless data.is_a?(Hash)
+
+    raw = data[:sell_keep_scrolls] || data['sell_keep_scrolls'] || []
+    raw.map { |entry| entry.to_s.scan(/\d+/).first.to_i }.select(&:positive?).uniq.sort
+  rescue StandardError
+    []
+  end
+
+  # ----------------------------
+  # GTK Setup GUI
+  # ----------------------------
+  module SetupGUI
+    def self.run
+      unless defined?(Gtk) && Gtk::Version::MAJOR == 3
+        echo "GTK3 is not available. Cannot open setup GUI."
+        exit
+      end
+
+      require 'yaml'
+
+      saved_filter    = CharSettings['scrollbrowser_spell_filter'].to_s
+      saved_use_eloot = CharSettings['scrollbrowser_use_eloot'] == 'true'
+      eloot_spells    = ScrollBrowser.load_eloot_keep_scrolls
+      eloot_display   = eloot_spells.empty? ? "(no eloot keep list found)" : eloot_spells.join(', ')
+
+      @running = true
+      @result  = nil
+
+      Gtk.queue do
+        @win = Gtk::Window.new(:toplevel)
+        @win.set_title("ScrollBrowser Setup")
+        @win.set_default_size(420, 260)
+        @win.set_border_width(12)
+        @win.keep_above = true
+
+        vbox = Gtk::Box.new(:vertical, 10)
+        @win.add(vbox)
+
+        grid = Gtk::Grid.new
+        grid.set_column_spacing(12)
+        grid.set_row_spacing(8)
+        grid.set_border_width(6)
+        vbox.pack_start(grid, expand: true, fill: true, padding: 0)
+
+        # Manual filter field
+        lbl_filter = Gtk::Label.new("Default Spell Filter:")
+        lbl_filter.set_halign(:end)
+        grid.attach(lbl_filter, 0, 0, 1, 1)
+
+        @filter_entry = Gtk::Entry.new
+        @filter_entry.set_placeholder_text("e.g. 911, 511, 712  (leave blank for all)")
+        @filter_entry.set_text(saved_filter) unless saved_filter.empty?
+        @filter_entry.set_hexpand(true)
+        @filter_entry.set_sensitive(!saved_use_eloot)
+        grid.attach(@filter_entry, 1, 0, 1, 1)
+
+        hint = Gtk::Label.new("Leave blank to show all scrolls by default.")
+        hint.set_halign(:start)
+        hint.set_margin_start(4)
+        grid.attach(hint, 1, 1, 1, 1)
+
+        # Separator
+        sep = Gtk::Separator.new(:horizontal)
+        grid.attach(sep, 0, 2, 2, 1)
+
+        # Eloot checkbox
+        @eloot_check = Gtk::CheckButton.new("Use eloot keep scroll list instead")
+        @eloot_check.set_active(saved_use_eloot)
+        grid.attach(@eloot_check, 0, 3, 2, 1)
+
+        # Eloot spells display
+        lbl_eloot = Gtk::Label.new("Eloot keep list:")
+        lbl_eloot.set_halign(:end)
+        grid.attach(lbl_eloot, 0, 4, 1, 1)
+
+        @eloot_display_lbl = Gtk::Label.new(eloot_display)
+        @eloot_display_lbl.set_halign(:start)
+        @eloot_display_lbl.set_line_wrap(true)
+        @eloot_display_lbl.set_max_width_chars(40)
+        @eloot_display_lbl.set_margin_start(4)
+        grid.attach(@eloot_display_lbl, 1, 4, 1, 1)
+
+        # Toggle filter entry sensitivity when eloot checkbox changes
+        @eloot_check.signal_connect("toggled") do
+          @filter_entry.set_sensitive(!@eloot_check.active?)
+        end
+
+        # Buttons
+        btnrow = Gtk::Box.new(:horizontal, 8)
+        vbox.pack_start(btnrow, expand: false, fill: false, padding: 4)
+
+        save_btn = Gtk::Button.new(label: "Save")
+        save_btn.signal_connect("clicked") do
+          filter_val    = @filter_entry.text.strip
+          use_eloot_val = @eloot_check.active? ? 'true' : 'false'
+          @result = { filter: filter_val, use_eloot: use_eloot_val }
+          @win.destroy
+        end
+        btnrow.pack_end(save_btn, expand: false, fill: false, padding: 0)
+
+        cancel_btn = Gtk::Button.new(label: "Cancel")
+        cancel_btn.signal_connect("clicked") { @win.destroy }
+        btnrow.pack_end(cancel_btn, expand: false, fill: false, padding: 0)
+
+        @win.signal_connect("destroy") do
+          Gtk.queue { @running = false }
+        end
+
+        @win.show_all
+      end
+
+      wait_while { @running }
+
+      if @result
+        CharSettings['scrollbrowser_spell_filter'] = @result[:filter]
+        CharSettings['scrollbrowser_use_eloot']    = @result[:use_eloot]
+
+        if @result[:use_eloot] == 'true'
+          echo "Setup saved: using eloot keep scroll list (#{eloot_display})"
+        elsif @result[:filter].empty?
+          echo "Setup saved: no default filter (shows all scrolls)."
+        else
+          echo "Setup saved: default filter = #{@result[:filter]}"
+        end
+      else
+        echo "Setup cancelled."
+      end
+    end
+  end
+
+  # ----------------------------
+  # Arg parsing
+  # ----------------------------
+  def self.parse_args(args)
+    raw = args[1..-1].compact.join(' ').strip
+
+    return ['setup', []] if raw =~ /\Asetup\z/i
+    return ['reset', []] if raw =~ /\Areset\z/i
+
+    if raw =~ /\Alist\s*(.*)\z/i
+      filter_str = $1.strip
+      filter = filter_str.empty? ? active_filter : parse_spell_filter(filter_str)
+      return ['list', filter]
+    end
+
+    return ['scan', parse_spell_filter(raw)] unless raw.empty?
+
+    ['scan', active_filter]
+  end
+
+  # Returns the active filter based on settings -- eloot list takes priority over manual filter
+  def self.active_filter
+    if CharSettings['scrollbrowser_use_eloot'] == 'true'
+      require 'yaml'
+      load_eloot_keep_scrolls
+    else
+      parse_spell_filter(CharSettings['scrollbrowser_spell_filter'].to_s)
+    end
+  end
+
+  def self.parse_spell_filter(str)
+    return [] if str.nil? || str.strip.empty?
+    str.scan(/\d+/).map(&:to_i).uniq
+  end
 
   # ----------------------------
   # Helpers
@@ -70,20 +246,40 @@ module ScrollBrowser
   # ----------------------------
   # Output
   # ----------------------------
-  def self.display_results
-    if @scroll_data.empty?
-      respond "No scrolls found."
+  def self.display_results(spell_filter = [])
+    filtered = if spell_filter.empty?
+      @scroll_data
+    else
+      @scroll_data.select do |_id, data|
+        data[:spells].any? { |num, _name| spell_filter.include?(num) }
+      end
+    end
+
+    if filtered.empty?
+      if spell_filter.empty?
+        respond "No scrolls found."
+      else
+        respond "No scrolls found containing spell(s): #{spell_filter.join(', ')}"
+      end
       return
     end
 
     respond ""
-    respond "=== Pawnshop Scrolls ==="
+    if spell_filter.empty?
+      respond "=== Pawnshop Scrolls ==="
+    else
+      respond "=== Pawnshop Scrolls (filter: #{spell_filter.join(', ')}) ==="
+    end
     respond ""
 
-    @scroll_data.each do |scroll_id, data|
+    filtered.each do |scroll_id, data|
       puts "<d cmd=\"get ##{scroll_id}\">#{data[:name]}</d>"
       data[:spells].each do |num, name|
-        puts "   #{num}: #{name}"
+        if !spell_filter.empty? && spell_filter.include?(num)
+          puts "<preset id='bold'>   #{num}: #{name}</preset>"
+        else
+          puts "   #{num}: #{name}"
+        end
       end
       puts ""
     end
@@ -133,19 +329,30 @@ module ScrollBrowser
   # Main
   # ----------------------------
   def self.run(args)
-    cmd = args[1].to_s.strip.downcase
+    cmd, spell_filter = parse_args(args)
 
-    if cmd == 'list'
+    case cmd
+    when 'setup'
+      SetupGUI.run
+      return
+
+    when 'reset'
+      CharSettings['scrollbrowser_spell_filter'] = nil
+      CharSettings['scrollbrowser_use_eloot']    = nil
+      echo "Settings cleared."
+      return
+
+    when 'list'
       if @scroll_data.empty?
         respond "[scrollbrowser] No cached data. Run without arguments to scan first."
       else
-        display_results
+        display_results(spell_filter)
       end
       return
     end
 
     scan
-    display_results
+    display_results(spell_filter)
   end
 end
 
