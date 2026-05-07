@@ -6,20 +6,20 @@ require 'thread'
 =begin
   Stay Mounted
 
-  Keeps your selected mount summoned and attempts to keep you mounted.
+  This script keeps your selected mount summoned and attempts to keep you
+  mounted, while optionally using mounted combat abilities when conditions
+  are right. It is designed to automate summon, remount, and mounted combat
+  actions while minimizing redundant commands and respecting cooldowns.
+
+  The script runs continuously and evaluates mount state, room presence,
+  cooldowns, stance, and combat context on a short polling interval.
 
   Usage:
     ;staymounted <mount>
     ;staymounted
     ;staymounted setup
 
-  Examples:
-    ;staymounted unicorn
-    ;staymounted yierka
-    ;staymounted horse
-		etc
-
-  Notes:
+  Features:
   - Mount argument can be a common/uncommon/rare noun for that mount family.
   - If no mount argument is supplied, script uses the mount family selected in ;staymounted setup.
   - Script determines the summoning item noun for the selected family.
@@ -28,25 +28,34 @@ require 'thread'
   - If summon item is not in inventory, the script checks for evidence that you are already mounted.
   - While mounted in offensive stance, script can use MOUNT TRAMPLE (3+ targets, chance-based) and MOUNT CHARGE.
   - Mount combat toggles are configurable in ;staymounted setup.
-  - For mount attacks, pauses hunt3_v2/bigshot if running.
-  - After MOUNT TRAMPLE, keeps those scripts paused until you are remounted.
+  - Optional pause settings let you pause `bigshot` and/or additional scripts during mounted actions.
+  - After MOUNT TRAMPLE, paused scripts remain paused until remount completes or timeout cleanup releases them.
   - Summon/mount attempts are throttled to reduce command spam.
   - If both hands are occupied, the script stashes the right hand before mounting and restores it afterward.
+  - MOUNT CHARGE now requires a weapon in hand before it will fire.
+  - The script skips active work while bleeding or during ecleanse disarm recovery.
   - Defers mount/summon/hand actions during ecleanse disarm recovery events.
 
+  Changelog:
+    1.3.21 (2026-05-06)
+      - Replaced the old master pause toggle with `Pause bigshot` plus an additional scripts list in setup, matching EnergyWings wording.
+      - Added remount unpause timeout protection and shutdown cleanup so paused scripts are less likely to get stranded.
+      - Updated pause ownership handling to work more safely with shared pause users like `energywings`.
+      - Added a charge-only weapon-in-hand guard so `MOUNT CHARGE` does not fire barehanded.
+    1.3.20 (2026-05-01)
+      - If you're bleeding the script will not do anything as injuries prevent you from riding.
+      - Added option in ;staymounted setup to toggle spell casting for MOUNT CHARGE.
+      - Mount/remount now uses right-hand stash/equip with a 10-second timeout guard.
+
   Author: Ruseoffools, Codex
-  Version: 1.3.20
-  Recently changed:
-	  - If you're bleeding the script will not do anything as injuries prevent you from riding.
-    - Added option in ;staymounted setup to toggle spell casting for MOUNT CHARGE.
-    - Mount/remount now uses right-hand stash/equip with a 10-second timeout guard.
   Tags: mount, utility, automation, ride, summon
+  Version: 1.3.21
 =end
 
 module StayMounted
   module_function
 
-  VERSION = '1.3.20'
+  VERSION = '1.3.21'
   POLL_SECONDS = 3
   REMOUNT_POLL_SECONDS = 1
   SUMMON_MOUNT_WAIT_SECONDS = 2
@@ -54,13 +63,14 @@ module StayMounted
   MOUNT_CHARGE_COOLDOWN_WAIT_SECONDS = 5
   HAND_ACTION_TIMEOUT_SECONDS = 10
   REMOUNT_UNPAUSE_TIMEOUT_SECONDS = 15
-  MANAGED_COMBAT_SCRIPTS = %w[hunt3_v2 bigshot].freeze
+  DEFAULT_SCRIPTS_TO_PAUSE = %w[bigshot hunt3_v2].freeze
   PAUSE_OWNER_KEY = 'staymounted'
   DEFAULT_SETTINGS = {
     selected_mount_family: nil,
     use_mount_charge: true,
     use_mount_trample: true,
-    pause_other_scripts: true,
+    pause_bigshot: DEFAULT_SCRIPTS_TO_PAUSE.include?('bigshot'),
+    additional_pause_scripts: 'hunt3_v2',
     prep_spell_for_mount_charge: false,
     mount_charge_prep_spell: nil
   }.freeze
@@ -443,6 +453,13 @@ module StayMounted
     (Effects::Cooldowns.to_h || {}).keys.any? { |k| k.to_s.downcase.include?(needle) }
   end
 
+  def scripts_to_pause
+    scripts = []
+    scripts << 'bigshot' if @settings[:pause_bigshot]
+    scripts.concat(parse_script_list_setting(@settings[:additional_pause_scripts]))
+    scripts.map(&:strip).reject(&:empty?).uniq
+  end
+
   def charge_loadout_ready?
     hand_holds_weapon?(GameObj.right_hand) || hand_holds_weapon?(GameObj.left_hand)
   rescue StandardError
@@ -529,10 +546,12 @@ module StayMounted
   end
 
   def pause_managed_combat_scripts
-    return unless @settings[:pause_other_scripts]
     return if @managed_pause_active
 
-    acquire_shared_script_pauses(PAUSE_OWNER_KEY, MANAGED_COMBAT_SCRIPTS)
+    scripts = scripts_to_pause
+    return if scripts.empty?
+
+    acquire_shared_script_pauses(PAUSE_OWNER_KEY, scripts)
     @managed_pause_active = true
   end
 
@@ -562,7 +581,7 @@ module StayMounted
   def unpause_managed_combat_scripts
     return unless @managed_pause_active
 
-    release_shared_script_pauses(PAUSE_OWNER_KEY, MANAGED_COMBAT_SCRIPTS)
+    release_shared_script_pauses(PAUSE_OWNER_KEY, scripts_to_pause)
     @managed_pause_active = false
   end
 
@@ -715,7 +734,8 @@ module StayMounted
     selected_mount_family = normalize_mount_family_setting(Settings[Char.name]['staymounted_selected_mount_family'])
     charge = Settings[Char.name]['staymounted_use_mount_charge']
     trample = Settings[Char.name]['staymounted_use_mount_trample']
-    pause_other_scripts = Settings[Char.name]['staymounted_pause_other_scripts']
+    pause_bigshot = Settings[Char.name]['staymounted_pause_bigshot']
+    additional_pause_scripts = Settings[Char.name]['staymounted_additional_pause_scripts']
     prep_charge_spell = Settings[Char.name]['staymounted_prep_spell_for_mount_charge']
     mount_charge_spell = normalize_spell_number_setting(Settings[Char.name]['staymounted_mount_charge_prep_spell'])
 
@@ -723,7 +743,8 @@ module StayMounted
       selected_mount_family: selected_mount_family,
       use_mount_charge: parse_setting_bool(charge, DEFAULT_SETTINGS[:use_mount_charge]),
       use_mount_trample: parse_setting_bool(trample, DEFAULT_SETTINGS[:use_mount_trample]),
-      pause_other_scripts: parse_setting_bool(pause_other_scripts, DEFAULT_SETTINGS[:pause_other_scripts]),
+      pause_bigshot: parse_setting_bool(pause_bigshot, DEFAULT_SETTINGS[:pause_bigshot]),
+      additional_pause_scripts: normalize_script_list_setting(additional_pause_scripts, DEFAULT_SETTINGS[:additional_pause_scripts]),
       prep_spell_for_mount_charge: parse_setting_bool(prep_charge_spell, DEFAULT_SETTINGS[:prep_spell_for_mount_charge]),
       mount_charge_prep_spell: mount_charge_spell
     )
@@ -731,7 +752,8 @@ module StayMounted
     Settings[Char.name]['staymounted_selected_mount_family'] = settings[:selected_mount_family]&.to_s
     Settings[Char.name]['staymounted_use_mount_charge'] = settings[:use_mount_charge]
     Settings[Char.name]['staymounted_use_mount_trample'] = settings[:use_mount_trample]
-    Settings[Char.name]['staymounted_pause_other_scripts'] = settings[:pause_other_scripts]
+    Settings[Char.name]['staymounted_pause_bigshot'] = settings[:pause_bigshot]
+    Settings[Char.name]['staymounted_additional_pause_scripts'] = normalize_script_list_setting(settings[:additional_pause_scripts], DEFAULT_SETTINGS[:additional_pause_scripts])
     Settings[Char.name]['staymounted_prep_spell_for_mount_charge'] = settings[:prep_spell_for_mount_charge]
     Settings[Char.name]['staymounted_mount_charge_prep_spell'] = settings[:mount_charge_prep_spell]
     Settings.save
@@ -752,6 +774,14 @@ module StayMounted
     else
       default
     end
+  end
+
+  def normalize_script_list_setting(value, default = '')
+    parse_script_list_setting(value.nil? ? default : value).join(', ')
+  end
+
+  def parse_script_list_setting(value)
+    value.to_s.split(/[,\r\n;]+/).map(&:strip).reject(&:empty?)
   end
 
   def normalize_mount_family_setting(value)
@@ -776,20 +806,23 @@ module StayMounted
     selected_mount_family = normalize_mount_family_setting(Settings[Char.name]['staymounted_selected_mount_family'])
     use_mount_charge = Settings[Char.name]['staymounted_use_mount_charge']
     use_mount_trample = Settings[Char.name]['staymounted_use_mount_trample']
-    pause_other_scripts = Settings[Char.name]['staymounted_pause_other_scripts']
+    pause_bigshot = Settings[Char.name]['staymounted_pause_bigshot']
+    additional_pause_scripts = Settings[Char.name]['staymounted_additional_pause_scripts']
     prep_spell_for_mount_charge = Settings[Char.name]['staymounted_prep_spell_for_mount_charge']
     mount_charge_prep_spell = normalize_spell_number_setting(Settings[Char.name]['staymounted_mount_charge_prep_spell'])
 
     selected_mount_family = DEFAULT_SETTINGS[:selected_mount_family] if selected_mount_family.nil?
     use_mount_charge = DEFAULT_SETTINGS[:use_mount_charge] if use_mount_charge.nil?
     use_mount_trample = DEFAULT_SETTINGS[:use_mount_trample] if use_mount_trample.nil?
-    pause_other_scripts = DEFAULT_SETTINGS[:pause_other_scripts] if pause_other_scripts.nil?
+    pause_bigshot = DEFAULT_SETTINGS[:pause_bigshot] if pause_bigshot.nil?
+    additional_pause_scripts = DEFAULT_SETTINGS[:additional_pause_scripts] if additional_pause_scripts.nil?
     prep_spell_for_mount_charge = DEFAULT_SETTINGS[:prep_spell_for_mount_charge] if prep_spell_for_mount_charge.nil?
     mount_charge_prep_spell = DEFAULT_SETTINGS[:mount_charge_prep_spell] if mount_charge_prep_spell.nil?
 
     window = window_action = nil
-    trample_check = charge_check = pause_scripts_check = prep_spell_check = nil
-    spell_entry = nil
+    trample_check = charge_check = prep_spell_check = nil
+    pause_bigshot_check = nil
+    spell_entry = additional_pause_scripts_entry = nil
     mount_checks = {}
     save_message = nil
 
@@ -798,16 +831,19 @@ module StayMounted
 
       trample_check = Gtk::CheckButton.new("Use Mount Trample")
       charge_check = Gtk::CheckButton.new("Use Mount Charge")
-      pause_scripts_check = Gtk::CheckButton.new("Pause other scripts while mounting/combat")
+      pause_bigshot_check = Gtk::CheckButton.new("Pause bigshot")
       prep_spell_check = Gtk::CheckButton.new("Prep spell before Mount Charge")
       spell_entry = Gtk::Entry.new
+      additional_pause_scripts_entry = Gtk::Entry.new
 
       trample_check.active = use_mount_trample
       charge_check.active = use_mount_charge
-      pause_scripts_check.active = parse_setting_bool(pause_other_scripts, DEFAULT_SETTINGS[:pause_other_scripts])
+      pause_bigshot_check.active = parse_setting_bool(pause_bigshot, DEFAULT_SETTINGS[:pause_bigshot])
       prep_spell_check.active = parse_setting_bool(prep_spell_for_mount_charge, DEFAULT_SETTINGS[:prep_spell_for_mount_charge])
       spell_entry.text = mount_charge_prep_spell.to_s
+      additional_pause_scripts_entry.text = additional_pause_scripts.to_s
       spell_entry.width_chars = 8 if spell_entry.respond_to?(:width_chars=)
+      additional_pause_scripts_entry.width_chars = 36 if additional_pause_scripts_entry.respond_to?(:width_chars=)
       spell_entry.sensitive = prep_spell_check.active?
 
       prep_spell_check.signal_connect('toggled') {
@@ -823,7 +859,12 @@ module StayMounted
       main_box.add(Gtk::Label.new("StayMounted Combat Settings"))
       main_box.add(trample_check)
       main_box.add(charge_check)
-      main_box.add(pause_scripts_check)
+      main_box.add(Gtk::HSeparator.new)
+      main_box.add(Gtk::Label.new("Pause these scripts while wing abilities fire"))
+      main_box.add(pause_bigshot_check)
+      main_box.add(Gtk::Label.new("Additional scripts to pause (comma or semicolon separated)"))
+      main_box.add(additional_pause_scripts_entry)
+      main_box.add(Gtk::HSeparator.new)
       main_box.add(prep_spell_check)
       main_box.add(Gtk::Label.new("Spell number to prep/release for Mount Charge"))
       main_box.add(spell_entry)
@@ -867,10 +908,11 @@ module StayMounted
           selected_mount_family = mount_checks.find { |_family, check| check.active? }&.first
           use_mount_trample = trample_check.active?
           use_mount_charge = charge_check.active?
-          pause_other_scripts = pause_scripts_check.active?
+          pause_bigshot = pause_bigshot_check.active?
+          additional_pause_scripts = normalize_script_list_setting(additional_pause_scripts_entry.text, DEFAULT_SETTINGS[:additional_pause_scripts])
           prep_spell_for_mount_charge = prep_spell_check.active?
           mount_charge_prep_spell = normalize_spell_number_setting(spell_entry.text)
-          save_message = "settings saved: family=#{selected_mount_family || 'none'} trample=#{use_mount_trample} charge=#{use_mount_charge} pause_scripts=#{pause_other_scripts} prep_charge_spell=#{prep_spell_for_mount_charge} spell=#{mount_charge_prep_spell || 'none'}"
+          save_message = "settings saved: family=#{selected_mount_family || 'none'} trample=#{use_mount_trample} charge=#{use_mount_charge} pause_bigshot=#{pause_bigshot} prep_charge_spell=#{prep_spell_for_mount_charge} spell=#{mount_charge_prep_spell || 'none'}"
           window_action = :save
         }
       }
@@ -888,7 +930,8 @@ module StayMounted
     Settings[Char.name]['staymounted_selected_mount_family'] = selected_mount_family&.to_s
     Settings[Char.name]['staymounted_use_mount_charge'] = use_mount_charge
     Settings[Char.name]['staymounted_use_mount_trample'] = use_mount_trample
-    Settings[Char.name]['staymounted_pause_other_scripts'] = pause_other_scripts
+    Settings[Char.name]['staymounted_pause_bigshot'] = pause_bigshot
+    Settings[Char.name]['staymounted_additional_pause_scripts'] = normalize_script_list_setting(additional_pause_scripts, DEFAULT_SETTINGS[:additional_pause_scripts])
     Settings[Char.name]['staymounted_prep_spell_for_mount_charge'] = prep_spell_for_mount_charge
     Settings[Char.name]['staymounted_mount_charge_prep_spell'] = mount_charge_prep_spell
     Settings.save
