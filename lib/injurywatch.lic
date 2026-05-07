@@ -1,38 +1,69 @@
 =begin
 
-  InjuryWatch - Triage window for StormFront/Wrayth
+  InjuryWatch - Room triage display for Gemstone IV
 
-  *** BETA - Work in progress, Published to get feedback please contact me with issues you find ***
+  *** BETA - Published, feedback welcome ***
 
-  InjuryWatch creates a dockable window in StormFront or Wrayth that shows
-  everyone currently in your room along with a simple triage status so you
-  can quickly identify who needs healing without cluttering your story window.
+  InjuryWatch tracks everyone in your room and displays a triage status for
+  each person so you can quickly identify who needs healing. It silently
+  appraises each person as they arrive and updates automatically as things
+  change - no commands needed during normal use.
 
-  When someone enters the room the script silently appraises them and labels
-  them with one of the following statuses:
-
+  Triage statuses:
       OK, Scarred, Injured, Bleeding, Nerve dmg, Poisoned, Diseased, Dead
 
-  The window updates automatically when people arrive or leave, when you
-  change rooms, and when you manually appraise someone. If you want to force
-  a refresh you can use the alias injr to re-appraise everyone in the room
-  or injr <name> to refresh a specific person.
+  Dead people show their injury status too, e.g. "Dead - Bleeding", so you
+  know what they will need when they are raised.
 
-  To start with debug output showing what the script is doing in real time:
+  The display updates automatically when:
+      - Someone arrives or leaves the room
+      - You change rooms (clears and rescans)
+      - You manually appraise someone
+      - A dead person is raised (checked every 15 seconds)
+
+  To force a manual refresh:
+      ;injurywatch refresh         re-appraises everyone in the room
+      ;injurywatch refresh <name>  re-appraises one specific person
+
+  Optional shortcut alias (saves typing):
+      ;alias add injr=;send injurywatch refresh \?
+      Then use: injr or injr <name>
+
+  To start with debug output:
       ;injurywatch debug
 
-  Known limitations:
-    - Cannot detect when another empath heals someone (manual refresh needed)
-    - Bodies fogged or dragged in may briefly show ? before resolving
-    - Requires StormFront or Wrayth frontend
+  Display modes:
+      The display mode is auto-detected based on your client. You can change
+      it using the setup screen or by setting the variable directly.
+
+      ;injurywatch setup
+          Opens a setup window to choose your display mode.
+
+      ;vars set injurywatch_display=dock
+          Dockable panel in StormFront or Wrayth (default for those clients).
+
+      ;vars set injurywatch_display=popup
+          Floating popup window, works in any client that supports GTK.
+
+      ;vars set injurywatch_display=text
+          Prints to your story window, works in all clients including Wizard.
+
+      Leave the variable unset or delete it to use auto-detection.
+
+  Known issues:
+      - Dead person detection and revival tracking are still being refined.
+        If someone shows incorrect Dead status use injr <name> to correct it.
+      - Cannot auto-detect when another empath heals someone.
+        Use injr <name> to refresh their status after they are healed.
+      - Bodies fogged or dragged in may briefly show ? before resolving.
+      - Poisoned and Diseased statuses are not yet fully tested.
 
        author: Mystienne
-         Game: Gemstone
+         game: gs
+         tags: heal, empath, triage, injury, window, hud
+     required: Lich >= 5.11.0
         email: Mystienne@mystienne.com
       discord: Mystienne
-         game: Gemstone IV
-         tags: heal, empath, triage, injury, window, hud
-     required: Lich >= 5.11.0, StormFront or Wrayth frontend
 
 =end
 
@@ -41,10 +72,7 @@ no_pause_all
 hide_me
 silence_me
 
-unless ['stormfront', 'wrayth'].include?($frontend)
-  respond "InjuryWatch only works in StormFront/Wrayth."
-  exit
-end
+
 
 module InjuryWatch
 
@@ -58,9 +86,138 @@ module InjuryWatch
   WOUND_WORDS = /fractured|severed|mangled|missing|crushed|broken|bruise|bruises|trauma/i
 
   @debug = false
+  @bulk_appraising = false
   def self.debug?; @debug; end
   def self.debug=(v); @debug = v; end
   def self.dbg(msg); respond "[IW] #{msg}" if @debug; end
+  def self.bulk_appraising?; @bulk_appraising; end
+  def self.bulk_appraising=(v); @bulk_appraising = v; end
+
+  # ---------------------------------------------------------------------------
+  # Detect or load display mode
+  # Supported: :dock (StormFront/Wrayth), :popup (all frontends)
+  # ---------------------------------------------------------------------------
+  def self.display_mode
+    saved = Vars[:injurywatch_display].to_s.strip
+    mode = if saved.empty?
+      # Auto detect - frontend takes priority over GTK
+      if ['stormfront', 'wrayth'].include?($frontend)
+        :dock
+      elsif defined?(Gtk)
+        :popup
+      else
+        :text
+      end
+    else
+      saved.to_sym
+    end
+
+    # Fallback if requested mode isn't available
+    if mode == :popup && !defined?(Gtk)
+      unless @warned_mode
+        respond "[InjuryWatch] GTK not available - using text mode."
+        @warned_mode = true
+      end
+      :text
+    elsif mode == :dock && !['stormfront', 'wrayth'].include?($frontend)
+      unless @warned_mode
+        respond "[InjuryWatch] Dock requires StormFront/Wrayth - using text mode."
+        @warned_mode = true
+      end
+      :text
+    else
+      mode
+    end
+  end
+
+  def self.display_mode=(mode)
+    Vars[:injurywatch_display] = mode.to_s
+  end
+
+  # ---------------------------------------------------------------------------
+  # GTK display - persistent window with live-updating labels
+  # ---------------------------------------------------------------------------
+  module PopupDisplay
+    @window  = nil
+    @labels  = {}
+    @running = false
+
+    def self.running?; @running; end
+
+    @exit_requested = false
+    def self.exit_requested?; @exit_requested; end
+
+    def self.open
+      return if @running
+      unless defined?(Gtk)
+        respond "[InjuryWatch] GTK is not available in this environment. Use display=dock instead."
+        return
+      end
+      @running = true
+      Gtk.queue do
+        @window = Gtk::Window.new
+        @window.title = 'Injury Watch'
+        @window.keep_above = true
+        @window.set_default_size(220, 80)
+        @window.signal_connect('delete_event') {
+          @window  = nil
+          @running = false
+          @exit_requested = true
+          false
+        }
+        @vbox = Gtk::Box.new(:vertical, 2)
+        @vbox.border_width = 4
+        @window.add(@vbox)
+        @window.show_all
+      end
+    end
+
+    def self.close
+      return unless @running
+      @running = false
+      return unless @window
+      Gtk.queue do
+        @window&.destroy rescue nil
+        @window = nil
+        @labels = {}
+      end
+    end
+
+    def self.update(people_status)
+      return unless @running
+      rows = people_status.values.sort_by { |p| p[:noun] }
+      Gtk.queue do
+        # Remove old labels
+        @vbox.children.each { |c| @vbox.remove(c) }
+        @labels = {}
+        if rows.empty?
+          lbl = Gtk::Label.new('No one here.')
+          lbl.set_alignment(0.0, 0.5)
+          @vbox.pack_start(lbl, expand: false, fill: false, padding: 1)
+        else
+          rows.each do |person|
+            lbl = Gtk::Label.new("#{person[:noun]}: #{person[:status]}")
+            lbl.set_alignment(0.0, 0.5)
+            @labels[person[:noun]] = lbl
+            @vbox.pack_start(lbl, expand: false, fill: false, padding: 1)
+          end
+        end
+        @window.resize(220, [rows.length * 20 + 16, 40].max)
+        @window.show_all
+      end
+    end
+
+    def self.not_running
+      return unless @running
+      Gtk.queue do
+        @vbox.children.each { |c| @vbox.remove(c) }
+        lbl = Gtk::Label.new('-- not running --')
+        lbl.set_alignment(0.0, 0.5)
+        @vbox.pack_start(lbl, expand: false, fill: false, padding: 1)
+        @window.show_all
+      end
+    end
+  end
 
   def self.strip_xml(str)
     str.to_s.gsub(/<[^>]+>/, '').gsub(/\s+/, ' ').strip
@@ -138,7 +295,7 @@ module InjuryWatch
     end
   end
 
-  def self.build_dialog(people_status)
+  def self.build_dock_xml(people_status)
     rows       = people_status.values.sort_by { |p| p[:noun] }
     row_height = 18
     top_pad    = 10
@@ -165,19 +322,43 @@ module InjuryWatch
     xml
   end
 
+  def self.display(people_status)
+    case display_mode
+    when :dock
+      puts(build_dock_xml(people_status))
+    when :popup
+      PopupDisplay.update(people_status)
+    when :text
+      rows = people_status.values.sort_by { |p| p[:noun] }
+      snapshot = rows.map { |p| "#{p[:noun]}:#{p[:status]}" }.join(",")
+      if snapshot != @last_text_snapshot
+        @last_text_snapshot = snapshot
+        respond "--- Injury Watch ---"
+        rows.empty? ? respond("  No one here.") : rows.each { |p| respond "  #{p[:noun]}: #{p[:status]}" }
+        respond "--------------------"
+      end
+    end
+  end
+
   def self.main
     before_dying do
       DownstreamHook.remove("iw_manual_appraise")
-      puts(
-        "<closeDialog id='InjuryWatch'/>"         "<openDialog type='dynamic' id='InjuryWatch' title='Injury Watch' "         "target='InjuryWatch' location='main' height='44' width='260' resident='true'>"         "<dialogData id='InjuryWatch' clear='t'>"         "<label id='iw0' value='-- not running --' justify='4' "         "top='10' left='5' height='18' width='245'/>"         "</dialogData></openDialog>"
-      )
+      DownstreamHook.remove("iw_death_watch")
+      DownstreamHook.remove("iw_revival_watch")
+      UpstreamHook.remove("iw_refresh")
+      if display_mode == :popup
+        PopupDisplay.close
+      end
     end
+
+    # Open GTK window if needed
+    PopupDisplay.open if display_mode == :popup
 
     checked       = {}
     people_status = {}
     known_dead    = []  # nouns we know are dead before they appear in GameObj
 
-    # Watch for revival — "The glazed look leaves X" fires on every rez regardless of custom message
+    # Watch for revival - "The glazed look leaves X" fires on every rez regardless of custom message
     DownstreamHook.add("iw_revival_watch", proc { |line|
       plain = line.gsub(/<[^>]+>/, ' ').gsub(/\s+/, ' ').strip
       if plain =~ /The glazed look leaves (\w+)/i
@@ -186,7 +367,7 @@ module InjuryWatch
         if entry && entry[1][:status] =~ /^Dead/
           dbg "revival watch -> glazed look left #{noun}, re-appraising"
           entry[1][:status] = "..."
-          puts(build_dialog(people_status))
+          display(people_status)
           refresh_queue << "refresh #{noun}"
         end
       end
@@ -216,9 +397,9 @@ module InjuryWatch
           next if entry[1][:status] =~ /^Dead/  # already marked, don't spam
           dbg "death watch -> #{noun} found, marking Dead"
           prior = entry[1][:status]
-          injury = (prior.nil? || prior == "..." || prior == "?") ? "..." : prior
+          injury = (prior.nil? || prior == "..." || prior == "?" || prior =~ /^Dead/) ? "..." : prior
           entry[1][:status] = "Dead - #{injury}"
-          puts(build_dialog(people_status))
+          display(people_status)
           # Queue appraise to confirm injury status
           refresh_queue << "refresh #{noun}"
         else
@@ -229,13 +410,15 @@ module InjuryWatch
       line
     })
 
-    # Watch for manual appraisals — matches both XML stream and plain text versions
-    last_appraised_id = nil
+    # Watch for manual appraisals - matches both XML stream and plain text versions
+    refresh_queue        = []
+    last_appraised_id    = nil
+    last_appraised_noun  = nil
     DownstreamHook.add("iw_manual_appraise", proc { |line|
       noun       = nil
       wound_text = nil
 
-      # XML version — grab name from tag content, wounds from end of line
+      # XML version - grab name from tag content, wounds from end of line
       if line =~ /You take a quick appraisal of <a [^>]*>([^<]+)<\/a> and find that [^<]*<[^>]+>[^<]*<\/[^>]+> has (.*?)\./i
         noun       = Regexp.last_match(1).strip
         wound_text = Regexp.last_match(2).gsub(/<[^>]+>/, '').gsub(/\s+/, ' ').strip
@@ -246,17 +429,33 @@ module InjuryWatch
         wound_text = Regexp.last_match(2).strip
       end
 
-      # Scar follow-up line — upgrade last appraised person from OK to Scarred
+      # "She is also quite dead." comes as a separate line after the wound line
+      plain = line.gsub(/<[^>]+>/, ' ').gsub(/\s+/, ' ').strip
+      if plain =~ /^(?:He|She) is also quite dead/i && last_appraised_noun
+        entry = people_status.find { |_id, p| p[:noun].downcase == last_appraised_noun.downcase }
+        if entry
+          dbg "manual appraise -> #{last_appraised_noun} is quite dead"
+          entry[1][:status] = "Dead - ..."
+          refresh_queue << "refresh #{last_appraised_noun}"
+          last_appraised_noun = nil
+          last_appraised_id   = nil
+          display(people_status)
+        end
+      end
+
+      # Scar follow-up line - upgrade last appraised person from OK to Scarred
+      # Only valid if the scar line immediately follows the appraise line
       if last_appraised_id && line !~ /You take a quick appraisal/i && line =~ /<a [^>]*>(?:He|She)<\/a> has (.*?)\./i
         scar_candidate = Regexp.last_match(1).gsub(/<[^>]+>/, '').gsub(/\s+/, ' ').strip
         if scar_candidate =~ SCAR_WORDS && people_status[last_appraised_id]&.dig(:status) == "OK"
           dbg "manual appraise -> scar follow-up for #{people_status[last_appraised_id][:noun]}: upgrading to Scarred"
           people_status[last_appraised_id][:status] = "Scarred"
-          puts(build_dialog(people_status))
+          display(people_status)
         end
+        last_appraised_id = nil  # clear after scar check so it doesn't bleed into next appraise
       end
 
-      if noun && wound_text
+      if noun && wound_text && !InjuryWatch.bulk_appraising?
         dbg "manual appraise -> noun: #{noun} wound: #{wound_text[0,60]}"
         entry = people_status.find { |_id, p| p[:noun].downcase == noun.downcase }
         dbg "manual appraise -> #{noun} #{entry ? 'found in window' : 'NOT in window'}"
@@ -274,15 +473,16 @@ module InjuryWatch
           elsif all_text =~ SCAR_WORDS   then "Scarred"
           else "OK"
           end
-          # Never overwrite Dead status from manual appraise — use injr to refresh
+          # Never overwrite Dead status from manual appraise - use injr to refresh
           if people_status[id][:status] =~ /^Dead/
             next
           end
           status = injury
           dbg "manual appraise -> #{noun} status set to: #{status}"
           people_status[id][:status] = status
-          last_appraised_id = id
-          puts(build_dialog(people_status))
+          last_appraised_noun = noun
+          last_appraised_id = (status == "OK") ? id : nil  # only track if OK, waiting for possible scar line
+          display(people_status)
         end
       end
       line
@@ -293,17 +493,18 @@ module InjuryWatch
       checked[id] = true
       people_status[id] = { noun: pc[:noun], status: "..." }
     end
-    puts(build_dialog(people_status))
+    display(people_status)
 
+    InjuryWatch.bulk_appraising = true if display_mode == :text
     startup_people.each do |id, pc|
       people_status[id][:status] = appraise(pc[:noun])
     end
-    puts(build_dialog(people_status))
+    InjuryWatch.bulk_appraising = false
+    display(people_status)
 
     last_room = Room.current.id
 
     # Intercept ;injurywatch r/refresh commands via UpstreamHook
-    refresh_queue = []
     UpstreamHook.add("iw_refresh", proc { |cmd|
       cmd_clean = cmd.gsub(/^<c>/, '').strip
       if cmd_clean =~ /^#{Regexp.escape($lich_char)}(?:injurywatch|inj)\s+(r|refresh)(?:\s+(\S+))?$/i
@@ -316,14 +517,24 @@ module InjuryWatch
       end
     })
 
+    # Also listen for ;send injurywatch refresh <name> messages from the injr alias
+    Thread.new do
+      loop do
+        msg = Script.current.gets
+        next unless msg
+        msg = msg.strip
+        refresh_queue << msg if msg =~ /^(?:r|refresh)(?:\s+\S+)?$/i
+      end
+    end
+
     loop do
-      # When we change rooms, wipe state — everyone here is new to us
+      # When we change rooms, wipe state - everyone here is new to us
       if Room.current.id != last_room
         last_room = Room.current.id
         checked.clear
         people_status.clear
         known_dead.clear
-        puts(build_dialog(people_status))
+        display(people_status)
         sleep CHECK_EVERY
         next
       end
@@ -351,8 +562,10 @@ module InjuryWatch
         end
       end
 
-      puts(build_dialog(people_status)) if !gone_ids.empty? || !new_ids.empty?
+      # For text mode, skip the intermediate "..." display - wait for appraisals
+      display(people_status) if (!gone_ids.empty? || !new_ids.empty?) && display_mode != :text
 
+      InjuryWatch.bulk_appraising = true if display_mode == :text
       new_ids.each do |id|
         if people_status[id][:status] == "Dead - ..."
           injury = appraise(current[id][:noun])
@@ -363,8 +576,10 @@ module InjuryWatch
           people_status[id][:status] = appraise(current[id][:noun])
         end
       end
+      InjuryWatch.bulk_appraising = false
 
-      puts(build_dialog(people_status)) unless new_ids.empty?
+      # Display once after all arrivals appraised, or on any departure
+      display(people_status) if !new_ids.empty? || !gone_ids.empty?
 
       # Handle refresh commands sent via ;send injurywatch refresh [noun]
       until refresh_queue.empty?
@@ -376,13 +591,13 @@ module InjuryWatch
             dbg "refresh #{target_noun}"
             result = appraise(entry[1][:noun])
             if result == "Dead"
-              # Still dead — keep dead status with current injury if known
+              # Still dead - keep dead status with current injury if known
               current = people_status[entry[0]][:status]
               people_status[entry[0]][:status] = current =~ /^Dead - / ? current : "Dead - ?"
             elsif result != "?"
               people_status[entry[0]][:status] = result
             end
-            puts(build_dialog(people_status))
+            display(people_status)
           else
             respond "[InjuryWatch] #{target_noun} not found in room."
           end
@@ -392,7 +607,7 @@ module InjuryWatch
             next if p[:status] == "Dead"
             people_status[id][:status] = appraise(p[:noun])
           end
-          puts(build_dialog(people_status))
+          display(people_status)
         end
       end
 
@@ -407,31 +622,126 @@ module InjuryWatch
           if result != "?" && result != "Dead" && result !~ /^Dead/
             dbg "revival detected: #{p[:noun]} no longer dead, status: #{result}"
             people_status[id][:status] = result
-            puts(build_dialog(people_status))
+            display(people_status)
           end
         end
       end
+
+      exit if display_mode == :popup && PopupDisplay.exit_requested?
 
       sleep CHECK_EVERY
     end
   end
 
+  # ---------------------------------------------------------------------------
+  # Setup screen - ;injurywatch setup
+  # ---------------------------------------------------------------------------
+  def self.show_setup
+    unless defined?(Gtk)
+      respond "[InjuryWatch] GTK is not available. Set your display preference with:"
+      respond "  ;vars set injurywatch_display=dock"
+      respond "  ;vars set injurywatch_display=popup"
+      return
+    end
+
+    done = false
+    Gtk.queue do
+      window = Gtk::Window.new
+      window.title = "InjuryWatch Setup"
+      window.set_default_size(300, 120)
+      window.set_window_position(:center)
+      window.border_width = 12
+
+      vbox = Gtk::Box.new(:vertical, 8)
+
+      # Display mode row
+      hbox = Gtk::Box.new(:horizontal, 8)
+      lbl  = Gtk::Label.new("Display Mode:")
+      lbl.set_alignment(0.0, 0.5)
+
+      combo = Gtk::ComboBoxText.new
+      combo.append_text("Auto (recommended)")
+      combo.append_text("Dock - dockable panel in StormFront/Wrayth")
+      combo.append_text("Popup - floating window, works in any client")
+      combo.append_text("Story Window - prints to story window, works everywhere")
+
+      # Set current selection
+      current = Vars[:injurywatch_display].to_s
+      case current
+      when "dock"   then combo.active = 1
+      when "popup"  then combo.active = 2
+      when "text"   then combo.active = 3
+      else               combo.active = 0
+      end
+
+      hbox.pack_start(lbl,   expand: false, fill: false, padding: 0)
+      hbox.pack_start(combo, expand: true,  fill: true,  padding: 0)
+      vbox.pack_start(hbox,  expand: false, fill: false, padding: 0)
+
+      # Info label
+      info = Gtk::Label.new("Setting is saved and used on next launch.
+You can also set it with: ;vars set injurywatch_display=dock")
+      info.set_alignment(0.0, 0.5)
+      info.set_line_wrap(true)
+      vbox.pack_start(info, expand: false, fill: false, padding: 0)
+
+      # Save button
+      btn_box  = Gtk::Box.new(:horizontal, 4)
+      save_btn = Gtk::Button.new(label: "Save")
+      save_btn.signal_connect("clicked") {
+        case combo.active
+        when 0 then Vars[:injurywatch_display] = nil
+        when 1 then Vars[:injurywatch_display] = "dock"
+        when 2 then Vars[:injurywatch_display] = "popup"
+        when 3 then Vars[:injurywatch_display] = "text"
+        end
+        respond "[InjuryWatch] display mode saved: #{Vars[:injurywatch_display] || 'auto'}"
+        done = true
+        window.destroy
+      }
+      cancel_btn = Gtk::Button.new(label: "Cancel")
+      cancel_btn.signal_connect("clicked") { done = true; window.destroy }
+      btn_box.pack_end(save_btn,   expand: false, fill: false, padding: 0)
+      btn_box.pack_end(cancel_btn, expand: false, fill: false, padding: 0)
+      vbox.pack_start(btn_box, expand: false, fill: false, padding: 0)
+
+      window.add(vbox)
+      window.signal_connect("delete_event") { done = true; false }
+      window.show_all
+    end
+
+    wait_until { done }
+  end
+
 end
 
 before_dying do
-  puts(
-    "<closeDialog id='InjuryWatch'/>" \
-    "<openDialog type='dynamic' id='InjuryWatch' title='Injury Watch' " \
-    "target='InjuryWatch' location='main' height='44' width='260' resident='true'>" \
-    "<dialogData id='InjuryWatch' clear='t'>" \
-    "<label id='iw0' value='-- not running --' justify='4' " \
-    "top='10' left='5' height='18' width='245'/>" \
-    "</dialogData></openDialog>"
-  )
+  if ['stormfront', 'wrayth'].include?($frontend) && Vars[:injurywatch_display].to_s != 'popup' && Vars[:injurywatch_display].to_s != 'text'
+    puts(
+      "<closeDialog id='InjuryWatch'/>" \
+      "<openDialog type='dynamic' id='InjuryWatch' title='Injury Watch' " \
+      "target='InjuryWatch' location='main' height='44' width='260' resident='true'>" \
+      "<dialogData id='InjuryWatch' clear='t'>" \
+      "<label id='iw0' value='-- not running --' justify='4' " \
+      "top='10' left='5' height='18' width='245'/>" \
+      "</dialogData></openDialog>"
+    )
+  end
 end
 
-# ;inj debug — start with debug mode on
+# Handle startup args
 args = Script.current.vars[1..-1].join(' ').strip
-InjuryWatch.debug = true if args =~ /^debug$/i
+InjuryWatch.debug = true if args =~ /\bdebug\b/i
+if args =~ /\bhelp\b/i
+  script_path = Script.current.file_name
+  File.read(script_path).match(/=begin(.+?)=end/m) { |m| respond m[1] }
+  exit
+elsif args =~ /\bsetup\b/i
+  InjuryWatch.show_setup
+  exit
+elsif args =~ /\bdisplay=(dock|popup)\b/i
+  InjuryWatch.display_mode = Regexp.last_match(1)
+  respond "[InjuryWatch] display mode set to: #{InjuryWatch.display_mode}"
+end
 
 InjuryWatch.main
