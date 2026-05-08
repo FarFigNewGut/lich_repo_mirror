@@ -1,0 +1,709 @@
+# frozen_string_literal: true
+
+=begin
+  Reserve
+
+  Maintains configured combat reserve items based on your subscription tier.
+  If a configured reserve slot is empty, the script attempts to get a matching
+  item from inventory and reserve it for use in combat.
+
+  Usage:
+    ;reserve
+    ;reserve setup
+
+  Notes:
+  - Subscription is auto-detected and uses 'Account.subscription' each time the script starts
+    and each time `;reserve setup` is opened.
+  - Configure up to 3 reserve items in setup. The script uses 1/2/3 slots based on
+    Basic/Premium/Platinum account status.
+  - The script checks `reserve list` on a throttled refresh cycle and uses
+    `GameObj.reserve` to track what is currently reserved.
+  - Opening `;reserve setup` also refreshes `reserve list` and auto-populates the
+    setup item lines from the live reserved items when any are present.
+  - If a configured line is blank and you have extra reserved items in game, the
+    script will `reserve clear` the unmatched extra item and stow it.
+  - While `;reserve` is running, manual `reserve ...` and `reserve clear ...`
+    commands are detected and the saved setup lines are synced from the live
+    reserve list after the command succeeds.
+  - When reserving or clearing items itself, the script uses item ids in game
+    commands to avoid noun/alias ambiguity.
+
+  Features:
+  - Supports Basic (1), Premium (2), and Platinum (3) reserve slots.
+  - Uses `reserve list` to refresh reserve slot state through `GameObj.reserve`.
+  - If a reserved consumable is used up, the script can replace it from inventory.
+  - Uses flexible item-term matching against both item name and noun.
+  - If both hands are occupied, temporarily stashes the right hand to reserve an item.
+  - Refreshes container contents on demand when searching for configured reserve items.
+
+  Author: Ruseoffools, Codex
+  Tags: reserve, combat, utility, gtk
+  Version: 1.0.16
+=end
+
+require 'timeout'
+
+module ReserveManager
+  module_function
+
+  VERSION = '1.0.16'
+  POLL_SECONDS = 5
+  REFRESH_SECONDS = 15
+  HAND_ACTION_TIMEOUT_SECONDS = 10
+  CONTAINER_RESCAN_SECONDS = 30
+  DEFAULT_SETTINGS = {
+    reserve_item_1: '',
+    reserve_item_2: '',
+    reserve_item_3: ''
+  }.freeze
+  SUBSCRIPTION_SLOT_COUNTS = {
+    'basic' => 1,
+    'premium' => 2,
+    'platinum' => 3
+  }.freeze
+
+  def run
+    @settings = load_settings
+    @containers_opened_by_reserve = []
+    @term_container_cache = {}
+    @term_item_cache = {}
+    @last_container_rescan_at = {}
+    @sync_settings_from_reserve_requested = false
+    @suppress_reserve_command_sync = false
+    before_dying do
+      remove_reserve_command_hook
+      remove_reserve_result_hook
+      cleanup_stashed_right_hand
+      cleanup_opened_containers
+    end
+
+    if setup_mode?
+      launch_settings_ui
+      return
+    end
+
+    refresh_subscription_level!
+    install_reserve_command_hook
+    install_reserve_result_hook
+    refresh_reserve_list(force: true)
+    echo "#{VERSION} active: subscription=#{@subscription_level} slots=#{desired_slot_count}"
+
+    loop do
+      begin
+        tick
+      rescue StandardError => e
+        echo "error: #{e.class} #{e.message}"
+      end
+
+      sleep POLL_SECONDS
+    end
+  end
+
+  def setup_mode?
+    Script.current.vars[1].to_s =~ /\Asetup\z/i
+  end
+
+  def tick
+    return unless reserve_action_ready?
+
+    sync_settings_from_reserve_list_if_requested
+    refresh_reserve_list
+    clear_blank_configured_slots
+
+    desired_terms.each do |term|
+      next if term.empty?
+      next if reserve_contains_term?(term)
+
+      ensure_reserved(term)
+    end
+  end
+
+  def desired_slot_count
+    SUBSCRIPTION_SLOT_COUNTS.fetch(@subscription_level || 'basic', 1)
+  end
+
+  def desired_terms
+    [
+      @settings[:reserve_item_1],
+      @settings[:reserve_item_2],
+      @settings[:reserve_item_3]
+    ].map { |term| normalize_item_term(term) }.first(desired_slot_count)
+  end
+
+  def clear_blank_configured_slots
+    reserve_items = Array(GameObj.reserve)
+    blank_slots = desired_terms.count(&:empty?)
+    return if blank_slots.zero?
+
+    unmatched_reserved_items = reserve_items.dup
+    desired_terms.reject(&:empty?).each do |term|
+      match_index = unmatched_reserved_items.index { |reserve_item| item_matches_term?(reserve_item, term) }
+      unmatched_reserved_items.delete_at(match_index) if match_index
+    end
+
+    unmatched_reserved_items.first(blank_slots).each do |reserve_item|
+      clear_reserved_item(reserve_item)
+      refresh_reserve_list(force: true)
+    end
+  end
+
+  def install_reserve_command_hook
+    @reserve_command_hook_id = "#{Script.current.name}_reserve_command_sync"
+    UpstreamHook.remove(@reserve_command_hook_id) rescue nil
+    UpstreamHook.add(@reserve_command_hook_id, proc do |command|
+      if !@suppress_reserve_command_sync && command.to_s =~ /^\s*reserve\s+(?!list\b)(?:clear\s+)?/i
+        @sync_settings_from_reserve_requested = true
+      end
+      command
+    end)
+  end
+
+  def remove_reserve_command_hook
+    return unless @reserve_command_hook_id
+
+    UpstreamHook.remove(@reserve_command_hook_id) rescue nil
+    @reserve_command_hook_id = nil
+  end
+
+  def install_reserve_result_hook
+    @reserve_result_hook_id = "#{Script.current.name}_reserve_result_sync"
+    DownstreamHook.remove(@reserve_result_hook_id) rescue nil
+    DownstreamHook.add(@reserve_result_hook_id, proc do |line|
+      if !@suppress_reserve_command_sync && line.to_s =~ /You reserve your .* for use in combat\.|You remove .* from your reserves and hold it in your hand\./i
+        @sync_settings_from_reserve_requested = true
+      end
+      line
+    end)
+  end
+
+  def remove_reserve_result_hook
+    return unless @reserve_result_hook_id
+
+    DownstreamHook.remove(@reserve_result_hook_id) rescue nil
+    @reserve_result_hook_id = nil
+  end
+
+  def sync_settings_from_reserve_list_if_requested
+    return unless @sync_settings_from_reserve_requested
+
+    refresh_reserve_list(force: true)
+    sync_settings_from_reserve_list
+    @sync_settings_from_reserve_requested = false
+  end
+
+  def sync_settings_from_reserve_list
+    reserve_items = Array(GameObj.reserve).first(desired_slot_count)
+    synced_settings = @settings.dup
+    desired_slot_count.times do |index|
+      reserve_item = reserve_items[index]
+      synced_settings[:"reserve_item_#{index + 1}"] = reserve_item ? normalize_item_term(reserve_item.name) : ''
+    end
+    ((desired_slot_count + 1)..3).each do |index|
+      synced_settings[:"reserve_item_#{index}"] = normalize_item_term(@settings[:"reserve_item_#{index}"])
+    end
+    persist_settings(synced_settings)
+    @settings = synced_settings
+  end
+
+  def normalize_item_term(value)
+    value.to_s.strip
+  end
+
+  def refresh_reserve_list(force: false)
+    @last_reserve_refresh_at ||= Time.at(0)
+    return unless force || (Time.now - @last_reserve_refresh_at) >= REFRESH_SECONDS
+
+    with_reserve_command_sync_suppressed do
+      if defined?(Lich::Util) && Lich::Util.respond_to?(:issue_command)
+        Lich::Util.issue_command(
+          'reserve list',
+          /RESERVE|reserved for use in combat|Nothing is currently reserved|You currently have/i,
+          /<prompt/,
+          include_end: false,
+          timeout: 3,
+          silent: true,
+          usexml: true,
+          quiet: true
+        )
+      else
+        fput 'reserve list'
+      end
+    end
+
+    @last_reserve_refresh_at = Time.now
+  rescue StandardError
+    nil
+  end
+
+  def reserve_contains_term?(term)
+    Array(GameObj.reserve).any? { |item| item_matches_term?(item, term) }
+  end
+
+  def find_inventory_item(term)
+    Array(GameObj.inv).find { |item| item_matches_term?(item, term) }
+  end
+
+  def find_container_item(term)
+    if (cached = @term_container_cache[term])
+      container = GameObj[cached]
+      item = if @term_item_cache[term]
+               Array(container&.contents).find { |container_item| container_item.id.to_s == @term_item_cache[term].to_s }
+             end
+      item ||= find_item_in_container(container, term)
+      return [item, container] if item && container
+    end
+
+    GameObj.containers.each do |container_id, contents|
+      item = Array(contents).find { |container_item| item_matches_term?(container_item, term) }
+      next unless item
+
+      container = GameObj[container_id]
+      @term_container_cache[term] = container_id if container
+      @term_item_cache[term] = item.id if item
+      return [item, container]
+    end
+    nil
+  end
+
+  def find_item_in_container(container, term)
+    return nil unless container
+
+    Array(container.contents).find { |container_item| item_matches_term?(container_item, term) }
+  end
+
+  def refresh_known_container_contents(term = nil)
+    if term
+      last_scan = @last_container_rescan_at[term] || Time.at(0)
+      return nil if (Time.now - last_scan) < CONTAINER_RESCAN_SECONDS
+      @last_container_rescan_at[term] = Time.now
+    end
+
+    containers = Array(GameObj.inv).select { |item| item.type.to_s =~ /container/i }
+    containers.each do |container|
+      next unless container
+      next if container.contents.is_a?(Array) && container.contents.any? { |item| term.nil? || item_matches_term?(item, term) }
+
+      refresh_container_contents(container)
+      next unless term
+
+      item = Array(container.contents).find { |container_item| item_matches_term?(container_item, term) }
+      if item
+        @term_container_cache[term] = container.id
+        @term_item_cache[term] = item.id
+        return [item, container]
+      end
+    end
+    nil
+  end
+
+  def refresh_container_contents(container)
+    return unless container
+
+    if defined?(Lich::Util) && Lich::Util.respond_to?(:issue_command)
+      lines = Lich::Util.issue_command("look in ##{container.id}", /In the|There is nothing|That is closed|Inside the|is shut too tightly to see its contents/i, /<prompt/, include_end: false, timeout: 3, silent: true, usexml: true, quiet: true)
+      line_text = Array(lines).join(' ')
+      if line_text =~ /That is closed|shut too tightly/i
+        open_lines = Lich::Util.issue_command("open ##{container.id}", /You open|That is already open|There doesn't seem to be any way to do that|You carefully|You unfasten/i, /<prompt/, include_end: false, timeout: 3, silent: true, usexml: true, quiet: true)
+        if Array(open_lines).join(' ') =~ /You open|You carefully|You unfasten/i
+          @containers_opened_by_reserve << container.id unless @containers_opened_by_reserve.include?(container.id)
+        end
+        Lich::Util.issue_command("look in ##{container.id}", /In the|There is nothing|Inside the/i, /<prompt/, include_end: false, timeout: 3, silent: true, usexml: true, quiet: true)
+      end
+    else
+      look_result = dothistimeout("look in ##{container.id}", 3, /In the|There is nothing|That is closed|Inside the|shut too tightly to see its contents/i)
+      if look_result =~ /That is closed|shut too tightly/i
+        open_result = dothistimeout("open ##{container.id}", 3, /You open|That is already open|You carefully|You unfasten/i)
+        if open_result =~ /You open|You carefully|You unfasten/i
+          @containers_opened_by_reserve << container.id unless @containers_opened_by_reserve.include?(container.id)
+        end
+        dothistimeout("look in ##{container.id}", 3, /In the|There is nothing|Inside the/i)
+      end
+    end
+  rescue StandardError
+    nil
+  end
+
+  def find_hand_item(term)
+    [GameObj.right_hand, GameObj.left_hand].compact.find { |item| item_matches_term?(item, term) }
+  end
+
+  def find_hand_item_by_id(id)
+    [GameObj.right_hand, GameObj.left_hand].compact.find { |item| item.id.to_s == id.to_s }
+  end
+
+  def find_accessible_item(term)
+    hand_item = find_hand_item(term)
+    return { item: hand_item, container: nil, location: :hand } if hand_item
+
+    inv_item = find_inventory_item(term)
+    return { item: inv_item, container: nil, location: :inventory } if inv_item
+
+    refreshed_item, refreshed_container = refresh_known_container_contents(term)
+    return { item: refreshed_item, container: refreshed_container, location: :container } if refreshed_item
+
+    container_item, container = find_container_item(term)
+    return { item: container_item, container: container, location: :container } if container_item
+
+    nil
+  end
+
+  def item_matches_term?(item, term)
+    return false unless item
+
+    pattern = item_term_pattern(term)
+    item.name.to_s =~ pattern || item.noun.to_s =~ pattern
+  end
+
+  def item_term_pattern(term)
+    Regexp.new(term.split.map { |word| Regexp.escape(word) }.join('.*'), Regexp::IGNORECASE)
+  end
+
+  def ensure_reserved(term)
+    located = find_accessible_item(term)
+    unless located
+      echo_missing_item(term)
+      return false
+    end
+    item = located[:item]
+    container = located[:container]
+
+    stashed_right = false
+    if both_hands_occupied? && find_hand_item(term).nil?
+      stashed_right = stash_right_hand_for_reserve
+      return false unless stashed_right
+    end
+
+    unless find_hand_item(term)
+      if container
+        get_result = dothistimeout("get ##{item.id} from ##{container.id}", 5, /You remove|You get|You pick up|What were you referring to\?|Get what\?/)
+        unless get_result =~ /You remove|You get|You pick up/
+          refresh_container_contents(container)
+          item = find_item_in_container(container, term)
+          unless item
+            @term_container_cache.delete(term)
+            @term_item_cache.delete(term)
+            restore_right_hand_after_reserve if stashed_right
+            cleanup_opened_containers
+            echo_missing_item(term)
+            return false
+          end
+
+          @term_container_cache[term] = container.id
+          @term_item_cache[term] = item.id
+          get_result = dothistimeout("get ##{item.id} from ##{container.id}", 5, /You remove|You get|You pick up|What were you referring to\?|Get what\?/)
+          unless get_result =~ /You remove|You get|You pick up/
+            restore_right_hand_after_reserve if stashed_right
+            cleanup_opened_containers
+            return false
+          end
+        end
+      else
+        result = dothistimeout("get ##{item.id}", 5, /You remove|You get|You pick up|What were you referring to\?|Get what\?/)
+        unless result =~ /You remove|You get|You pick up/
+          restore_right_hand_after_reserve if stashed_right
+          cleanup_opened_containers
+          return false
+        end
+      end
+      waitrt?
+    end
+
+    held_item = find_hand_item_by_id(item.id) || find_hand_item(term)
+    return false unless held_item
+
+    result = with_reserve_command_sync_suppressed do
+      dothistimeout("reserve ##{held_item.id}", 5, /You reserve your|You must be holding|You can't reserve|RESERVE \{item\}/i)
+    end
+    refresh_reserve_list(force: true)
+    restore_right_hand_after_reserve if stashed_right
+    cleanup_opened_containers
+    result =~ /You reserve your/
+  rescue StandardError
+    restore_right_hand_after_reserve if stashed_right
+    cleanup_opened_containers
+    false
+  end
+
+  def clear_reserved_item(item)
+    return false unless item
+
+    stashed_right = false
+    if both_hands_occupied?
+      stashed_right = stash_right_hand_for_reserve
+      return false unless stashed_right
+    end
+
+    result = with_reserve_command_sync_suppressed do
+      dothistimeout("reserve clear ##{item.id}", 5, /You remove .* from your reserves|You do not currently have that item reserved|RESERVE CLEAR/i)
+    end
+    stow_cleared_reserved_item(item)
+    restore_right_hand_after_reserve if stashed_right
+    result =~ /You remove .* from your reserves|You do not currently have that item reserved/
+  rescue StandardError
+    restore_right_hand_after_reserve if stashed_right
+    false
+  end
+
+  def stow_cleared_reserved_item(item)
+    return unless item
+
+    if GameObj.right_hand&.id.to_s == item.id.to_s
+      dothistimeout('stow right', 5, /You put|You hang|You tuck|You sling|You attach|What were you referring to\?/i)
+    elsif GameObj.left_hand&.id.to_s == item.id.to_s
+      dothistimeout('stow left', 5, /You put|You hang|You tuck|You sling|You attach|What were you referring to\?/i)
+    end
+  rescue StandardError
+    nil
+  end
+
+  def both_hands_occupied?
+    !right_hand_empty? && !left_hand_empty?
+  end
+
+  def reserve_action_ready?
+    return false if checkrt.to_i > 0
+    return false if checkcastrt.to_i > 0
+    return false if stunned?
+    return false unless standing?
+
+    true
+  rescue StandardError
+    false
+  end
+
+  def right_hand_empty?
+    GameObj.right_hand.nil? || GameObj.right_hand.name.to_s == 'Empty'
+  end
+
+  def left_hand_empty?
+    GameObj.left_hand.nil? || GameObj.left_hand.name.to_s == 'Empty'
+  end
+
+  def stash_right_hand_for_reserve
+    with_hand_action_timeout('stash_right_hand') do
+      waitrt?
+      Lich::Stash::stash_hands(right: true)
+      @stashed_right_for_reserve = true
+      waitrt?
+    end
+  end
+
+  def restore_right_hand_after_reserve
+    with_hand_action_timeout('restore_right_hand') do
+      waitrt?
+      Lich::Stash::equip_hands(right: true)
+      @stashed_right_for_reserve = false
+      waitrt?
+    end
+  end
+
+  def cleanup_stashed_right_hand
+    return unless @stashed_right_for_reserve
+
+    begin
+      Lich::Stash::equip_hands(right: true)
+    rescue StandardError
+      nil
+    ensure
+      @stashed_right_for_reserve = false
+    end
+  end
+
+  def cleanup_opened_containers
+    Array(@containers_opened_by_reserve).reverse_each do |container_id|
+      begin
+        dothistimeout("close ##{container_id}", 2, /You close|That is already closed|What were you referring to\?/i)
+      rescue StandardError
+        nil
+      end
+    end
+    @containers_opened_by_reserve = []
+  end
+
+  def with_hand_action_timeout(action_name)
+    Timeout.timeout(HAND_ACTION_TIMEOUT_SECONDS) { yield }
+    true
+  rescue Timeout::Error
+    echo "#{action_name} timed out after #{HAND_ACTION_TIMEOUT_SECONDS}s; continuing"
+    false
+  rescue StandardError
+    false
+  end
+
+  def with_reserve_command_sync_suppressed
+    @suppress_reserve_command_sync = true
+    yield
+  ensure
+    @suppress_reserve_command_sync = false
+  end
+
+  def echo_missing_item(term)
+    @last_missing_by_term ||= {}
+    last = @last_missing_by_term[term] || Time.at(0)
+    return if (Time.now - last) < 30
+
+    echo "missing configured reserve item in inventory: #{term}"
+    @last_missing_by_term[term] = Time.now
+  end
+
+  def load_settings
+    Settings.load
+    Settings[Char.name] ||= {}
+
+    settings = DEFAULT_SETTINGS.merge(
+      reserve_item_1: normalize_item_term(Settings[Char.name]['reserve_item_1']),
+      reserve_item_2: normalize_item_term(Settings[Char.name]['reserve_item_2']),
+      reserve_item_3: normalize_item_term(Settings[Char.name]['reserve_item_3'])
+    )
+
+    persist_settings(settings)
+    settings
+  rescue StandardError
+    DEFAULT_SETTINGS.dup
+  end
+
+  def persist_settings(settings)
+    Settings[Char.name]['reserve_item_1'] = normalize_item_term(settings[:reserve_item_1])
+    Settings[Char.name]['reserve_item_2'] = normalize_item_term(settings[:reserve_item_2])
+    Settings[Char.name]['reserve_item_3'] = normalize_item_term(settings[:reserve_item_3])
+    Settings.save
+  end
+
+  def determine_subscription_level
+    subscription = current_account_type
+    game_code = XMLData.game.to_s
+    case subscription
+    when /platinum/i
+      'platinum'
+    when /premium/i
+      'premium'
+    when /shattered/i
+      game_code =~ /GSX|GSPlat/i ? 'platinum' : 'basic'
+    else
+      game_code =~ /GSX|GSPlat/i ? 'platinum' : 'basic'
+    end
+  end
+
+  def refresh_subscription_level!
+    @subscription_level = determine_subscription_level
+  end
+
+  def current_account_type
+    ensure_account_type_detected
+    type = defined?(Lich::Common::Account) ? Lich::Common::Account.type.to_s : ''
+    return type unless type.to_s.empty?
+
+    return '' unless defined?(Lich::Common::Account)
+
+    subscription = Lich::Common::Account.subscription.to_s
+    if subscription =~ /premium/i && XMLData.game.to_s =~ /GSX|GSPlat/i
+      'Platinum'
+    else
+      subscription
+    end
+  end
+
+  def ensure_account_type_detected
+    if defined?(Lich::Common::Account)
+      Lich::Util.issue_command("ACCOUNT", /Account Type:|<output class="mono"\/>/, /<prompt/, include_end: true, timeout: 5, silent: true, usexml: true, quiet: true)
+    end
+
+    if defined?(Lich::Common::Account)
+      Lich::Common::Account.type.to_s
+    else
+      ''
+    end
+  end
+
+  def settings_from_live_reserve_list(base_settings)
+    reserve_items = Array(GameObj.reserve)
+    return base_settings if reserve_items.empty?
+
+    synced_settings = base_settings.dup
+    3.times do |index|
+      reserve_item = reserve_items[index]
+      synced_settings[:"reserve_item_#{index + 1}"] = reserve_item ? normalize_item_term(reserve_item.name) : ''
+    end
+    synced_settings
+  end
+
+  def launch_settings_ui
+    Settings.load
+    Settings[Char.name] ||= {}
+    settings = load_settings
+    refresh_subscription_level!
+    refresh_reserve_list(force: true)
+    settings = settings_from_live_reserve_list(settings)
+    subscription_level = @subscription_level
+    slot_count = desired_slot_count
+
+    window = window_action = nil
+    save_message = nil
+    slot_1_entry = slot_2_entry = slot_3_entry = nil
+
+    Gtk.queue {
+      Gtk::Button.new('Save')
+
+      slot_1_entry = Gtk::Entry.new
+      slot_2_entry = Gtk::Entry.new
+      slot_3_entry = Gtk::Entry.new
+      [slot_1_entry, slot_2_entry, slot_3_entry].each do |entry|
+        entry.width_chars = 36 if entry.respond_to?(:width_chars=)
+      end
+      slot_1_entry.text = settings[:reserve_item_1].to_s
+      slot_2_entry.text = settings[:reserve_item_2].to_s
+      slot_3_entry.text = settings[:reserve_item_3].to_s
+
+      save_btn = Gtk::Button.new('Save')
+
+      content_box = Gtk::VBox.new(false, 0)
+      content_box.border_width = 5 if content_box.respond_to?(:border_width=)
+      content_box.add(Gtk::HSeparator.new)
+      content_box.add(Gtk::Label.new('Reserve Settings'))
+      content_box.add(Gtk::Label.new("Detected subscription: #{subscription_level.capitalize} (#{slot_count} slot#{slot_count == 1 ? '' : 's'})"))
+      content_box.add(Gtk::HSeparator.new)
+      content_box.add(Gtk::Label.new('Reserve item 1'))
+      content_box.add(slot_1_entry)
+      content_box.add(Gtk::Label.new('Reserve item 2'))
+      content_box.add(slot_2_entry)
+      content_box.add(Gtk::Label.new('Reserve item 3'))
+      content_box.add(slot_3_entry)
+      content_box.add(Gtk::HSeparator.new)
+      content_box.add(save_btn)
+
+      window = Gtk::Window.new
+      window.title = 'Reserve Setup'
+      window.border_width = 5
+      window.set_default_size(420, 260) if window.respond_to?(:set_default_size)
+      window.set_window_position(:center) if window.respond_to?(:set_window_position)
+      window.set_keep_above(true) if window.respond_to?(:set_keep_above)
+      window.add(content_box)
+
+      save_btn.signal_connect('clicked') {
+        Gtk.queue {
+          settings[:reserve_item_1] = normalize_item_term(slot_1_entry.text)
+          settings[:reserve_item_2] = normalize_item_term(slot_2_entry.text)
+          settings[:reserve_item_3] = normalize_item_term(slot_3_entry.text)
+          save_message = "settings saved: subscription=#{subscription_level} item1=#{settings[:reserve_item_1].empty? ? 'none' : settings[:reserve_item_1]} item2=#{settings[:reserve_item_2].empty? ? 'none' : settings[:reserve_item_2]} item3=#{settings[:reserve_item_3].empty? ? 'none' : settings[:reserve_item_3]}"
+          window_action = :save
+        }
+      }
+
+      window.signal_connect('delete_event') { window_action = :cancel }
+      window.show_all
+      window.present if window.respond_to?(:present)
+    }
+
+    before_dying { Gtk.queue { window.destroy if window } }
+    wait_while { window_action.nil? }
+    undo_before_dying
+    Gtk.queue { window.destroy if window }
+
+    persist_settings(settings) if window_action == :save
+    echo save_message if window_action == :save && save_message
+  rescue StandardError => e
+    echo "setup UI error: #{e.class} #{e.message}"
+  end
+end
+
+ReserveManager.run
