@@ -1,5 +1,5 @@
 # frozen_string_literal: true
-
+no_kill_all
 =begin
   Reserve
 
@@ -36,9 +36,27 @@
   - If both hands are occupied, temporarily stashes the right hand to reserve an item.
   - Refreshes container contents on demand when searching for configured reserve items.
 
+  Changelog:
+    1.0.24 (2026-05-08)
+      - Recognize successful herb-satchel return messaging and avoid unnecessary stow fallback.
+    1.0.22 (2026-05-08)
+      - Improve post-get hand matching for herb doses that change id/name on extraction.
+      - Return unmatched extracted items to their source container using the same robust hand matcher.
+    1.0.21 (2026-05-08)
+      - Stop retry loops on unreservable items by clearing the configured entry and notifying the user.
+    1.0.20 (2026-05-08)
+      - Force `reserve list` on the first safe tick after combat/loot/cleanse clears.
+      - Keep low-frequency background reserve refresh while using immediate reconcile on safe windows.
+    1.0.19 (2026-05-08)
+      - Add herb normalization based on eherbs-compatible herb naming.
+      - Parse special herb container DOSE/TINCTURE output when searching reserve items.
+      - Only refill reserve when room is empty of targets and eloot and ecleanse are not running.
+    1.0.18 (2026-05-08)
+      - Reserve list will keep track of counts of items to allow duplicates.
+
   Author: Ruseoffools, Codex
   Tags: reserve, combat, utility, gtk
-  Version: 1.0.16
+  Version: 1.0.24
 =end
 
 require 'timeout'
@@ -46,11 +64,29 @@ require 'timeout'
 module ReserveManager
   module_function
 
-  VERSION = '1.0.16'
-  POLL_SECONDS = 5
+  VERSION = '1.0.24'
+  POLL_SECONDS = 1
   REFRESH_SECONDS = 15
   HAND_ACTION_TIMEOUT_SECONDS = 10
+  HAND_UPDATE_WAIT_ATTEMPTS = 30
+  HAND_UPDATE_WAIT_SECONDS = 0.1
+  RECENT_GET_GRACE_SECONDS = 5
   CONTAINER_RESCAN_SECONDS = 30
+  GET_SUCCESS_REGEX = Regexp.union(
+    /^You (?:shield the opening of .*? from view as you |discreetly |carefully |deftly |deftly|just |slowly )?(?:remove|pick up|draw|grab|reach|slip|tuck|retrieve|already have|unsheathe|detach|swap|sling|withdraw)/,
+    /^You already have that/,
+    /You retrieve/,
+    /You just poured yourself/,
+    /You break off/
+  ).freeze
+  GET_RESPONSE_REGEX = Regexp.union(
+    GET_SUCCESS_REGEX,
+    /^Get what\?$/,
+    /^Why don't you leave some for others\?$/,
+    /^You need a free hand/,
+    /^What were you referring to\?$/,
+    /^I could not find what you were referring to\./
+  ).freeze
   DEFAULT_SETTINGS = {
     reserve_item_1: '',
     reserve_item_2: '',
@@ -61,6 +97,16 @@ module ReserveManager
     'premium' => 2,
     'platinum' => 3
   }.freeze
+  HERB_NOISE_WORDS = %w[
+    some bunch of large tincture potion leaf lichen flower moss spine fruit stem
+    root grass clove dose doses tinctures tincture
+  ].freeze
+  CONTAINER_NAME_PATTERN = /\b(?:container|satchel|pack|backpack|hip-satchel|sack|pouch|cloak|longcoat|coat|carryall|case|kit|trunk|box|bag)\b/i
+  DEFAULT_HERB_TERMS = [
+    'acantha', 'wolifrew', 'bolmara', 'woth', 'torban', 'ambrominas', 'ephlox',
+    'cactacae', 'calamia', 'rose-marrow', 'aloeas', 'haphip', 'brostheras',
+    'basal', 'pothinir', 'talneo', 'wingstem', 'bur-clover', 'sovyn'
+  ].freeze
 
   def run
     @settings = load_settings
@@ -68,7 +114,11 @@ module ReserveManager
     @term_container_cache = {}
     @term_item_cache = {}
     @last_container_rescan_at = {}
+    @synthetic_container_contents = {}
+    @recent_get_hints = {}
     @sync_settings_from_reserve_requested = false
+    @pending_reconcile_after_safe_window = false
+    @last_reserve_refill_safe = false
     @suppress_reserve_command_sync = false
     before_dying do
       remove_reserve_command_hook
@@ -104,18 +154,25 @@ module ReserveManager
   end
 
   def tick
-    return unless reserve_action_ready?
+    safe_now = reserve_refill_safe?
+    if safe_now && !@last_reserve_refill_safe
+      @pending_reconcile_after_safe_window = true
+    end
+    @last_reserve_refill_safe = safe_now
+
+    return unless reserve_command_ready?
 
     sync_settings_from_reserve_list_if_requested
-    refresh_reserve_list
-    clear_blank_configured_slots
+    return unless safe_now
 
-    desired_terms.each do |term|
-      next if term.empty?
-      next if reserve_contains_term?(term)
-
-      ensure_reserved(term)
+    if @pending_reconcile_after_safe_window
+      refresh_reserve_list(force: true)
+      @pending_reconcile_after_safe_window = false
+    else
+      refresh_reserve_list
     end
+
+    reconcile_reserved_items
   end
 
   def desired_slot_count
@@ -130,21 +187,39 @@ module ReserveManager
     ].map { |term| normalize_item_term(term) }.first(desired_slot_count)
   end
 
-  def clear_blank_configured_slots
+  def reconcile_reserved_items
     reserve_items = Array(GameObj.reserve)
-    blank_slots = desired_terms.count(&:empty?)
-    return if blank_slots.zero?
-
     unmatched_reserved_items = reserve_items.dup
-    desired_terms.reject(&:empty?).each do |term|
+    desired_nonblank_terms.each do |term|
       match_index = unmatched_reserved_items.index { |reserve_item| item_matches_term?(reserve_item, term) }
       unmatched_reserved_items.delete_at(match_index) if match_index
     end
 
-    unmatched_reserved_items.first(blank_slots).each do |reserve_item|
+    unmatched_reserved_items.each do |reserve_item|
       clear_reserved_item(reserve_item)
       refresh_reserve_list(force: true)
+      return
     end
+
+    missing_terms.each do |term|
+      if ensure_reserved(term)
+        refresh_reserve_list(force: true)
+        return
+      end
+    end
+  end
+
+  def desired_nonblank_terms
+    desired_terms.reject(&:empty?)
+  end
+
+  def missing_terms
+    unmatched_desired_terms = desired_nonblank_terms.dup
+    Array(GameObj.reserve).each do |reserve_item|
+      match_index = unmatched_desired_terms.index { |term| item_matches_term?(reserve_item, term) }
+      unmatched_desired_terms.delete_at(match_index) if match_index
+    end
+    unmatched_desired_terms
   end
 
   def install_reserve_command_hook
@@ -235,10 +310,6 @@ module ReserveManager
     nil
   end
 
-  def reserve_contains_term?(term)
-    Array(GameObj.reserve).any? { |item| item_matches_term?(item, term) }
-  end
-
   def find_inventory_item(term)
     Array(GameObj.inv).find { |item| item_matches_term?(item, term) }
   end
@@ -247,14 +318,14 @@ module ReserveManager
     if (cached = @term_container_cache[term])
       container = GameObj[cached]
       item = if @term_item_cache[term]
-               Array(container&.contents).find { |container_item| container_item.id.to_s == @term_item_cache[term].to_s }
+               combined_container_contents(container).find { |container_item| container_item.id.to_s == @term_item_cache[term].to_s }
              end
       item ||= find_item_in_container(container, term)
       return [item, container] if item && container
     end
 
     GameObj.containers.each do |container_id, contents|
-      item = Array(contents).find { |container_item| item_matches_term?(container_item, term) }
+      item = (Array(contents) + Array(@synthetic_container_contents[container_id])).find { |container_item| item_matches_term?(container_item, term) }
       next unless item
 
       container = GameObj[container_id]
@@ -268,7 +339,13 @@ module ReserveManager
   def find_item_in_container(container, term)
     return nil unless container
 
-    Array(container.contents).find { |container_item| item_matches_term?(container_item, term) }
+    combined_container_contents(container).find { |container_item| item_matches_term?(container_item, term) }
+  end
+
+  def combined_container_contents(container)
+    return [] unless container
+
+    (Array(container.contents) + Array(@synthetic_container_contents[container.id])).uniq { |item| item.id.to_s }
   end
 
   def refresh_known_container_contents(term = nil)
@@ -278,20 +355,115 @@ module ReserveManager
       @last_container_rescan_at[term] = Time.now
     end
 
-    containers = Array(GameObj.inv).select { |item| item.type.to_s =~ /container/i }
+    containers = Array(GameObj.inv).select { |item| container_candidate?(item) }
     containers.each do |container|
       next unless container
-      next if container.contents.is_a?(Array) && container.contents.any? { |item| term.nil? || item_matches_term?(item, term) }
+      if herb_key(term)
+        item = refresh_eherbs_container_contents(container, term)
+        if item
+          @term_container_cache[term] = container.id
+          @term_item_cache[term] = item.id
+          return [item, container]
+        end
+      end
+      next if combined_container_contents(container).any? { |item| term.nil? || item_matches_term?(item, term) }
 
       refresh_container_contents(container)
+      if herb_key(term)
+        item = refresh_eherbs_container_contents(container, term)
+        if item
+          @term_container_cache[term] = container.id
+          @term_item_cache[term] = item.id
+          return [item, container]
+        end
+      end
       next unless term
 
-      item = Array(container.contents).find { |container_item| item_matches_term?(container_item, term) }
+      item = combined_container_contents(container).find { |container_item| item_matches_term?(container_item, term) }
       if item
         @term_container_cache[term] = container.id
         @term_item_cache[term] = item.id
         return [item, container]
       end
+    end
+    nil
+  end
+
+  def container_candidate?(item)
+    return false unless item
+    return true if item.type.to_s =~ /container/i
+    return true if item.contents.is_a?(Array)
+
+    item.name.to_s =~ CONTAINER_NAME_PATTERN || item.noun.to_s =~ CONTAINER_NAME_PATTERN
+  rescue StandardError
+    false
+  end
+
+  def refresh_eherbs_container_contents(container, term = nil)
+    return nil unless container
+    return nil unless herb_key(term)
+    contents =
+      if defined?(EHerbs) && defined?(Inventory) && Inventory.respond_to?(:herb_container_contents_load)
+        Inventory.herb_container_contents_load(container)
+      else
+        local_herb_container_contents_load(container)
+      end
+    herb_items = Array(contents.is_a?(Hash) ? contents[:all] : contents)
+    return nil if herb_items.empty?
+
+    @synthetic_container_contents[container.id] = herb_items
+    herb_items.find { |container_item| term.nil? || item_matches_term?(container_item, term) }
+  rescue StandardError
+    nil
+  end
+
+  def configured_herb_container
+    @configured_herb_container_id ||= nil
+    if @configured_herb_container_id
+      container = GameObj[@configured_herb_container_id]
+      return container if container
+    end
+
+    herb_sack_name = UserVars.respond_to?(:herbsack) ? UserVars.herbsack.to_s.strip : ''
+    return nil if herb_sack_name.empty?
+
+    container = Array(GameObj.inv).find { |obj| obj.name.to_s =~ /\b#{Regexp.escape(herb_sack_name)}\b/i }
+    @configured_herb_container_id = container.id if container
+    container
+  rescue StandardError
+    nil
+  end
+
+  def local_herb_container_contents_load(container)
+    return [] unless container
+
+    open_herb_container(container)
+    wait_for_container_contents(container)
+    Array(container.contents)
+  rescue StandardError
+    []
+  end
+
+  def open_herb_container(container)
+    return if GameObj.containers.keys.include?(container.id) && container.contents.is_a?(Array)
+
+    if defined?(Lich::Util) && Lich::Util.respond_to?(:issue_command)
+      Lich::Util.issue_command("open ##{container.id}", /You open|That is already open|You carefully|You unfasten|There doesn't seem to be any way|<container|<exposeContainer/i, /<prompt/, include_end: false, timeout: 3, silent: true, usexml: true, quiet: true)
+      lines = Lich::Util.issue_command("look in ##{container.id}", /In the|There is nothing|That is closed|Inside the|contains DOSEs|contains TINCTUREs|<container|<exposeContainer/i, /<prompt/, include_end: false, timeout: 3, silent: true, usexml: true, quiet: true)
+      parse_special_herb_container_contents(container, Array(lines).join(' '))
+    else
+      dothistimeout("open ##{container.id}", 3, /You open|That is already open|You carefully|You unfasten|There doesn't seem to be any way/i)
+      lines = dothistimeout("look in ##{container.id}", 3, /In the|There is nothing|That is closed|Inside the|contains DOSEs|contains TINCTUREs/i)
+      parse_special_herb_container_contents(container, lines.to_s)
+    end
+  rescue StandardError
+    nil
+  end
+
+  def wait_for_container_contents(container, attempts: 20)
+    attempts.times do
+      return if GameObj.containers.keys.include?(container.id) && container.contents.is_a?(Array)
+      sleep 0.1
     end
     nil
   end
@@ -302,23 +474,43 @@ module ReserveManager
     if defined?(Lich::Util) && Lich::Util.respond_to?(:issue_command)
       lines = Lich::Util.issue_command("look in ##{container.id}", /In the|There is nothing|That is closed|Inside the|is shut too tightly to see its contents/i, /<prompt/, include_end: false, timeout: 3, silent: true, usexml: true, quiet: true)
       line_text = Array(lines).join(' ')
+      parse_special_herb_container_contents(container, line_text)
       if line_text =~ /That is closed|shut too tightly/i
         open_lines = Lich::Util.issue_command("open ##{container.id}", /You open|That is already open|There doesn't seem to be any way to do that|You carefully|You unfasten/i, /<prompt/, include_end: false, timeout: 3, silent: true, usexml: true, quiet: true)
         if Array(open_lines).join(' ') =~ /You open|You carefully|You unfasten/i
           @containers_opened_by_reserve << container.id unless @containers_opened_by_reserve.include?(container.id)
         end
-        Lich::Util.issue_command("look in ##{container.id}", /In the|There is nothing|Inside the/i, /<prompt/, include_end: false, timeout: 3, silent: true, usexml: true, quiet: true)
+        second_lines = Lich::Util.issue_command("look in ##{container.id}", /In the|There is nothing|Inside the/i, /<prompt/, include_end: false, timeout: 3, silent: true, usexml: true, quiet: true)
+        parse_special_herb_container_contents(container, Array(second_lines).join(' '))
       end
     else
       look_result = dothistimeout("look in ##{container.id}", 3, /In the|There is nothing|That is closed|Inside the|shut too tightly to see its contents/i)
+      parse_special_herb_container_contents(container, look_result.to_s)
       if look_result =~ /That is closed|shut too tightly/i
         open_result = dothistimeout("open ##{container.id}", 3, /You open|That is already open|You carefully|You unfasten/i)
         if open_result =~ /You open|You carefully|You unfasten/i
           @containers_opened_by_reserve << container.id unless @containers_opened_by_reserve.include?(container.id)
         end
-        dothistimeout("look in ##{container.id}", 3, /In the|There is nothing|Inside the/i)
+        second_result = dothistimeout("look in ##{container.id}", 3, /In the|There is nothing|Inside the/i)
+        parse_special_herb_container_contents(container, second_result.to_s)
       end
     end
+  rescue StandardError
+    nil
+  end
+
+  def parse_special_herb_container_contents(container, line_text)
+    return unless container
+    return if line_text.to_s.empty?
+
+    parsed_items = []
+    if line_text =~ %r{contains DOSEs .*?\.}i || line_text =~ %r{contains TINCTUREs .*?\.}i
+      line_text.scan(%r{<a exist="(-?\d+)" noun="(.*?)">(.*?)</a>\s*\(\d+\)}i).each do |exist, noun, name|
+        parsed_items << GameObj.new_inv(exist, noun, name, container.id.to_s)
+      end
+    end
+
+    @synthetic_container_contents[container.id] = parsed_items if parsed_items.any?
   rescue StandardError
     nil
   end
@@ -331,7 +523,33 @@ module ReserveManager
     [GameObj.right_hand, GameObj.left_hand].compact.find { |item| item.id.to_s == id.to_s }
   end
 
+  def find_hand_item_by_noun(noun)
+    normalized_noun = noun.to_s.strip.downcase
+    return nil if normalized_noun.empty?
+
+    [GameObj.right_hand, GameObj.left_hand].compact.find { |item| item.noun.to_s.strip.downcase == normalized_noun }
+  end
+
+  def find_hand_item_by_name(name)
+    normalized_name = name.to_s.strip.downcase
+    return nil if normalized_name.empty?
+
+    [GameObj.right_hand, GameObj.left_hand].compact.find { |item| item.name.to_s.strip.downcase == normalized_name }
+  end
+
   def find_accessible_item(term)
+    if (recent_held_item = recently_retrieved_held_item(term))
+      return { item: recent_held_item, container: nil, location: :hand }
+    end
+
+    if herb_key(term)
+      herb_container = configured_herb_container
+      if herb_container
+        herb_item = refresh_eherbs_container_contents(herb_container, term)
+        return { item: herb_item, container: herb_container, location: :container } if herb_item
+      end
+    end
+
     hand_item = find_hand_item(term)
     return { item: hand_item, container: nil, location: :hand } if hand_item
 
@@ -350,12 +568,43 @@ module ReserveManager
   def item_matches_term?(item, term)
     return false unless item
 
+    item_herb_key = herb_key(item.name.to_s) || herb_key(item.noun.to_s)
+    term_herb_key = herb_key(term)
+    return true if item_herb_key && term_herb_key && item_herb_key == term_herb_key
+
     pattern = item_term_pattern(term)
     item.name.to_s =~ pattern || item.noun.to_s =~ pattern
   end
 
   def item_term_pattern(term)
     Regexp.new(term.split.map { |word| Regexp.escape(word) }.join('.*'), Regexp::IGNORECASE)
+  end
+
+  def herb_key(text)
+    normalized = text.to_s.downcase
+    return nil if normalized.empty?
+
+    herb_family_terms.each do |family|
+      return family if normalized.include?(family)
+    end
+
+    nil
+  end
+
+  def herb_family_terms
+    @herb_family_terms ||= begin
+      source_terms = []
+      if defined?(EHerbs) && EHerbs.respond_to?(:known_herbs)
+        source_terms = EHerbs.known_herbs.flat_map { |herb| [herb[:name], herb[:short_name]] }.compact
+      end
+      source_terms = DEFAULT_HERB_TERMS if source_terms.empty?
+
+      source_terms.flat_map { |term|
+        term.to_s.downcase.scan(/[a-z]+(?:-[a-z]+)?/)
+      }.reject { |word|
+        HERB_NOISE_WORDS.include?(word)
+      }.uniq.sort_by { |word| -word.length }
+    end
   end
 
   def ensure_reserved(term)
@@ -366,6 +615,7 @@ module ReserveManager
     end
     item = located[:item]
     container = located[:container]
+    echo_reserve_attempt(term, item, container)
 
     stashed_right = false
     if both_hands_occupied? && find_hand_item(term).nil?
@@ -373,10 +623,15 @@ module ReserveManager
       return false unless stashed_right
     end
 
+    if recent_get_pending?(term)
+      held_item = wait_for_recent_held_item(term)
+      return false unless held_item
+    end
+
     unless find_hand_item(term)
       if container
-        get_result = dothistimeout("get ##{item.id} from ##{container.id}", 5, /You remove|You get|You pick up|What were you referring to\?|Get what\?/)
-        unless get_result =~ /You remove|You get|You pick up/
+        get_result = dothistimeout("get ##{item.id} from ##{container.id}", 5, GET_RESPONSE_REGEX)
+        unless get_result =~ GET_SUCCESS_REGEX
           refresh_container_contents(container)
           item = find_item_in_container(container, term)
           unless item
@@ -390,38 +645,82 @@ module ReserveManager
 
           @term_container_cache[term] = container.id
           @term_item_cache[term] = item.id
-          get_result = dothistimeout("get ##{item.id} from ##{container.id}", 5, /You remove|You get|You pick up|What were you referring to\?|Get what\?/)
-          unless get_result =~ /You remove|You get|You pick up/
+          get_result = dothistimeout("get ##{item.id} from ##{container.id}", 5, GET_RESPONSE_REGEX)
+          unless get_result =~ GET_SUCCESS_REGEX
             restore_right_hand_after_reserve if stashed_right
             cleanup_opened_containers
             return false
           end
         end
+        remember_recent_get(term, item)
       else
-        result = dothistimeout("get ##{item.id}", 5, /You remove|You get|You pick up|What were you referring to\?|Get what\?/)
-        unless result =~ /You remove|You get|You pick up/
+        result = dothistimeout("get ##{item.id}", 5, GET_RESPONSE_REGEX)
+        unless result =~ GET_SUCCESS_REGEX
           restore_right_hand_after_reserve if stashed_right
           cleanup_opened_containers
           return false
         end
+        remember_recent_get(term, item)
       end
       waitrt?
     end
 
-    held_item = find_hand_item_by_id(item.id) || find_hand_item(term)
-    return false unless held_item
+    held_item = wait_for_held_item(item, term)
+    unless held_item
+      return_item_to_container(item, container)
+      restore_right_hand_after_reserve if stashed_right
+      cleanup_opened_containers
+      return false
+    end
 
     result = with_reserve_command_sync_suppressed do
       dothistimeout("reserve ##{held_item.id}", 5, /You reserve your|You must be holding|You can't reserve|RESERVE \{item\}/i)
     end
+    clear_recent_get(term)
     refresh_reserve_list(force: true)
     restore_right_hand_after_reserve if stashed_right
     cleanup_opened_containers
+    if result =~ /You can't reserve/i
+      handle_unreservable_term(term, held_item, container)
+      return false
+    end
     result =~ /You reserve your/
   rescue StandardError
+    clear_recent_get(term)
     restore_right_hand_after_reserve if stashed_right
     cleanup_opened_containers
     false
+  end
+
+  def handle_unreservable_term(term, item = nil, container = nil)
+    clear_configured_term(term)
+    if item
+      returned = return_item_to_container(item, container)
+      stow_cleared_reserved_item(item) unless returned
+    end
+    echo "configured reserve item is not reservable and has been cleared from setup: #{term}"
+  rescue StandardError
+    nil
+  end
+
+  def clear_configured_term(term)
+    normalized_term = normalize_item_term(term)
+    return if normalized_term.empty?
+
+    changed = false
+    synced_settings = @settings.dup
+    1.upto(3) do |index|
+      key = :"reserve_item_#{index}"
+      next unless normalize_item_term(synced_settings[key]) == normalized_term
+
+      synced_settings[key] = ''
+      changed = true
+    end
+
+    return unless changed
+
+    persist_settings(synced_settings)
+    @settings = synced_settings
   end
 
   def clear_reserved_item(item)
@@ -456,17 +755,130 @@ module ReserveManager
     nil
   end
 
+  def return_item_to_container(item, container)
+    return unless item && container
+
+    held_item = find_held_item_match(item, item.name)
+    return unless held_item
+
+    result = dothistimeout("put ##{held_item.id} in ##{container.id}", 5, /You put|You carefully put|You tuck|You place|You add the single dose|What were you referring to\?/i)
+    result =~ /You put|You carefully put|You tuck|You place|You add the single dose/i
+  rescue StandardError
+    false
+  end
+
+  def wait_for_held_item(item, term)
+    held_item = find_held_item_match(item, term)
+    return held_item if held_item
+
+    HAND_UPDATE_WAIT_ATTEMPTS.times do
+      sleep HAND_UPDATE_WAIT_SECONDS
+      held_item = find_held_item_match(item, term)
+      return held_item if held_item
+    end
+
+    nil
+  rescue StandardError
+    nil
+  end
+
+  def find_held_item_match(item, term = nil)
+    return nil unless item
+
+    find_hand_item_by_id(item.id) ||
+      find_hand_item_by_noun(item.noun) ||
+      find_hand_item_by_name(item.name) ||
+      (term && find_hand_item(term))
+  rescue StandardError
+    nil
+  end
+
+  def remember_recent_get(term, item)
+    @recent_get_hints[normalize_item_term(term)] = {
+      at: Time.now,
+      id: item.id.to_s,
+      noun: item.noun.to_s,
+      name: item.name.to_s
+    }
+  rescue StandardError
+    nil
+  end
+
+  def clear_recent_get(term)
+    @recent_get_hints.delete(normalize_item_term(term))
+  rescue StandardError
+    nil
+  end
+
+  def recently_retrieved_held_item(term)
+    hint = @recent_get_hints[normalize_item_term(term)]
+    return nil unless hint
+    return clear_recent_get(term) if (Time.now - hint[:at]) > RECENT_GET_GRACE_SECONDS
+
+    [GameObj.right_hand, GameObj.left_hand].compact.find do |hand_item|
+      hand_item.id.to_s == hint[:id].to_s ||
+        hand_item.noun.to_s == hint[:noun].to_s ||
+        hand_item.name.to_s == hint[:name].to_s
+    end
+  rescue StandardError
+    nil
+  end
+
+  def recent_get_pending?(term)
+    hint = @recent_get_hints[normalize_item_term(term)]
+    return false unless hint
+    return clear_recent_get(term) if (Time.now - hint[:at]) > RECENT_GET_GRACE_SECONDS
+
+    true
+  rescue StandardError
+    false
+  end
+
+  def wait_for_recent_held_item(term)
+    held_item = recently_retrieved_held_item(term)
+    return held_item if held_item
+
+    HAND_UPDATE_WAIT_ATTEMPTS.times do
+      sleep HAND_UPDATE_WAIT_SECONDS
+      held_item = recently_retrieved_held_item(term)
+      return held_item if held_item
+    end
+
+    nil
+  rescue StandardError
+    nil
+  end
+
   def both_hands_occupied?
     !right_hand_empty? && !left_hand_empty?
   end
 
-  def reserve_action_ready?
+  def reserve_command_ready?
     return false if checkrt.to_i > 0
     return false if checkcastrt.to_i > 0
     return false if stunned?
     return false unless standing?
 
     true
+  rescue StandardError
+    false
+  end
+
+  def reserve_refill_safe?
+    return false if running?('eloot')
+    return false if running?('ecleanse')
+    return false if aggressive_targets_present?
+
+    true
+  end
+
+  def aggressive_targets_present?
+    Array(GameObj.targets).any? do |target|
+      next false unless target
+      next false if target.status.to_s =~ /dead|gone/i
+
+      target.type.to_s =~ /aggressive/i
+    end
   rescue StandardError
     false
   end
@@ -542,8 +954,22 @@ module ReserveManager
     last = @last_missing_by_term[term] || Time.at(0)
     return if (Time.now - last) < 30
 
-    echo "missing configured reserve item in inventory: #{term}"
+    echo "Cannot find #{term} in inventory to place in reserve."
     @last_missing_by_term[term] = Time.now
+  end
+
+  def echo_reserve_attempt(term, item, container)
+    @last_attempt_echo ||= {}
+    key = [term.to_s, item&.id.to_s, container&.id.to_s].join(':')
+    last = @last_attempt_echo[key] || Time.at(0)
+    return if (Time.now - last) < 5
+
+    if container
+      echo "refilling reserve: term=#{term} item=#{item&.name} ##{item&.id} from #{container&.name} ##{container&.id}"
+    else
+      echo "refilling reserve: term=#{term} item=#{item&.name} ##{item&.id}"
+    end
+    @last_attempt_echo[key] = Time.now
   end
 
   def load_settings
