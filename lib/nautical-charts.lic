@@ -10,6 +10,8 @@ before_dying {
   $combat_flash_active = false
   $combat_draw = nil
   $mac_settings_win = nil
+  GLib::Source.remove($configure_timer_id) if $configure_timer_id rescue nil
+  $configure_timer_id = nil
 
   # 4. Final Window Cleanup
   # CRITICAL on Mac: never call ANY GTK method (including hide/destroy) from
@@ -39,13 +41,14 @@ def stop_audio
     end
     system("taskkill /f /im powershell.exe /fi \"WINDOWTITLE eq Hidden\" > nul 2>&1")
   elsif RUBY_PLATFORM =~ /darwin/
-    # macOS - kill only the PID we spawned (a shell wrapping afplay).
-    # Sending TERM to the shell PID also signals its afplay child via the
-    # process group, so we don't need a blanket pkill that would affect
-    # other apps using afplay (system sounds, other scripts, etc).
     if $current_audio_pid
       begin
-        Process.kill('TERM', -Process.getpgid($current_audio_pid))
+        # Kill the shell process directly by PID only.
+        # Using -getpgid (process group kill) is dangerous if the PID has been
+        # recycled by the OS -- it can accidentally signal Lich's own process group.
+        Process.kill('TERM', $current_audio_pid)
+        # Also kill any child afplay process by name scoped to our shell's children
+        system("pkill -P #{$current_audio_pid} afplay 2>/dev/null")
       rescue Errno::ESRCH, Errno::EPERM
         # Process already gone - not an error
       end
@@ -386,54 +389,67 @@ def render_images
 		target_h = ($map_pixbuf_orig.height * $scale).round
 		return if target_w <= 0 || target_h <= 0
 
-		# 3. Render Scaled Map
+		# 3. Scale pixbufs on current thread (heavy computation - must NOT block GTK thread)
+		# These are passed into Gtk.queue as locals so no shared state issues
 		map_scaled = $map_pixbuf_orig.scale_simple(target_w, target_h, GdkPixbuf::InterpType::BILINEAR)
 		return if map_scaled.nil?
-		$map_image.set_from_pixbuf(map_scaled)
 
-		# 4. Update Layout Boundaries
-		$layout.set_size(map_scaled.width, map_scaled.height)
-
-		# 5. Handle Background
+		bg_scaled = nil
 		if $show_background && $bg_pixbuf_orig
 			bg_w = ($bg_pixbuf_orig.width * $scale).round
 			bg_h = ($bg_pixbuf_orig.height * $scale).round
 			if bg_w > 0 && bg_h > 0
 				bg_scaled = $bg_pixbuf_orig.scale_simple(bg_w, bg_h, GdkPixbuf::InterpType::BILINEAR)
-				$bg_image.set_from_pixbuf(bg_scaled)
-				$bg_image.show
 			end
-		else
-			$bg_image.hide
 		end
 
-		# 6. Handle Ship Icon Scaling
 		ship_size = (40 * $scale).round
+		ship_scaled = nil
 		if $ship_pixbuf_orig && ship_size > 0
 			ship_scaled = $ship_pixbuf_orig.scale_simple(ship_size, ship_size, GdkPixbuf::InterpType::BILINEAR)
-			$ship_image.set_from_pixbuf(ship_scaled)
 		end
 
-		# 7. Position the Ship
-		if $current_cx && $current_cy
-			sx = ($current_cx * $scale).round - (ship_size / 2)
-			sy = ($current_cy * $scale).round - (ship_size / 2)
-			$layout.move($ship_image, sx, sy)
-			$ship_image.show
-		else
-			$ship_image.hide
-		end
+		cx = $current_cx
+		cy = $current_cy
+		scale_snap = $scale
+		map_file_snap = $current_map_file
+		room_id_snap = $current_room_id
 
-		# 8. Status Bar Update
-		if $status && $status.respond_to?(:set_text)
-			$status.set_text("Map: #{$current_map_file} | Room: #{$current_room_id} | Scale: #{($scale*100).to_i}%")
+		# 4. Hand pre-scaled pixbufs to GTK thread for widget updates only
+		Gtk.queue do
+			next unless $minimap_win && !$minimap_win.destroyed?
+
+			$map_image.set_from_pixbuf(map_scaled)
+			$layout.set_size(map_scaled.width, map_scaled.height)
+
+			if bg_scaled
+				$bg_image.set_from_pixbuf(bg_scaled)
+				$bg_image.show
+			else
+				$bg_image.hide
+			end
+
+			if ship_scaled
+				$ship_image.set_from_pixbuf(ship_scaled)
+			end
+
+			if cx && cy
+				sx = (cx * scale_snap).round - (ship_size / 2)
+				sy = (cy * scale_snap).round - (ship_size / 2)
+				$layout.move($ship_image, sx, sy)
+				$ship_image.show
+			else
+				$ship_image.hide
+			end
+
+			if $status && $status.respond_to?(:set_text)
+				$status.set_text("Map: #{map_file_snap} | Room: #{room_id_snap} | Scale: #{(scale_snap*100).to_i}%")
+			end
 		end
 end
 
 def update_images
-	Gtk.queue do
-		render_images
-	end
+	render_images
 end
 
 def trigger_combat_flash
@@ -443,7 +459,6 @@ def trigger_combat_flash
 		elapsed = Time.now - $combat_last_dismissed
 		if elapsed < COMBAT_COOLDOWN
 			remaining = (COMBAT_COOLDOWN - elapsed).ceil
-			debug_echo "Combat alert on cooldown (#{remaining}s remaining)"
 			return
 		end
 	end
@@ -909,42 +924,56 @@ def show_mac_settings_window
 end
 
 def load_map_assets(map_file, manual = false)
+
+  # Load pixbufs on the Ruby thread (file I/O - does not need GTK thread)
+  new_map_pixbuf = nil
+  new_bg_pixbuf = nil
+  new_map_file = nil
+  new_scale = $scale
+  port_img = nil
+
+  unless manual
+    PORT_RANGES.each { |range, filename| (port_img = filename; break) if range.include?($current_room_id.to_i) }
+  end
+
+  if port_img && File.exist?(File.join(PORT_BG_DIR, port_img))
+    begin
+      new_map_pixbuf = GdkPixbuf::Pixbuf.new(file: File.join(PORT_BG_DIR, port_img))
+      new_bg_pixbuf = nil
+      new_map_file = port_img
+      new_scale = 0.25
+    rescue => e
+      mm_echo "Failed to load port image #{port_img}: #{e.message}"
+    end
+  elsif map_file
+    map_path = File.join(PNG_DIR, map_file)
+    if File.exist?(map_path)
+      begin
+        new_map_pixbuf = GdkPixbuf::Pixbuf.new(file: map_path)
+        bg_filename = map_file.gsub(/\.png$/i, '_background.png')
+        bg_path = File.join(BG_DIR, bg_filename)
+        new_bg_pixbuf = File.exist?(bg_path) ? GdkPixbuf::Pixbuf.new(file: bg_path) : nil
+        new_map_file = map_file
+        new_scale = 0.50 if $scale == 0.25 || manual
+      rescue => e
+        mm_echo "Failed to load map #{map_file}: #{e.message}"
+      end
+    else
+    end
+  else
+  end
+
+  # Hand off loaded pixbufs to GTK thread for widget updates only
   Gtk.queue do
     $ship_image.hide if $ship_image
-
-    port_img = nil
-    unless manual
-      PORT_RANGES.each { |range, filename| (port_img = filename; break) if range.include?($current_room_id.to_i) }
-    end
-
-    if port_img && File.exist?(File.join(PORT_BG_DIR, port_img))
-      begin
-        $map_pixbuf_orig = GdkPixbuf::Pixbuf.new(file: File.join(PORT_BG_DIR, port_img))
-        $bg_pixbuf_orig = nil
-        $current_map_file = port_img
-        $scale = 0.25
-      rescue => e
-        mm_echo "Failed to load port image #{port_img}: #{e.message}"
-      end
-    elsif map_file
-      map_path = File.join(PNG_DIR, map_file)
-      if File.exist?(map_path)
-        begin
-          $map_pixbuf_orig = GdkPixbuf::Pixbuf.new(file: map_path)
-          bg_filename = map_file.gsub(/\.png$/i, '_background.png')
-          bg_path = File.join(BG_DIR, bg_filename)
-          $bg_pixbuf_orig = File.exist?(bg_path) ? GdkPixbuf::Pixbuf.new(file: bg_path) : nil
-          $current_map_file = map_file
-          $scale = 0.50 if $scale == 0.25 || manual
-        rescue => e
-          mm_echo "Failed to load map #{map_file}: #{e.message}"
-        end
-      end
-    end
-    # Trigger redraw now that new assets are loaded, still inside the GTK thread
-    # Call render_images directly (not update_images) to avoid nested Gtk.queue deadlock
-    render_images
+    $map_pixbuf_orig = new_map_pixbuf if new_map_pixbuf
+    $bg_pixbuf_orig = new_bg_pixbuf
+    $current_map_file = new_map_file if new_map_file
+    $scale = new_scale
   end
+
+  # render_images runs scale_simple on Ruby thread then queues only widget calls
+  render_images
 end
 
 def load_room!(room_id, force: false)
@@ -965,8 +994,6 @@ def load_room!(room_id, force: false)
 
     if (is_port != was_port) || ($current_map_file != map_file && !is_port) || force
         load_map_assets(map_file)
-        # update_images is called inside Gtk.queue by load_map_assets on transition
-        # so we only call it directly here if no asset reload was needed
     else
         update_images
     end
@@ -1031,20 +1058,35 @@ end
 		$minimap_win.set_keep_above($keep_on_top) 
 
 		# 2. Real-Time Tracking Listener
-		# This captures every move or resize and updates our variables immediately
+		# Debounced with a flag and 500ms timeout to prevent Mac Quartz signal storms
+		# that occur when layout changes during port/sea transitions trigger cascading
+		# configure-event callbacks.
+		$configure_event_busy = false
+		$configure_timer_id = nil
 		$minimap_win.signal_connect('configure-event') do
-			unless $minimap_win.destroyed?
-				# Update global variables with current window state
-				$win_x, $win_y = $minimap_win.position
-				$win_w, $win_h = $minimap_win.size
-				
-				# Push directly to UserVars for safety in case of a crash or ;kill
-				UserVars.sea_charts[:win_x] = $win_x
-				UserVars.sea_charts[:win_y] = $win_y
-				UserVars.sea_charts[:win_w] = $win_w
-				UserVars.sea_charts[:win_h] = $win_h
+			unless $configure_event_busy || $minimap_win.nil? || $minimap_win.destroyed?
+				# Cancel previous pending save
+				GLib::Source.remove($configure_timer_id) if $configure_timer_id
+				win_ref = $minimap_win
+				$configure_timer_id = GLib::Timeout.add(500) do
+					$configure_timer_id = nil
+					next false if win_ref.nil? || win_ref.destroyed?
+					$configure_event_busy = true
+					begin
+						$win_x, $win_y = win_ref.position
+						$win_w, $win_h = win_ref.size
+						UserVars.sea_charts[:win_x] = $win_x
+						UserVars.sea_charts[:win_y] = $win_y
+						UserVars.sea_charts[:win_w] = $win_w
+						UserVars.sea_charts[:win_h] = $win_h
+					rescue
+					ensure
+						$configure_event_busy = false
+					end
+					false
+				end
 			end
-			false # Allow the event to continue to other GTK handlers
+			false
 		end
 
 		# 3. GUI Construction
@@ -1143,24 +1185,18 @@ end
 				rid = $1.to_i
 				if rid != last_seen_id
 					last_seen_id = rid
-					debug_echo "Detected room #{rid}, alive=#{$minimap_alive}"
-					debug_echo "Calling load_room!"
 					result = load_room!(rid)
-					debug_echo "load_room! returned #{result}"
 					update_images if result
 				end
 			elsif line =~ /You begin to watch the ocean waters surrounding the ship|You are already watching the ocean/
 				# User manually typed watch ocean -- mark as started without script sending its own command
 				$ocean_watch_started = true
-				debug_echo "Ocean watch detected from user input"
 			elsif line =~ COMBAT_REGEX
-				debug_echo "Combat detected!"
 				trigger_combat_flash
 			end
 		end
 		sleep 0.1
 	end
-	debug_echo "Exited main loop -- minimap_alive=#{$minimap_alive}"
 rescue => e
   mm_echo "CRASH: #{e.class}: #{e.message}"
   mm_echo e.backtrace.first(5).join("\n")

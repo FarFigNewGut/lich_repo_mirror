@@ -2,38 +2,38 @@
 =begin
 
   InjuryWatch - Room triage display for Gemstone IV
-
   *** BETA - Published, feedback welcome ***
 
-  Tip: Type FLAG DIALOGS OFF in game to disable appraise popups.
+  Tip: Type FLAG DIALOGS OFF to disable appraise popups.
 
-  Displays triage status for everyone in your room so you can quickly
-  identify who needs healing. Silently appraises each person on arrival
-  and updates automatically as things change.
+  Silently appraises everyone in your room and displays their injury status
+  so you can quickly identify who needs healing. Updates automatically on
+  arrivals, departures, room changes, manual appraisals, and ecure/mcure heals.
 
-  Triage statuses (priority order):
-      Dead, Poisoned, Diseased, Bleeding, Injured, Nerve dmg, Scarred, OK
+  Statuses (priority order): Dead, Poisoned, Diseased, Bleeding, Injured,
+                             Nerve dmg, Scarred, OK
+  Dead shows injury too e.g. "Dead - Bleeding" so you know what they need
+  before being raised. Combat updates require manual appraisal to catch up.
 
-  Dead people show injury status e.g. "Dead - Bleeding" so you know
-  what they will need before they are raised.
+  Refresh commands:
+      ;send injurywatch refresh        re-appraises injured people only
+      ;send injurywatch refresh room   re-appraises everyone in the room
 
-  Updates automatically when someone arrives, leaves, changes rooms,
-  is manually appraised, or is healed by ecure/mcure.
-
-  Commands:
-      ;injurywatch setup    opens display mode setup window
-      ;injurywatch debug    starts with debug output
-      ;injurywatch help     shows this help text
-
-  Display modes (auto-detected, or set manually):
+  Display modes (auto-detected, or change via ;injurywatch setup):
       ;vars set injurywatch_display=dock    StormFront/Wrayth dockable panel
       ;vars set injurywatch_display=popup   floating window (requires GTK)
       ;vars set injurywatch_display=text    prints to story window
 
+  Other commands:
+      ;injurywatch setup   opens display mode setup window
+      ;injurywatch debug   starts with debug output
+      ;injurywatch help    shows this help text
+
   Known issues:
-      - Dead detection/revival tracking still being refined.
-      - Cannot detect when another empath heals someone.
-      - Poisoned and Diseased statuses not yet fully tested.
+      - Dead detection/revival still being refined; manual appraise to correct.
+      - Cannot detect when another empath heals someone; manual appraise to update.
+      - Fogged/dragged bodies may briefly show ? before resolving.
+      - Poisoned and Diseased not yet fully tested.
 
        author: Mystienne
          game: gs
@@ -434,19 +434,30 @@ module InjuryWatch
     people_status = {}
     refresh_queue = []
 
-    # Combat injury detection - watch for injury messages and queue re-appraise
-    # Only triggers if person is currently showing OK to avoid spam
+    # get is called in main loop each tick to check for refresh commands
+
+    # Combat injury detection and other-empath heal detection
     DownstreamHook.add("iw_combat_watch", proc { |line|
       plain = line.gsub(/<[^>]+>/, ' ').gsub(/\s+/, ' ').strip
       noun  = nil
 
-      # "Nythera's left arm is mangled!" / "Nythera's chest is heavily damaged!"
+      # Other empath healing: "Devantis's head wound gradually fades..."
+      # Target is being healed - queue re-appraise
+      if plain =~ /^(\w+)'s \w+ wound gradually fades/i
+        noun = Regexp.last_match(1)
+        entry = people_status.find { |_id, p| p[:noun].downcase == noun.downcase }
+        if entry && entry[1][:status] !~ /^OK$/
+          dbg "other empath heal -> #{noun} being healed, queuing re-appraise"
+          refresh_queue << "refresh #{noun}"
+        end
+        next line
+      end
+
+      # Combat injury detection - only triggers if person is currently OK
       if plain =~ /^(\w+)'s? (?:left |right )?(?:arm|leg|hand|eye|chest|neck|back|head|abdomen)/i
         noun = Regexp.last_match(1)
-      # "Nythera is stunned!" / "Nythera is bleeding!"
       elsif plain =~ /^(\w+) is (?:stunned|bleeding|knocked|struck|hit|burned|frozen|electrified)/i
         noun = Regexp.last_match(1)
-      # "Nythera takes X points of damage!"
       elsif plain =~ /^(\w+) takes \d+ points? of damage/i
         noun = Regexp.last_match(1)
       end
@@ -528,23 +539,35 @@ module InjuryWatch
         next nil  # suppress from story window
       end
 
-      # Scar/nerve follow-up line
-      if last_appraised_id && line !~ /You take a quick appraisal/i && line =~ /<a [^>]*>(?:He|She)<\/a> has (.*?)\./i
-        candidate      = Regexp.last_match(1).gsub(/<[^>]+>/, '').gsub(/\s+/, ' ').strip
-        current_status = people_status[last_appraised_id]&.dig(:status)
-        if candidate =~ SCAR_WORDS && current_status == "OK"
-          dbg "manual appraise -> scar follow-up for #{people_status[last_appraised_id][:noun]}"
-          people_status[last_appraised_id][:status] = "Scarred"
-          display(people_status)
-        elsif candidate =~ NERVE_WORDS && (current_status == "OK" || current_status == "Injured")
-          dbg "manual appraise -> nerve follow-up for #{people_status[last_appraised_id][:noun]}"
-          people_status[last_appraised_id][:status] = "Nerve dmg"
-          display(people_status)
+      # Scar/nerve follow-up line - suppress if person is dead
+      if line !~ /You take a quick appraisal/i && line =~ /<a [^>]*>(?:He|She)<\/a> has (.*?)\./i
+        # Suppress plain text scar line that leaks through for dead people
+        if last_appraised_noun
+          entry = people_status.find { |_id, p| p[:noun].downcase == last_appraised_noun.downcase }
+          next nil if entry && entry[1][:status] =~ /^Dead/
         end
-        last_appraised_id = nil
+        if last_appraised_id
+          candidate      = Regexp.last_match(1).gsub(/<[^>]+>/, '').gsub(/\s+/, ' ').strip
+          current_status = people_status[last_appraised_id]&.dig(:status)
+          if candidate =~ SCAR_WORDS && current_status == "OK"
+            dbg "manual appraise -> scar follow-up for #{people_status[last_appraised_id][:noun]}"
+            people_status[last_appraised_id][:status] = "Scarred"
+            display(people_status)
+          elsif candidate =~ NERVE_WORDS && (current_status == "OK" || current_status == "Injured")
+            dbg "manual appraise -> nerve follow-up for #{people_status[last_appraised_id][:noun]}"
+            people_status[last_appraised_id][:status] = "Nerve dmg"
+            display(people_status)
+          end
+          last_appraised_id = nil
+        end
       end
 
       # Process wound line
+      # Suppress plain text "She/He has..." follow-up lines - we handle these internally
+      if plain =~ /^(?:He|She) has /i && last_appraised_noun
+        next nil
+      end
+
       if noun && wound_text && !InjuryWatch.bulk_appraising?
         dbg "manual appraise -> noun: #{noun} wound: #{wound_text[0,60]}"
         entry = people_status.find { |_id, p| p[:noun].downcase == noun.downcase }
@@ -585,6 +608,18 @@ module InjuryWatch
     last_room = Room.current.id
 
     loop do
+      # Check for ;send injurywatch refresh / refresh room commands
+      while (msg = Script.current.gets?)
+        msg = msg.strip.downcase
+        if msg == "refresh room"
+          refresh_queue << "refresh_room"
+          dbg "refresh room queued"
+        elsif msg == "refresh"
+          refresh_queue << "refresh_injured"
+          dbg "refresh injured queued"
+        end
+      end
+
       # Room change - preserve group members, clear everyone else
       if Room.current.id != last_room
         last_room = Room.current.id
@@ -640,18 +675,25 @@ module InjuryWatch
         end
       end
 
-      display(people_status) if (!new_ids.empty? || !gone_ids.empty?) && display_mode != :text
+      display(people_status) if !new_ids.empty? || !gone_ids.empty?
 
       InjuryWatch.bulk_appraising = true if display_mode == :text
       sleep 0.5 if !new_ids.empty?  # let room settle before appraising
       new_ids.each do |id|
-        if people_status[id][:status] == "Dead - ..."
-          injury = appraise(current[id][:noun])
-          injury = "Unknown" if injury == "?" || injury == "..."
+        if people_status[id][:status] =~ /^Dead/
+          result = appraise(current[id][:noun])
+          # Strip any Dead prefix from result — we add our own
+          injury = result.gsub(/^Dead\s*-?\s*/i, '').strip
+          injury = "Unknown" if injury.empty? || injury == "?" || injury == "..."
           people_status[id][:status] = "Dead - #{injury}"
-          dbg "dead arrival #{current[id][:noun]} -> #{injury}"
+          dbg "dead arrival #{current[id][:noun]} -> Dead - #{injury}"
         else
-          people_status[id][:status] = appraise(current[id][:noun])
+          result = appraise(current[id][:noun])
+          people_status[id][:status] = result
+          if result == "?"
+            dbg "#{current[id][:noun]} returned ?, will retry"
+            refresh_queue << "retry #{current[id][:noun]}"
+          end
         end
       end
       InjuryWatch.bulk_appraising = false
@@ -661,19 +703,48 @@ module InjuryWatch
       # Process refresh queue (used internally by death/revival hooks)
       until refresh_queue.empty?
         msg = refresh_queue.shift
-        if msg =~ /^(?:r|refresh)\s+(\S+)$/i
+        if msg == "refresh_room"
+          dbg "refresh all (#{people_status.length} people)"
+          people_status.each { |id, _| people_status[id][:status] = "..." }
+          display(people_status)
+          people_status.each { |id, p| people_status[id][:status] = appraise(p[:noun]) }
+          display(people_status)
+        elsif msg == "refresh_injured"
+          injured = people_status.select { |_id, p| p[:status] !~ /^OK$|^\.\.\.$|\?/ }
+          dbg "refresh injured (#{injured.length} people)"
+          injured.each { |id, _| people_status[id][:status] = "..." }
+          display(people_status)
+          injured.each { |id, p| people_status[id][:status] = appraise(p[:noun]) }
+          display(people_status)
+        elsif msg =~ /^retry\s+(\S+)$/i
+          target = Regexp.last_match(1)
+          entry  = people_status.find { |_id, p| p[:noun].downcase == target.downcase }
+          if entry && entry[1][:status] == "?"
+            dbg "retrying appraise for #{target}"
+            sleep 1.0
+            result = appraise(target)
+            if result != "?"
+              people_status[entry[0]][:status] = result
+              display(people_status)
+            end
+          end
+        elsif msg =~ /^(?:r|refresh)\s+(\S+)$/i
           target = Regexp.last_match(1)
           entry  = people_status.find { |_id, p| p[:noun].downcase == target.downcase }
           if entry
             dbg "refresh #{target}"
             result = appraise(entry[1][:noun])
-            people_status[entry[0]][:status] = result unless result == "?"
+            unless result == "?"
+              if result =~ /^Dead/
+                injury = result.gsub(/^Dead\s*-?\s*/i, '').strip
+                injury = "Unknown" if injury.empty?
+                people_status[entry[0]][:status] = "Dead - #{injury}"
+              else
+                people_status[entry[0]][:status] = result
+              end
+            end
             display(people_status)
           end
-        else
-          dbg "refresh all"
-          people_status.each { |id, p| people_status[id][:status] = appraise(p[:noun]) }
-          display(people_status)
         end
       end
 
