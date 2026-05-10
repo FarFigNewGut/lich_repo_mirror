@@ -374,8 +374,58 @@ end
 
 def ensure_ocean_watch
   return if $ocean_watch_started
-  Lich::Util.quiet_command("watch ocean", /You begin to watch the ocean waters surrounding the ship|You are already watching the ocean|I could not find what you were referring to/, end_pattern = /You begin to watch the ocean waters surrounding the ship|You are already watching the ocean|I could not find what you were referring to/, include_end = true, timeout = 3, silent = true)
-  Lich::Util.quiet_command("look ocean", /^\[/, end_pattern = /^\[/, include_end = true, timeout = 3, silent = true)
+  watch_result = Lich::Util.quiet_command("watch ocean", /You begin to watch the ocean waters surrounding the ship|You are already watching the ocean|I could not find what you were referring to/, end_pattern = /You begin to watch the ocean waters surrounding the ship|You are already watching the ocean|I could not find what you were referring to/, include_end = true, timeout = 3, silent = true)
+  rid = nil
+  if watch_result.to_s =~ /You begin to watch the ocean waters surrounding the ship|You are already watching the ocean/
+    look_result = Lich::Util.quiet_command("look ocean", /^\[/, end_pattern = /^\[/, include_end = true, timeout = 3, silent = true)
+    if look_result.to_s =~ /\((\d{7})\)/
+      rid = $1.to_i
+    end
+  end
+  # Fallback -- if watch/look ocean gave us nothing, check Room.current.uid
+  # This handles being on port docks where watch ocean is unavailable
+  if rid.nil?
+    begin
+      current_uid = Room.current.uid
+      current_uid = current_uid.first if current_uid.is_a?(Array)
+      rid = current_uid.to_i if current_uid && current_uid.to_i > 0
+    rescue
+    end
+  end
+  # Final fallback -- match Room.current.location against known port towns
+  # and use the first room ID in that port's range as a starting point
+  if rid.nil?
+    begin
+      location = Room.current.location.to_s.downcase
+      port_location_map = {
+        /wehnimer/          => 7122001,
+        /solhaven/          => 7124001,
+        /river.?s rest/     => 7125001,
+        /icemule/           => 7133002,
+        /brisker/           => 7140101,
+        /teras/             => 7123001,
+        /kraken/            => 7118240,
+        /talon/             => 7150106,
+        /sleeping drake|ornath/ => 7142001,
+        /glaoveln/          => 4426101,
+        /nielira/           => 14150001,
+        /ta.?vaalor|vaalor/ => 7136002
+      }
+      port_location_map.each do |pattern, start_rid|
+        if location =~ pattern
+          rid = start_rid
+          mm_echo "Location match: #{Room.current.location} -> loading port image"
+          break
+        end
+      end
+    rescue
+    end
+  end
+  if rid
+    $current_room_id = rid
+    result = load_room!(rid)
+    update_images if result
+  end
   $ocean_watch_started = true
 end
 
@@ -641,8 +691,11 @@ def show_context_menu(event)
           $ship_icon_file = filename
           save_settings
           icon_path = File.join(ICON_DIR, $ship_icon_file)
-          $ship_pixbuf_orig = GdkPixbuf::Pixbuf.new(file: icon_path) rescue GdkPixbuf::Pixbuf.new(file: File.join(ICON_DIR, 'default_icon.png'))
-          update_images
+          Thread.new do
+            new_pixbuf = GdkPixbuf::Pixbuf.new(file: icon_path) rescue GdkPixbuf::Pixbuf.new(file: File.join(ICON_DIR, 'default_icon.png'))
+            $ship_pixbuf_orig = new_pixbuf
+            update_images
+          end
         end
       end
       icon_menu.append(item)
@@ -670,14 +723,12 @@ def show_context_menu(event)
 				
 				item.signal_connect("activate") do
 					if item.active? # Only trigger when turned ON
-						Gtk.queue do
-							$current_map_file = file
-							$current_cx = nil
-							$current_cy = nil
-							# Pass 'true' for manual override to reset scale to .50
-							load_map_assets(file, true) 
-							update_images
-						end
+						$current_map_file = file
+						$current_cx = nil
+						$current_cy = nil
+						# Pass 'true' for manual override to reset scale to .50
+						# load_map_assets handles its own Gtk.queue and calls update_images internally
+						load_map_assets(file, true)
 					end
 				end
 				map_menu.append(item)
@@ -878,8 +929,11 @@ def show_mac_settings_window
         $ship_icon_file = filename
         save_settings
         icon_path = File.join(ICON_DIR, $ship_icon_file)
-        $ship_pixbuf_orig = GdkPixbuf::Pixbuf.new(file: icon_path) rescue GdkPixbuf::Pixbuf.new(file: File.join(ICON_DIR, 'default_icon.png'))
-        update_images
+        Thread.new do
+          new_pixbuf = GdkPixbuf::Pixbuf.new(file: icon_path) rescue GdkPixbuf::Pixbuf.new(file: File.join(ICON_DIR, 'default_icon.png'))
+          $ship_pixbuf_orig = new_pixbuf
+          update_images
+        end
       end
     end
     icon_box.pack_start(btn, expand: false, fill: false, padding: 0)
@@ -907,7 +961,6 @@ def show_mac_settings_window
           $current_cx = nil
           $current_cy = nil
           load_map_assets(file, true)
-          update_images
         end
       end
       map_box.pack_start(btn, expand: false, fill: false, padding: 0)
@@ -963,14 +1016,14 @@ def load_map_assets(map_file, manual = false)
   else
   end
 
-  # Hand off loaded pixbufs to GTK thread for widget updates only
-  Gtk.queue do
-    $ship_image.hide if $ship_image
-    $map_pixbuf_orig = new_map_pixbuf if new_map_pixbuf
-    $bg_pixbuf_orig = new_bg_pixbuf
-    $current_map_file = new_map_file if new_map_file
-    $scale = new_scale
-  end
+  # Assign globals on Ruby thread immediately so render_images sees them
+  $map_pixbuf_orig = new_map_pixbuf if new_map_pixbuf
+  $bg_pixbuf_orig = new_bg_pixbuf
+  $current_map_file = new_map_file if new_map_file
+  $scale = new_scale
+
+  # Hide ship on GTK thread, then render
+  Gtk.queue { $ship_image.hide if $ship_image }
 
   # render_images runs scale_simple on Ruby thread then queues only widget calls
   render_images
@@ -1031,7 +1084,6 @@ end
 $debug_mode = script.vars.include?('--debug')
 
 flag_settings
-ensure_ocean_watch
 
 begin
   $data = JSON.parse(File.read(JSON_PATH))
@@ -1177,7 +1229,15 @@ end
 	end
 
 	last_seen_id = nil
+	# Wait for GTK window to finish constructing before running ensure_ocean_watch
+	# GLib::Idle.add is async so $minimap_win may not exist yet at this point
+	sleep 0.1 until $minimap_win
+	# Give the window a moment to fully render show_all before we try to draw into it
+	sleep 0.3
 	ensure_ocean_watch
+	# Force a redraw after startup in case update_images fired before layout was ready
+	sleep 0.2
+	update_images if $current_room_id
 	while $minimap_alive
 		line = get?
 		if line
@@ -1189,8 +1249,28 @@ end
 					update_images if result
 				end
 			elsif line =~ /You begin to watch the ocean waters surrounding the ship|You are already watching the ocean/
-				# User manually typed watch ocean -- mark as started without script sending its own command
+				# User manually typed watch ocean -- follow up with look ocean to get current room
 				$ocean_watch_started = true
+				rid = nil
+				look_result = Lich::Util.quiet_command("look ocean", /^\[/, end_pattern = /^\[/, include_end = true, timeout = 3, silent = true)
+				if look_result.to_s =~ /\((\d{7})\)/
+					rid = $1.to_i
+				end
+				# Fallback to Room.current.uid if look ocean gave nothing
+				if rid.nil?
+					begin
+						current_uid = Room.current.uid
+						current_uid = current_uid.first if current_uid.is_a?(Array)
+						rid = current_uid.to_i if current_uid && current_uid.to_i > 0
+					rescue
+					end
+				end
+				if rid
+					last_seen_id = rid
+					$current_room_id = rid
+					result = load_room!(rid)
+					update_images if result
+				end
 			elsif line =~ COMBAT_REGEX
 				trigger_combat_flash
 			end
