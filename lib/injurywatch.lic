@@ -2,38 +2,65 @@
 =begin
 
   InjuryWatch - Room triage display for Gemstone IV
+
   *** BETA - Published, feedback welcome ***
 
-  Tip: Type FLAG DIALOGS OFF to disable appraise popups.
+  Tip: To disable the appraise popup windows that appear during silent
+  appraisals, type FLAG DIALOGS OFF in your game client. Type FLAG DIALOGS
+  ON to re-enable them.
 
-  Silently appraises everyone in your room and displays their injury status
-  so you can quickly identify who needs healing. Updates automatically on
-  arrivals, departures, room changes, manual appraisals, and ecure/mcure heals.
+  InjuryWatch tracks everyone in your room and displays a triage status for
+  each person so you can quickly identify who needs healing. It silently
+  appraises each person as they arrive and updates automatically as things
+  change - no commands needed during normal use.
 
-  Statuses (priority order): Dead, Poisoned, Diseased, Bleeding, Injured,
-                             Nerve dmg, Scarred, OK
-  Dead shows injury too e.g. "Dead - Bleeding" so you know what they need
-  before being raised. Combat updates require manual appraisal to catch up.
+  Triage statuses (displayed in priority order):
+      Dead, Poisoned, Diseased, Bleeding, Injured, Nerve dmg, Scarred, OK
 
-  Refresh commands:
-      ;send injurywatch refresh        re-appraises injured people only
-      ;send injurywatch refresh room   re-appraises everyone in the room
+  Dead people show their injury status too, e.g. "Dead - Bleeding", so you
+  know what they will need before they are raised.
 
-  Display modes (auto-detected, or change via ;injurywatch setup):
-      ;vars set injurywatch_display=dock    StormFront/Wrayth dockable panel
-      ;vars set injurywatch_display=popup   floating window (requires GTK)
-      ;vars set injurywatch_display=text    prints to story window
+  The display updates automatically when:
+      - Someone arrives or leaves the room
+      - You change rooms (clears and rescans)
+      - You manually appraise someone
+      - A dead person is raised (checked every 15 seconds)
 
-  Other commands:
-      ;injurywatch setup   opens display mode setup window
-      ;injurywatch debug   starts with debug output
-      ;injurywatch help    shows this help text
+  Note: The window only updates when an appraise is performed. In active
+  combat situations statuses may lag behind until you manually appraise
+  the person.
+
+  To update someone's status after they have been healed, simply appraise
+  them manually and the window will update automatically.
+
+  To start with debug output:
+      ;injurywatch debug
+
+  Display modes:
+      The display mode is auto-detected based on your client. You can change
+      it using the setup screen or by setting the variable directly.
+
+      ;injurywatch setup
+          Opens a setup window to choose your display mode.
+
+      ;vars set injurywatch_display=dock
+          Dockable panel in StormFront or Wrayth (default for those clients).
+
+      ;vars set injurywatch_display=popup
+          Floating popup window, works in any client that supports GTK.
+
+      ;vars set injurywatch_display=text
+          Prints to your story window, works in all clients including Wizard.
+
+      Leave the variable unset or delete it to use auto-detection.
 
   Known issues:
-      - Dead detection/revival still being refined; manual appraise to correct.
-      - Cannot detect when another empath heals someone; manual appraise to update.
-      - Fogged/dragged bodies may briefly show ? before resolving.
-      - Poisoned and Diseased not yet fully tested.
+      - Dead person detection and revival tracking are still being refined.
+        If someone shows incorrect Dead status manually appraise them to correct it.
+      - Cannot auto-detect when another empath heals someone.
+        Manually appraise them to update their status in the window.
+      - Bodies fogged or dragged in may briefly show ? before resolving.
+      - Poisoned and Diseased statuses are not yet fully tested.
 
        author: Mystienne
          game: gs
@@ -442,13 +469,16 @@ module InjuryWatch
       noun  = nil
 
       # Other empath healing: "Devantis's head wound gradually fades..."
-      # Target is being healed - queue re-appraise
+      # Target is being healed - queue re-appraise after a delay
       if plain =~ /^(\w+)'s \w+ wound gradually fades/i
         noun = Regexp.last_match(1)
         entry = people_status.find { |_id, p| p[:noun].downcase == noun.downcase }
         if entry && entry[1][:status] !~ /^OK$/
-          dbg "other empath heal -> #{noun} being healed, queuing re-appraise"
-          refresh_queue << "refresh #{noun}"
+          dbg "other empath heal -> #{noun} being healed, queuing re-appraise (5s delay)"
+          Thread.new do
+            sleep 5
+            refresh_queue << "refresh #{noun}"
+          end
         end
         next line
       end
@@ -514,18 +544,27 @@ module InjuryWatch
         noun = nil  # prevent falling through to appraise matching
       end
 
-      # Match appraise result line
+      # Match appraise result line - reset tracking when new appraise starts
       if line =~ /You take a quick appraisal of <a [^>]*>([^<]+)<\/a> and find that [^<]*<[^>]+>[^<]*<\/[^>]+> has (.*?)\./i
-        noun       = Regexp.last_match(1).strip
-        wound_text = Regexp.last_match(2).gsub(/<[^>]+>/, '').gsub(/\s+/, ' ').strip
+        noun                = Regexp.last_match(1).strip
+        wound_text          = Regexp.last_match(2).gsub(/<[^>]+>/, '').gsub(/\s+/, ' ').strip
+        last_appraised_noun = noun  # reset to current person
+        last_appraised_id   = nil
       elsif line =~ /You take a quick appraisal of (\w+) and find that (?:he|she) has (.*?)\./i
-        noun       = Regexp.last_match(1)
-        wound_text = Regexp.last_match(2).strip
+        noun                = Regexp.last_match(1)
+        wound_text          = Regexp.last_match(2).strip
+        last_appraised_noun = noun
+        last_appraised_id   = nil
+      elsif line =~ /You also notice that <a [^>]*>(?:he|she)<\/a> has (.*?)\./i
+        wound_text          = strip_xml(Regexp.last_match(1))
+        last_appraised_noun = noun if noun
+      elsif plain =~ /You also notice that (?:he|she) has (.*?)\./i
+        wound_text          = Regexp.last_match(1).strip
       end
 
-      # Quite dead follow-up line - suppress from story window
+      # Quite dead follow-up line
       if plain =~ /^(?:He|She) is also quite dead/i
-        if last_appraised_noun
+        if last_appraised_noun && !InjuryWatch.bulk_appraising?
           entry = people_status.find { |_id, p| p[:noun].downcase == last_appraised_noun.downcase }
           if entry
             dbg "manual appraise -> #{last_appraised_noun} quite dead, queuing appraise"
@@ -536,7 +575,7 @@ module InjuryWatch
             display(people_status)
           end
         end
-        next nil  # suppress from story window
+        next nil if InjuryWatch.bulk_appraising?
       end
 
       # Scar/nerve follow-up line - suppress if person is dead
@@ -722,7 +761,9 @@ module InjuryWatch
           if entry && entry[1][:status] == "?"
             dbg "retrying appraise for #{target}"
             sleep 1.0
+            InjuryWatch.bulk_appraising = true
             result = appraise(target)
+            InjuryWatch.bulk_appraising = false
             if result != "?"
               people_status[entry[0]][:status] = result
               display(people_status)
@@ -733,7 +774,9 @@ module InjuryWatch
           entry  = people_status.find { |_id, p| p[:noun].downcase == target.downcase }
           if entry
             dbg "refresh #{target}"
+            InjuryWatch.bulk_appraising = true
             result = appraise(entry[1][:noun])
+            InjuryWatch.bulk_appraising = false
             unless result == "?"
               if result =~ /^Dead/
                 injury = result.gsub(/^Dead\s*-?\s*/i, '').strip
