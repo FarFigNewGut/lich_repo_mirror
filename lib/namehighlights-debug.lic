@@ -1,0 +1,1007 @@
+# encoding: utf-8
+=begin
+
+  namehighlights-debug is a safe diagnostic companion for namehighlights.
+  Its default run does not scan WHO, send game commands, import settings, or
+  edit character XML files. It reads the NameHighlights config, character data,
+  and generated import file, then writes a clean report to the highlights folder.
+  Run ;namehighlights-debug backup to copy known NameHighlights and front-end
+  settings files into a timestamped backup folder before testing. Run
+  ;namehighlights-debug cleanlogs to delete older NameHighlights debug/command
+  text logs from the highlights folder.
+
+      Author: Mystienne
+ Contributor: Peggyanne
+     Version: 0.1.0
+        Game: GS
+        Tags: highlights, names, diagnostics, debug
+    Required: Lich >= 5.11.0
+       Email: Mystienne@mystienne.com
+     Discord: Mystienne
+
+=end
+
+require 'fileutils'
+require 'json'
+require 'rexml/document'
+require 'time'
+require 'yaml'
+
+SCRIPT_NAME = 'namehighlights-debug'
+VALID_MODES = %w[profession race race_profession].freeze
+VALID_DUPLICATE_MODES = %w[replace skip clear].freeze
+PROFESSIONS = %w[
+  Bard Cleric Empath Monk Paladin Ranger Rogue Sorcerer Warrior Wizard
+].freeze
+RACES = [
+  'Human',
+  'Giantman',
+  'Half-Elf',
+  'Sylvankind',
+  'Dark Elf',
+  'Elf',
+  'Dwarf',
+  'Halfling',
+  'Forest Gnome',
+  'Burghal Gnome',
+  'Half-Krolvin',
+  'Erithian',
+  'Aelotoi',
+].freeze
+BUILT_IN_TAGS = %w[Friend Family Enemy Self].freeze
+UNKNOWN_RACE_COLOR = '#7CFF00'
+DEFAULT_RACE_COLORS = {
+  'Human'         => '#FFE08A',
+  'Giantman'      => '#FFB080',
+  'Half-Elf'      => '#99CCFF',
+  'Sylvankind'    => '#66FF99',
+  'Dark Elf'      => '#CC99FF',
+  'Elf'           => '#99FFFF',
+  'Dwarf'         => '#FFCC66',
+  'Halfling'      => '#FFFF99',
+  'Forest Gnome'  => '#66CC66',
+  'Burghal Gnome' => '#CCAAFF',
+  'Half-Krolvin'  => '#FF8888',
+  'Erithian'      => '#FF99CC',
+  'Aelotoi'       => '#CCFFFF',
+}.freeze
+
+def nd_echo(message = '')
+  if defined?(echo)
+    echo message.to_s
+  else
+    puts message.to_s
+  end
+end
+
+def user_home
+  (Dir.home rescue nil) || ENV['USERPROFILE'] || ENV['HOME'] || Dir.pwd
+end
+
+def windows?
+  !!(RUBY_PLATFORM =~ /mswin|mingw|cygwin/i)
+end
+
+def export_dir
+  if windows?
+    'C:/Gemstone IV Highlights'
+  else
+    File.join(user_home, 'GemStone IV Highlights')
+  end
+end
+
+def data_dir
+  if defined?(DATA_DIR) && DATA_DIR && Dir.exist?(DATA_DIR.to_s)
+    DATA_DIR
+  else
+    script_dir = File.expand_path(__dir__) rescue Dir.pwd
+    candidates = [
+      ENV['LICH_DATA_DIR'],
+      File.join(Dir.pwd, 'data'),
+      File.expand_path(File.join(script_dir, '..', 'data')),
+      File.join(user_home, 'Desktop', 'Lich5', 'data'),
+      File.join(user_home, 'lich', 'data'),
+    ].compact.map(&:to_s).reject(&:empty?)
+    candidates.find { |path| Dir.exist?(path) } || candidates.first || Dir.pwd
+  end
+end
+
+def config_path
+  File.join(data_dir, 'namehighlights.yml')
+end
+
+def character_data_path
+  File.join(export_dir, 'namehighlights-characterdata.yml')
+end
+
+def import_path
+  File.join(export_dir, 'namehighlights-importme.xml')
+end
+
+def wizard_path
+  File.join(export_dir, 'namehighlights_importme.cmd')
+end
+
+def report_path
+  FileUtils.mkdir_p(export_dir)
+  stamp = Time.now.strftime('%Y%m%d-%H%M%S')
+  File.join(export_dir, "namehighlights-debug-#{stamp}.txt")
+end
+
+def command_transcript_token
+  stamp = Time.now.strftime('%Y%m%d-%H%M%S')
+  stamp
+end
+
+def command_transcript_path(token)
+  FileUtils.mkdir_p(export_dir)
+  File.join(export_dir, "namehighlights-command-#{token}.txt")
+end
+
+def backup_root_path
+  FileUtils.mkdir_p(export_dir)
+  stamp = Time.now.strftime('%Y%m%d-%H%M%S')
+  File.join(export_dir, "namehighlights-backup-#{stamp}")
+end
+
+def log_file_pattern
+  /\Anamehighlights-(?:debug|command)-\d{8}-\d{6}\.txt\z/
+end
+
+def matching_log_files
+  return [] unless Dir.exist?(export_dir)
+
+  Dir.children(export_dir).select { |name| name =~ log_file_pattern }.map { |name| File.join(export_dir, name) }.select { |path| File.file?(path) }
+end
+
+def safe_inside_export_dir?(path)
+  root = File.expand_path(export_dir)
+  resolved = File.expand_path(path)
+  resolved.start_with?(root + File::SEPARATOR)
+end
+
+def add_cleanlogs_report(report, keep_current_path = nil)
+  report << ''
+  report << 'Log Cleanup'
+  report << '-----------'
+  unless Dir.exist?(export_dir)
+    report << "NOTE: highlights folder does not exist: #{export_dir}"
+    return
+  end
+
+  files = matching_log_files.sort_by { |path| File.mtime(path) rescue Time.at(0) }.reverse
+  keep = keep_current_path || files.first
+  keep = File.expand_path(keep) if keep
+  deleted = 0
+
+  files.each do |path|
+    expanded = File.expand_path(path)
+    next if keep && expanded == keep
+
+    unless safe_inside_export_dir?(expanded)
+      report << "WARN: skipped suspicious path outside highlights folder: #{expanded}"
+      next
+    end
+
+    File.delete(expanded)
+    deleted += 1
+  rescue => error
+    report << "WARN: failed to delete #{path}: #{error.class}: #{error.message}"
+  end
+
+  report << "Deleted old NameHighlights debug/command logs: #{deleted}"
+  report << "Kept: #{keep || '(none found)'}"
+end
+
+def file_summary(path)
+  return 'missing' unless File.exist?(path)
+
+  "#{File.size(path)} bytes, modified #{File.mtime(path).strftime('%Y-%m-%d %H:%M:%S')}"
+end
+
+def safe_yaml(path, label, report)
+  unless File.exist?(path)
+    if label == 'character data'
+      report << "NOTE: #{label} file is missing; this is normal before the first 3-mode scan: #{path}"
+    else
+      report << "WARN: #{label} file is missing: #{path}"
+    end
+    return {}
+  end
+
+  data = YAML.load_file(path)
+  unless data.is_a?(Hash)
+    report << "WARN: #{label} YAML root is #{data.class}; expected Hash."
+    return {}
+  end
+
+  report << "OK: #{label} YAML parsed."
+  data
+rescue => error
+  report << "ERROR: #{label} YAML failed to parse: #{error.class}: #{error.message}"
+  {}
+end
+
+def safe_path_label(path)
+  path.to_s.gsub(/[^A-Za-z0-9_.-]+/, '_').gsub(/\A_+|_+\z/, '')[0, 80]
+end
+
+def copy_file_with_report(source, destination, report)
+  FileUtils.mkdir_p(File.dirname(destination))
+  if File.extname(source).downcase == '.json'
+    return copy_redacted_json_with_report(source, destination, report)
+  end
+
+  FileUtils.cp(source, destination)
+  report << "BACKUP: #{source} -> #{destination}"
+  true
+rescue => error
+  report << "WARN: failed to back up #{source}: #{error.class}: #{error.message}"
+  false
+end
+
+def sensitive_json_key?(key)
+  key.to_s =~ /\A(?:password|pass|pwd|username|user|login|account|token|secret|api[_-]?key|session|cookie|auth)\z/i
+end
+
+def redact_json_secrets(value)
+  case value
+  when Hash
+    value.each_with_object({}) do |(key, child), copy|
+      copy[key] = sensitive_json_key?(key) ? '[REDACTED]' : redact_json_secrets(child)
+    end
+  when Array
+    value.map { |child| redact_json_secrets(child) }
+  else
+    value
+  end
+end
+
+def copy_redacted_json_with_report(source, destination, report)
+  data = JSON.parse(File.read(source))
+  File.write(destination, JSON.pretty_generate(redact_json_secrets(data)) + "\n")
+  report << "BACKUP: #{source} -> #{destination} (JSON secrets redacted)"
+rescue => error
+  report << "WARN: #{source} looked like JSON but could not be redacted: #{error.class}: #{error.message}"
+  false
+end
+
+def backup_single_file(source, backup_root, subdir, report)
+  return unless source && File.file?(source)
+
+  destination = File.join(backup_root, subdir, File.basename(source))
+  copy_file_with_report(source, destination, report)
+end
+
+def backup_matching_files(source_dir, backup_root, label, report, patterns = ['*.xml', '*.json', '*.plist', '*.cmd', '*.wiz'])
+  return 0 unless source_dir && Dir.exist?(source_dir)
+
+  target_dir = File.join(backup_root, 'frontend-files', safe_path_label(label))
+  copied = 0
+  skipped = 0
+  total_bytes = 0
+  max_files = 500
+  max_bytes = 100 * 1024 * 1024
+  files = patterns.flat_map { |pattern| Dir.glob(File.join(source_dir, pattern)) }.uniq.select { |path| File.file?(path) }
+  files.sort.each do |source|
+    size = File.size(source) rescue 0
+    if copied >= max_files || total_bytes + size > max_bytes
+      skipped += 1
+      next
+    end
+
+    destination = File.join(target_dir, File.basename(source))
+    copied += 1 if copy_file_with_report(source, destination, report)
+    total_bytes += size
+  end
+
+  report << "BACKUP: #{source_dir} copied #{copied} file(s)#{skipped.positive? ? ", skipped #{skipped} due to backup limits" : ''}."
+  copied
+end
+
+def frontend_backup_candidates(config)
+  candidates = []
+  copy_settings = config.is_a?(Hash) && config['copy_settings'].is_a?(Hash) ? config['copy_settings'] : {}
+  candidates << ['saved-copy-target', copy_settings['target_dir'].to_s] unless copy_settings['target_dir'].to_s.strip.empty?
+
+  if windows?
+    appdata = ENV['APPDATA'].to_s
+    candidates << ['wrayth-gs4-appdata', File.join(appdata, 'Wrayth', 'GS4')] unless appdata.empty?
+    candidates << ['stormfront-gs4-appdata', File.join(appdata, 'StormFront', 'GS4')] unless appdata.empty?
+    candidates << ['warlock-appdata', File.join(appdata, 'Warlock')] unless appdata.empty?
+  else
+    library = File.join(user_home, 'Library', 'Application Support')
+    candidates << ['wrayth-gs4-library', File.join(library, 'Wrayth', 'GS4')]
+    candidates << ['stormfront-gs4-library', File.join(library, 'StormFront', 'GS4')]
+    candidates << ['warlock-library', File.join(library, 'Warlock')]
+    candidates << ['lich-data', data_dir]
+  end
+
+  candidates.uniq { |_label, path| path }
+end
+
+def add_backup_report(report, config)
+  backup_root = backup_root_path
+  FileUtils.mkdir_p(backup_root)
+
+  report << ''
+  report << 'Backup'
+  report << '------'
+  report << "backup folder: #{backup_root}"
+  backup_single_file(config_path, backup_root, 'namehighlights-files', report)
+  backup_single_file(character_data_path, backup_root, 'namehighlights-files', report)
+  backup_single_file(import_path, backup_root, 'namehighlights-files', report)
+  backup_single_file(wizard_path, backup_root, 'namehighlights-files', report)
+
+  found_frontend_dir = false
+  frontend_backup_candidates(config).each do |label, path|
+    next if path.to_s.strip.empty?
+
+    if Dir.exist?(path)
+      found_frontend_dir = true
+      backup_matching_files(path, backup_root, label, report)
+    else
+      report << "BACKUP: frontend candidate missing: #{label} #{path}"
+    end
+  end
+
+  report << 'WARN: no known front-end settings folders were found to back up.' unless found_frontend_dir
+  report << 'Backup is read-only: no live settings files were changed.'
+rescue => error
+  report << "ERROR: backup failed: #{error.class}: #{error.message}"
+end
+
+def valid_hex?(value)
+  value.to_s.strip =~ /\A#[0-9A-Fa-f]{6}\z/
+end
+
+def transparent?(value)
+  text = value.to_s.strip
+  text.empty? || text =~ /\A(?:none|transparent|clear)\z/i
+end
+
+def validate_color_pair(report, label, pair, allow_transparent_back = true)
+  unless pair.is_a?(Array) && pair.length == 2
+    report << "WARN: #{label} color should be a two-item list."
+    return
+  end
+
+  fore, back = pair
+  report << "WARN: #{label} foreground is not #RRGGBB: #{fore.inspect}" unless valid_hex?(fore)
+  unless valid_hex?(back) || (allow_transparent_back && transparent?(back))
+    report << "WARN: #{label} background is not #RRGGBB or transparent: #{back.inspect}"
+  end
+end
+
+def normalize_name(name)
+  name.to_s.strip
+end
+
+def character_records(data)
+  names = data['names']
+  return {} unless names.is_a?(Hash)
+
+  names
+end
+
+def import_document(path, report)
+  return nil unless File.exist?(path)
+
+  REXML::Document.new(File.read(path))
+rescue => error
+  report << "ERROR: import XML failed to parse: #{error.class}: #{error.message}"
+  nil
+end
+
+def xml_text_attribute(element)
+  element.attributes['text'] ||
+    element.attributes['string'] ||
+    element.attributes['name'] ||
+    element.attributes['content']
+end
+
+def collect_import_entries(doc)
+  entries = []
+  return entries unless doc
+
+  REXML::XPath.each(doc, '//*') do |element|
+    text = xml_text_attribute(element)
+    next if text.to_s.strip.empty?
+
+    fore = element.attributes['foreColor'] ||
+           element.attributes['foreground'] ||
+           element.attributes['fgColor'] ||
+           element.attributes['color']
+    back = element.attributes['backColor'] ||
+           element.attributes['background'] ||
+           element.attributes['bgColor'] ||
+           element.attributes['bgcolor']
+    entries << {
+      name: element.name,
+      text: text.to_s.strip,
+      fore: fore.to_s.strip,
+      back: back.to_s.strip,
+    }
+  end
+  entries
+end
+
+def count_by(records)
+  counts = Hash.new(0)
+  records.each { |value| counts[value] += 1 unless value.to_s.strip.empty? }
+  counts.sort.to_h
+end
+
+def add_config_report(report, config)
+  report << ''
+  report << 'Config'
+  report << '------'
+  mode = config['mode'].to_s
+  legacy_config = mode.empty?
+  report << "mode: #{mode.empty? ? '(missing)' : mode}"
+  report << "frontend: #{config['frontend'].to_s.empty? ? '(missing)' : config['frontend']}"
+  unknown_race_color = config['unknown_race_color'].to_s.strip
+  unknown_race_color = UNKNOWN_RACE_COLOR if unknown_race_color.empty?
+  report << "unknown_race_color: #{unknown_race_color}#{config['unknown_race_color'].to_s.strip.empty? ? ' (runtime default)' : ''}"
+  report << "copy_settings: #{config['copy_settings'].is_a?(Hash) ? config['copy_settings'].inspect : '(missing or invalid)'}"
+  if legacy_config
+    report << 'NOTE: mode is missing because this looks like an older profession-only config. The main script should migrate it on first run.'
+  elsif !VALID_MODES.include?(mode)
+    report << "WARN: invalid mode #{mode.inspect}; expected #{VALID_MODES.join(', ')}"
+  end
+  report << 'WARN: unknown_race_color is not #RRGGBB.' unless valid_hex?(unknown_race_color)
+
+  profession_colors = config['profession_colors'].is_a?(Hash) ? config['profession_colors'] : {}
+  race_colors = config['race_colors'].is_a?(Hash) ? config['race_colors'] : {}
+  tag_colors = config['tag_colors'].is_a?(Hash) ? config['tag_colors'] : {}
+
+  missing_professions = PROFESSIONS - profession_colors.keys
+  missing_races = RACES - race_colors.keys
+  missing_tags = BUILT_IN_TAGS - tag_colors.keys
+  report << "profession_colors: #{profession_colors.length} entries"
+  report << "race_colors: #{race_colors.length} entries"
+  report << "tag_colors: #{tag_colors.length} entries"
+  report << "WARN: missing profession colors: #{missing_professions.join(', ')}" unless missing_professions.empty?
+  if legacy_config && missing_races.length == RACES.length
+    report << 'NOTE: race colors are missing because this looks like an older profession-only config.'
+  else
+    report << "WARN: missing race colors: #{missing_races.join(', ')}" unless missing_races.empty?
+  end
+  if legacy_config && missing_tags == ['Self']
+    report << 'NOTE: Self tag color is missing because this looks like an older config; it should be added as white on transparent.'
+  else
+    report << "WARN: missing built-in tag colors: #{missing_tags.join(', ')}" unless missing_tags.empty?
+  end
+
+  profession_colors.each { |name, pair| validate_color_pair(report, "profession #{name}", pair) }
+  tag_colors.each { |name, pair| validate_color_pair(report, "tag #{name}", pair) }
+  race_colors.each do |name, value|
+    report << "WARN: race #{name} color is not #RRGGBB: #{value.inspect}" unless valid_hex?(value)
+  end
+
+  copy = config['copy_settings'].is_a?(Hash) ? config['copy_settings'] : {}
+  duplicate_mode = copy['duplicates'].to_s
+  if !duplicate_mode.empty? && !VALID_DUPLICATE_MODES.include?(duplicate_mode)
+    report << "WARN: copy duplicate mode #{duplicate_mode.inspect} is invalid."
+  end
+  source = copy['source_path'].to_s
+  target = copy['target_dir'].to_s
+  report << "copy source exists: #{source.empty? ? '(not set)' : File.exist?(source)}"
+  report << "copy target exists: #{target.empty? ? '(not set)' : Dir.exist?(target)}"
+end
+
+def add_character_data_report(report, data)
+  records = character_records(data)
+  values = records.values.select { |entry| entry.is_a?(Hash) }
+  bad_records = records.length - values.length
+  names = values.map { |entry| normalize_name(entry['name']) }
+  duplicate_display_names = names.group_by(&:downcase).select { |_key, list| list.length > 1 }
+  with_profession = values.count { |entry| !entry['profession'].to_s.strip.empty? }
+  with_race = values.count { |entry| !entry['race'].to_s.strip.empty? }
+  with_both = values.count { |entry| !entry['profession'].to_s.strip.empty? && !entry['race'].to_s.strip.empty? }
+  with_custom = values.count { |entry| !entry['custom_tag'].to_s.strip.empty? }
+
+  report << ''
+  report << 'Character Data'
+  report << '--------------'
+  report << "records: #{records.length}"
+  report << "invalid records: #{bad_records}"
+  report << "with profession: #{with_profession}"
+  report << "with race: #{with_race}"
+  report << "with both: #{with_both}"
+  report << "with custom tag: #{with_custom}"
+  report << "profession only: #{values.count { |entry| !entry['profession'].to_s.strip.empty? && entry['race'].to_s.strip.empty? }}"
+  report << "race only: #{values.count { |entry| entry['profession'].to_s.strip.empty? && !entry['race'].to_s.strip.empty? }}"
+  report << "no race/profession data: #{values.count { |entry| entry['profession'].to_s.strip.empty? && entry['race'].to_s.strip.empty? }}"
+  report << "profession counts: #{count_by(values.map { |entry| entry['profession'].to_s.strip }).inspect}"
+  report << "race counts: #{count_by(values.map { |entry| entry['race'].to_s.strip }).inspect}"
+  report << "custom tag counts: #{count_by(values.map { |entry| entry['custom_tag'].to_s.strip }).inspect}"
+  report << "WARN: duplicate display names: #{duplicate_display_names.keys.join(', ')}" unless duplicate_display_names.empty?
+
+  invalid_names = values.map { |entry| normalize_name(entry['name']) }.select { |name| name.empty? || name !~ /\A[A-Za-z][A-Za-z'-]{1,29}\z/ }
+  report << "WARN: invalid-looking character names: #{invalid_names.first(25).join(', ')}" unless invalid_names.empty?
+end
+
+def add_import_report(report, config, data)
+  path = import_path
+  report << ''
+  report << 'Import File'
+  report << '-----------'
+  report << "path: #{path}"
+  report << "status: #{file_summary(path)}"
+  doc = import_document(path, report)
+  return unless doc
+
+  report << 'OK: import XML parsed.'
+  entries = collect_import_entries(doc)
+  name_entries = entries.select { |entry| entry[:name].to_s =~ /name/i || entry[:text] !~ /\A-=\{ .+ \}=-\z/ }
+  custom_entries = entries.select { |entry| entry[:text] =~ /\A-=\{ .+ \}=-\z/ }
+  duplicate_import_texts = entries.map { |entry| entry[:text] }.group_by(&:downcase).select { |_key, list| list.length > 1 }
+
+  report << "total highlight-like entries: #{entries.length}"
+  report << "legend/custom label entries: #{custom_entries.length}"
+  report << "name-like entries: #{name_entries.length}"
+  report << "transparent backgrounds: #{entries.count { |entry| transparent?(entry[:back]) }}"
+  report << "WARN: duplicate import strings: #{duplicate_import_texts.keys.first(40).join(', ')}" unless duplicate_import_texts.empty?
+
+  bad_fore = entries.reject { |entry| valid_hex?(entry[:fore]) }
+  bad_back = entries.reject { |entry| valid_hex?(entry[:back]) || transparent?(entry[:back]) }
+  report << "WARN: entries with invalid foreground colors: #{bad_fore.first(20).map { |entry| entry[:text] }.join(', ')}" unless bad_fore.empty?
+  report << "WARN: entries with invalid backgrounds: #{bad_back.first(20).map { |entry| entry[:text] }.join(', ')}" unless bad_back.empty?
+
+  records = character_records(data)
+  record_names = records.values.select { |entry| entry.is_a?(Hash) }.map { |entry| normalize_name(entry['name']).downcase }
+  imported_names = name_entries.map { |entry| entry[:text].downcase }
+  missing_from_data = imported_names.reject { |name| record_names.include?(name) }
+  not_exported = record_names.reject { |name| imported_names.include?(name) }
+  report << "imported names not in character data: #{missing_from_data.length}"
+  report << "character data names not in import: #{not_exported.length}"
+  report << "sample not exported: #{not_exported.first(25).join(', ')}" unless not_exported.empty?
+
+  mode = config['mode'].to_s
+  if mode == 'race_profession'
+    race_only = records.values.count { |entry| entry.is_a?(Hash) && entry['profession'].to_s.strip.empty? && !entry['race'].to_s.strip.empty? }
+    profession_only = records.values.count { |entry| entry.is_a?(Hash) && !entry['profession'].to_s.strip.empty? && entry['race'].to_s.strip.empty? }
+    report << "race+profession fallback expected race-only transparent backgrounds: #{race_only}"
+    report << "race+profession fallback expected profession-only unknown foregrounds: #{profession_only}"
+  end
+end
+
+def add_environment_report(report)
+  report << 'NameHighlights Diagnostic Report'
+  report << "Generated: #{Time.now.strftime('%Y-%m-%d %H:%M:%S')}"
+  report << "Ruby: #{RUBY_VERSION} #{RUBY_PLATFORM}"
+  report << "Lich frontend: #{defined?($frontend) ? $frontend.inspect : '(unknown)'}"
+  report << "Working directory: #{Dir.pwd}"
+  report << "Lich DATA_DIR: #{defined?(DATA_DIR) ? DATA_DIR : '(not defined)'}"
+  report << "Resolved data dir: #{data_dir}"
+  report << ''
+  report << 'Files'
+  report << '-----'
+  report << "config: #{config_path}"
+  report << "config status: #{file_summary(config_path)}"
+  report << "character data: #{character_data_path}"
+  report << "character data status: #{file_summary(character_data_path)}"
+  report << "import XML: #{import_path}"
+  report << "import XML status: #{file_summary(import_path)}"
+  report << "wizard CMD: #{wizard_path}"
+  report << "wizard CMD status: #{file_summary(wizard_path)}"
+end
+
+def script_args
+  if defined?(Script) && Script.respond_to?(:current) && Script.current.respond_to?(:vars)
+    Script.current.vars.map(&:to_s)
+  else
+    ARGV.map(&:to_s)
+  end
+end
+
+def command_capture_mode(args)
+  lowered = args.map(&:downcase)
+  return :fulltest if lowered.include?('fulltest') || lowered.include?('alltest')
+  return :test if lowered.include?('test') || lowered.include?('selftest')
+  return :scan if lowered.include?('scan') || lowered.include?('live')
+  return :safe if lowered.include?('run') || lowered.include?('commands')
+
+  nil
+end
+
+def backup_requested?(args)
+  args.map(&:downcase).include?('backup')
+end
+
+def cleanlogs_requested?(args)
+  lowered = args.map(&:downcase)
+  lowered.include?('cleanlogs') || lowered.include?('cleanup') || lowered.include?('clean')
+end
+
+def lich_script_runner_available?
+  defined?(start_script) && defined?(running?) && defined?(wait_while)
+end
+
+def namehighlights_running_exact?
+  if defined?(Script) && Script.respond_to?(:running)
+    Script.running.any? { |running_script| running_script.respond_to?(:name) && running_script.name.to_s.downcase == 'namehighlights' }
+  else
+    running?('namehighlights')
+  end
+end
+
+def wait_for_namehighlights_to_finish(timeout_seconds)
+  started = Time.now
+  wait_while do
+    namehighlights_running_exact? && (Time.now - started) < timeout_seconds
+  end
+  !namehighlights_running_exact?
+end
+
+def run_namehighlights_command(report, transcript, command_args, timeout_seconds = 180)
+  unless lich_script_runner_available?
+    report << "WARN: cannot run ;namehighlights #{command_args.join(' ')} outside Lich."
+    return
+  end
+
+  if namehighlights_running_exact?
+    report << "WARN: skipped ;namehighlights #{command_args.join(' ')} because namehighlights is already running."
+    return
+  end
+
+  full_args = command_args + ['report', transcript]
+  report << "RUN: ;namehighlights #{command_args.join(' ')}"
+  start_script('namehighlights', full_args)
+  if wait_for_namehighlights_to_finish(timeout_seconds)
+    report << "OK: ;namehighlights #{command_args.join(' ')} finished."
+  else
+    report << "WARN: ;namehighlights #{command_args.join(' ')} did not finish within #{timeout_seconds} seconds."
+  end
+rescue => error
+  report << "ERROR: failed to run ;namehighlights #{command_args.join(' ')}: #{error.class}: #{error.message}"
+end
+
+def snapshot_paths
+  [config_path, character_data_path, import_path, wizard_path]
+end
+
+def snapshot_files
+  snapshot_paths.each_with_object({}) do |path, snapshot|
+    snapshot[path] = File.exist?(path) ? File.binread(path) : nil
+  end
+end
+
+def restore_files(snapshot, report)
+  snapshot.each do |path, content|
+    if content.nil?
+      File.delete(path) if File.exist?(path)
+    else
+      FileUtils.mkdir_p(File.dirname(path))
+      File.binwrite(path, content)
+    end
+  end
+  report << 'OK: restored config, character data, and generated export files after command test.'
+rescue => error
+  report << "ERROR: failed to restore files after command test: #{error.class}: #{error.message}"
+end
+
+def test_yaml(path, label, report)
+  safe_yaml(path, label, report)
+end
+
+def test_records
+  character_records(YAML.load_file(character_data_path))
+rescue
+  {}
+end
+
+def test_config
+  YAML.load_file(config_path)
+rescue
+  {}
+end
+
+def record_has?(name, field, expected)
+  record = test_records[name.downcase]
+  record.is_a?(Hash) && record[field].to_s == expected
+end
+
+def config_tag_color(tag)
+  config = test_config
+  colors = config['tag_colors'].is_a?(Hash) ? config['tag_colors'] : {}
+  colors[tag]
+end
+
+def import_contains_text?(text)
+  return false unless File.exist?(import_path)
+
+  File.read(import_path).include?("text='#{text}'") || File.read(import_path).include?("text=\"#{text}\"")
+end
+
+def write_copy_test_source(path)
+  FileUtils.mkdir_p(File.dirname(path))
+  File.write(path, <<~XML)
+    <settings>
+      <strings local=''>
+        <h text='-={ CopyTest }=-' color='#ABCDEF' bgcolor='#123456' case='y'/>
+      </strings>
+      <names local=''>
+        <h text='Copyalpha' color='#111111' bgcolor='#222222' case='y'/>
+        <h text='Copybeta' color='#333333' bgcolor='#444444' case='y'/>
+      </names>
+    </settings>
+  XML
+end
+
+def write_copy_test_target(path)
+  FileUtils.mkdir_p(File.dirname(path))
+  File.write(path, <<~XML)
+    <settings>
+      <strings local=''>
+        <h text='-={ CopyTest }=-' color='#000000' bgcolor='#000000' case='y'/>
+        <h text='KeepString' color='#010101' bgcolor='#020202' case='y'/>
+      </strings>
+      <names local=''>
+        <h text='Copyalpha' color='#000000' bgcolor='#000000' case='y'/>
+        <h text='Keepname' color='#010101' bgcolor='#020202' case='y'/>
+      </names>
+    </settings>
+  XML
+end
+
+def copy_test_target_entry(path, section, text)
+  doc = REXML::Document.new(File.read(path))
+  node = doc.root.elements[section]&.get_elements('h')&.find { |item| item.attributes['text'].to_s.downcase == text.downcase }
+  return nil unless node
+
+  { fore: node.attributes['color'].to_s, back: node.attributes['bgcolor'].to_s }
+rescue
+  nil
+end
+
+def copy_test_entry_exists?(path, section, text)
+  !!copy_test_target_entry(path, section, text)
+end
+
+def import_entry_for(text)
+  doc = import_document(import_path, [])
+  collect_import_entries(doc).find { |entry| entry[:text].to_s.downcase == text.to_s.downcase }
+end
+
+def configured_profession_pair(profession)
+  config = test_config
+  colors = config['profession_colors'].is_a?(Hash) ? config['profession_colors'] : {}
+  pair = colors[profession]
+  pair.is_a?(Array) ? pair : nil
+end
+
+def configured_race_color(race)
+  config = test_config
+  colors = config['race_colors'].is_a?(Hash) ? config['race_colors'] : {}
+  saved = colors[race].to_s.strip.upcase
+  saved = '' if race == 'Human' && saved == '#FFFFFF'
+  valid_hex?(saved) ? saved : DEFAULT_RACE_COLORS[race]
+end
+
+def entry_colors_match?(name, fore, back)
+  entry = import_entry_for(name)
+  entry && entry[:fore].to_s.upcase == fore.to_s.upcase && entry[:back].to_s.upcase == back.to_s.upcase
+end
+
+def report_entry_colors(report, label, name, expected_fore, expected_back)
+  entry = import_entry_for(name)
+  actual = if entry
+             "#{entry[:fore].inspect} on #{entry[:back].inspect}"
+           else
+             '(missing)'
+           end
+  report << "CHECK: #{label} expected #{expected_fore.inspect} on #{expected_back.inspect}; actual #{actual}"
+end
+
+def assert_test(report, label)
+  if yield
+    report << "PASS: #{label}"
+  else
+    report << "FAIL: #{label}"
+  end
+rescue => error
+  report << "FAIL: #{label}: #{error.class}: #{error.message}"
+end
+
+def run_command_selftest(report, transcript_token)
+  tag_input = 'NhDebug'
+  tag = 'Nhdebug'
+  names = {
+    custom_one: 'Nhdebugone',
+    custom_two: 'Nhdebugtwo',
+    race: 'Nhdebugrace',
+    profession: 'Nhdebugprof',
+    mode: 'Nhdebugmode',
+  }
+
+  report << 'mode: command self-test with restore'
+  report << 'note: temporarily changes NameHighlights files, then restores them.'
+  snapshot = snapshot_files
+
+  run_namehighlights_command(report, transcript_token, ['tag', tag_input, '#112233', '#445566'], 60)
+  assert_test(report, 'custom tag color was saved') { config_tag_color(tag) == ['#112233', '#445566'] }
+
+  run_namehighlights_command(report, transcript_token, ['addcustom', tag_input, names[:custom_one], names[:custom_two]], 60)
+  assert_test(report, 'custom test names were tagged') do
+    record_has?(names[:custom_one], 'custom_tag', tag) && record_has?(names[:custom_two], 'custom_tag', tag)
+  end
+  assert_test(report, 'custom test names were written to import') do
+    import_contains_text?(names[:custom_one]) && import_contains_text?(names[:custom_two])
+  end
+
+  run_namehighlights_command(report, transcript_token, ['addrace', 'Human', names[:race]], 60)
+  assert_test(report, 'manual race data was saved') { record_has?(names[:race], 'race', 'Human') }
+
+  run_namehighlights_command(report, transcript_token, ['addprof', 'Wizard', names[:profession]], 60)
+  assert_test(report, 'manual profession data was saved') { record_has?(names[:profession], 'profession', 'Wizard') }
+
+  run_namehighlights_command(report, transcript_token, ['addrace', 'Human', names[:mode]], 60)
+  run_namehighlights_command(report, transcript_token, ['addprof', 'Wizard', names[:mode]], 60)
+  profession_pair = configured_profession_pair('Wizard')
+  human_color = configured_race_color('Human')
+  assert_test(report, 'mode test colors are available') { profession_pair && human_color }
+
+  run_namehighlights_command(report, transcript_token, ['mode', 'profession'], 60)
+  report_entry_colors(report, 'profession mode', names[:mode], profession_pair && profession_pair[0], profession_pair && profession_pair[1])
+  assert_test(report, 'profession mode rewrote import with profession colors') do
+    profession_pair && entry_colors_match?(names[:mode], profession_pair[0], profession_pair[1])
+  end
+
+  run_namehighlights_command(report, transcript_token, ['mode', 'race'], 60)
+  report_entry_colors(report, 'race mode', names[:mode], human_color, '#000000')
+  assert_test(report, 'race mode rewrote import with race colors') do
+    human_color && entry_colors_match?(names[:mode], human_color, '#000000')
+  end
+
+  run_namehighlights_command(report, transcript_token, ['mode', 'race_profession'], 60)
+  report_entry_colors(report, 'race+profession mode', names[:mode], human_color, profession_pair && profession_pair[1])
+  assert_test(report, 'race+profession mode rewrote import with race text and profession background') do
+    profession_pair && human_color && entry_colors_match?(names[:mode], human_color, profession_pair[1])
+  end
+
+  run_namehighlights_command(report, transcript_token, ['remove', names[:custom_one], names[:custom_two]], 60)
+  assert_test(report, 'manual custom tags were removed from test names') do
+    record_has?(names[:custom_one], 'custom_tag', '') && record_has?(names[:custom_two], 'custom_tag', '')
+  end
+
+  run_namehighlights_command(report, transcript_token, ['untag', tag_input], 60)
+  assert_test(report, 'custom tag color was removed') { config_tag_color(tag).nil? }
+ensure
+  restore_files(snapshot, report) if snapshot
+  restored_config = test_config
+  restored_records = test_records
+  restored_tags = restored_config['tag_colors'].is_a?(Hash) ? restored_config['tag_colors'] : {}
+  leftovers = names ? names.values.select { |name| restored_records.key?(name.downcase) } : []
+  report << "PASS: test tag removed after restore" unless restored_tags.key?(tag)
+  report << "PASS: test names removed after restore" if leftovers.empty?
+  report << "FAIL: test names still present after restore: #{leftovers.join(', ')}" unless leftovers.empty?
+end
+
+def run_full_command_selftest(report, transcript_token)
+  report << 'mode: full command self-test with restore'
+  report << 'note: uses temporary copy XML files and restores NameHighlights files afterward.'
+  snapshot = snapshot_files
+  temp_root = File.join(export_dir, "namehighlights-copy-test-#{Time.now.strftime('%Y%m%d-%H%M%S')}")
+  source_path = File.join(temp_root, 'source.xml')
+  target_dir = File.join(temp_root, 'targets')
+  target_path = File.join(target_dir, '123456.xml')
+
+  run_command_selftest(report, transcript_token)
+
+  run_namehighlights_command(report, transcript_token, ['list'], 60)
+  report << 'PASS: list command completed'
+
+  run_namehighlights_command(report, transcript_token, ['changes'], 60)
+  report << 'PASS: changes command completed'
+
+  run_namehighlights_command(report, transcript_token, ['legend', 'window'], 60)
+  report << 'PASS: legend window command completed'
+
+  run_namehighlights_command(report, transcript_token, ['legend', 'close'], 60)
+  report << 'PASS: legend close command completed'
+
+  write_copy_test_source(source_path)
+  write_copy_test_target(target_path)
+
+  run_namehighlights_command(report, transcript_token, ['copy', 'setup', "source=#{source_path}", "target=#{target_dir}", 'duplicates=skip'], 60)
+  assert_test(report, 'copy setup saved temporary skip settings') do
+    config = test_config
+    settings = config['copy_settings'].is_a?(Hash) ? config['copy_settings'] : {}
+    settings['source_path'] == source_path && settings['target_dir'] == target_dir && settings['duplicates'] == 'skip' && !settings['confirmed']
+  end
+
+  run_namehighlights_command(report, transcript_token, ['copy', 'confirm', "source=#{source_path}", "target=#{target_dir}", 'duplicates=skip'], 60)
+  assert_test(report, 'copy skip kept existing duplicate and added missing name') do
+    existing = copy_test_target_entry(target_path, 'names', 'Copyalpha')
+    existing && existing[:fore] == '#000000' && copy_test_entry_exists?(target_path, 'names', 'Copybeta')
+  end
+
+  write_copy_test_target(target_path)
+  run_namehighlights_command(report, transcript_token, ['copy', 'confirm', "source=#{source_path}", "target=#{target_dir}", 'duplicates=replace'], 60)
+  assert_test(report, 'copy replace overwrote duplicate and kept unrelated name') do
+    existing = copy_test_target_entry(target_path, 'names', 'Copyalpha')
+    existing && existing[:fore] == '#111111' && copy_test_entry_exists?(target_path, 'names', 'Keepname')
+  end
+
+  write_copy_test_target(target_path)
+  run_namehighlights_command(report, transcript_token, ['copy', 'confirm', "source=#{source_path}", "target=#{target_dir}", 'duplicates=clear'], 60)
+  assert_test(report, 'copy clear removed unrelated name and added source names') do
+    copy_test_entry_exists?(target_path, 'names', 'Copyalpha') &&
+      copy_test_entry_exists?(target_path, 'names', 'Copybeta') &&
+      !copy_test_entry_exists?(target_path, 'names', 'Keepname')
+  end
+
+  run_namehighlights_command(report, transcript_token, ['copy', 'status'], 60)
+  report << 'PASS: copy status command completed after copy tests'
+
+  run_namehighlights_command(report, transcript_token, ['reset'], 60)
+  assert_test(report, 'reset cleared character data during temporary test') { test_records.empty? }
+ensure
+  restore_files(snapshot, report) if snapshot
+  FileUtils.rm_rf(temp_root) if temp_root && Dir.exist?(temp_root)
+  report << 'OK: removed temporary copy test folder.'
+end
+
+def add_command_capture_report(report, args)
+  mode = command_capture_mode(args)
+  return unless mode
+
+  transcript_token = command_transcript_token
+  transcript = command_transcript_path(transcript_token)
+  report << ''
+  report << 'Command Capture'
+  report << '---------------'
+  report << "transcript: #{transcript}"
+  if mode == :fulltest
+    run_full_command_selftest(report, transcript_token)
+  elsif mode == :test
+    run_command_selftest(report, transcript_token)
+  elsif mode == :safe
+    report << 'mode: safe commands only'
+    run_namehighlights_command(report, transcript_token, ['mode'], 60)
+    run_namehighlights_command(report, transcript_token, ['legend'], 60)
+    run_namehighlights_command(report, transcript_token, ['copy', 'status'], 60)
+  else
+    report << 'mode: live scan'
+    report << 'note: this runs ;namehighlights debug, which scans WHO and rewrites the import file.'
+    run_namehighlights_command(report, transcript_token, ['debug'], 240)
+  end
+end
+
+report = []
+raw_args = script_args
+add_environment_report(report)
+initial_config = safe_yaml(config_path, 'config', report)
+add_backup_report(report, initial_config) if backup_requested?(raw_args)
+add_command_capture_report(report, raw_args)
+config = safe_yaml(config_path, 'config', report)
+report << 'OK: config reloaded after command capture.' if command_capture_mode(raw_args)
+data = safe_yaml(character_data_path, 'character data', report)
+add_config_report(report, config)
+add_character_data_report(report, data)
+add_import_report(report, config, data)
+
+warnings = report.count { |line| line.start_with?('WARN:') }
+errors = report.count { |line| line.start_with?('ERROR:') }
+failures = report.count { |line| line.start_with?('FAIL:') }
+report << ''
+report << 'Summary'
+report << '-------'
+report << "warnings: #{warnings}"
+report << "errors: #{errors}"
+report << "test failures: #{failures}"
+report << 'No live character files were changed.'
+
+path = report_path
+File.write(path, report.join("\n") + "\n")
+if cleanlogs_requested?(raw_args)
+  cleanup_report = []
+  add_cleanlogs_report(cleanup_report, path)
+  File.open(path, 'a') { |file| file.write(cleanup_report.join("\n") + "\n") }
+  report.concat(cleanup_report)
+end
+nd_echo "NameHighlights diagnostic report written:"
+nd_echo "  #{path}"
+nd_echo "Warnings: #{warnings}, Errors: #{errors}, Test failures: #{failures}"
