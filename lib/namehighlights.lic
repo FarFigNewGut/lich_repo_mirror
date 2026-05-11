@@ -1,0 +1,1243 @@
+# encoding: utf-8
+=begin
+
+  NameHighlights - Profession and custom name highlights for GemStone IV
+
+  NameHighlights scans the live WHO profession lists and builds a front-end
+  import file that color-codes player names by profession. It remembers names
+  between runs, adds newly seen names, and detects profession changes so the
+  highlight file can stay current without hand-editing character settings.
+
+  Profession colors can be changed from the setup window. The script also
+  supports manual labels such as Friend, Family, Enemy, and custom labels.
+  Manual labels take priority over profession colors, so important people keep
+  the color you choose even if their profession changes.
+
+  The script writes an import file instead of editing character XML directly.
+  Import Name highlights to apply player-name colors. Import Custom highlights
+  only if you want the optional legend labels to color themselves.
+
+  Basic commands:
+      ;namehighlights
+          Scans WHO profession data and writes the import file.
+
+      ;namehighlights setup
+          Opens the GTK color and tag setup window when GTK is available.
+
+      ;namehighlights legend window
+          Opens a small resident legend window in supported front ends.
+
+      ;namehighlights help
+          Shows the full command list.
+
+       author: Mystienne
+  contributor: Peggyanne
+         game: gs
+      version: 0.5.9
+         tags: highlights, names, professions, colors, tags, customization, frontend
+     required: Lich >= 5.11.0
+        email: Mystienne@mystienne.com
+      discord: Mystienne
+
+=end
+
+require 'fileutils'
+require 'rexml/document'
+require 'time'
+require 'yaml'
+
+NAMEHIGHLIGHTS_VERSION = '0.5.9'
+SCRIPT_NAME = 'namehighlights'
+
+DEFAULT_PROFESSION_COLORS = {
+  'Bard'     => ['#FFFFFF', '#600060'],
+  'Cleric'   => ['#00FFFF', '#001A1A'],
+  'Empath'   => ['#FF66FF', '#250025'],
+  'Monk'     => ['#FFA500', '#3A1F00'],
+  'Paladin'  => ['#FFD700', '#102542'],
+  'Ranger'   => ['#32CD32', '#0A2A0A'],
+  'Rogue'    => ['#AAAAAA', '#0F0F0F'],
+  'Sorcerer' => ['#FF6A6A', '#2B0000'],
+  'Warrior'  => ['#C0C0FF', '#1A1A2E'],
+  'Wizard'   => ['#66CCFF', '#0A0D2B'],
+}.freeze
+
+DEFAULT_TAG_COLORS = {
+  'Friend' => ['#FFFF00', '#FF00FF'],
+  'Family' => ['#FF0000', '#00FFFF'],
+  'Enemy'  => ['#FFFF00', '#FF0000'],
+}.freeze
+
+USER_HOME = (Dir.home rescue nil) || ENV['USERPROFILE'] || ENV['HOME'] || DATA_DIR
+DESKTOP_DIR = File.directory?(File.join(USER_HOME, 'Desktop')) ? File.join(USER_HOME, 'Desktop') : USER_HOME
+CONFIG_PATH = File.join(DATA_DIR, 'namehighlights.yml')
+LEGACY_CONFIG_PATH = File.join(DATA_DIR, 'profhighlights.yml')
+
+def ph_echo(message = '')
+  if defined?(respond)
+    respond message.to_s
+  elsif defined?(_respond)
+    _respond message.to_s
+  else
+    puts message.to_s
+  end
+end
+
+def ph_debug(enabled, message = '')
+  ph_echo "DEBUG: #{message}" if enabled
+end
+
+def current_character_name
+  if defined?(Char) && Char.respond_to?(:name) && Char.name.to_s.strip.length > 0
+    Char.name.to_s.strip
+  elsif defined?(XMLData) && XMLData.respond_to?(:name) && XMLData.name.to_s.strip.length > 0
+    XMLData.name.to_s.strip
+  else
+    nil
+  end
+end
+
+def default_config
+  {
+    'seen_names' => {},
+    'tagged_names' => {},
+    'disabled_tags' => [],
+    'profession_changes' => [],
+    'profession_colors' => DEFAULT_PROFESSION_COLORS,
+    'tag_colors' => DEFAULT_TAG_COLORS,
+    'frontend' => 'auto',
+  }
+end
+
+def legend_label(group)
+  "-={ #{group} }=-"
+end
+
+def load_config
+  path = File.exist?(CONFIG_PATH) ? CONFIG_PATH : LEGACY_CONFIG_PATH
+  return default_config unless File.exist?(path)
+
+  data = YAML.load_file(path)
+  data = default_config unless data.is_a?(Hash)
+  data['seen_names'] ||= {}
+  data['tagged_names'] ||= {}
+  data['disabled_tags'] ||= []
+  data['profession_changes'] ||= []
+  data['profession_colors'] ||= DEFAULT_PROFESSION_COLORS
+  data['tag_colors'] ||= DEFAULT_TAG_COLORS
+  data['frontend'] ||= 'auto'
+  data
+rescue
+  default_config
+end
+
+def save_config(config)
+  config['seen_names'] ||= {}
+  config['tagged_names'] ||= {}
+  config['disabled_tags'] ||= []
+  config['profession_changes'] ||= []
+  config['profession_colors'] ||= DEFAULT_PROFESSION_COLORS
+  config['tag_colors'] ||= DEFAULT_TAG_COLORS
+  config['frontend'] ||= 'auto'
+  FileUtils.mkdir_p(File.dirname(CONFIG_PATH))
+  File.write(CONFIG_PATH, config.to_yaml)
+end
+
+def profession_colors(config)
+  saved = config['profession_colors'] || {}
+  DEFAULT_PROFESSION_COLORS.each_with_object({}) do |(profession, default_pair), colors|
+    pair = saved[profession]
+    pair = default_pair unless pair.is_a?(Array) && pair.length == 2
+    fore = normalize_hex(pair[0]) || default_pair[0]
+    back = normalize_background(pair[1], default_pair[1])
+    colors[profession] = [fore, back]
+  end
+end
+
+def tag_colors(config)
+  saved = config['tag_colors'] || {}
+  disabled = (config['disabled_tags'] || []).map { |tag| tag.to_s.downcase }
+  defaults = DEFAULT_TAG_COLORS.merge(saved)
+  defaults.each_with_object({}) do |(tag, pair), colors|
+    next unless tag.to_s =~ /\A[A-Za-z][A-Za-z0-9_-]*\z/
+    next if disabled.include?(tag.to_s.downcase)
+
+    pair = DEFAULT_TAG_COLORS[tag] unless pair.is_a?(Array) && pair.length == 2
+    pair ||= ['#FFFFFF', '#000000']
+    fore = normalize_hex(pair[0]) || '#FFFFFF'
+    back = normalize_background(pair[1], '#000000')
+    colors[tag] = [fore, back]
+  end
+end
+
+def highlight_colors(config)
+  profession_colors(config).merge(tag_colors(config))
+end
+
+def normalize_hex(value)
+  text = value.to_s.strip
+  text = "##{text}" if text =~ /\A[0-9A-Fa-f]{6}\z/
+  return text.upcase if text =~ /\A#[0-9A-Fa-f]{6}\z/
+
+  nil
+end
+
+def normalize_background(value, default = '#000000')
+  text = value.to_s.strip
+  return '' if text.empty? || text =~ /\A(?:none|transparent|clear)\z/i
+
+  normalize_hex(text) || default
+end
+
+def current_frontend
+  defined?($frontend) ? $frontend.to_s.downcase.strip : ''
+end
+
+def detected_export_format
+  case current_frontend
+  when 'wizard', 'avalon'
+    'wizard'
+  when 'stormfront', 'wrayth'
+    'wrayth'
+  else
+    'wrayth'
+  end
+end
+
+def dock_frontend?
+  ['stormfront', 'wrayth', 'warlock'].include?(current_frontend)
+end
+
+def export_format_from_args(args, config)
+  explicit = args.find { |arg| arg =~ /\A(?:front|frontend|format|export)=/i }
+  value = explicit ? explicit.split('=', 2)[1] : config['frontend']
+  value = value.to_s.downcase.strip
+
+  case value
+  when '', 'auto'
+    detected_export_format
+  when 'xml', 'wrayth', 'stormfront', 'sf'
+    'wrayth'
+  when 'cmd', 'wizard', 'wiz', 'avalon'
+    'wizard'
+  when 'warlock'
+    'warlock'
+  else
+    'wrayth'
+  end
+end
+
+def default_export_path(format)
+  extension = format == 'wizard' ? 'cmd' : 'xml'
+  File.join(DESKTOP_DIR, "#{SCRIPT_NAME}-names.#{extension}")
+end
+
+def export_path_from_args(args, format)
+  explicit = args.find { |arg| arg =~ /\A(?:out|outfile|file|path)=/i }
+  return explicit.split('=', 2)[1] if explicit
+
+  default_export_path(format)
+end
+
+def strip_xml_tags(line)
+  line.to_s.gsub(/<[^>]+>/, ' ').gsub(/&nbsp;|&#160;/i, ' ').gsub(/&amp;/, '&')
+end
+
+def parse_who_names(lines)
+  names = []
+  in_list = false
+
+  lines.each do |raw|
+    line = strip_xml_tags(raw).strip
+    next if line.empty?
+
+    if line =~ /Brave Adventurers Questing:/i
+      in_list = true
+      next
+    end
+
+    break if line =~ /^Total:\s*\d+/i
+    next unless in_list
+    next if line =~ /^Active Players:/i
+    next if line =~ /^Staff on duty:/i
+
+    line.scan(/\b[A-Z][A-Za-z'-]{1,29}\b/) do |name|
+      names << name
+    end
+  end
+
+  names.uniq.sort
+end
+
+def fetch_profession_names(colors, debug = false)
+  results = {}
+
+  colors.each_key do |profession|
+    ph_debug(debug, "Scanning #{profession}...")
+    command = "who profession #{profession.downcase}"
+    ph_debug(debug, "command=#{command.inspect}")
+    lines = Lich::Util.quiet_command_xml(
+      command,
+      /Brave Adventurers Questing:|Total:\s*\d+|There are no adventurers/i,
+      /<prompt/i,
+      true,
+      8,
+      true
+    )
+    ph_debug(debug, "#{profession}: captured #{lines.length} raw lines")
+    lines.first(3).each_with_index do |line, index|
+      ph_debug(debug, "#{profession}: raw[#{index}]=#{strip_xml_tags(line).strip[0, 160]}")
+    end
+    names = parse_who_names(lines)
+    results[profession] = names
+    ph_debug(debug, "#{profession}: #{names.length} names")
+    ph_debug(debug, "#{profession}: parsed sample=#{names.first(10).join(', ')}")
+  end
+
+  results
+end
+
+def filter_changed_names(profession_names, config, refresh)
+  return profession_names if refresh
+
+  seen = config['seen_names'] || {}
+  tagged = config['tagged_names'] || {}
+  filtered = {}
+
+  profession_names.each do |profession, names|
+    filtered[profession] = names.reject do |name|
+      next true if tagged.key?(name.downcase)
+
+      remembered_profession = seen.dig(name.downcase, 'profession').to_s
+      remembered_profession == profession
+    end
+  end
+
+  filtered
+end
+
+def changed_profession_names(profession_names, config)
+  seen = config['seen_names'] || {}
+  tagged = config['tagged_names'] || {}
+  changed = []
+
+  profession_names.each do |profession, names|
+    names.each do |name|
+      next if tagged.key?(name.downcase)
+
+      remembered_profession = seen.dig(name.downcase, 'profession').to_s
+      next if remembered_profession.empty? || remembered_profession == profession
+
+      changed << {
+        name: name,
+        old_profession: remembered_profession,
+        new_profession: profession,
+      }
+    end
+  end
+
+  changed.sort_by { |entry| [entry[:new_profession], entry[:name]] }
+end
+
+def remember_names(profession_names, config)
+  config['seen_names'] ||= {}
+  profession_names.each do |profession, names|
+    names.each do |name|
+      config['seen_names'][name.downcase] = {
+        'name' => name,
+        'profession' => profession,
+        'last_seen' => Time.now.utc.iso8601,
+      }
+    end
+  end
+  save_config(config)
+end
+
+def record_profession_changes(changes, config)
+  return if changes.empty?
+
+  config['profession_changes'] ||= []
+  changes.each do |entry|
+    config['profession_changes'] << {
+      'name' => entry[:name],
+      'old_profession' => entry[:old_profession],
+      'new_profession' => entry[:new_profession],
+      'changed_at' => Time.now.utc.iso8601,
+    }
+  end
+  config['profession_changes'] = config['profession_changes'].last(500)
+  save_config(config)
+end
+
+def remembered_profession_names(config)
+  remembered = {}
+  highlight_colors(config).keys.each { |group| remembered[group] = [] }
+  tagged = config['tagged_names'] || {}
+
+  (config['seen_names'] || {}).each_value do |entry|
+    next unless entry.is_a?(Hash)
+
+    name = entry['name'].to_s.strip
+    profession = entry['profession'].to_s.strip
+    next if name.empty? || !remembered.key?(profession) || tagged.key?(name.downcase)
+
+    remembered[profession] << name
+  end
+
+  tagged.each_value do |entry|
+    next unless entry.is_a?(Hash)
+
+    name = entry['name'].to_s.strip
+    tag = entry['tag'].to_s.strip
+    next if name.empty? || !remembered.key?(tag)
+
+    remembered[tag] << name
+  end
+
+  remembered.each_value do |names|
+    names.uniq!
+    names.sort!
+  end
+  remembered
+end
+
+def simulated_remembered_profession_names(config, profession_names)
+  copy = YAML.load(YAML.dump(config))
+  remember_names_without_saving(profession_names, copy)
+  remembered_profession_names(copy)
+end
+
+def remember_names_without_saving(profession_names, config)
+  config['seen_names'] ||= {}
+  profession_names.each do |profession, names|
+    names.each do |name|
+      config['seen_names'][name.downcase] = {
+        'name' => name,
+        'profession' => profession,
+        'last_seen' => Time.now.utc.iso8601,
+      }
+    end
+  end
+  config
+end
+
+def build_import_document(profession_names, colors)
+  doc = REXML::Document.new
+  settings = doc.add_element('settings')
+  settings.add_attribute('client', '1.0.1.28')
+  strings_node = settings.add_element('strings')
+  strings_node.add_attribute('local', '')
+  names_node = settings.add_element('names')
+  names_node.add_attribute('local', '')
+
+  added = 0
+  colors.each do |group, pair|
+    fore, back = pair
+    h = REXML::Element.new('h')
+    h.add_attribute('text', legend_label(group))
+    h.add_attribute('color', fore)
+    h.add_attribute('bgcolor', back)
+    h.add_attribute('case', 'y')
+    strings_node.add_element(h)
+    added += 1
+  end
+
+  profession_names.each do |profession, names|
+    fore, back = colors[profession]
+    names.each do |name|
+      h = REXML::Element.new('h')
+      h.add_attribute('text', name)
+      h.add_attribute('color', fore)
+      h.add_attribute('bgcolor', back)
+      h.add_attribute('case', 'y')
+      names_node.add_element(h)
+      added += 1
+    end
+  end
+
+  [doc, added]
+end
+
+def build_wizard_script(profession_names, colors)
+  lines = [
+    "# #{SCRIPT_NAME} generated name highlights",
+    "# Run/import this in Wizard-compatible front ends to add name highlights.",
+    "# The label entries below color the legend words when your front end supports custom string highlights.",
+  ]
+  added = 0
+
+  colors.each do |group, pair|
+    fore, back = pair
+    safe_group = legend_label(group).to_s.gsub('"', '\"')
+    lines << "AddToHighlight string=\"#{safe_group}\" foreColor=#{fore} backColor=#{back} highlightEntireLine=False notOnWordBoundary=FALSE caseInsensitive=FALSE"
+    added += 1
+  end
+
+  profession_names.each do |profession, names|
+    fore, back = colors[profession]
+    lines << ''
+    lines << "# #{profession}"
+    names.each do |name|
+      safe_name = name.to_s.gsub('"', '\"')
+      lines << "AddToHighlightNames string=\"#{safe_name}\" foreColor=#{fore} backColor=#{back} highlightEntireLine=False notOnWordBoundary=FALSE caseInsensitive=TRUE"
+      added += 1
+    end
+  end
+
+  lines << ''
+  lines << "ECHO #{SCRIPT_NAME}: added #{added} name highlights."
+  [lines.join("\n"), added]
+end
+
+def write_import_file(path, profession_names, colors, format = 'wrayth')
+  if format == 'wizard'
+    content, added = build_wizard_script(profession_names, colors)
+    FileUtils.mkdir_p(File.dirname(path))
+    File.write(path, content)
+    return { file: path, added: added, format: format }
+  end
+
+  if format == 'warlock'
+    ph_echo 'Warlock export is not available yet. Please send a Warlock highlight/settings export sample so this can write the right format.'
+    return { file: path, added: 0, format: format }
+  end
+
+  doc, added = build_import_document(profession_names, colors)
+  FileUtils.mkdir_p(File.dirname(path))
+
+  formatter = REXML::Formatters::Pretty.new(2)
+  formatter.compact = true
+  File.open(path, 'w') { |file| formatter.write(doc, file) }
+
+  { file: path, added: added, format: format }
+end
+
+def show_usage
+  ph_echo ''
+  ph_echo "   NameHighlights v#{NAMEHIGHLIGHTS_VERSION}"
+  ph_echo ''
+  ph_echo '   Usage:'
+  ph_echo ''
+  ph_echo '   ;namehighlights                         Scan professions and write the export file'
+  ph_echo '   ;namehighlights refresh                 Rebuild memory from the current WHO data'
+  ph_echo '   ;namehighlights reset                   Clear memory, manual tags, and default export'
+  ph_echo ''
+  ph_echo '   Setup and Display:'
+  ph_echo ''
+  ph_echo '   ;namehighlights config                  Open color/tag configuration'
+  ph_echo '   ;namehighlights legend                  Print legend labels'
+  ph_echo '   ;namehighlights legend window           Open/update the resident legend window'
+  ph_echo '   ;namehighlights legend close            Close the resident legend window'
+  ph_echo '   ;namehighlights list                    Print remembered names by profession/tag'
+  ph_echo '   ;namehighlights changes                 Print remembered profession changes'
+  ph_echo ''
+  ph_echo '   Manual Tags:'
+  ph_echo ''
+  ph_echo '   ;namehighlights tag VIP #FFFFFF #000000 Create or recolor a tag'
+  ph_echo '   ;namehighlights untag VIP               Remove a custom tag label'
+  ph_echo '   ;namehighlights Friend Bob Sue          Add names to a tag'
+  ph_echo '   ;namehighlights Bob Sue Friend          Same command, tag last'
+  ph_echo '   ;namehighlights remove Bob Sue          Remove names from manual tags'
+  ph_echo ''
+  ph_echo '   Output Options:'
+  ph_echo ''
+  ph_echo '   ;namehighlights frontend=auto           Pick export format from your frontend'
+  ph_echo '   ;namehighlights frontend=wrayth         Write Wrayth XML export'
+  ph_echo '   ;namehighlights frontend=wizard         Write Wizard/Avalon command export'
+  ph_echo '   ;namehighlights out=/path/to/names.xml  Write a custom export file'
+  ph_echo ''
+  ph_echo '   Debugging:'
+  ph_echo ''
+  ph_echo '   ;namehighlights debug                   Verbose real run'
+  ph_echo ''
+end
+
+def canonical_tag(config, tag_name)
+  wanted = tag_name.to_s.strip
+  return nil if wanted.empty?
+
+  known_tags = tag_colors(config).keys + DEFAULT_TAG_COLORS.keys + (config['tag_colors'] || {}).keys
+  known_tags.find { |tag| tag.downcase == wanted.downcase } || wanted
+end
+
+def valid_tag_name?(tag)
+  tag.to_s =~ /\A[A-Za-z][A-Za-z0-9_-]*\z/
+end
+
+def normalize_person_name(name)
+  text = name.to_s.strip.gsub(/[,;]/, '')
+  return nil unless text =~ /\A[A-Za-z][A-Za-z'-]{1,29}\z/
+
+  text.downcase.split(/([-'])/).map do |part|
+    if part == '-' || part == "'"
+      part
+    else
+      part[0].to_s.upcase + part[1, part.length].to_s
+    end
+  end.join
+end
+
+def tag_names(config, tag, names)
+  tag = canonical_tag(config, tag)
+  unless valid_tag_name?(tag)
+    ph_echo "Invalid tag name: #{tag.inspect}. Use letters, numbers, underscores, or dashes."
+    return false
+  end
+
+  config['tag_colors'] ||= {}
+  config['tag_colors'][tag] ||= DEFAULT_TAG_COLORS[tag] || ['#FFFFFF', '#000000']
+  config['tagged_names'] ||= {}
+
+  normalized = names.map { |name| normalize_person_name(name) }.compact.uniq
+  if normalized.empty?
+    ph_echo 'No valid names provided.'
+    return false
+  end
+
+  normalized.each do |name|
+    config['tagged_names'][name.downcase] = {
+      'name' => name,
+      'tag' => tag,
+      'tagged_at' => Time.now.utc.iso8601,
+    }
+  end
+  save_config(config)
+  ph_echo "Tagged #{normalized.length} name(s) as #{tag}: #{normalized.join(', ')}"
+  true
+end
+
+def untag_names(config, names)
+  config['tagged_names'] ||= {}
+  normalized = names.map { |name| normalize_person_name(name) }.compact.uniq
+  removed = []
+  normalized.each do |name|
+    removed << name if config['tagged_names'].delete(name.downcase)
+  end
+  save_config(config)
+  ph_echo "Removed manual tags from #{removed.length} name(s): #{removed.join(', ')}"
+  true
+end
+
+def remove_tag(config, tag)
+  tag = canonical_tag(config, tag)
+  unless valid_tag_name?(tag)
+    ph_echo 'Usage: ;namehighlights untag LABEL'
+    return false
+  end
+
+  if DEFAULT_TAG_COLORS.keys.any? { |default_tag| default_tag.downcase == tag.downcase }
+    ph_echo "#{tag} is a built-in tag and cannot be removed. Use remove NAME to clear names from it."
+    return false
+  end
+
+  config['tag_colors'] ||= {}
+  config['tagged_names'] ||= {}
+  config['disabled_tags'] ||= []
+
+  unless config['tag_colors'].keys.any? { |custom_tag| custom_tag.downcase == tag.downcase }
+    ph_echo "No custom tag named #{tag} exists."
+    return false
+  end
+
+  config['tag_colors'].delete_if { |custom_tag, _pair| custom_tag.to_s.downcase == tag.downcase }
+  config['disabled_tags'] << tag.downcase
+  config['disabled_tags'].uniq!
+
+  removed_names = []
+  config['tagged_names'].delete_if do |_key, entry|
+    matched = entry.is_a?(Hash) && entry['tag'].to_s.downcase == tag.downcase
+    removed_names << entry['name'] if matched
+    matched
+  end
+
+  save_config(config)
+  ph_echo "Removed tag #{tag} and #{removed_names.length} tagged name(s)."
+  true
+end
+
+def set_tag_color(config, tag, fore, back)
+  tag = canonical_tag(config, tag)
+  fore = normalize_hex(fore)
+  back = normalize_background(back, nil)
+  unless valid_tag_name?(tag) && fore && !back.nil?
+    ph_echo 'Usage: ;namehighlights tag LABEL #RRGGBB #RRGGBB'
+    ph_echo '       Use none, transparent, clear, or blank for no background.'
+    return false
+  end
+
+  config['tag_colors'] ||= {}
+  config['disabled_tags'] ||= []
+  config['disabled_tags'].delete_if { |disabled| disabled.to_s.downcase == tag.downcase }
+  config['tag_colors'][tag] = [fore, back]
+  save_config(config)
+  ph_echo "Set #{tag} colors to #{fore} on #{back}"
+  true
+end
+
+def print_profession_changes(config)
+  changes = config['profession_changes'] || []
+  if changes.empty?
+    ph_echo 'No profession changes have been recorded.'
+    return
+  end
+
+  ph_echo "Recorded profession changes: #{changes.length}"
+  changes.last(100).each do |entry|
+    ph_echo "  #{entry['name']}: #{entry['old_profession']} -> #{entry['new_profession']} @ #{entry['changed_at']}"
+  end
+end
+
+def print_profession_legend(config, colors, debug = false)
+  remembered = remembered_profession_names(config)
+  ph_echo 'Name highlight legend:'
+  unless debug
+    labels = colors.keys.map { |profession| legend_label(profession) }
+    columns = labels.length >= 9 ? 3 : 2
+    rows = (labels.length.to_f / columns).ceil
+    width = labels.map(&:length).max.to_i + 4
+    rows.times do |row|
+      line = ''
+      columns.times do |column|
+        label = labels[row + (column * rows)]
+        next unless label
+
+        line << label.ljust(width)
+      end
+      ph_echo "  #{line.rstrip}"
+    end
+    ph_echo 'Import Custom highlights to color these labels.'
+    return
+  end
+
+  colors.each do |profession, pair|
+    fore, back = pair
+    sample_names = remembered[profession].to_a.first(5)
+    sample = sample_names.empty? ? "#{profession} sample" : sample_names.join(', ')
+    ph_echo "  #{legend_label(profession).ljust(18)} #{fore} on #{back}  #{sample}"
+  end
+end
+
+def xml_escape(text)
+  text.to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;').gsub('"', '&quot;').gsub("'", '&apos;')
+end
+
+def send_client_xml(xml)
+  if defined?(_respond)
+    _respond xml
+  elsif defined?(respond)
+    respond xml
+  else
+    puts xml
+  end
+end
+
+def close_legend_window
+  send_client_xml "<closeDialog id='NameHighlightsLegend' />"
+  send_client_xml "<closeDialog id='namehighlightsLegend' />"
+  send_client_xml "<closeStream id='namehighlightsLegend' />"
+  send_client_xml "<clearStream id='namehighlightsLegend' />"
+  ph_echo 'Closed the Name Highlights legend window.'
+end
+
+def open_legend_window(config, colors)
+  unless dock_frontend?
+    ph_echo 'Legend window requires StormFront/Wrayth/Warlock. Printing the legend here instead.'
+    print_profession_legend(config, colors, false)
+    return
+  end
+
+  buffer = []
+  buffer << "<closeDialog id='NameHighlightsLegend' />"
+  buffer << "<streamWindow id='namehighlightsLegend' title='Name Highlights' location='center' save='save' resident='true' />"
+  buffer << "<exposeStream id='namehighlightsLegend' />"
+  buffer << "<clearStream id='namehighlightsLegend' />"
+  buffer << "<pushStream id='namehighlightsLegend' />"
+  buffer << "<output class='mono' />"
+  colors.each_key do |group|
+    buffer << "#{xml_escape(legend_label(group))}\n"
+  end
+  buffer << "<output class='' />"
+  buffer << "<popStream/>"
+  send_client_xml buffer.join
+  ph_echo 'Opened/updated the resident Name Highlights legend window.'
+end
+
+def print_remembered_names(config)
+  remembered = remembered_profession_names(config)
+  total = remembered.values.flatten.length
+  ph_echo "Remembered names: #{total}"
+  remembered.each do |profession, names|
+    ph_echo "#{profession} (#{names.length}):"
+    if names.empty?
+      ph_echo '  (none)'
+    else
+      names.each_slice(6) do |slice|
+        ph_echo "  #{slice.join(', ')}"
+      end
+    end
+  end
+end
+
+def print_debug_snapshot(config, colors, out_path, format)
+  ph_echo "DEBUG: version=#{NAMEHIGHLIGHTS_VERSION}"
+  ph_echo "DEBUG: config_path=#{CONFIG_PATH}"
+  ph_echo "DEBUG: config_exists=#{File.exist?(CONFIG_PATH)}"
+  ph_echo "DEBUG: export_format=#{format}"
+  ph_echo "DEBUG: export_path=#{out_path}"
+  ph_echo "DEBUG: export_exists=#{File.exist?(out_path)}"
+  ph_echo "DEBUG: current_character=#{current_character_name || '(unknown)'}"
+  ph_echo "DEBUG: remembered_total=#{(config['seen_names'] || {}).length}"
+  colors.each do |profession, pair|
+    count = remembered_profession_names(config)[profession].to_a.length
+    ph_echo "DEBUG: color #{profession}=#{pair[0]} on #{pair[1]} remembered=#{count}"
+  end
+end
+
+def hex_to_rgba(hex)
+  hex = normalize_hex(hex) || '#000000'
+  r = hex[1, 2].to_i(16) / 255.0
+  g = hex[3, 2].to_i(16) / 255.0
+  b = hex[5, 2].to_i(16) / 255.0
+  Gdk::RGBA.new(r, g, b, 1.0)
+end
+
+def rgba_to_hex(rgba)
+  r = [[(rgba.red * 255).round.to_i, 0].max, 255].min
+  g = [[(rgba.green * 255).round.to_i, 0].max, 255].min
+  b = [[(rgba.blue * 255).round.to_i, 0].max, 255].min
+  format('#%02X%02X%02X', r, g, b)
+end
+
+def transparent_background?(value)
+  value.to_s.strip.empty? || value.to_s.strip =~ /\A(?:none|transparent|clear)\z/i
+end
+
+def apply_preview_colors(label, fore_hex, back_hex)
+  return unless defined?(Gdk)
+
+  fore = hex_to_rgba(fore_hex)
+  label.override_color(Gtk::StateFlags::NORMAL, fore)
+  if transparent_background?(back_hex)
+    label.override_background_color(Gtk::StateFlags::NORMAL, nil)
+  else
+    back = hex_to_rgba(back_hex)
+    label.override_background_color(Gtk::StateFlags::NORMAL, back)
+  end
+rescue
+  nil
+end
+
+def color_button(hex)
+  return nil unless defined?(Gtk::ColorButton) && defined?(Gdk::RGBA)
+
+  button = Gtk::ColorButton.new
+  button.rgba = hex_to_rgba(hex) if button.respond_to?(:rgba=)
+  button
+rescue
+  nil
+end
+
+def show_color_config_window(config)
+  unless defined?(Gtk)
+    ph_echo 'GTK is not available in this Lich session.'
+    return
+  end
+
+  colors = highlight_colors(config)
+  color_groups = colors.keys
+  action = nil
+  widgets = {}
+  window_ref = nil
+
+  Gtk.queue {
+    window = Gtk::Window.new(:toplevel)
+    window_ref = window
+    window.title = 'Name Highlights Colors'
+    window.border_width = 8
+    window.set_position(Gtk::WindowPosition::CENTER) if defined?(Gtk::WindowPosition)
+    window.set_default_size(760, 560) if window.respond_to?(:set_default_size)
+
+    table = Gtk::Table.new(color_groups.length + 1, 7, false)
+    table.attach(Gtk::Label.new('Group'), 0, 1, 0, 1, Gtk::AttachOptions::FILL, Gtk::AttachOptions::FILL, 4, 4)
+    table.attach(Gtk::Label.new('Text'), 1, 2, 0, 1, Gtk::AttachOptions::FILL, Gtk::AttachOptions::FILL, 4, 4)
+    table.attach(Gtk::Label.new('Background'), 2, 3, 0, 1, Gtk::AttachOptions::FILL, Gtk::AttachOptions::FILL, 4, 4)
+    table.attach(Gtk::Label.new('Pick Text'), 3, 4, 0, 1, Gtk::AttachOptions::FILL, Gtk::AttachOptions::FILL, 4, 4)
+    table.attach(Gtk::Label.new('Pick Back'), 4, 5, 0, 1, Gtk::AttachOptions::FILL, Gtk::AttachOptions::FILL, 4, 4)
+    table.attach(Gtk::Label.new('Clear Back'), 5, 6, 0, 1, Gtk::AttachOptions::FILL, Gtk::AttachOptions::FILL, 4, 4)
+    table.attach(Gtk::Label.new('Preview'), 6, 7, 0, 1, Gtk::AttachOptions::FILL, Gtk::AttachOptions::FILL, 4, 4)
+
+    refresh_preview = proc do |profession|
+      info = widgets[profession]
+      fore = normalize_hex(info[:fore_entry].text) || '#FFFFFF'
+      back = normalize_background(info[:back_entry].text, '#000000')
+      info[:preview].text = " #{profession} sample "
+      apply_preview_colors(info[:preview], fore, back)
+    end
+
+    add_color_row = proc do |group, fore, back|
+      row = color_groups.index(group).to_i + 1
+      table.resize(color_groups.length + 1, 7) if table.respond_to?(:resize)
+      fore_entry = Gtk::Entry.new
+      fore_entry.text = fore
+      fore_entry.width_chars = 9 if fore_entry.respond_to?(:width_chars=)
+      back_entry = Gtk::Entry.new
+      back_entry.text = back
+      back_entry.width_chars = 12 if back_entry.respond_to?(:width_chars=)
+      preview = Gtk::Label.new(" #{group} sample ")
+
+      fore_button = color_button(fore)
+      back_button = color_button(back)
+      clear_back_button = Gtk::Button.new(:label => 'None')
+
+      widgets[group] = {
+        fore_entry: fore_entry,
+        back_entry: back_entry,
+        fore_button: fore_button,
+        back_button: back_button,
+        clear_back_button: clear_back_button,
+        preview: preview,
+      }
+
+      table.attach(Gtk::Label.new(group), 0, 1, row, row + 1, Gtk::AttachOptions::FILL, Gtk::AttachOptions::FILL, 4, 3)
+      table.attach(fore_entry, 1, 2, row, row + 1, Gtk::AttachOptions::FILL, Gtk::AttachOptions::FILL, 4, 3)
+      table.attach(back_entry, 2, 3, row, row + 1, Gtk::AttachOptions::FILL, Gtk::AttachOptions::FILL, 4, 3)
+      table.attach(fore_button || Gtk::Label.new('(n/a)'), 3, 4, row, row + 1, Gtk::AttachOptions::FILL, Gtk::AttachOptions::FILL, 4, 3)
+      table.attach(back_button || Gtk::Label.new('(n/a)'), 4, 5, row, row + 1, Gtk::AttachOptions::FILL, Gtk::AttachOptions::FILL, 4, 3)
+      table.attach(clear_back_button, 5, 6, row, row + 1, Gtk::AttachOptions::FILL, Gtk::AttachOptions::FILL, 4, 3)
+      table.attach(preview, 6, 7, row, row + 1, Gtk::AttachOptions::FILL, Gtk::AttachOptions::FILL, 4, 3)
+
+      fore_entry.signal_connect('changed') { refresh_preview.call(group) }
+      back_entry.signal_connect('changed') { refresh_preview.call(group) }
+
+      if fore_button
+        fore_button.signal_connect('color-set') do
+          fore_entry.text = rgba_to_hex(fore_button.rgba)
+          refresh_preview.call(group)
+        end
+      end
+      if back_button
+        back_button.signal_connect('color-set') do
+          back_entry.text = rgba_to_hex(back_button.rgba)
+          refresh_preview.call(group)
+        end
+      end
+      clear_back_button.signal_connect('clicked') do
+        back_entry.text = ''
+        refresh_preview.call(group)
+      end
+
+      refresh_preview.call(group)
+    end
+
+    color_groups.each { |group| add_color_row.call(group, colors[group][0], colors[group][1]) }
+
+    add_entry = Gtk::Entry.new
+    add_entry.width_chars = 18 if add_entry.respond_to?(:width_chars=)
+    add_entry.text = 'NewTag'
+    add_button = Gtk::Button.new(:label => 'Add Tag')
+    add_box = Gtk::Box.new(:horizontal, 6)
+    add_box.pack_start(Gtk::Label.new('New tag:'), :expand => false)
+    add_box.pack_start(add_entry, :expand => false)
+    add_box.pack_start(add_button, :expand => false)
+    add_button.signal_connect('clicked') do
+      requested = add_entry.text.to_s.strip
+      tag = canonical_tag({ 'tag_colors' => color_groups.each_with_object({}) { |name, memo| memo[name] = ['#FFFFFF', '#000000'] } }, requested)
+      if !valid_tag_name?(tag)
+        ph_echo 'Invalid tag name. Use letters, numbers, underscores, or dashes.'
+      elsif color_groups.any? { |existing| existing.downcase == tag.downcase }
+        ph_echo "#{tag} already exists in the color list."
+      else
+        color_groups << tag
+        add_color_row.call(tag, '#FFFFFF', '#000000')
+        config['tag_colors'] ||= {}
+        config['tag_colors'][tag] ||= ['#FFFFFF', '#000000']
+        save_config(config)
+        ph_echo "Added tag color row: #{tag}. It has been saved; click Save after changing its colors."
+        table.show_all if table.respond_to?(:show_all)
+        window.show_all if window.respond_to?(:show_all)
+        window.present if window.respond_to?(:present)
+        add_entry.text = ''
+      end
+    end
+
+    save = Gtk::Button.new(:label => 'Save')
+    defaults = Gtk::Button.new(:label => 'Defaults')
+    clear = Gtk::Button.new(:label => 'Clear Data')
+    close = Gtk::Button.new(:label => 'Close')
+    button_box = Gtk::Box.new(:horizontal, 6)
+    button_box.pack_start(save, :expand => false)
+    button_box.pack_start(defaults, :expand => false)
+    button_box.pack_start(clear, :expand => false)
+    button_box.pack_start(close, :expand => false)
+
+    save.signal_connect('clicked') { action = :save }
+    clear.signal_connect('clicked') { action = :clear }
+    close.signal_connect('clicked') { action = :close }
+    defaults.signal_connect('clicked') do
+      DEFAULT_PROFESSION_COLORS.merge(DEFAULT_TAG_COLORS).each do |profession, pair|
+        next unless widgets[profession]
+
+        widgets[profession][:fore_entry].text = pair[0]
+        widgets[profession][:back_entry].text = pair[1]
+        refresh_preview.call(profession)
+      end
+    end
+
+    vbox = Gtk::Box.new(:vertical, 6)
+    scroller = Gtk::ScrolledWindow.new
+    scroller.set_policy(Gtk::PolicyType::AUTOMATIC, Gtk::PolicyType::AUTOMATIC) if scroller.respond_to?(:set_policy)
+    scroller.set_size_request(740, 500) if scroller.respond_to?(:set_size_request)
+    if scroller.respond_to?(:add_with_viewport)
+      scroller.add_with_viewport(table)
+    else
+      scroller.add(table)
+    end
+    vbox.pack_start(scroller, :expand => true, :fill => true, :padding => 0)
+    vbox.pack_start(add_box, :expand => false, :fill => false, :padding => 0)
+    vbox.pack_start(button_box, :expand => false, :fill => false, :padding => 0)
+
+    window.signal_connect('delete_event') { action = :close }
+    window.add(vbox)
+    window.show_all
+    window.present
+  }
+
+  before_dying { Gtk.queue { window_ref.destroy if window_ref && !window_ref.destroyed? } }
+  wait_until { action }
+  undo_before_dying
+
+  if action == :clear
+    config['seen_names'] = {}
+    config['tagged_names'] = {}
+    config['disabled_tags'] = []
+    config['profession_changes'] = []
+    save_config(config)
+    [default_export_path('wrayth'), default_export_path('wizard')].each do |path|
+      File.delete(path) if File.exist?(path)
+    end
+    ph_echo 'Cleared remembered names, manual tags, profession changes, and default export files if they existed.'
+  elsif action == :save
+    updated = {}
+    widgets.each do |profession, info|
+      fore = normalize_hex(info[:fore_entry].text)
+      back = normalize_background(info[:back_entry].text, nil)
+      unless fore && !back.nil?
+        ph_echo "Invalid color for #{profession}; use #RRGGBB or leave background blank for transparent."
+        next
+      end
+      updated[profession] = [fore, back]
+    end
+    if updated.length == color_groups.length
+      config['profession_colors'] = {}
+      config['tag_colors'] = {}
+      updated.each do |group, pair|
+        if DEFAULT_PROFESSION_COLORS.key?(group)
+          config['profession_colors'][group] = pair
+        else
+          config['tag_colors'][group] = pair
+        end
+      end
+      save_config(config)
+      ph_echo "Saved name highlight colors to #{CONFIG_PATH}"
+    else
+      ph_echo 'Colors were not saved because one or more rows were invalid.'
+    end
+  else
+    ph_echo 'Closed color configuration without saving.'
+  end
+
+  Gtk.queue { window_ref.destroy if window_ref && !window_ref.destroyed? }
+end
+
+def show_export_instructions(path, format, has_profession_changes = false)
+  if format == 'wizard'
+    ph_echo 'Wizard/Avalon instructions:'
+    ph_echo "  1. Save/use this command file: #{path}"
+    ph_echo '  2. Run it from your Wizard-compatible front end to add the generated name highlights.'
+    ph_echo '  3. If profession colors changed, rerun/import the generated file so existing names recolor.'
+    return
+  end
+
+  if format == 'warlock'
+    ph_echo 'Warlock instructions:'
+    ph_echo '  Warlock export support needs a sample Warlock highlight/settings file before this script can write it safely.'
+    return
+  end
+
+  ph_echo 'Import instructions:'
+  ph_echo '  1. In your front end, open Options -> Settings -> Import.'
+  ph_echo "  2. Paste this filename: #{path}"
+  if has_profession_changes
+    ph_echo '  3. Set Name highlights to "import all" so profession color changes update existing names.'
+    ph_echo '     Set Custom highlights to "import all" only if you use the legend window.'
+  else
+    ph_echo '  3. Set Name highlights to "only import new".'
+    ph_echo '     Set Custom highlights to "only import new" only if you use the legend window.'
+  end
+  ph_echo '  4. Leave Macros, Scripts, Variables, Window Configuration, and Palette and Colors as "don''t import".'
+  ph_echo '  5. Click Import.'
+end
+
+raw_args = Script.current.vars.map(&:to_s)
+args = raw_args.map(&:downcase)
+if args.include?('help') || args.include?('--help') || args.include?('-h')
+  show_usage
+  exit
+end
+
+config = load_config
+
+if args.include?('config') || args.include?('setup') || args.include?('colors')
+  show_color_config_window(config)
+  exit
+end
+
+refresh = args.include?('refresh') || args.include?('full') || args.include?('--refresh')
+debug = args.include?('debug') || args.include?('--debug')
+export_format = export_format_from_args(raw_args, config)
+out_path = export_path_from_args(raw_args, export_format)
+profession_active_colors = profession_colors(config)
+active_colors = highlight_colors(config)
+
+if args.include?('list') || args.include?('names')
+  print_remembered_names(config)
+  exit
+end
+
+if args.include?('changes') || args.include?('changed')
+  print_profession_changes(config)
+  exit
+end
+
+if args.include?('legend') && (args.include?('window') || args.include?('dock') || args.include?('panel'))
+  open_legend_window(config, active_colors)
+  exit
+end
+
+if args.include?('legend') && args.include?('close')
+  close_legend_window
+  exit
+end
+
+if args.include?('legend') || args.include?('colors-list') || args.include?('palette')
+  print_profession_legend(config, active_colors, debug)
+  exit
+end
+
+if args[0] == 'tag' || args[0] == 'tagcolor'
+  if set_tag_color(config, raw_args[1], raw_args[2], raw_args[3])
+    updated_config = load_config
+    result = write_import_file(out_path, remembered_profession_names(updated_config), highlight_colors(updated_config), export_format)
+    ph_echo "Rewrote cumulative #{export_format} export with #{result[:added]} highlights: #{result[:file]}"
+    show_export_instructions(result[:file], export_format, true)
+  end
+  exit
+end
+
+if args[0] == 'untag'
+  if remove_tag(config, raw_args[1])
+    updated_config = load_config
+    result = write_import_file(out_path, remembered_profession_names(updated_config), highlight_colors(updated_config), export_format)
+    ph_echo "Rewrote cumulative #{export_format} export with #{result[:added]} highlights: #{result[:file]}"
+    show_export_instructions(result[:file], export_format, true)
+  end
+  exit
+end
+
+if args[0] == 'remove'
+  if untag_names(config, raw_args[1, raw_args.length] || [])
+    updated_config = load_config
+    result = write_import_file(out_path, remembered_profession_names(updated_config), highlight_colors(updated_config), export_format)
+    ph_echo "Rewrote cumulative #{export_format} export with #{result[:added]} highlights: #{result[:file]}"
+    show_export_instructions(result[:file], export_format, true)
+  end
+  exit
+end
+
+shortcut_tag = tag_colors(config).keys.find { |tag| tag.downcase == args[0].to_s }
+if shortcut_tag && raw_args.length > 1
+  if tag_names(config, shortcut_tag, raw_args[1, raw_args.length] || [])
+    updated_config = load_config
+    result = write_import_file(out_path, remembered_profession_names(updated_config), highlight_colors(updated_config), export_format)
+    ph_echo "Rewrote cumulative #{export_format} export with #{result[:added]} highlights: #{result[:file]}"
+    show_export_instructions(result[:file], export_format, true)
+  end
+  exit
+end
+
+command_words = %w[
+  help --help -h config setup colors refresh full --refresh debug --debug
+  list names changes changed legend window dock panel close colors-list palette tagcolor tag untag remove reset
+]
+trailing_shortcut_tag = tag_colors(config).keys.find { |tag| tag.downcase == args[-1].to_s }
+if trailing_shortcut_tag && raw_args.length > 1 && (args & command_words).empty?
+  if tag_names(config, trailing_shortcut_tag, raw_args[0, raw_args.length - 1] || [])
+    updated_config = load_config
+    result = write_import_file(out_path, remembered_profession_names(updated_config), highlight_colors(updated_config), export_format)
+    ph_echo "Rewrote cumulative #{export_format} export with #{result[:added]} highlights: #{result[:file]}"
+    show_export_instructions(result[:file], export_format, true)
+  end
+  exit
+end
+
+print_debug_snapshot(config, active_colors, out_path, export_format) if debug
+
+if args.include?('reset')
+  config['seen_names'] = {}
+  config['tagged_names'] = {}
+  config['disabled_tags'] = []
+  config['profession_changes'] = []
+  save_config(config)
+  File.delete(out_path) if File.exist?(out_path)
+  ph_echo "Forgot saved name memory, manual tags, profession changes, and deleted #{out_path} if it existed."
+  exit
+end
+
+ph_echo "Refresh: #{refresh ? 'yes' : 'no'}"
+ph_echo "Debug: #{debug ? 'yes' : 'no'}"
+ph_echo "Export format: #{export_format}"
+ph_echo "Export file: #{out_path}"
+ph_echo "Already remembered names: #{config['seen_names'].length}"
+
+ph_echo 'Scanning professions...'
+profession_names = fetch_profession_names(profession_active_colors, debug)
+ph_echo "Scanned #{profession_names.length} professions."
+total_names = profession_names.values.flatten.uniq.length
+ph_echo "Total unique names parsed: #{total_names}"
+ph_debug(debug, "total parsed with profession memberships=#{profession_names.values.flatten.length}")
+
+names_to_write = filter_changed_names(profession_names, config, refresh)
+profession_changes = refresh ? [] : changed_profession_names(profession_names, config)
+new_total = names_to_write.values.flatten.uniq.length
+skipped_total = total_names - new_total
+ph_echo "Names already remembered/skipped: #{skipped_total}" unless refresh
+ph_echo "New/changed names this run: #{new_total}"
+unless profession_changes.empty?
+  ph_echo "Profession changes detected: #{profession_changes.length}"
+  profession_changes.first(20).each do |entry|
+    ph_echo "  #{entry[:name]}: #{entry[:old_profession]} -> #{entry[:new_profession]}"
+  end
+  ph_echo '  (showing first 20 changes)' if profession_changes.length > 20
+end
+ph_debug(debug, "new/changed names by profession=#{names_to_write.transform_values(&:length).inspect}")
+ph_debug(debug, "new/changed name sample=#{names_to_write.values.flatten.first(25).join(', ')}")
+
+names_to_write.each do |profession, names|
+  next if names.empty?
+  next unless debug
+
+  fore, back = active_colors[profession]
+  sample = names.first(5).join(', ')
+  ph_echo "#{profession.ljust(9)} #{names.length.to_s.rjust(3)} names  #{fore} on #{back}  sample: #{sample}"
+end
+
+record_profession_changes(profession_changes, config)
+remember_names(refresh ? profession_names : names_to_write, config)
+updated_config = load_config
+cumulative_names = remembered_profession_names(updated_config)
+result = write_import_file(out_path, cumulative_names, active_colors, export_format)
+ph_echo "Wrote #{result[:added]} cumulative name highlights to #{result[:file]}"
+ph_echo "Remembered names now: #{updated_config['seen_names'].length}"
+ph_debug(debug, "cumulative counts written=#{cumulative_names.transform_values(&:length).inspect}")
+ph_debug(debug, "export file size=#{File.size(result[:file]) rescue 'unknown'}")
+show_export_instructions(result[:file], export_format, !profession_changes.empty?)
