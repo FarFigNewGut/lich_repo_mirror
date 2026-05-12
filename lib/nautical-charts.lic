@@ -12,6 +12,8 @@ before_dying {
   $mac_settings_win = nil
   GLib::Source.remove($configure_timer_id) if $configure_timer_id rescue nil
   $configure_timer_id = nil
+  GLib::Source.remove($follow_timer_id) if $follow_timer_id rescue nil
+  $follow_timer_id = nil
 
   # 4. Final Window Cleanup
   # CRITICAL on Mac: never call ANY GTK method (including hide/destroy) from
@@ -64,7 +66,7 @@ def stop_audio
 end
 
 =begin
-	   Nautical-Charts Version: 1.2.2 (May 10, 2026)
+	   Nautical-Charts Version: 1.2.3 (May 11, 2026)
 	
 	   Usage: 
 	
@@ -96,7 +98,8 @@ end
                       May 3, 2026 - Added Selectable Ship Icons, Window Placement/Size Memory, Port Images and Sounds (With Toggle For On/Off).
                       May 9, 2026 - Added Combat Detection and Alert Animation w/ Sound.
                      May 10, 2026 - Updated The OceanDB and Some Of The Map Files To Fix Broken Pathways.
-=end 
+                     May 11, 2026 - Improved Icon Tracking, Location Detection and Scale Response W/Persistant Setting. Also Fixed the Center Button.
+=end
 
 i_stand_alone
 clear
@@ -145,7 +148,6 @@ $combat_last_dismissed = nil
 $mac_settings_win = nil
 PORT_SCALE = 0.25  
 SEA_SCALE  = 0.50  
-$scale = SEA_SCALE 
 
 # ----------------------
 SHIP_BASE_PX = 40
@@ -207,6 +209,8 @@ $theme_mode      = (UserVars.sea_charts[:theme] || 'dark').to_sym
 $keep_on_top     = UserVars.sea_charts[:keep_on_top].nil? ? false : UserVars.sea_charts[:keep_on_top]
 $ship_icon_file  = UserVars.sea_charts[:ship_icon] || 'default_icon.png'
 $enable_sounds   = UserVars.sea_charts[:enable_sounds].nil? ? true : UserVars.sea_charts[:enable_sounds]
+$sea_scale_user  = UserVars.sea_charts[:sea_scale] || SEA_SCALE
+$scale           = $sea_scale_user
 # Load saved dimensions (default to 500x500 if none exist)
 $win_w = UserVars.sea_charts[:win_w] || 500
 $win_h = UserVars.sea_charts[:win_h] || 500
@@ -214,15 +218,16 @@ $win_x = UserVars.sea_charts[:win_x] || 100
 $win_y = UserVars.sea_charts[:win_y] || 100
 
 def save_settings
-  UserVars.sea_charts[:show_bg]     = $show_background
-  UserVars.sea_charts[:theme]       = $theme_mode.to_s
-  UserVars.sea_charts[:keep_on_top] = $keep_on_top
-  UserVars.sea_charts[:ship_icon]   = $ship_icon_file
+  UserVars.sea_charts[:show_bg]       = $show_background
+  UserVars.sea_charts[:theme]         = $theme_mode.to_s
+  UserVars.sea_charts[:keep_on_top]   = $keep_on_top
+  UserVars.sea_charts[:ship_icon]     = $ship_icon_file
   UserVars.sea_charts[:enable_sounds] = $enable_sounds
-  UserVars.sea_charts[:win_x] = $win_x
-  UserVars.sea_charts[:win_y] = $win_y
-  UserVars.sea_charts[:win_w] = $win_w
-  UserVars.sea_charts[:win_h] = $win_h
+  UserVars.sea_charts[:sea_scale]     = $sea_scale_user
+  UserVars.sea_charts[:win_x]         = $win_x
+  UserVars.sea_charts[:win_y]         = $win_y
+  UserVars.sea_charts[:win_w]         = $win_w
+  UserVars.sea_charts[:win_h]         = $win_h
 end
 
 # ---------- HELPER METHODS ----------
@@ -326,14 +331,14 @@ end
 # ----- Global state -----
 $minimap_win = nil
 $minimap_alive = true
-$scale = SEA_SCALE
 $data = nil
 $ship_pixbuf_orig = nil
 $current_room_id = nil
 $current_map_file = nil
 $current_cx = nil
 $current_cy = nil
-$map_pixbuf_orig = nil
+$follow_ship = true
+$follow_timer_id = nil
 $bg_pixbuf_orig = nil      
 $map_image = nil
 $bg_image = nil            
@@ -374,60 +379,81 @@ def flag_settings
 end
 
 def ensure_ocean_watch
-  return if $ocean_watch_started
-  watch_result = Lich::Util.quiet_command("watch ocean", /You begin to watch the ocean waters surrounding the ship|You are already watching the ocean|I could not find what you were referring to/, end_pattern = /You begin to watch the ocean waters surrounding the ship|You are already watching the ocean|I could not find what you were referring to/, include_end = true, timeout = 3, silent = true)
   rid = nil
-  if watch_result.to_s =~ /You begin to watch the ocean waters surrounding the ship|You are already watching the ocean/
-    look_result = Lich::Util.quiet_command("look ocean", /^\[/, end_pattern = /^\[/, include_end = true, timeout = 3, silent = true)
-    if look_result.to_s =~ /\((\d{7})\)/
-      rid = $1.to_i
-    end
-  end
-  # Fallback -- if watch/look ocean gave us nothing, check Room.current.uid
-  # This handles being on port docks where watch ocean is unavailable
-  if rid.nil?
-    begin
-      current_uid = Room.current.uid
-      current_uid = current_uid.first if current_uid.is_a?(Array)
-      rid = current_uid.to_i if current_uid && current_uid.to_i > 0
-    rescue
-    end
-  end
-  # Final fallback -- match Room.current.location against known port towns
-  # and use the first room ID in that port's range as a starting point
-  if rid.nil?
-    begin
-      location = Room.current.location.to_s.downcase
+
+  begin
+    raw_location = Room.current.location
+    raw_location = raw_location.first if raw_location.is_a?(Array)
+    location = raw_location.to_s.downcase
+
+    if location == 'ships'
+      unless $ocean_watch_started
+        watch_result = Lich::Util.quiet_command("watch ocean", /You begin to watch the ocean waters surrounding the ship|You are already watching the ocean|I could not find what you were referring to/, end_pattern = /^\[|I could not find what you were referring to/, include_end = true, timeout = 2, silent = true)
+
+        if watch_result.to_s =~ /You begin to watch the ocean waters surrounding the ship/
+          # Watch succeeded -- try to parse room ID from the bracket line returned
+          $ocean_watch_started = true
+          if watch_result.to_s =~ /\((\d{6,8})\)/
+            rid = $1.to_i
+          end
+
+        elsif watch_result.to_s =~ /You are already watching the ocean/
+          # Already watching -- script restarted but watch persists, do look ocean to get current room
+          $ocean_watch_started = true
+          hook_name = 'nautical_suppress_look'
+          DownstreamHook.add(hook_name, proc { |server_string| nil })
+          look_result = Lich::Util.quiet_command("look ocean", /\[.*?\]\s*\(\d{6,8}\)|I could not find what you were referring to/, end_pattern = /\[.*?\]\s*\(\d{6,8}\)|I could not find what you were referring to/, include_end = true, timeout = 2, silent = true)
+          DownstreamHook.remove(hook_name)
+          if look_result.to_s =~ /\((\d{6,8})\)/
+            rid = $1.to_i
+          end
+
+        elsif watch_result.to_s =~ /I could not find what you were referring to/
+          # Watch failed -- cannot see ocean (inside ship or in port)
+          # Try look ocean to get current room ID
+          # Suppress look ocean output from appearing in client
+          hook_name = 'nautical_suppress_look'
+          DownstreamHook.add(hook_name, proc { |server_string| nil })
+          look_result = Lich::Util.quiet_command("look ocean", /\[.*?\]\s*\(\d{6,8}\)|I could not find what you were referring to/, end_pattern = /\[.*?\]\s*\(\d{6,8}\)|I could not find what you were referring to/, include_end = true, timeout = 2, silent = true)
+          DownstreamHook.remove(hook_name)
+          if look_result.to_s =~ /\((\d{6,8})\)/
+            rid = $1.to_i
+          end
+        end
+      end
+    else
+      # On land at a port town -- match location string directly, no watch needed
       port_location_map = {
-        /wehnimer/          => 7122001,
-        /solhaven/          => 7124001,
-        /river.?s rest/     => 7125001,
-        /icemule/           => 7133002,
-        /brisker/           => 7140101,
-        /teras/             => 7123001,
-        /kraken/            => 7118240,
-        /talon/             => 7150106,
-        /sleeping drake|ornath/ => 7142001,
-        /glaoveln/          => 4426101,
-        /nielira/           => 14150001,
-        /ta.?vaalor|vaalor/ => 7136002
+        /wehnimer/               => 7122001,
+        /solhaven/               => 7124001,
+        /river.?s rest/          => 7125001,
+        /icemule/                => 7133002,
+        /brisker/                => 7140101,
+        /teras/                  => 7123001,
+        /kraken/                 => 7118240,
+        /talon|sailor.? grief/   => 7150106,
+        /sleeping drake|ornath/  => 7142001,
+        /glaoveln/               => 4426101,
+        /nielira/                => 14150001,
+        /ta.?vaalor|vaalor/      => 7136002
       }
       port_location_map.each do |pattern, start_rid|
         if location =~ pattern
           rid = start_rid
-          mm_echo "Location match: #{Room.current.location} -> loading port image"
+          mm_echo "Location match: #{raw_location} -> loading port image"
           break
         end
       end
-    rescue
     end
+  rescue => e
+    mm_echo "ensure_ocean_watch error: #{e.message}"
   end
+
   if rid
     $current_room_id = rid
     result = load_room!(rid)
     update_images if result
   end
-  $ocean_watch_started = true
 end
 
 def render_images
@@ -489,6 +515,25 @@ def render_images
 				sy = (cy * scale_snap).round - (ship_size / 2)
 				$layout.move($ship_image, sx, sy)
 				$ship_image.show
+				# Auto-center on ship if follow mode is enabled
+				# Deferred via Timeout to avoid triggering configure-event cascade
+				if $follow_ship
+					ship_px = (cx * scale_snap).round
+					ship_py = (cy * scale_snap).round
+					GLib::Source.remove($follow_timer_id) if $follow_timer_id rescue nil
+					$follow_timer_id = GLib::Timeout.add(50) do
+						$follow_timer_id = nil
+						if $scroller && $follow_ship
+							hadj = $scroller.hadjustment
+							vadj = $scroller.vadjustment
+							if hadj && vadj
+								hadj.value = clamp(ship_px - (hadj.page_size / 2.0), 0, [hadj.upper - hadj.page_size, 0].max)
+								vadj.value = clamp(ship_py - (vadj.page_size / 2.0), 0, [vadj.upper - vadj.page_size, 0].max)
+							end
+						end
+						false
+					end
+				end
 			else
 				$ship_image.hide
 			end
@@ -724,11 +769,12 @@ def show_context_menu(event)
 				
 				item.signal_connect("activate") do
 					if item.active? # Only trigger when turned ON
+						$follow_ship = false
+						GLib::Source.remove($follow_timer_id) if $follow_timer_id rescue nil
+						$follow_timer_id = nil
 						$current_map_file = file
 						$current_cx = nil
 						$current_cy = nil
-						# Pass 'true' for manual override to reset scale to .50
-						# load_map_assets handles its own Gtk.queue and calls update_images internally
 						load_map_assets(file, true)
 					end
 				end
@@ -747,7 +793,10 @@ def show_context_menu(event)
       item.active = ($scale == s)
       item.signal_connect("activate") do 
         if item.active?
-          $scale = s; update_images
+          $scale = s
+          $sea_scale_user = s unless $scale == PORT_SCALE
+          save_settings
+          update_images
         end
       end
       scale_menu.append(item)
@@ -868,7 +917,14 @@ def show_mac_settings_window
     btn = Gtk::RadioButton.new(s_group, "#{(s*100).to_i}%")
     s_group = btn
     btn.active = ($scale == s)
-    btn.signal_connect("toggled") { $scale = s; update_images if btn.active? }
+    btn.signal_connect("toggled") do
+      if btn.active?
+        $scale = s
+        $sea_scale_user = s unless $scale == PORT_SCALE
+        save_settings
+        update_images
+      end
+    end
     settings_box.pack_start(btn, expand: false, fill: false, padding: 0)
   end
 
@@ -958,6 +1014,9 @@ def show_mac_settings_window
       btn.active = ($current_map_file == file)
       btn.signal_connect("toggled") do
         if btn.active?
+          $follow_ship = false
+          GLib::Source.remove($follow_timer_id) if $follow_timer_id rescue nil
+          $follow_timer_id = nil
           $current_map_file = file
           $current_cx = nil
           $current_cy = nil
@@ -1008,7 +1067,7 @@ def load_map_assets(map_file, manual = false)
         bg_path = File.join(BG_DIR, bg_filename)
         new_bg_pixbuf = File.exist?(bg_path) ? GdkPixbuf::Pixbuf.new(file: bg_path) : nil
         new_map_file = map_file
-        new_scale = 0.50 if $scale == 0.25 || manual
+        new_scale = $sea_scale_user if $scale == 0.25
       rescue => e
         mm_echo "Failed to load map #{map_file}: #{e.message}"
       end
@@ -1022,9 +1081,6 @@ def load_map_assets(map_file, manual = false)
   $bg_pixbuf_orig = new_bg_pixbuf
   $current_map_file = new_map_file if new_map_file
   $scale = new_scale
-
-  # Hide ship on GTK thread, then render
-  Gtk.queue { $ship_image.hide if $ship_image }
 
   # render_images runs scale_simple on Ruby thread then queues only widget calls
   render_images
@@ -1040,10 +1096,15 @@ def load_room!(room_id, force: false)
     cx, cy = room ? [room["cx"], room["cy"]] : [nil, nil]
     was_port = PORT_RANGES.values.include?($current_map_file)
 
-    if is_port
+    if is_port != was_port
+      if is_port
+        # Entering port -- save current user scale then lock to port scale
+        $sea_scale_user = $scale
         $scale = PORT_SCALE
-    else
-        $scale = SEA_SCALE
+      else
+        # Leaving port -- restore user's sea scale
+        $scale = $sea_scale_user
+      end
     end
 
     if (is_port != was_port) || ($current_map_file != map_file && !is_port) || force
@@ -1212,6 +1273,7 @@ end
 		center_btn.set_margin_bottom(10)
 		center_btn.signal_connect("clicked") {
 			if $current_room_id
+				$follow_ship = true
 				load_room!($current_room_id, force: true)
 			end
 		}
@@ -1236,7 +1298,7 @@ end
 	# Give the window a moment to fully render show_all before we try to draw into it
 	sleep 0.3
 	ensure_ocean_watch
-	# Force a redraw after startup in case update_images fired before layout was ready
+	# Force a redraw after startup
 	sleep 0.2
 	update_images if $current_room_id
 	while $minimap_alive
@@ -1249,20 +1311,30 @@ end
 					result = load_room!(rid)
 					update_images if result
 				end
+			elsif line =~ /^\[.*?\]\s*\((\d{6,8})\)/
+				# Bracket line from sea departure or room transition in text stream
+				rid = $1.to_i
+				if rid != last_seen_id && find_room($data, rid)
+					last_seen_id = rid
+					result = load_room!(rid)
+					update_images if result
+				end
 			elsif line =~ /You begin to watch the ocean waters surrounding the ship|You are already watching the ocean/
 				# User manually typed watch ocean -- follow up with look ocean to get current room
 				$ocean_watch_started = true
 				rid = nil
-				look_result = Lich::Util.quiet_command("look ocean", /^\[/, end_pattern = /^\[/, include_end = true, timeout = 3, silent = true)
-				if look_result.to_s =~ /\((\d{7})\)/
+				look_result = Lich::Util.quiet_command("look ocean", /\[.*?\]\s*\(\d{6,8}\)|I could not find what you were referring to/, end_pattern = /\[.*?\]\s*\(\d{6,8}\)|I could not find what you were referring to/, include_end = true, timeout = 2, silent = true)
+				if look_result.to_s =~ /\((\d{6,8})\)/
 					rid = $1.to_i
 				end
 				# Fallback to Room.current.uid if look ocean gave nothing
+				# Only accept if room exists in ocean database
 				if rid.nil?
 					begin
 						current_uid = Room.current.uid
 						current_uid = current_uid.first if current_uid.is_a?(Array)
-						rid = current_uid.to_i if current_uid && current_uid.to_i > 0
+						candidate = current_uid.to_i
+						rid = candidate if candidate > 0 && find_room($data, candidate)
 					rescue
 					end
 				end
