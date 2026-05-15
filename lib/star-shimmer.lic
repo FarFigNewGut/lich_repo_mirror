@@ -1,0 +1,524 @@
+# QUIET
+=begin
+  shimmer.lic - Shimmer Trinket set manager
+  Version: 1.3.0
+
+  Displays all Shimmer Trinket appearance sets in a Stormfront window.
+  Click any set to switch to it. Script exits after each action -- no
+  persistent process. Clicking a link just runs ;shimmer goto N.
+
+  Usage:
+    ;shimmer            -- scan and open window (uses cache if available)
+    ;shimmer rescan     -- force re-scan all sets (clears cache)
+    ;shimmer goto N     -- push trinket to set N, redraw window, exit
+    ;shimmer help       -- show usage
+
+  Total number of sets is detected automatically from ANA output.
+
+  Author: Starsworn
+=end
+
+module ShimmerTrinket
+
+  SCRIPT_NAME  = "star-shimmer"
+  WINDOW_ID    = "shimmerTrinketWindow"
+  WINDOW_TITLE = "Shimmer Trinket"
+  TRINKET_NOUN = "trinket"
+
+  # ---------------------------------------------------------------------------
+  # TrinketData
+  # ---------------------------------------------------------------------------
+
+  class TrinketData
+    attr_accessor :active, :current_set, :total_sets, :sets,
+                  :trinket_id, :trinket_name
+
+    def initialize
+      @active       = false
+      @current_set  = 1
+      @total_sets   = 1
+      @sets         = {}
+      @trinket_id   = nil
+      @trinket_name = "shimmering trinket"
+    end
+
+    def set_items(n)
+      @sets[n] || []
+    end
+
+    def populated?
+      @sets.values.any? { |v| !v.empty? }
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Parser
+  # ---------------------------------------------------------------------------
+
+  module Parser
+
+    def self.parse_item_list(raw)
+      return [] if raw.nil? || raw.strip.empty?
+      cleaned = raw.strip.chomp(".")
+      # Normalise ", and " and bare " and " before last item
+      cleaned = cleaned.gsub(/,\s*and\s+/, ", ").sub(/\s+and\s+([^,]+)$/, ', \1')
+      cleaned.split(/,\s*/).map(&:strip).reject(&:empty?)
+    end
+
+    # Parse ANA output lines into data.
+    # total_sets is read directly from "out of N" in the ANA text --
+    # this is the canonical source; we never hard-code or assume a count.
+    def self.parse_analyze(lines, data)
+      full = lines.join(" ").gsub(/\s+/, " ")
+
+      if full =~ /It is currently active and using set (\d+) \(out of (\d+)\):\s*(.+?)(?:The trinket must|You can tell|$)/i
+        data.active      = true
+        data.current_set = $1.to_i
+        data.total_sets  = $2.to_i
+        data.sets[data.current_set] = parse_item_list($3.to_s)
+      elsif full =~ /It is not currently active, but is using set (\d+) \(out of (\d+)\):\s*(.+?)(?:The trinket must|You can tell|$)/i
+        data.active      = false
+        data.current_set = $1.to_i
+        data.total_sets  = $2.to_i
+        raw = $3.to_s.strip
+        data.sets[data.current_set] = (raw =~ /nothing special/i) ? [] : parse_item_list(raw)
+      end
+
+      data
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Finder
+  # ---------------------------------------------------------------------------
+
+  module Finder
+
+    def self.find_trinket
+      return nil unless defined?(GameObj) && GameObj.respond_to?(:inv)
+
+      candidates = []
+      Array(GameObj.inv).each do |obj|
+        candidates << obj
+        Array(obj.contents).each { |c| candidates << c }
+      end
+
+      # Strict: noun == "trinket" AND name contains "shimmer"
+      found = candidates.find { |o|
+        o.noun.to_s.downcase == TRINKET_NOUN &&
+        o.name.to_s.downcase.include?("shimmer")
+      }
+
+      # Fallback: noun == "trinket" AND name contains "trinket"
+      found ||= candidates.find { |o|
+        o.noun.to_s.downcase == TRINKET_NOUN &&
+        o.name.to_s.downcase =~ /\btrinket\b/
+      }
+
+      found
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Analyzer
+  # ---------------------------------------------------------------------------
+
+  module Analyzer
+
+    TIMEOUT = 12
+
+    def self.run_analyze(trinket_obj)
+      cmd = trinket_obj ? "analyze ##{trinket_obj.id}" : "analyze my #{TRINKET_NOUN}"
+      capture(cmd)
+    end
+
+    def self.capture(cmd)
+      lines     = []
+      capturing = false
+      deadline  = Time.now + TIMEOUT
+
+      clear
+      put cmd
+
+      loop do
+        break if Time.now > deadline
+        line = get
+        break if line.nil?
+        capturing = true if !capturing && line =~ /You analyze/i
+        lines << line if capturing
+        break if capturing && line =~ /as light as it can get|can not be lightened|further lightened/i
+      end
+
+      lines
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # SetScanner
+  # ---------------------------------------------------------------------------
+
+  module SetScanner
+
+    def self.scan_all_sets(trinket_obj, data)
+      total     = data.total_sets
+      start_set = data.current_set
+      current   = start_set
+
+      echo "[shimmer] Scanning all #{total} sets. Will return to set #{start_set}."
+
+      (total - 1).times do
+        waitrt?
+        push_trinket(trinket_obj)
+        pause 0.6
+        lines = Analyzer.run_analyze(trinket_obj)
+        if lines.empty?
+          pause 1.0
+          lines = Analyzer.run_analyze(trinket_obj)
+        end
+        Parser.parse_analyze(lines, data)
+        current = data.current_set
+        echo "[shimmer]   Set #{current}/#{total}: #{data.set_items(current).length} items"
+      end
+
+      pushes_back = (start_set - current) % total
+      if pushes_back > 0
+        echo "[shimmer] Returning to set #{start_set}..."
+        pushes_back.times { waitrt?; push_trinket(trinket_obj); pause 0.4 }
+        waitrt?
+        Parser.parse_analyze(Analyzer.run_analyze(trinket_obj), data)
+      end
+
+      echo "[shimmer] Scan complete. On set #{data.current_set}."
+      data
+    end
+
+    def self.push_trinket(trinket_obj)
+      trinket_obj ? fput("push ##{trinket_obj.id}") : fput("push my #{TRINKET_NOUN}")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # GotoHandler
+  # ---------------------------------------------------------------------------
+
+  module GotoHandler
+
+    def self.go_to_set(target, data, trinket_obj)
+      current = data.current_set
+      total   = data.total_sets
+
+      if target < 1 || target > total
+        echo "[shimmer] Set #{target} out of range (1..#{total})."
+        return data
+      end
+      if target == current
+        echo "[shimmer] Already on set #{target}."
+        return data
+      end
+
+      pushes = (target - current) % total
+      echo "[shimmer] #{current} -> #{target} (#{pushes} push#{"es" if pushes != 1})."
+      pushes.times { waitrt?; SetScanner.push_trinket(trinket_obj); pause 0.3 }
+
+      waitrt?
+      Parser.parse_analyze(Analyzer.run_analyze(trinket_obj), data)
+
+      if data.current_set == target
+        echo "[shimmer] Now on set #{target}."
+      else
+        echo "[shimmer] Warning: expected #{target}, got #{data.current_set}."
+      end
+      data
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # GUI
+  #
+  # Stormfront native XML window protocol (from triage.lic):
+  #   _respond "<streamWindow id='X' title='Y' location='center' save='save' resident='true' />"
+  #   _respond "<exposeStream id='X' />"
+  #   _respond "<clearStream  id='X' />"
+  #   _respond "<pushStream   id='X' />"
+  #   ... plain text + <d cmd='...'> clickable links ...
+  #   _respond "<popStream />"
+  #
+  # cmd values in <d> tags are sent to the game as typed -- prefixed with ;
+  # so they invoke this script. Since the script exits after drawing,
+  # each click starts a fresh instance.
+  # ---------------------------------------------------------------------------
+
+  module GUI
+
+    def self.open_window(data)
+      if $frontend.to_s =~ /stormfront/i
+        sf_display(data)
+      else
+        text_display(data)
+      end
+    end
+
+    def self.sf_display(data)
+      status = data.active ? "ACTIVE" : "INACTIVE"
+
+      _respond "<streamWindow id='#{WINDOW_ID}' title='#{WINDOW_TITLE}'" \
+               " subtitle=' set #{data.current_set}/#{data.total_sets}'" \
+               " location='center' save='save' resident='true' />"
+      _respond "<exposeStream id='#{WINDOW_ID}' />"
+      _respond "<clearStream  id='#{WINDOW_ID}' />"
+      _respond "<pushStream   id='#{WINDOW_ID}' />"
+
+      _respond "#{WINDOW_TITLE} -- #{xe(data.trinket_name)}\n"
+      _respond "Status: #{status}   Set: #{data.current_set} / #{data.total_sets}\n"
+      _respond "<d cmd=';#{SCRIPT_NAME} rescan'>[rescan]</d>\n"
+      _respond "#{"=" * 38}\n\n"
+
+      1.upto(data.total_sets) do |n|
+        items  = data.set_items(n)
+        is_cur = (n == data.current_set)
+
+        if is_cur
+          _respond ">> Set #{n} (current)\n"
+        else
+          _respond "<d cmd=';#{SCRIPT_NAME} goto #{n}'>[ Switch to Set #{n} ]</d>\n"
+        end
+
+        if items.empty?
+          _respond "   (empty)\n"
+        else
+          items.each { |i| _respond "   #{xe(i)}\n" }
+        end
+        _respond "\n"
+      end
+
+      _respond "<popStream />"
+    end
+
+    def self.text_display(data)
+      respond ""
+      respond "+-- #{WINDOW_TITLE} -- #{data.trinket_name}"
+      respond "+-- Status: #{data.active ? "ACTIVE" : "INACTIVE"}  Set: #{data.current_set}/#{data.total_sets}"
+      respond "+" + ("-" * 50)
+      1.upto(data.total_sets) do |n|
+        items  = data.set_items(n)
+        marker = (n == data.current_set) ? ">>" : "  "
+        if items.empty?
+          respond "| #{marker} Set #{n}: (empty)"
+        else
+          respond "| #{marker} Set #{n}: #{items.first}"
+          items[1..-1].each { |i| respond "|          #{i}" }
+        end
+      end
+      respond "+" + ("-" * 50)
+      respond ""
+    end
+
+    def self.xe(s)
+      s.to_s
+       .gsub("&", "&amp;")
+       .gsub("<", "&lt;")
+       .gsub(">", "&gt;")
+       .gsub("'", "&apos;")
+       .gsub('"', "&quot;")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Cache
+  # ---------------------------------------------------------------------------
+
+  module Cache
+
+    KEY_CHAR  = "char"
+    KEY_TOTAL = "total_sets"
+    KEY_SETS  = "sets"
+
+    def self.load
+      begin
+        Settings.load
+        return nil if Settings[KEY_CHAR] != checkname
+        total = Settings[KEY_TOTAL].to_i
+        return nil if total < 1
+        raw = Settings[KEY_SETS]
+        return nil unless raw.is_a?(Hash)
+        td            = TrinketData.new
+        td.total_sets = total
+        raw.each { |k, v| td.sets[k.to_i] = Array(v) }
+        td
+      rescue
+        nil
+      end
+    end
+
+    def self.save(data)
+      begin
+        Settings.load
+        Settings[KEY_CHAR]  = checkname
+        Settings[KEY_TOTAL] = data.total_sets
+        h = {}
+        data.sets.each { |k, v| h[k.to_s] = v }
+        Settings[KEY_SETS] = h
+        Settings.save
+      rescue => e
+        echo "[shimmer] Cache save error: #{e.message}"
+      end
+    end
+
+    def self.clear
+      begin
+        Settings.load
+        Settings.clear
+        Settings.save
+        echo "[shimmer] Cache cleared."
+      rescue
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Controller
+  # ---------------------------------------------------------------------------
+
+  class Controller
+
+    def initialize(args)
+      @args    = Array(args)
+      @data    = TrinketData.new
+      @trinket = nil
+    end
+
+    def run
+      arg = @args.join(" ").strip.downcase
+
+      case arg
+      when "help", "-h", "--help"
+        print_help
+
+      when /^goto\s+(\d+)$/
+        locate_trinket
+        sync_current_set
+        @data = GotoHandler.go_to_set($1.to_i, @data, @trinket)
+        Cache.save(@data)
+        # Window is already open -- no need to redraw after switching sets
+
+      when "rescan"
+        locate_trinket
+        Cache.clear
+        full_scan
+        GUI.open_window(@data)
+        Cache.save(@data)
+
+      else
+        locate_trinket
+        load_or_scan
+        GUI.open_window(@data)
+      end
+
+      # Always exit -- no persistent process.
+      # Clicking a window link runs ;shimmer goto N as a fresh instance.
+    end
+
+    private
+
+    def locate_trinket
+      @trinket = Finder.find_trinket
+      if @trinket
+        @data.trinket_name = @trinket.name.to_s
+        @data.trinket_id   = @trinket.id
+        echo "[shimmer] Found: #{@trinket.name} (##{@trinket.id})"
+      else
+        echo "[shimmer] Trinket not found via GameObj -- using noun fallback."
+      end
+    end
+
+    # Lightweight: load cache for set contents, do one ANA to get current
+    # set and total. Does not cycle through all sets.
+    def sync_current_set
+      cached = Cache.load
+      if cached
+        @data              = cached
+        @data.trinket_name = @trinket.name.to_s if @trinket
+        @data.trinket_id   = @trinket.id         if @trinket
+      end
+      lines = Analyzer.run_analyze(@trinket)
+      if lines.any?
+        saved = @data.sets.dup
+        Parser.parse_analyze(lines, @data)
+        saved.each { |k, v| @data.sets[k] ||= v }
+      end
+    end
+
+    def load_or_scan
+      cached = Cache.load
+      if cached && cached.populated?
+        @data              = cached
+        @data.trinket_name = @trinket.name.to_s if @trinket
+        @data.trinket_id   = @trinket.id         if @trinket
+        echo "[shimmer] Loaded #{@data.total_sets} sets from cache. ';shimmer rescan' to refresh."
+        # Quick single ANA to sync current_set without cycling
+        lines = Analyzer.run_analyze(@trinket)
+        if lines.any?
+          saved = @data.sets.dup
+          Parser.parse_analyze(lines, @data)
+          # total_sets from ANA is authoritative -- update cache if it changed
+          # (e.g. sides were added since last scan)
+          if @data.total_sets != cached.total_sets
+            echo "[shimmer] Set count changed (#{cached.total_sets} -> #{@data.total_sets}). Re-scanning..."
+            full_scan
+          else
+            saved.each { |k, v| @data.sets[k] ||= v }
+          end
+        end
+      else
+        full_scan
+        Cache.save(@data)
+      end
+    end
+
+    def full_scan
+      echo "[shimmer] Analyzing trinket..."
+      lines = Analyzer.run_analyze(@trinket)
+
+      if lines.empty?
+        echo "[shimmer] ERROR: No ANA output captured."
+        echo "[shimmer]   GameObj found: #{@trinket ? @trinket.name + " ##" + @trinket.id.to_s : 'none'}"
+        return
+      end
+
+      echo "[shimmer] Captured #{lines.length} lines."
+      Parser.parse_analyze(lines, @data)
+      echo "[shimmer] #{@data.total_sets} set(s) detected | active=#{@data.active} | current=#{@data.current_set}"
+
+      SetScanner.scan_all_sets(@trinket, @data) if @data.total_sets > 1
+      Cache.save(@data)
+    end
+
+    def print_help
+      respond ""
+      respond "  shimmer.lic -- Shimmer Trinket set manager"
+      respond "  Total sets detected automatically from ANA output."
+      respond ""
+      respond "  Usage:"
+      respond "    ;shimmer            open window (cached or fresh scan)"
+      respond "    ;shimmer rescan     force full re-scan of all sets"
+      respond "    ;shimmer goto N     push trinket to set N"
+      respond "    ;shimmer help       this help"
+      respond ""
+    end
+  end
+
+end # module ShimmerTrinket
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+no_pause_all
+hide_me
+
+begin
+  ShimmerTrinket::Controller.new(Script.current.vars[1..-1] || []).run
+rescue => e
+  echo "[shimmer] Fatal: #{e.message}"
+  echo e.backtrace.first(5).join("\n")
+end
