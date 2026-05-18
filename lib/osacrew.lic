@@ -1,4 +1,4 @@
-version = '6.0.9 (May 17, 2026)'
+version = '6.0.18 (May 18, 2026)'
 =begin
                                        ..
                                      .(  )`-._
@@ -36,7 +36,7 @@ version = '6.0.9 (May 17, 2026)'
    _.-` ``--..  ..  `.-._  `._  `- `-._ .-_. ._.- -._ --.._`` _.-`-.
 
 --------------------------------------------------------------------------
-	OSACrew Version: 6.0.9 (May 17, 2026)
+	OSACrew Version: 6.0.18 (May 18, 2026)
 	
 	   Usage: 
 	
@@ -73,12 +73,20 @@ version = '6.0.9 (May 17, 2026)'
              January 26, 2026 - Fixed Issue With Empath Commanders Stalling During Boarding and Fixed Issues With Sinking Ship Via Cannons.
               Febuary 1, 2026 - Update Yaml Read/Write Methods To Include FLOCK Operations To Prevent Data Corruption.
              Febuary 13, 2026 - Gave In To The Hype And Rewrote YAML config and GTK3 Using AI.
-                 May 16, 2026 - Cannons tab: duty, cannon, and Wind Sails/Use Cannons checkboxes are now mutually exclusive.
-                 May 16, 2026 - Gunners Man Your Irons encounter now checks windedsails and winds sails before combat if not a cannoneer.
-                 May 16, 2026 - winded_sails now waits 90 seconds between casting passes but checks winded_active every second to break out immediately if stopped.
-                 May 16, 2026 - Cannons tab: duty, cannon, and Wind Sails/Use Cannons checkboxes are now mutually exclusive.
+               May 16, 2026 - Cannons tab: duty, cannon, and Wind Sails/Use Cannons checkboxes are now mutually exclusive.
+               May 16, 2026 - Gunners Man Your Irons encounter now checks windedsails and winds sails before combat if not a cannoneer.
+               May 16, 2026 - winded_sails now waits 90 seconds between casting passes but checks winded_active every second to break out immediately if stopped.
                  May 17, 2026 - Replaced old no_file/needfile dependency check with clean check_dependencies method; added osasail_watch, osacannon_watch and osa_migrate to dependency list with correct authors.
-               
+                 May 17, 2026 - Fixed gunner methods going dormant due to stale XML hand state; added pause 0.3 after get/load/fire for XML sync and retry counters (max 5) on all else branches.
+                 May 17, 2026 - Added police_cannon_balls; crew members with Perform Crew Tasks will now collect stray cannon balls from all cannon decks and return them to the cargo hold before beginning damage control.
+                 May 17, 2026 - Increased dothistimeout in gunner_get_balls/load/fire from 5s to 10s to account for 4sec RT; reduced retry threshold to 3; added stall counter to gunner_cycle.
+                 May 18, 2026 - Reverted Wind Sails / Use Cannons mutual exclusion; both can now be checked independently. Cannon encounters no longer call wind the sails.
+                 May 18, 2026 - Added gunner_scavenge_balls; when pile is empty and hands are empty the gunner now checks cannon deck and cargo hold floors for loose balls before declaring out of balls.
+                 May 18, 2026 - Fixed cannon_should_stop? always reloading @crew_data from YAML so stop flags set by any method break the cycle immediately.
+                 May 18, 2026 - gunner_get_balls now checks cannon deck floor for loose balls before going to the cargo hold pile, preventing ball accumulation on deck.
+                 May 18, 2026 - Rewrote gunner_get_balls/load/fire with correct linear flow: pile -> hold floor -> deck floor -> out of balls. Fire-both duty now reloads from deck floor and re-fires within gunner_fire_cannon before returning to cycle.
+                 May 18, 2026 - Fire-only duty now pauses 3 seconds when cannon is not yet loaded instead of spamming fire commands.
+               May 16, 2026 - Cannons tab: duty, cannon, and Wind Sails/Use Cannons checkboxes are now mutually exclusive.
 =end
 
 def lnet_crew(msg)
@@ -1137,13 +1145,18 @@ def gunner_get_balls
 	return if cannon_should_stop?
 	return if !GameObj.left_hand.id.nil? && !GameObj.right_hand.id.nil?  # both hands full
 
+	# 1. Go to cargo hold and try to get balls from the pile
+	waitrt?
+	cargo_hold
+
+	retries = 0
 	loop do
 		return if cannon_should_stop?
 
 		waitrt?
-		cargo_hold
 
-		result = dothistimeout "get balls", 5,
+		# get balls has a 4 sec RT - use 10 sec timeout
+		result = dothistimeout "get balls", 10,
 			/You cannot fire your cannons while boarded|You search through the cannon balls and find an iron cannon ball|You search through the cannon balls only to find that you are out of cannon balls|You will need a free hand to search for supplies/
 
 		if result.to_s =~ /You cannot fire your cannons while boarded/
@@ -1156,18 +1169,47 @@ def gunner_get_balls
 
 		elsif result.to_s =~ /You search through the cannon balls and find an iron cannon ball/
 			waitrt?
+			pause 0.3
+			retries = 0
 			return if !GameObj.left_hand.id.nil? && !GameObj.right_hand.id.nil?
 			next  # grab another
 
 		elsif result.to_s =~ /You search through the cannon balls only to find that you are out of cannon balls/
-			if GameObj.left_hand.id || GameObj.right_hand.id
-				return  # have at least one, carry on
-			else
-				gunner_out_of_balls
-				return
+			# 2. Pile empty - check cargo hold floor
+			pause 0.3
+			while checkloot.include?("ball") &&
+			      (GameObj.left_hand.id.nil? || GameObj.right_hand.id.nil?)
+				waitrt?
+				fput "get ball"
+				pause 0.3
 			end
+			return if GameObj.left_hand.id || GameObj.right_hand.id
+
+			# 3. Hold floor empty - check cannon deck floor
+			unless Room.current.tags.include?(@cannons)
+				start_script("go2", [@cannons])
+				wait_while { running?("go2") }
+			end
+			while checkloot.include?("ball") &&
+			      (GameObj.left_hand.id.nil? || GameObj.right_hand.id.nil?)
+				waitrt?
+				fput "get ball"
+				pause 0.3
+			end
+			return if GameObj.left_hand.id || GameObj.right_hand.id
+
+			# 4. Nothing anywhere - out of balls
+			gunner_out_of_balls
+			return
 
 		else
+			# dothistimeout timed out - server lag
+			retries += 1
+			if retries >= 3
+				respond "--- OSACrew: gunner_get_balls: no response after #{retries} attempts, giving up this pass."
+				return
+			end
+			pause 0.5
 			waitrt?
 			next
 		end
@@ -1175,6 +1217,7 @@ def gunner_get_balls
 end
 
 def gunner_out_of_balls
+	pause 0.3
 	if GameObj.right_hand.noun.to_s == "ball"
 		fput "drop right"
 	end
@@ -1182,14 +1225,15 @@ def gunner_out_of_balls
 		fput "drop left"
 	end
 	respond "
-	
+
 	         ------------====== The Ship Is Out Of Cannon Balls ======-------------
-	
+
 	"
 	save_to_crew("cannoneer_thirty", true)
 end
 
 def gunner_load_cannon
+	retries = 0
 	loop do
 		return if cannon_should_stop?
 
@@ -1199,18 +1243,23 @@ def gunner_load_cannon
 			wait_while { running?("go2") }
 		end
 
-		result = dothistimeout "load cannon", 5,
+		# load cannon also has RT - use 10 sec timeout
+		result = dothistimeout "load cannon", 10,
 			/You carefully lift your cannon ball and drop it into the tubular opening of a (.*) cannon|You need to be holding a cannon ball in order to load the (.*) cannon|You cannot fire your cannons while boarded|The (.*) cannon already appears to be loaded to capacity/
 
 		if result.to_s =~ /You carefully lift your cannon ball and drop it into the tubular opening of a (.*) cannon/
 			waitrt?
-			fput "get ball" if checkloot.include?("ball")
-			gunner_get_balls if GameObj.left_hand.id.nil? && GameObj.right_hand.id.nil?
-			# cannon accepted a ball - loop to load the next one (or stop condition will break us)
+			pause 0.3
+			retries = 0
+			# Ball loaded - if hands empty, get more (deck floor first, then pile)
+			if GameObj.left_hand.id.nil? && GameObj.right_hand.id.nil?
+				gunner_get_balls
+			end
 			next
 
 		elsif result.to_s =~ /You need to be holding a cannon ball in order to load the (.*) cannon/
 			gunner_get_balls
+			return if cannon_should_stop?
 			next
 
 		elsif result.to_s =~ /You cannot fire your cannons while boarded/
@@ -1219,12 +1268,20 @@ def gunner_load_cannon
 			return
 
 		elsif result.to_s =~ /The (.*) cannon already appears to be loaded to capacity/
+			# Cannon full - drop any balls still in hand and return to fire
+			pause 0.3
 			fput "drop right" if GameObj.right_hand.noun.to_s == "ball"
 			fput "drop left"  if GameObj.left_hand.noun.to_s  == "ball"
-			return  # loaded to capacity - caller (gunner_cycle) decides what's next
+			return
 
 		else
-			# dothistimeout timed out or got something unexpected; back off and retry
+			# dothistimeout timed out - server lag
+			retries += 1
+			if retries >= 3
+				respond "--- OSACrew: gunner_load_cannon: no response after #{retries} attempts, giving up this pass."
+				return
+			end
+			pause 0.5
 			waitrt?
 			next
 		end
@@ -1232,6 +1289,7 @@ def gunner_load_cannon
 end
 
 def gunner_fire_cannon
+	retries = 0
 	loop do
 		return if cannon_should_stop?
 
@@ -1241,7 +1299,8 @@ def gunner_fire_cannon
 			wait_while { running?("go2") }
 		end
 
-		result = dothistimeout "fire cannon", 5,
+		# fire cannon also has RT - use 10 sec timeout
+		result = dothistimeout "fire cannon", 10,
 			/You cannot fire your cannons while boarded|You'll need to load one of the cannons first|You fire a (.*) cannon at the (.*)/
 
 		if result.to_s =~ /You cannot fire your cannons while boarded/
@@ -1250,13 +1309,44 @@ def gunner_fire_cannon
 			return
 
 		elsif result.to_s =~ /You'll need to load one of the cannons first/
-			return  # nothing loaded; let gunner_cycle handle it
+			# Cannon not yet loaded - pause to give the loader time before trying again
+			pause 3
+			return
 
 		elsif result.to_s =~ /You fire a (.*) cannon at the (.*)/
 			waitrt?
-			return  # one shot fired; let gunner_cycle decide whether to fire again
+			pause 0.3
+			retries = 0
+			# Fired - if duty is both, pick up any deck balls and reload before firing again
+			if @duty == "both"
+				# Pick up loose balls from deck if any
+				while checkloot.include?("ball") &&
+				      (GameObj.left_hand.id.nil? || GameObj.right_hand.id.nil?)
+					waitrt?
+					fput "get ball"
+					pause 0.3
+				end
+				if GameObj.left_hand.id || GameObj.right_hand.id
+					# Have balls in hand - load and fire again
+					gunner_load_cannon
+					break if cannon_should_stop?
+					next  # loop back to fire again
+				else
+					# No balls on deck - return to gunner_cycle to get more from pile
+					return
+				end
+			else
+				return  # fire-only duty, one shot then return
+			end
 
 		else
+			# dothistimeout timed out - server lag
+			retries += 1
+			if retries >= 3
+				respond "--- OSACrew: gunner_fire_cannon: no response after #{retries} attempts, giving up this pass."
+				return
+			end
+			pause 0.5
 			waitrt?
 			next
 		end
@@ -1265,6 +1355,7 @@ end
 
 def gunner_boarded
 	waitrt?
+	pause 0.3  # allow XML hand state to update
 	if GameObj.right_hand.noun.to_s == "ball"
 		fput "drop right"
 	end
@@ -1297,6 +1388,7 @@ end
 
 def gunner_stop
 	waitrt?
+	pause 0.3  # allow XML hand state to update
 	if GameObj.right_hand.noun.to_s == "ball"
 		fput "drop right"
 	end
@@ -1314,6 +1406,7 @@ end
 
 def gunner_sunk
 	waitrt?
+	pause 0.3  # allow XML hand state to update
 	if GameObj.right_hand.noun.to_s == "ball"
 		fput "drop right"
 	end
@@ -1334,6 +1427,9 @@ def gunner_cycle
 		@cannons = "mid_cannon"
 	elsif @crew_data["forwardcannons"]
 		@cannons = "forward_cannon"
+	else
+		@cannons = "main_cannon"  # default to main cannon if none selected
+		respond "--- OSACrew: No cannon selected in settings, defaulting to main cannon."
 	end
 
 	if @crew_data["loadonly"]
@@ -1342,9 +1438,13 @@ def gunner_cycle
 		@duty = "fire"
 	elsif @crew_data["loadandfire"]
 		@duty = "both"
+	else
+		@duty = "both"  # default to load and fire if none selected
+		respond "--- OSACrew: No duty selected in settings, defaulting to load and fire."
 	end
 
 	# Loop until any stop condition is set by osacannon_watch
+	stall_count = 0
 	until cannon_should_stop?
 		# Reload flags from YAML on every pass so we see what osacannon_watch wrote
 		@crew_data = osacrew_data
@@ -1364,6 +1464,14 @@ def gunner_cycle
 			break if cannon_should_stop?
 		end
 
+		# Detect stalling - if we keep cycling without any game action breaking out
+		stall_count += 1
+		if stall_count >= 10
+			respond "--- OSACrew: gunner_cycle appears stalled after #{stall_count} cycles, pausing 5 seconds."
+			pause 5
+			stall_count = 0
+		end
+
 		pause 0.1  # brief breath so we don't spam the server
 	end
 
@@ -1378,8 +1486,10 @@ def gunner_cycle
 	end
 end
 
-# Helper - true when any stop condition is active
+# Helper - true when any stop condition is active.
+# Always reloads @crew_data from YAML so flags written by any method are seen immediately.
 def cannon_should_stop?
+	@crew_data = osacrew_data
 	@crew_data["cannoneer_boarded"] ||
 		@crew_data["cannoneer_thirty"] ||
 		@crew_data["cannoneer_sunk"]   ||
@@ -1388,12 +1498,73 @@ end
 
 #================ Damage Control Section ================
 
+def police_cannon_balls
+	# Collect cannon balls from each deck that has cannons on this ship,
+	# then return them to the cargo hold. Hands must be free to start.
+	return if !GameObj.left_hand.id.nil? && !GameObj.right_hand.id.nil?
+
+	# Build list of cannon deck tags present on this ship.
+	# ship_type has already tagged the relevant rooms, so we check those directly.
+	ship_type
+	cannon_decks = ["main_cannon"]
+	# Check a known set of room IDs that could carry mid_cannon or forward_cannon tags
+	mid_cannon_rooms     = [30130, 30131]
+	forward_cannon_rooms = [30144, 30121, 30132, 30171, 30177]
+	cannon_decks << "mid_cannon"     if mid_cannon_rooms.any?     { |id| Room[id] && Room[id].tags.include?("mid_cannon") }
+	cannon_decks << "forward_cannon" if forward_cannon_rooms.any? { |id| Room[id] && Room[id].tags.include?("forward_cannon") }
+
+	cannon_decks.each do |deck_tag|
+		# Navigate to the cannon deck
+		unless Room.current.tags.include?(deck_tag)
+			ship_type
+			start_script("go2", [deck_tag])
+			wait_while { running?("go2") }
+		end
+
+		# Pick up any balls on the ground, up to two hands worth
+		while checkloot.include?("ball") &&
+		      (GameObj.left_hand.id.nil? || GameObj.right_hand.id.nil?)
+			waitrt?
+			fput "get ball"
+			pause 0.3  # allow XML to update
+		end
+	end
+
+	# If we picked anything up, go to the cargo hold and put them back in the pile
+	pause 0.3
+	if !GameObj.left_hand.id.nil? || !GameObj.right_hand.id.nil?
+		cargo_hold
+		waitrt?
+		2.times do
+			pause 0.3
+			if GameObj.right_hand.noun.to_s == "ball"
+				result = dothistimeout "put my ball in balls", 5,
+					/You carefully add your cannon ball|You can't possibly add the cannon ball/
+				if result.to_s =~ /You can't possibly add the cannon ball/
+					fput "drop right"
+				end
+				waitrt?
+			end
+			if GameObj.left_hand.noun.to_s == "ball"
+				result = dothistimeout "put my ball in balls", 5,
+					/You carefully add your cannon ball|You can't possibly add the cannon ball/
+				if result.to_s =~ /You can't possibly add the cannon ball/
+					fput "drop left"
+				end
+				waitrt?
+			end
+		end
+	end
+end
+
 def damage_control
 	if @crew_data["osacrewtasks"]
 		wait_while { running?("osacombat") }
 		if !GameObj.left_hand.id.nil? or !GameObj.right_hand.id.nil?
 			fput "store both"
 		end
+		# Police cannon balls from all decks before beginning repairs
+		police_cannon_balls
 		if @crew_data["osacrewtasks"]
 			main_deck
 			ship_map
@@ -2613,9 +2784,6 @@ def self.populate_general(rows)
 	add_checks.call([
     { label: "Perform Crew Tasks", tip: "Checking this will enable the script to handle sails and repairs automatically.", var: 'osacrewtasks'},
 	{ label: "Wind The Sails", tip: 'Checking this will enable you to automatically cast "Breeze" or "Call Wind" on the sails to increase the ships speed. Checking this will override any other sailing commands until combat is engaged.', var: 'windedsails', default: false}], cols: 2)
-	# Stash windedsails widget for cross-tab mutual exclusion with cannoneer
-	raw_ws = @OSA_CREW_ENTRY['windedsails']
-	@cb_windedsails = raw_ws.is_a?(Gtk::Box) ? raw_ws.children.first : raw_ws
 	add_checks.call([
 	{ label: "Use Mana Spellup", tip: 'Checking this will enable the script to automatically use "Mana Spellup" before doing crew spellup sessions.', var: 'mana_spellup'},
 	{ label: "Spellup Crew", tip: "Checking this will enable the script to cast spells on other crew members during crew spellup sessions.", var: 'groupspellup', default: false},
@@ -2705,7 +2873,6 @@ def self.populate_cannons(rows)
 		label: "Use Cannons",
 		tip: "Checking this will allow the script when called for by the commander, to utilize the shipboard cannons in combat.",
 		var: 'cannoneer', default: false, group: :general_checks, col: 0)
-	@cb_cannoneer = unwrap.call(@OSA_CREW_ENTRY['cannoneer'])
 
 	# --- Duties (col 0) and Cannons (col 1), laid out in 3 rows ---
 	duty_defs = [
@@ -2751,19 +2918,6 @@ def self.populate_cannons(rows)
 			if cb.active?
 				(cannon_cbs - [cb]).each { |other| other.active = false }
 			end
-		end
-	end
-
-	# Wire Wind Sails <-> Use Cannons mutual exclusion (cross-tab)
-	# @cb_windedsails was stashed in populate_general
-	cb_cannoneer  = @cb_cannoneer
-	cb_windedsails = @cb_windedsails
-	if cb_cannoneer && cb_windedsails
-		cb_cannoneer.signal_connect("toggled") do
-			cb_windedsails.active = false if cb_cannoneer.active?
-		end
-		cb_windedsails.signal_connect("toggled") do
-			cb_cannoneer.active = false if cb_windedsails.active?
 		end
 	end
 end
@@ -3348,17 +3502,6 @@ while line = get
 			gunner_cycle
 			stop_script("osacannon_watch") if running?("osacannon_watch")
 		else
-			if @crew_data["windedsails"]
-				save_to_crew("winded_active", true)
-				@crew_data = osacrew_data
-				stop_script("osasail_watch") if running?("osasail_watch")
-				start_script("osasail_watch", ["combat"])
-				winded_sails
-				stop_script("osasail_watch") if running?("osasail_watch")
-				save_to_crew("winded_active", false)
-				wait_until { checkpcs.include?(@crew_data["commander"]) }
-				fput "join #{@crew_data["commander"]}"
-			end
 			if osacombat_data["osacombat"]
 				if !running? "osacombat"
 					start_script "osacombat"
