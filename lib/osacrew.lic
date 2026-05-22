@@ -1,4 +1,4 @@
-version = '6.0.19 (May 19, 2026)'
+version = '6.0.22 (May 21, 2026)'
 =begin
                                        ..
                                      .(  )`-._
@@ -36,7 +36,7 @@ version = '6.0.19 (May 19, 2026)'
    _.-` ``--..  ..  `.-._  `._  `- `-._ .-_. ._.- -._ --.._`` _.-`-.
 
 --------------------------------------------------------------------------
-	OSACrew Version: 6.0.19 (May 19, 2026)
+	OSACrew Version: 6.0.22 (May 21, 2026)
 	
 	   Usage: 
 	
@@ -83,6 +83,8 @@ version = '6.0.19 (May 19, 2026)'
                              deck floor and re-fires within gunner_fire_cannon. Fire-only duty now pauses 3 seconds when cannon not yet loaded. Fixed cannon_should_stop? 
                              always reloading @crew_data so stop flags break the cycle immediately.
               May 19, 2026 - Fixed cannon fire and ship detection triggers re-launching osacommander mid-encounter; both now reload @crew_data before checking boarding flag.
+              May 20, 2026 - resource_check now reads all data from resource.lic YAML (weekly, total, suffused, bonus); removed old quiet_command resource parsing entirely.
+              May 21, 2026 - gunner_out_of_balls now sends lnet crew notification when cannon_engage is true. gunner_boarded routes to helm (not combat) when out of balls during cannon-only encounter.
 =end
 
 def lnet_crew(msg)
@@ -1210,6 +1212,10 @@ def gunner_out_of_balls
 	         ------------====== The Ship Is Out Of Cannon Balls ======-------------
 
 	"
+	# Notify commander via crew channel so they know to kick capstan
+	if osacommander_data["cannon_engage"]
+		lnet_crew("The Ship Is Out Of Cannon Balls!")
+	end
 	save_to_crew("cannoneer_thirty", true)
 end
 
@@ -1342,6 +1348,18 @@ def gunner_boarded
 	end
 	if GameObj.left_hand.noun.to_s == "ball"
 		fput "drop left"
+	end
+	# If this was a cannon-only encounter (out of balls), go to helm and wait
+	# for the commander rather than heading to combat
+	if @crew_data["cannoneer_thirty"] && osacommander_data["cannon_engage"]
+		helm
+		wait_until { checkpcs.include?(@crew_data["commander"]) }
+		fput "join #{@crew_data["commander"]}"
+		save_to_crew("cannoneer_boarded", false)
+		save_to_crew("cannoneer_thirty", false)
+		save_to_crew("cannoneer_sunk", false)
+		save_to_crew("cannoneer_stop", false)
+		return
 	end
 	main_deck
 	wait_until {checkpcs.include? @crew_data["commander"]}
@@ -2191,29 +2209,72 @@ def gemstone_check
 end
 
 def resource_check
-	@resource = nil
-	@resource_total = nil
-	@resource_weekly = nil
-	resource = Lich::Util.quiet_command("resource", /Health: ([0-9,]+)\/([0-9,]+)     Mana: ([0-9,]+)\/([0-9,]+)     Stamina: ([0-9,]+)\/([0-9,]+)     Spirit: ([0-9,]+)\/([0-9,]+)/, end_pattern = /Suffused (Vitality|Necrotic Energy|Essence|Motes of Tranquility|Devotion|Nature's Grace|Luck Inspiration|Grit|Guile): ([0-9,]+)/, include_end = true, timeout = 3, silent = true)
-	if resource.to_s =~ /(Vitality|Necrotic Energy|Essence|Motes of Tranquility|Devotion|Nature's Grace|Luck Inspiration|Grit|Guile): ([0-9,]+)\/50,000/
-		@resource = $1
-		@resource_weekly = $2
-	end
-	if resource.to_s =~ /([0-9,]+)\/200,000/
-		@resource_total = $1
-	end
-	if resource.to_s =~ /(.*) ([0-9,]+)\/200,000/
-		@resource_total = $2
-	end
-	if !@resource.nil? && checkname != @crew_data["commander"]
-		pause rand(1..3)
-		LNet.send_message(attr = { 'type' => 'private', 'to' => @crew_data["commander"] }, "Weekly #{@resource}: #{@resource_weekly} | Total #{@resource}: #{@resource_total}")
-	end
-	if !@resource.nil? && checkname == @crew_data["commander"]
-		pause 1
-		respond ""
-		respond "    Your Resource Stats Are:           Weekly #{@resource}: #{@resource_weekly} | Total #{@resource}: #{@resource_total}"
-		respond ""
+	# Run resource silent to refresh the saved data then read everything from YAML
+	begin
+		pause rand(1..5)
+		start_script("resource", ["silent"])
+		wait_while { running?("resource") }
+		bonus_file = File.join(DATA_DIR, "resource", "bonuses.yaml")
+		return unless File.exist?(bonus_file)
+
+		all_bonuses = YAML.load_file(bonus_file)
+		char_key = "#{XMLData.game}:#{Char.name}"
+		return unless all_bonuses && all_bonuses[char_key]
+
+		entry      = all_bonuses[char_key]
+		prof       = entry[:prof].to_s
+		bonus_data = entry[:bonus]
+		weekly     = entry[:weekly]
+		total      = entry[:total]
+		suffused   = entry[:suffused]
+
+		# Map profession to resource type name
+		resource_name = case prof
+			when "Wizard"   then "Essence"
+			when "Sorcerer" then "Necrotic Energy"
+			when "Bard"     then "Luck Inspiration"
+			when "Cleric"   then "Devotion"
+			when "Paladin"  then "Devotion"
+			when "Ranger"   then "Nature's Grace"
+			when "Empath"   then "Vitality"
+			when "Monk"     then "Motes of Tranquility"
+			when "Warrior"  then "Grit"
+			when "Rogue"    then "Guile"
+			else "Resource"
+		end
+
+		# Build bonus string per profession
+		bonus_msg = case prof
+			when "Warrior"
+				" | Weapon Bonus: #{bonus_data["Weapon"]} | Armor Bonus: #{bonus_data["Armor"]}"
+			when "Monk"
+				" | Self Tattoo Bonus: #{bonus_data["Self"]} | Other Tattoo Bonus: #{bonus_data["Other"]}"
+			when "Rogue"
+				" | Sidestep: #{bonus_data["Sidestep"]} | Keen Eye: #{bonus_data["Keen Eye"]} | Escape Artist: #{bonus_data["Escape Artist"]} | Swift Recovery: #{bonus_data["Swift Recovery"]} | Poisoncraft: #{bonus_data["Poisoncraft"]} | Recharge: #{bonus_data["Recharge"]}"
+			when "Wizard"   then " | Enchanting Bonus: #{bonus_data}"
+			when "Sorcerer" then " | Ensorcelling Bonus: #{bonus_data}"
+			when "Bard"     then " | Luck Bonus: #{bonus_data}"
+			when "Cleric"   then " | Sanctify Bonus: #{bonus_data}"
+			when "Paladin"  then " | Battle Standard Bonus: #{bonus_data}"
+			when "Ranger"   then " | Resist Bonus: #{bonus_data}"
+			when "Empath"   then " | Bloodstone Bonus: #{bonus_data}"
+			else ""
+		end
+
+		suffused_msg = suffused ? " | Suffused: #{suffused}" : ""
+		full_msg = "Weekly #{resource_name}: #{weekly} | Total #{resource_name}: #{total}#{suffused_msg}#{bonus_msg}"
+
+		if checkname != @crew_data["commander"]
+			pause rand(1..3)
+			LNet.send_message(attr = { 'type' => 'private', 'to' => @crew_data["commander"] }, full_msg)
+		else
+			pause 1
+			respond ""
+			respond "    Your Resource Stats Are:  #{full_msg}"
+			respond ""
+		end
+	rescue => e
+		respond "--- OSACrew: resource_check failed: #{e.message}"
 	end
 end
 

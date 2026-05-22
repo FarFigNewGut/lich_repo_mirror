@@ -24,7 +24,7 @@
 
   Author: Phocosoen, ChatGPT
   Tags: wrayth, frontend, mod, window, target, creature, mob, bounty, advguild, avalon, wizard, gtk3
-  Version: 1.6.0
+  Version: 1.6.1
   Recently changed:
     - Added bounty action buttons for workflow automation (guild, guard, furrier, gem, herb, skin).
     - Added gem bounty automation with inventory-aware handling and gemshop routing controls.
@@ -32,7 +32,7 @@
     - Added skin bounty action that tracks on-hand skin progress and automates furrier turn-in.
     - Added guard-return workflow support that can prep heirloom turn-ins and run scripted return flow.
     - Added turn-in NPC targeting safeguards that avoid invalid NPC types (for example familiars/animates).
-	- Added TTK/KPM metrics display support with toggles in the creature window.
+	  - Added TTK/KPM metrics display support with toggles in the creature window.
 =end
 
 no_kill_all
@@ -50,6 +50,7 @@ module CreatureWindow
   GEMSHOP_UID_BY_TOWN = {
     "Cold River" => "u7503259",
   }.freeze
+  BOUNTY_POLL_SECONDS = 1
 
   class << self
     attr_accessor :settings, :window_settings, :use_gtk_window,
@@ -66,6 +67,31 @@ def CreatureWindow.deep_merge_hash(base, override)
       override_val
     end
   end
+end
+
+def CreatureWindow.coerce_integer(value, min: nil, max: nil, allow_nil: false)
+  return nil if allow_nil && value.nil?
+
+  integer =
+    case value
+    when Integer then value
+    when Float then value.to_i
+    when String
+      stripped = value.strip
+      return nil if allow_nil && stripped.empty?
+      Integer(stripped, 10)
+    else
+      return nil if allow_nil
+      raise ArgumentError, "invalid integer value: #{value.inspect}"
+    end
+
+  integer = [integer, min].max if min
+  integer = [integer, max].min if max
+  integer
+rescue ArgumentError, TypeError
+  return nil if allow_nil
+
+  raise
 end
 
 CW_DEFAULT_WINDOW_SETTINGS = {
@@ -85,6 +111,35 @@ CW_DEFAULT_WINDOW_SETTINGS = {
   },
 } unless defined?(CW_DEFAULT_WINDOW_SETTINGS)
 
+def CreatureWindow.sanitize_window_settings(settings)
+  sanitized = CreatureWindow.deep_merge_hash(CW_DEFAULT_WINDOW_SETTINGS, settings.is_a?(Hash) ? settings : {})
+  cw = sanitized["creaturewindow"] ||= {}
+  defaults = CW_DEFAULT_WINDOW_SETTINGS["creaturewindow"]
+
+  %w[
+    use_gtk_creaturewindow
+    display_bounty
+    display_avg_ttk
+    display_last_ttk
+    display_kpm
+    single_column
+  ].each do |key|
+    cw[key] = !!cw[key]
+  end
+
+  cw["font_size"] = CreatureWindow.coerce_integer(cw["font_size"], min: 8, max: 30) rescue defaults["font_size"]
+  cw["width"] = CreatureWindow.coerce_integer(cw["width"], min: 220, max: 2400, allow_nil: true)
+  cw["height"] = CreatureWindow.coerce_integer(cw["height"], min: 120, max: 1800, allow_nil: true)
+  cw["x"] = CreatureWindow.coerce_integer(cw["x"], min: -10_000, max: 10_000, allow_nil: true)
+  cw["y"] = CreatureWindow.coerce_integer(cw["y"], min: -10_000, max: 10_000, allow_nil: true)
+  palette_names = defined?(CreatureWindow::PALETTES) ? CreatureWindow::PALETTES.keys : [defaults["palette"]]
+  cw["palette"] = defaults["palette"] unless palette_names.include?(cw["palette"])
+
+  sanitized
+rescue StandardError
+  CreatureWindow.deep_merge_hash(CW_DEFAULT_WINDOW_SETTINGS, {})
+end
+
 def CreatureWindow.window_settings_path(name: Char.name)
   # Use $data_dir and XMLData.game for Lich data structure
   base_dir = "#{$data_dir}#{XMLData.game}/#{name}"
@@ -101,11 +156,11 @@ def CreatureWindow.load_window_settings(name: Char.name)
     begin
       raw = File.read(filename)
       parsed = YAML.safe_load(raw, permitted_classes: [Hash, Array, String, Integer, Float, TrueClass, FalseClass, NilClass], aliases: false)
-      parsed = {} unless parsed.is_a?(Hash)
-      settings_hash = CreatureWindow.deep_merge_hash(CW_DEFAULT_WINDOW_SETTINGS, parsed)
+      settings_hash = CreatureWindow.sanitize_window_settings(parsed)
+      File.write(filename, settings_hash.to_yaml) if parsed != settings_hash
     rescue => e
       echo "Window settings: Corrupt settings file detected (#{e.message}). Rebuilding defaults..."
-      settings_hash = CreatureWindow.deep_merge_hash(CW_DEFAULT_WINDOW_SETTINGS, {})
+      settings_hash = CreatureWindow.sanitize_window_settings({})
       File.write(filename, settings_hash.to_yaml)
     end
   elsif !File.exist?(filename) && name != Char.name
@@ -113,7 +168,7 @@ def CreatureWindow.load_window_settings(name: Char.name)
     settings_hash = nil
   elsif !File.exist?(filename) && name == Char.name
     echo "Window settings: No current settings found. Loading defaults..."
-    settings_hash = CreatureWindow.deep_merge_hash(CW_DEFAULT_WINDOW_SETTINGS, {})
+    settings_hash = CreatureWindow.sanitize_window_settings({})
     File.write(filename, settings_hash.to_yaml)
   else
     echo "Window settings: Unknown error loading profile (#{name})"
@@ -125,7 +180,7 @@ end
 
 def CreatureWindow.save_window_settings(settings, name: Char.name)
   filename = CreatureWindow.window_settings_path(name: name)
-  File.write(filename, settings.to_yaml)
+  File.write(filename, CreatureWindow.sanitize_window_settings(settings).to_yaml)
 end
 
 CreatureWindow.settings = CreatureWindow.load_window_settings
@@ -400,8 +455,12 @@ class CreatureWindowGtk
     )
 
     # - Restore geometry -
-    @window.resize(cw["width"], cw["height"]) if cw["width"] && cw["height"]
-    @window.move(cw["x"], cw["y"]) if cw["x"] && cw["y"]
+    begin
+      @window.resize(cw["width"], cw["height"]) if cw["width"] && cw["height"]
+      @window.move(cw["x"], cw["y"]) if cw["x"] && cw["y"]
+    rescue StandardError => e
+      echo "Creaturewindow: Ignoring invalid saved GTK geometry (#{e.message})."
+    end
 
     @scroll = Gtk::ScrolledWindow.new
     @scroll.set_policy(Gtk::PolicyType::AUTOMATIC, Gtk::PolicyType::AUTOMATIC)
@@ -1464,9 +1523,20 @@ def CreatureWindow.normalize_bounty_item_name(name)
       .downcase
       .gsub(/[^\w\s'-]/, " ")
       .gsub(/\A(?:a|an|some)\s+/, "")
-      .gsub(/\A(?:piece|handful)\s+of\s+/, "")
+      .gsub(/\A(?:piece|pieces|handful|handfuls|bundle|bundles)\s+of\s+/, "")
       .gsub(/\s+/, " ")
       .strip
+end
+
+def CreatureWindow.item_text_for_bounty_match(item)
+  parts = []
+  parts << item.name.to_s if item.respond_to?(:name)
+  parts << item.noun.to_s if item.respond_to?(:noun)
+  parts << item.after_name.to_s if item.respond_to?(:after_name)
+  parts << item.full_name.to_s if item.respond_to?(:full_name)
+  parts.compact.join(" ")
+rescue StandardError
+  item.to_s
 end
 
 def CreatureWindow.item_matches_bounty_name?(item_name, bounty_name)
@@ -1510,11 +1580,55 @@ def CreatureWindow.gem_items_for_turnin
   gem_name = CreatureWindow.current_gem_name
   return [] if gem_name.empty?
 
-  CreatureWindow.collect_all_inv_items.select { |i| CreatureWindow.item_matches_bounty_name?(i.name.to_s, gem_name) }
+  CreatureWindow.collect_all_inv_items.select do |i|
+    CreatureWindow.item_matches_bounty_name?(CreatureWindow.item_text_for_bounty_match(i), gem_name)
+  end
+end
+
+def CreatureWindow.gem_item_container?(item)
+  item_name = item.name.to_s
+  item_noun = item.noun.to_s
+  item_after = item.respond_to?(:after_name) ? item.after_name.to_s : ""
+  combined = "#{item_name} #{item_noun}".downcase
+
+  (combined =~ /\b(?:bottle|jar|vial|flask)\b/i) ||
+    item_after.downcase.include?("containing")
 end
 
 def CreatureWindow.gem_count_on_hand
   CreatureWindow.gem_items_for_turnin.inject(0) { |sum, item| sum + CreatureWindow.item_stack_count(item) }
+end
+
+def CreatureWindow.loose_gem_in_hands(excluding_id: nil)
+  gem_name = CreatureWindow.current_gem_name
+  hands = [GameObj.left_hand, GameObj.right_hand].compact
+  hands.find do |item|
+    next false if excluding_id && item.id == excluding_id
+
+    CreatureWindow.item_matches_bounty_name?(CreatureWindow.item_text_for_bounty_match(item), gem_name)
+  end
+end
+
+def CreatureWindow.find_item_in_hands_by_id(item_id)
+  [GameObj.left_hand, GameObj.right_hand].compact.find { |item| item.id == item_id }
+end
+
+def CreatureWindow.shake_gem_container_for_turnin(container_item)
+  return nil unless container_item
+
+  fput "get ##{container_item.id}" unless CreatureWindow.find_item_in_hands_by_id(container_item.id)
+  shake_result = dothistimeout(
+    "shake ##{container_item.id}",
+    4,
+    /You give your .* a hard shake, causing|few times before you realize|You shake .* but nothing happens|You can't seem to get anything more out of/i
+  )
+
+  if shake_result =~ /You give your .* a hard shake, causing/i
+    sleep 0.1
+    return CreatureWindow.loose_gem_in_hands(excluding_id: container_item.id)
+  end
+
+  nil
 end
 
 def CreatureWindow.current_skin_name
@@ -1568,11 +1682,30 @@ def CreatureWindow.sell_gems_to_npc(npc)
 
   target_count = @cw_bounty_remaining.to_i
   target_count = 1 if target_count < 1
-  gem_ids = CreatureWindow.gem_items_for_turnin.take(target_count).map(&:id)
 
-  gem_ids.each do |gem_id|
-    fput "get ##{gem_id}"
-    fput "sell ##{gem_id}"
+  sold_count = 0
+  active_container_id = nil
+  loop do
+    break if sold_count >= target_count
+
+    gem_item = active_container_id ? CreatureWindow.find_item_in_hands_by_id(active_container_id) : nil
+    gem_item ||= CreatureWindow.gem_items_for_turnin.first
+    break unless gem_item
+
+    if CreatureWindow.gem_item_container?(gem_item)
+      active_container_id = gem_item.id
+      loose_gem = CreatureWindow.shake_gem_container_for_turnin(gem_item)
+      break unless loose_gem
+
+      fput "sell ##{loose_gem.id}"
+      sold_count += 1
+    else
+      active_container_id = nil
+      stack_count = CreatureWindow.item_stack_count(gem_item)
+      fput "get ##{gem_item.id}"
+      fput "sell ##{gem_item.id}"
+      sold_count += [stack_count, 1].max
+    end
   end
 
   CreatureWindow.ask_bounty_and_sync(npc, use_put: true)
@@ -2065,7 +2198,13 @@ before_dying do
   DownstreamHook.remove(downstream_hook_id) rescue nil
 
   if CreatureWindow.gtk_available && defined?(CreatureWindowGtk) && (cw = CreatureWindowGtk.instance_variable_get(:@window))
-    Gtk.queue { cw.hide }
+    Gtk.queue do
+      begin
+        cw.close
+      rescue StandardError
+        cw.hide rescue nil
+      end
+    end
   end
 end
 
@@ -2073,6 +2212,7 @@ echo "Creaturewindow is active." if $frontend == "stormfront"
 
 CreatureWindow.capture_bounty_origin_context
 CreatureWindow.parse_bounty_from_checkbounty
+@cw_last_bounty_signature = CreatureWindow.bounty_state_signature
 @cw_last_bounty_check ||= Time.now
 
 Thread.new do
@@ -2123,10 +2263,15 @@ loop do
   end
 
   # - periodic bounty refresh -
-  if Time.now - @cw_last_bounty_check > 5
+  if Time.now - @cw_last_bounty_check > CreatureWindow::BOUNTY_POLL_SECONDS
     CreatureWindow.capture_bounty_origin_context if @cw_bounty_origin_npc_id.nil?
+    previous_signature = @cw_last_bounty_signature
     CreatureWindow.parse_bounty_from_checkbounty
-    CreatureWindow::CMD_QUEUE.push("update_window")
+    current_signature = CreatureWindow.bounty_state_signature
+    if current_signature != previous_signature
+      CreatureWindow::CMD_QUEUE.push("update_window")
+      @cw_last_bounty_signature = current_signature
+    end
     @cw_last_bounty_check = Time.now
   end
 

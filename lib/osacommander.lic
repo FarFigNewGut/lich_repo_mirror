@@ -1,5 +1,5 @@
 =begin
-	   OSACommander Version: '4.0.18 (May 20, 2026)
+	   OSACommander Version: '4.0.21 (May 21, 2026)
 	
 	   Usage: 
 	
@@ -77,6 +77,9 @@
              May 19, 2026 - Fixed pier ship search reading commander_ship_name from wrong YAML; script was walking past its own ship. Rewrote fire_launcher, reel_launcher, check_for_crate as non-recursive loops; 
                             fixes multiple fire commands with multiple crates in the water.
              May 20, 2026 - Audited all cross-script flags for push: false; fixed cleanup, othersailors, stowaways, no_stow, check_for_group, osalooter, and remaining piratehunter saves to flush to YAML immediately.
+             May 20, 2026 - Added commander_resource_check; reads from resource.lic YAML like osacrew does, displays commander's own stats then collects crew private reports.
+             May 21, 2026 - Fixed ph_off and ph_on reading piratehunter from wrong YAML (osacrew vs osacommander); fixed ph_on push: false so piratehunter true persists after getting underway.
+             May 21, 2026 - Added commander_kick_capstan for cannon-only encounters; commander goes to helm and kicks capstan until victory or collision. commander_check_role now routes to kick_capstan when cannon_engage is true.
 =end 
 
 def load_yaml_file(path)
@@ -1108,6 +1111,69 @@ def commander_gemstone_check
 	end
 end
 
+def commander_resource_check
+	# Run resource silent to refresh the commander's own data first
+	begin
+		pause rand(1..5)
+		start_script("resource", ["silent"])
+		wait_while { running?("resource") }
+		bonus_file = File.join(DATA_DIR, "resource", "bonuses.yaml")
+		if File.exist?(bonus_file)
+			all_bonuses = YAML.load_file(bonus_file)
+			char_key = "#{XMLData.game}:#{Char.name}"
+			if all_bonuses && all_bonuses[char_key]
+				entry      = all_bonuses[char_key]
+				prof       = entry[:prof].to_s
+				bonus_data = entry[:bonus]
+				weekly     = entry[:weekly]
+				total      = entry[:total]
+				suffused   = entry[:suffused]
+
+				resource_name = case prof
+					when "Wizard"   then "Essence"
+					when "Sorcerer" then "Necrotic Energy"
+					when "Bard"     then "Luck Inspiration"
+					when "Cleric"   then "Devotion"
+					when "Paladin"  then "Devotion"
+					when "Ranger"   then "Nature's Grace"
+					when "Empath"   then "Vitality"
+					when "Monk"     then "Motes of Tranquility"
+					when "Warrior"  then "Grit"
+					when "Rogue"    then "Guile"
+					else "Resource"
+				end
+
+				bonus_msg = case prof
+					when "Warrior"
+						" | Weapon Bonus: #{bonus_data["Weapon"]} | Armor Bonus: #{bonus_data["Armor"]}"
+					when "Monk"
+						" | Self Tattoo Bonus: #{bonus_data["Self"]} | Other Tattoo Bonus: #{bonus_data["Other"]}"
+					when "Rogue"
+						" | Sidestep: #{bonus_data["Sidestep"]} | Keen Eye: #{bonus_data["Keen Eye"]} | Escape Artist: #{bonus_data["Escape Artist"]} | Swift Recovery: #{bonus_data["Swift Recovery"]} | Poisoncraft: #{bonus_data["Poisoncraft"]} | Recharge: #{bonus_data["Recharge"]}"
+					when "Wizard"   then " | Enchanting Bonus: #{bonus_data}"
+					when "Sorcerer" then " | Ensorcelling Bonus: #{bonus_data}"
+					when "Bard"     then " | Luck Bonus: #{bonus_data}"
+					when "Cleric"   then " | Sanctify Bonus: #{bonus_data}"
+					when "Paladin"  then " | Battle Standard Bonus: #{bonus_data}"
+					when "Ranger"   then " | Resist Bonus: #{bonus_data}"
+					when "Empath"   then " | Bloodstone Bonus: #{bonus_data}"
+					else ""
+				end
+
+				suffused_msg = suffused ? " | Suffused: #{suffused}" : ""
+				full_msg = "Weekly #{resource_name}: #{weekly} | Total #{resource_name}: #{total}#{suffused_msg}#{bonus_msg}"
+
+				respond ""
+				respond "    Your Resource Stats Are:  #{full_msg}"
+				respond ""
+			end
+		end
+	rescue => e
+		respond "--- OSACommander: resource_check failed: #{e.message}"
+	end
+
+end
+
 def recieve_bless
 	result = matchtimeout 15, /a moment and then gently dissipates|leaving a soft white afterglow|appears to become incorporated into it|but it quickly returns to normal/
 		if result.to_s =~ /a moment and then gently dissipates|leaving a soft white afterglow|appears to become incorporated into it|but it quickly returns to normal/
@@ -1622,7 +1688,9 @@ end
 def commander_check_role
 	save_to_crew("boarding", true)
 	save_to_crew("sunk_ship", false, push: false)
-	if @commander_data["helmsman_enabled"]
+	if @commander_data["cannon_engage"]
+		commander_kick_capstan
+	elsif @commander_data["helmsman_enabled"]
 		commander_navigator
 	else
 		commander_helmsman
@@ -2435,7 +2503,6 @@ def commander_get_underway
 		fput "yell Anchor's Aweigh!"
 		@anchor_aweigh = false
 	end
-	#move "go wooden door"
 	captains_quarters
 	commander_task_complete
 	if percentmana <= 84
@@ -2454,6 +2521,60 @@ def commander_get_underway
 	lnet_crew("Underway!")
 	fput "yell Underway!"
 	ph_on
+end
+
+def commander_kick_capstan
+	# Anchor the ship then watch for the enemy sinking, collision, or out of balls
+	helm
+	waitrt?
+	fput "kick capstan"
+	waitrt?
+
+	crew_ch = osacrew_data["crew"].to_s
+	$capstan_result = nil
+	capstan_thread = Thread.new do
+		loop do
+			line = get
+			case line
+			when /Tenebrous Cauldron\.  Victory is yours!/
+				$capstan_result = :victory
+				break
+			when /The sides of the (.*) collide against your (.*)!/
+				$capstan_result = :collision
+				break
+			when /^\[#{Regexp.escape(crew_ch)}\]-GSIV:.*\: \"The Ship Is Out Of Cannon Balls!\"/
+				$capstan_result = :out_of_balls
+				break
+			end
+		end
+	end
+
+	capstan_thread.join
+
+	case $capstan_result
+	when :victory
+		commander_sunk_ship
+	when :collision
+		commander_final_approach_2
+	when :out_of_balls
+		commander_out_of_balls
+	end
+end
+
+def commander_out_of_balls
+	# Balls depleted during cannon encounter - raise anchor and begin boarding
+	respond ""
+	respond " ------ Out Of Cannon Balls - Raising Anchor To Begin Boarding ------ "
+	respond ""
+	helm
+	raise_anchor
+	waitrt?
+	# Now proceed to boarding approach
+	if @commander_data["helmsman_enabled"]
+		commander_navigator
+	else
+		commander_helmsman
+	end
 end
 
 def commander_ship_info
@@ -2911,7 +3032,7 @@ def anti_poaching_on
 end
 
 def ph_off
-	if osacrew_data["piratehunter"]
+	if osacommander_data["piratehunter"]
 		save_to_commander("piratehunter", false)
 		respond "     *===============================================================================*
 					|                    *****Enemy Ship Detection Disabled*****                    |     
@@ -2923,8 +3044,8 @@ def ph_off
 end
 
 def ph_on
-	if !osacrew_data["piratehunter"]
-		save_to_commander("piratehunter", true, push: false)
+	if !osacommander_data["piratehunter"]
+		save_to_commander("piratehunter", true)
 		respond "    *===============================================================================*
 				|                    *****Enemy Ship Detection Enabled*****                     |     
 				|                            Happy Hunting Captain!                             |
@@ -3081,6 +3202,12 @@ def commander_sunk_ship
 		wait_until {!running? "osacombat"}
 	end
 	pause 3
+	# If we anchored to use cannons, raise anchor before getting underway again
+	if @commander_data["cannon_engage"]
+		helm
+		raise_anchor
+		waitrt?
+	end
 	lnet_crew("Turn To!")
 	if XMLData.injuries.any?{|key,value| value["wound"] > 1}
 		start_script("eherbs", ['--buy=off', '--mending=on', '--skipscars=on', '--yaba=on', '--potions=on'])
@@ -3458,7 +3585,7 @@ def commander_begin_it
 		status_check
 	elsif variable[1] =~ /resource/
 		lnet_crew("Resource Report")
-		resource_check
+		commander_resource_check
 	elsif variable[1] =~ /gemstone/
 		lnet_crew("Gemstone Report")
 		@weekly_gemstone_count = Array.new
@@ -4306,7 +4433,7 @@ def self.load_commander_yaml
 	path
 end
 
-save_to_commander("commanderversion", "4.0.18 (May 20, 2026)", push: false)
+save_to_commander("commanderversion", "4.0.21 (May 21, 2026)", push: false)
 TITLE = "OSACommander: v. (#{@commander_data["commanderversion"]})"
 require "yaml"
 require "gtk3"
