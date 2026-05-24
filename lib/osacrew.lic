@@ -1,4 +1,4 @@
-version = '6.0.23 (May 22, 2026)'
+version = '6.0.24 (May 22, 2026)'
 =begin
                                        ..
                                      .(  )`-._
@@ -36,7 +36,7 @@ version = '6.0.23 (May 22, 2026)'
    _.-` ``--..  ..  `.-._  `._  `- `-._ .-_. ._.- -._ --.._`` _.-`-.
 
 --------------------------------------------------------------------------
-	OSACrew Version: 6.0.23 (May 22, 2026)
+	OSACrew Version: 6.0.24 (May 22, 2026)
 	
 	   Usage: 
 	
@@ -86,6 +86,11 @@ version = '6.0.23 (May 22, 2026)'
               May 20, 2026 - resource_check now reads all data from resource.lic YAML (weekly, total, suffused, bonus); removed old quiet_command resource parsing entirely.
               May 21, 2026 - gunner_out_of_balls now sends lnet crew notification when cannon_engage is true. gunner_boarded routes to helm (not combat) when out of balls during cannon-only encounter.
               May 22, 2026 - Removed unused Win32Sound/winmm audio code that was crashing on macOS.
+              May 22, 2026 - Added profiles support (osacrew profiles folder); Save As, Load, Delete via GUI matching osacombat profile logic.
+              May 23, 2026 - Added crew_cast_sever, crew_sever_cleanup methods and Begin Sever/Sever Spellup Complete lnet triggers. Fixed
+                             sever spell callout to read sever_spell_1 through sever_spell_4 from osacombat YAML. Crew casts known sever
+                             spells on requesters, then waits for Sever Spellup Complete signal before stopping non-preference spells.
+                             Cleanup uses severance.lic logic; group spells and arcane circles always exempt.
 =end
 
 def lnet_crew(msg)
@@ -1797,6 +1802,57 @@ def crew_check_task
 		end
 end
 
+def crew_cast_sever
+	return if @severlist.empty?
+	pause_script("osacombat") if running?("osacombat")
+
+	# Cast sever spells on requesters
+	@severlist.each do |entry|
+		target   = entry[0]
+		spells   = entry[1..]
+		spells.compact.reject(&:empty?).each do |spell_num|
+			num = spell_num.to_s.strip
+			next if num.empty?
+			if Spell[num.to_i] && Spell[num.to_i].known?
+				waitrt?
+				waitcastrt?
+				Spell[num.to_i].cast(target)
+			end
+		end
+	end
+	@severlist.clear
+
+	unpause_script("osacombat") if running?("osacombat")
+	crew_task_complete
+end
+
+def crew_sever_cleanup
+	# Stop any active spells not on this crew member's sever preference list.
+	# Mirrors severance.lic logic: group spells and arcane circles are always exempt.
+	sever_group_exempt = [307,310,605,620,1006,1007,1018,1035,1213,1216,1125,1605,1609,1617,1618,1699]
+	sever_keep = [
+		@combat_data["sever_spell_1"].to_s.strip.to_i,
+		@combat_data["sever_spell_2"].to_s.strip.to_i,
+		@combat_data["sever_spell_3"].to_s.strip.to_i,
+		@combat_data["sever_spell_4"].to_s.strip.to_i
+	].reject { |n| n == 0 }
+
+	to_stop = Spell.active.select { |s|
+		!s.known? &&
+		!sever_group_exempt.include?(s.num.to_i) &&
+		s.circle.to_i <= 16 &&
+		s.num - (s.circle.to_i * 100) <= 50 &&
+		!sever_keep.include?(s.num.to_i)
+	}
+
+	to_stop.each do |s|
+		waitrt?
+		waitcastrt?
+		fput "stop #{s.num}"
+		respond "--- crew_sever: stopped #{s.name} (#{s.num})"
+	end
+end
+
 def crew_task_complete
 	if !@crew_data["commander"].include? "#{checkname}"
 		wait_until {checkpcs.include? @crew_data["commander"]}
@@ -2991,6 +3047,76 @@ def self.save_settings!
   @crew_data = self.osacrew_data
   respond "--- OSACrew: Settings saved."
 end
+def self.profiles_dir
+	File.join(DATA_DIR, XMLData.game, Char.name, "osacrew profiles")
+end
+
+def self.profile_path(name)
+	File.join(profiles_dir, "#{name}.yaml")
+end
+
+def self.list_profiles
+	FileUtils.mkdir_p(profiles_dir)
+	Dir.glob(File.join(profiles_dir, "*.yaml")).map { |f| File.basename(f, ".yaml") }.sort
+rescue StandardError
+	[]
+end
+
+def self.save_profile(name)
+	FileUtils.mkdir_p(profiles_dir)
+	File.write(profile_path(name), YAML.dump(@crew_data))
+	respond "--- OSACrew: Profile saved: #{name}"
+rescue StandardError => e
+	respond "--- OSACrew: Save failed: #{e.message}\n#{e.backtrace.first(3).join('\n')}"
+end
+
+def self.load_profile(name)
+	path = profile_path(name)
+	return unless File.exist?(path)
+	raw  = File.read(path)
+	data = YAML.safe_load(raw, permitted_classes: [Time, Symbol], aliases: true) || {}
+	@crew_data = data.transform_keys(&:to_s)
+	full_path = File.join(DATA_DIR, XMLData.game, Char.name, "osacrew.yaml")
+	File.write(full_path, YAML.dump(@crew_data))
+	respond "--- OSACrew: Profile loaded: #{name}"
+rescue StandardError => e
+	respond "--- OSACrew: Load failed: #{e.message}"
+end
+
+def self.delete_profile(name)
+	File.delete(profile_path(name)) if File.exist?(profile_path(name))
+	respond "--- OSACrew: Profile deleted: #{name}"
+rescue StandardError => e
+	respond "--- OSACrew: Delete failed: #{e.message}"
+end
+
+def self.refresh_crew_widgets
+	return unless @OSA_CREW_ENTRY && @OSA_CREW_WINDOW
+	@OSA_CREW_ENTRY.each do |var, widget|
+		value = @crew_data[var.to_s]
+		next if value.nil?
+		begin
+			if widget.is_a?(Gtk::CheckButton)
+				widget.active = value ? true : false
+			elsif widget.is_a?(Gtk::Entry)
+				widget.text = value.to_s
+			elsif widget.is_a?(Gtk::ComboBoxText)
+				found = false
+				widget.model.each do |_m, _path, iter|
+					if iter[0].to_s == value.to_s
+						widget.active_iter = iter
+						found = true
+						break
+					end
+				end
+				widget.active = -1 unless found
+			end
+		rescue StandardError
+			next
+		end
+	end
+end
+
 def self.build_crewsetup_window
 	self.load_crew_yaml
 	@OSA_CREW_WINDOW = Gtk::Window.new
@@ -3026,6 +3152,72 @@ def self.build_crewsetup_window
 	populate_general(@OSA_CREW_ROWS1)
 	populate_support(@OSA_CREW_ROWS2)
 	populate_cannons(@OSA_CREW_ROWS3)
+
+	# Profiles section
+	profile_sep = Gtk::Separator.new(:horizontal)
+	main_box.pack_start(profile_sep, false, false, 4)
+	profile_header = Gtk::Label.new
+	profile_header.set_markup("<b>Profiles:</b>")
+	profile_header.set_halign(:start)
+	main_box.pack_start(profile_header, false, false, 2)
+	# Row 1: combo + Load + Save + Delete
+	profile_row1 = Gtk::Box.new(:horizontal, 6)
+	profile_row1.set_border_width(4)
+	@crew_profile_combo = Gtk::ComboBoxText.new
+	list_profiles.each { |p| @crew_profile_combo.append_text(p) }
+	@crew_profile_combo.active = 0 unless list_profiles.empty?
+	profile_row1.pack_start(@crew_profile_combo, true, true, 4)
+	profile_load_btn = Gtk::Button.new(label: "Load")
+	profile_load_btn.signal_connect("clicked") do
+		name = @crew_profile_combo.active_text
+		next unless name && !name.empty?
+		load_profile(name)
+		refresh_crew_widgets
+	end
+	profile_row1.pack_start(profile_load_btn, false, false, 2)
+	profile_save_btn = Gtk::Button.new(label: "Save")
+	profile_save_btn.signal_connect("clicked") do
+		name = @crew_profile_combo.active_text
+		next unless name && !name.empty?
+		save_settings!
+		save_profile(name)
+	end
+	profile_row1.pack_start(profile_save_btn, false, false, 2)
+	profile_del_btn = Gtk::Button.new(label: "Delete")
+	profile_del_btn.signal_connect("clicked") do
+		name = @crew_profile_combo.active_text
+		next unless name && !name.empty?
+		delete_profile(name)
+		@crew_profile_combo.remove_all
+		list_profiles.each { |p| @crew_profile_combo.append_text(p) }
+		@crew_profile_combo.active = 0 unless list_profiles.empty?
+	end
+	profile_row1.pack_start(profile_del_btn, false, false, 2)
+	main_box.pack_start(profile_row1, false, false, 0)
+	# Row 2: name entry + Save As
+	profile_row2 = Gtk::Box.new(:horizontal, 6)
+	profile_row2.set_border_width(4)
+	@crew_profile_name_entry = Gtk::Entry.new
+	@crew_profile_name_entry.placeholder_text = "New profile name..."
+	profile_row2.pack_start(@crew_profile_name_entry, true, true, 4)
+	save_as_btn = Gtk::Button.new(label: "Save As")
+	save_as_btn.signal_connect("clicked") do
+		name = @crew_profile_name_entry.text.strip
+		next if name.empty?
+		begin
+			save_settings!
+			save_profile(name)
+			@crew_profile_name_entry.text = ""
+			@crew_profile_combo.remove_all
+			list_profiles.each { |p| @crew_profile_combo.append_text(p) }
+			@crew_profile_combo.active = list_profiles.index(name) || 0
+		rescue StandardError => e
+			respond "--- OSACrew: Save As failed: #{e.message}"
+		end
+	end
+	profile_row2.pack_start(save_as_btn, false, false, 2)
+	main_box.pack_start(profile_row2, false, false, 0)
+
 	button_row = Gtk::Box.new(:horizontal, 12)
 	button_row.set_halign(:end)
 	save_btn  = Gtk::Button.new(label: "Save")
@@ -3834,19 +4026,25 @@ while line = get
 			pause 0.5
 			LNet.send_message(attr = { 'type' => 'private', 'to' => @newcheckin }, "Excellent Crewman #{@newcheckin}, Welcome Aboard! Our Medical Officer Is: #{@crew_data["medicalofficer"]}. Our Shipboard Communications Channel Is: #{@crew_data["crew"]}")
 		end
-	when /^\[#{@crew_data["crew"]}\]-GSIV:#{@crew_data["commander"]}\: \"Submit your sever spell requests\!\"/
-			pause rand(1..3)
-			if $sever_spell.empty?
-				nil
-			elsif !$sever_spell.empty? && $sever_spell2.empty?
-				lnet_crew("I Require #{}, Please")
-			elsif !$sever_spell.empty? && !$sever_spell2.empty? && $sever_spell3.empty?
-				lnet_crew("I Require #{} and #{}, Please")
-			elsif !$sever_spell3.empty? && $sever_spell4.empty?
-				lnet_crew("I Require #{}, #{} and #{}, Please")
-			else
-				lnet_crew("I Require #{}, #{}, #{} and #{}, Please")
-			end
+	when /^\[#{@crew_data["crew"]}\]-(You|GSIV:#{@crew_data["commander"]})\: \"Submit your sever spell requests\!\"/
+		pause rand(1..3)
+		sever_spells = [
+			@combat_data["sever_spell_1"].to_s.strip,
+			@combat_data["sever_spell_2"].to_s.strip,
+			@combat_data["sever_spell_3"].to_s.strip,
+			@combat_data["sever_spell_4"].to_s.strip
+		].reject(&:empty?)
+		if sever_spells.empty?
+			nil
+		elsif sever_spells.length == 1
+			lnet_crew("I Require #{sever_spells[0]}, Please")
+		elsif sever_spells.length == 2
+			lnet_crew("I Require #{sever_spells[0]} and #{sever_spells[1]}, Please")
+		elsif sever_spells.length == 3
+			lnet_crew("I Require #{sever_spells[0]}, #{sever_spells[1]} and #{sever_spells[2]}, Please")
+		else
+			lnet_crew("I Require #{sever_spells[0]}, #{sever_spells[1]}, #{sever_spells[2]} and #{sever_spells[3]}, Please")
+		end
 	when /^\[#{@crew_data["crew"]}\]-GSIV:(.*): \"I Require (.*), (.*), (.*) and (.*)\, Please/
 		person = $1
 		sever_spell = $2
@@ -3869,6 +4067,10 @@ while line = get
 		person = $1
 		sever_spell = $2
 		@severlist.push([person, sever_spell])
+	when /^\[#{@crew_data["crew"]}\]-GSIV:#{@crew_data["commander"]}\: \"Begin Sever\!\"/
+		crew_cast_sever
+	when /^\[#{@crew_data["crew"]}\]-GSIV:#{@crew_data["commander"]}\: \"Sever Spellup Complete\"/
+		crew_sever_cleanup
 	when /^\[#{@crew_data["crew"]}\]-(GSIV:#{@crew_data["commander"]}|You)\: \"Does Anyone Need Armor Adjustments\?\"/
 		pause rand(1..3)
 		if @crew_data["need_armor_blessing"]
