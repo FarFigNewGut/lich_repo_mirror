@@ -1,0 +1,169 @@
+=begin
+  diskhider.lic
+
+  Hides other people's disks from your room view, compacting them
+  into a "(3 hidden disks)" note.
+
+  Your own and your group's disks stay visible.
+
+  Usage:
+    ;diskhider     start
+    ;k diskhider   stop
+=end
+
+module DiskHider
+  # One clickable room object: <a exist="-12345" noun="disk">the foo disk</a>
+  ANCHOR_RE = /<a\s+exist="(-?\d+)"[^>]*>.*?<\/a>/m
+
+  # Separator between list items inside a gap: a comma OR " and " (the final).
+  SEP_RE = /\s*,\s*|\s+and\b\s*/
+
+  # Room object list wrapped in the persistent component (the common case).
+  COMPONENT_RE = /\A(?<pre>.*?You also see)(?<body>.*)(?<post>\.<\/component>.*)\z/m
+
+  # Best-effort fallback: a plain "You also see ... ." narrative line.
+  PLAIN_RE = /\A(?<pre>.*?You also see)(?<body>.*)(?<post>\.\s*)\z/m
+
+  class << self
+    # Rewrite a room-object-list string, removing the anchors whose exist id is
+    # in hide_ids and replacing them with a "(N hidden disk[s])" marker. Returns
+    # the input unchanged if there is nothing to hide or it isn't a room list.
+    def filter_room_objs(raw, hide_ids)
+      return raw if hide_ids.nil? || hide_ids.empty?
+
+      m = raw.match(COMPONENT_RE) || raw.match(PLAIN_RE)
+      return raw unless m
+      pre, body, post = m[:pre], m[:body], m[:post]
+
+      parsed = parse_body(body)
+      return raw if parsed.nil? # no clickable objects -> leave alone
+
+      hide = hide_ids.map(&:to_i)
+      elements = parsed[:elements]
+      kept = elements.reject { |e| hide.include?(e[:id]) }
+      n_hidden = elements.size - kept.size
+      return raw if n_hidden.zero? # nothing actually hidden -> byte-for-byte unchanged
+
+      marker = " (#{n_hidden} hidden #{n_hidden == 1 ? 'disk' : 'disks'})"
+      return "#{pre}#{marker}#{post}" if kept.empty?
+
+      joined = rebuild(parsed, kept)
+      glue = joined.start_with?('<') ? '' : ' ' # bold items carry their own leading space
+      "#{pre}#{glue}#{joined}#{marker}#{post}"
+    end
+
+    # Live set of exist ids to hide: all disks minus mine/my group's.
+    # Lich-only; safe to call only when the GemStone Disk module is loaded.
+    def hide_ids
+      return [] unless defined?(Lich::Gemstone::Disk)
+
+      keep = []
+      keep.concat(Array(Lich::Gemstone::Group.disks)) if defined?(Lich::Gemstone::Group)
+      mine = Lich::Gemstone::Disk.mine
+      keep << mine if mine
+      keep_ids = keep.compact.map(&:id)
+
+      Lich::Gemstone::Disk.all.map(&:id).reject { |id| keep_ids.include?(id) }
+    rescue StandardError
+      [] # never let disk bookkeeping break the client display
+    end
+
+    private
+
+    # Split body (text between "You also see" and the final ".") into:
+    #   :elements => [{id:, anchor:, index:}] in order
+    #   :head     => text before the first anchor (leading article of element 0)
+    #   :gaps     => gaps[i] is the text between anchor i and anchor i+1
+    #   :tail     => text after the last anchor
+    def parse_body(body)
+      anchors = []
+      body.scan(ANCHOR_RE) do
+        anchors << { id: Regexp.last_match(1).to_i, match: Regexp.last_match(0),
+                     begin: Regexp.last_match.begin(0), end: Regexp.last_match.end(0) }
+      end
+      return nil if anchors.empty?
+
+      gaps = (0...anchors.size - 1).map { |i| body[anchors[i][:end]...anchors[i + 1][:begin]] }
+      {
+        elements: anchors.each_with_index.map { |a, i| { id: a[:id], anchor: a[:match], index: i } },
+        head: body[0...anchors.first[:begin]],
+        gaps: gaps,
+        tail: body[anchors.last[:end]..] || ""
+      }
+    end
+
+    # Split a gap into [trailing_of_prev_item, leading_of_next_item].
+    def split_gap(gap)
+      if (m = gap.match(SEP_RE))
+        [gap[0...m.begin(0)], gap[m.end(0)..] || ""]
+      else
+        ["", gap]
+      end
+    end
+
+    def leading_of(parsed, idx)
+      idx.zero? ? parsed[:head] : split_gap(parsed[:gaps][idx - 1])[1]
+    end
+
+    def trailing_of(parsed, idx)
+      idx == parsed[:elements].size - 1 ? parsed[:tail] : split_gap(parsed[:gaps][idx])[0]
+    end
+
+    # Reassemble the kept elements with correct list grammar. A gap is reused
+    # verbatim between two elements that were adjacent in the input AND aren't
+    # the final pair (so bold tags and the game's exact spacing survive);
+    # otherwise the separator is synthesized, with " and " for the final pair.
+    def rebuild(parsed, kept)
+      gaps = parsed[:gaps]
+      out = +""
+      out << leading_of(parsed, kept.first[:index]).sub(/\A\s+/, '') << kept.first[:anchor]
+
+      kept.each_cons(2).with_index do |(prev, cur), j|
+        is_final = (j == kept.size - 2)
+        if cur[:index] == prev[:index] + 1 && !is_final
+          out << gaps[prev[:index]] # verbatim
+        else
+          trailing = split_gap(gaps[prev[:index]])[0]
+          leading  = split_gap(gaps[cur[:index] - 1])[1]
+          out << join_sep(trailing, is_final ? ' and' : ',', leading)
+        end
+        out << cur[:anchor]
+      end
+
+      out << trailing_of(parsed, kept.last[:index])
+      out
+    end
+
+    # Join two list items across a synthesized separator, matching the game's
+    # convention of NO space before a bold item (the "<b> " supplies its own).
+    def join_sep(trailing, sep_word, leading)
+      glue = leading.start_with?('<') ? '' : ' '
+      "#{trailing}#{sep_word}#{glue}#{leading}"
+    end
+  end
+end
+
+# --- Runtime activation (skipped when loaded by the unit tests) --------------
+if defined?(DownstreamHook)
+  hook_name = 'diskhider'
+
+  DownstreamHook.remove(hook_name) # tidy up any previous instance
+  DownstreamHook.add(hook_name, proc do |server_string|
+    begin
+      if server_string.include?('You also see') && server_string.include?('<a exist=')
+        DiskHider.filter_room_objs(server_string, DiskHider.hide_ids)
+      else
+        server_string
+      end
+    rescue StandardError => e
+      respond "--- diskhider: #{e.message}"
+      server_string
+    end
+  end)
+
+  before_dying { DownstreamHook.remove(hook_name) }
+
+  respond "--- diskhider: hiding non-group disks from your room view. Use ;k diskhider to restore."
+
+  loop { sleep 60 }
+end
