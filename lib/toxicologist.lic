@@ -1,0 +1,819 @@
+=begin
+  toxicologist.lic
+
+  Crafts poison vials with the rogue Poisoncraft covert art (FEAT POISONCRAFT
+  CREATE {poison}) and then either APPLYs the vial to your readied armament or
+  stows it in a container for later use.
+
+  Each CREATE consumes one "unremarkable apothecary kit" (10,000 silver from the
+  Rogue Guild shop). Kits are generic and work for any poison. Keep a stack of
+  them in a worn container; the script will pull one into a free hand before each
+  create (and warns you when you run out).
+
+  Usage:
+    ;toxicologist <poison>                 create one vial and APPLY it (default)
+    ;toxicologist <poison> apply           create one vial and APPLY it
+    ;toxicologist <poison> stow            create one vial, STOW it (default container)
+    ;toxicologist <poison> stow <noun>     create + PUT into container <noun>
+    ;toxicologist <poison> x5              create five (combine with stow/apply)
+    ;toxicologist <poison> stow x5 <noun>  order of options doesn't matter
+    ;toxicologist <poison> ... debug       also dump raw CREATE/APPLY game output
+    ;toxicologist kits                     show kit count + saved settings
+    ;toxicologist buy [N] [container]      buy N kits; STOW them (or PUT into <noun>)
+    ;toxicologist autobuy on|off          auto-buy missing kits (persistent)
+    ;toxicologist list                     list poison names + short codes
+    ;toxicologist help                     this help
+
+  Auto-buying kits:
+    With AUTOBUY ON (a per-character setting that persists between sessions), if
+    you run out of apothecary kits the script will go2 'rogue guild shop'
+    (nearest guild shop), DEPOSIT ALL and withdraw a weightless bank NOTE for
+    payment, and ORDER -> BUY a kit. With AUTOBUY OFF (default) it just warns
+    you and stops when you run out.
+
+    For travel into the guild, save your rogue_password in go2:
+      ;vars set rogue_password=rub, tap, kick, punch, scream, flail
+
+  <poison> may be a short code or (fuzzy) name:
+    Disabling:  dreamer  merrybud  snailspace  dullard  jester
+    Deadly:     ravager  ophidian  shatterlimb  fools   arachne
+
+  Notes / assumptions:
+    - You must be a rogue trained in Poisoncraft, and high enough rank to craft
+      the chosen poison (ranks 1-5 unlock the codes above in order).
+    - For APPLY you must already be wielding/holding the armament you want
+      poisoned in your other hand -- hold the kit in one hand, the armament in
+      the other. CREATE transforms the kit into a vial in that same hand; APPLY
+      is two-step (feat poisoncraft apply, then apply again to confirm).
+    - The exact CREATE/APPLY game text isn't publicly documented, so success is
+      detected by a poison vial actually appearing in your hand. If the in-game
+      messaging differs from the patterns below, run with `debug` and adjust the
+      *_RX regexes near the top of this file.
+
+         author: Maraella + cla
+           game: Gemstone
+           tags: rogue, poison, poisoncraft, covert arts, crafting
+       requires: Lich >= 5.9.0
+        version: 1.0.0
+
+  Version Control:
+    1.0.0 (2026-05-30)
+      Initial release.
+=end
+
+# ---------------------------------------------------------------------------
+# Config / patterns (tweak the regexes if your game messaging differs).
+# ---------------------------------------------------------------------------
+
+# When no container noun is given, items are stowed with the game's STOW verb
+# (into your configured default container). We stow whichever hand holds the item.
+STOW_HAND_RX = /You (?:put|place|stow|tuck)|already|can't|cannot|don't|What were|isn't|full|room|backpack|container|satchel|pack|sack|pouch/i
+
+# How an apothecary kit is recognized in your inventory, and the fallback noun
+# used to GET one if the script can't resolve a specific item id.
+KIT_RX   = /apothecary kit/i
+KIT_NOUN = "kit"
+
+# Baseline kit price (silver). Used to estimate how much to withdraw from the
+# bank up front. Per-character price only ever drops below this, so it's a safe
+# upper bound for funding.
+KIT_PRICE = 10_000
+
+# go2 destination for the Rogue Guild shop. This tag always routes to the
+# nearest guild shop, so it never needs configuring.
+SHOP_DEST = "rogue guild shop"
+
+# A freshly crafted poison in hand (CREATE turns the kit into e.g. "violet-tinted poison").
+POISON_VIAL_RX = /\b(?:vials?|poison)\b/i
+
+def poison_vial?(obj)
+  return false unless obj
+  obj.noun.to_s.downcase == "poison" || obj.name.to_s =~ POISON_VIAL_RX
+end
+
+def held_poison_vials
+  held_objs.select { |o| poison_vial?(o) }
+end
+
+def strip_game_xml(text)
+  text.to_s.gsub(/<[^>]+>/, " ").gsub(/\s+/, " ").strip
+end
+
+# Lines that end/identify the CREATE response (success or failure).
+CREATE_RX = /You\s+(?:carefully|skillfully|deftly|begin|fill|craft|create|prepare|produce|distill|mix|combine|finish|complete)|vial|poison|apothecary|don't|do not|cannot|can't|aren't|isn't|need|lack|require|not\s+a\s+rogue|don't\s+know|nothing\s+happens|free\s+hand|Roundtime/i
+
+# Lines that end/identify the APPLY response (success, confirmation, or failure).
+APPLY_RX = /Applying a|To continue.*APPLY|You\s+(?:carefully|skillfully|apply|coat|smear|daub|treat)|now\s+coated|applied|charges|poison|There\s+is|don't|do not|cannot|can't|need|must|not\s+(?:wielding|holding)|isn't|aren't|nothing\s+happens|empty|Roundtime/i
+APPLY_CONFIRM_RX = /To continue.*APPLY|click.*APPLY in the next/i
+APPLY_SUCCESS_RX = /You\s+(?:carefully|skillfully|apply|coat|smear|daub|treat)|now\s+coated|applied|charges/i
+
+# tag => metadata. The tag is what gets sent to FEAT POISONCRAFT CREATE <tag>.
+POISONS = {
+  "dreamer"     => { name: "Dreamer's Milk",     type: :disabling, rank: 1 },
+  "merrybud"    => { name: "Merrybud",           type: :disabling, rank: 2 },
+  "snailspace"  => { name: "Snailspace Poison",  type: :disabling, rank: 3 },
+  "dullard"     => { name: "Dullard's Folly",    type: :disabling, rank: 4 },
+  "jester"      => { name: "Jester's Bane",      type: :disabling, rank: 5 },
+  "ravager"     => { name: "Ravager's Revenge",  type: :deadly,    rank: 1 },
+  "ophidian"    => { name: "Ophidian Kiss",      type: :deadly,    rank: 2 },
+  "shatterlimb" => { name: "Shatterlimb Poison", type: :deadly,    rank: 3 },
+  "fools"       => { name: "Fool's Deathwort",   type: :deadly,    rank: 4 },
+  "arachne"     => { name: "Arachne's Bite",     type: :deadly,    rank: 5 },
+}
+
+# Friendly aliases -> canonical tag.
+POISON_ALIASES = {
+  "milk"      => "dreamer",  "dreamers" => "dreamer",
+  "merry"     => "merrybud",
+  "snail"     => "snailspace",
+  "folly"     => "dullard",
+  "bane"      => "jester",
+  "revenge"   => "ravager",
+  "kiss"      => "ophidian",
+  "shatter"   => "shatterlimb",
+  "deathwort" => "fools",  "fool" => "fools",
+  "bite"      => "arachne", "arachnes" => "arachne",
+}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Thin wrapper around Lich::Util.issue_command with our standard options.
+def issue(cmd, start_rx, timeout: 5)
+  Lich::Util.issue_command(
+    cmd, start_rx, /<prompt/,
+    include_end: false, timeout: timeout, silent: true, usexml: true, quiet: true
+  )
+rescue
+  # Fall back to a plain command if issue_command isn't happy with the patterns.
+  fput cmd
+  []
+end
+
+def held_objs
+  [GameObj.right_hand, GameObj.left_hand].select { |o| o && o.id }
+end
+
+def free_hand?
+  GameObj.right_hand.nil? || GameObj.right_hand.id.nil? ||
+    GameObj.left_hand.nil? || GameObj.left_hand.id.nil?
+end
+
+# All item objects we can currently see: both hands, top-level inventory, and
+# the contents of any containers Lich knows about.
+def all_items
+  items = held_objs.dup
+  items.concat(Array(GameObj.inv))
+  GameObj.containers.each_value { |c| items.concat(Array(c)) }
+  items.compact
+end
+
+def count_kits
+  all_items.count { |o| o.name.to_s =~ KIT_RX }
+end
+
+def holding_kit
+  held_objs.find { |o| o.name.to_s =~ KIT_RX }
+end
+
+def held_vials
+  held_poison_vials
+end
+
+# Persistent (per-character) toggle. CharSettings auto-saves on script exit.
+# AUTOBUY ON implies the script may travel to the shop and use the bank.
+def autobuy_enabled?; CharSettings['autobuy'] == true; end
+
+def set_bool(key, val); CharSettings[key] = (val == true); end
+
+# --- travel & banking ------------------------------------------------------
+
+# Run go2 to a destination and wait for it to finish.
+def go2_wait(dest)
+  dest = dest.to_s.strip
+  return false if dest.empty?
+  start_script 'go2', [dest]
+  sleep 0.2
+  wait_while { running?('go2') }
+  true
+rescue StandardError => e
+  respond "    [debug] go2 error: #{e}" if $toxicologist_debug
+  false
+end
+
+# Are we standing in the Rogue Guild shop?
+def in_shop?
+  tags = (Room.current.tags rescue []) || []
+  title = (Room.current.title rescue nil).to_s
+  tags.include?("rogue guild shop") || title =~ /Rogue Guild,\s*Shop/i
+end
+
+# Travel to the shop if we aren't there. Returns true if we end up in the shop.
+def ensure_at_shop(allow_travel, debug)
+  return true if in_shop?
+  return false unless allow_travel
+  respond "    -> traveling to the Rogue Guild shop (#{SHOP_DEST})..."
+  go2_wait(SHOP_DEST)
+  sleep 0.3
+  in_shop?
+end
+
+# Read full WEALTH output (WEALTH QUIET omits the bond-notes line).
+def wealth_text
+  dothistimeout('wealth', 4, /silver|notes/i)
+  sleep 0.2
+  reget(12).to_s
+rescue StandardError
+  ''
+end
+
+# Silver in bank notes currently carried (weightless for shop purchases).
+def note_silver
+  buf = wealth_text
+  m = buf.match(/(?:bond )?notes valued at a total of ([\d,]+) silver/i)
+  m ? m[1].delete(',').to_i : 0
+end
+
+# Spendable silver: coins plus notes (shop accepts either).
+def spendable_silver
+  buf = wealth_text
+  if buf =~ /carrying (?:a total of )?([\d,]+) silver between notes and coins/i
+    return Regexp.last_match(1).delete(',').to_i
+  end
+  coins = 0
+  if buf =~ /You have (no|but one|[\d,]+) silver with you/i
+    val = Regexp.last_match(1)
+    coins = val == 'no' ? 0 : (val =~ /but one/i ? 1 : val.delete(',').to_i)
+  end
+  coins + note_silver
+rescue StandardError
+  0
+end
+
+def waitfor_bank_withdraw
+  waitfor(
+    'The teller', 'hands you', 'records', 'makes some marks', 'scribbles',
+    'street urchin', 'returns in a few moments', 'scurries off', 'pocket',
+    'Very well', "seem to have that much", 'What were you referring', "don't have"
+  )
+rescue StandardError
+  sleep 0.8
+end
+
+def waitfor_deposit_all
+  waitfor(
+    'You deposit', 'into your account', 'hand over your deposit', 'street urchin',
+    "don't have any", 'no coins to deposit', 'nothing to deposit', 'What were you referring'
+  )
+rescue StandardError
+  sleep 0.8
+end
+
+# Go to the bank, DEPOSIT ALL (sheds heavy coins) and withdraw `amount` as a
+# bank NOTE. Notes are effectively weightless, so the shop won't refuse the
+# purchase on encumbrance. Returns true on the attempt.
+def bank_get_note(amount, debug)
+  amt = amount.to_i
+  return false if amt < 1
+  respond "    -> banking: depositing coins, withdrawing a #{comma_silver(amt)} silver note..."
+  go2_wait('bank')
+  sleep 0.2
+  fput 'deposit all'
+  waitfor_deposit_all
+  sleep 0.2
+  fput "withdraw #{amt} note"
+  waitfor_bank_withdraw
+  sleep 0.3
+  true
+end
+
+def comma_silver(n)
+  n.to_i.to_s.reverse.gsub(/(\d{3})(?=\d)/, "\\1,").reverse
+end
+
+# Convert funds to a weightless note covering `total` before shopping.
+# Skips the bank when a note already covers the amount. If you only have heavy
+# coins, deposits them and withdraws a note instead.
+def prepare_funds(total, allow_bank, debug)
+  total = total.to_i
+  return true if total < 1
+  notes = note_silver
+  return true if notes >= total
+  return false unless allow_bank
+  shortfall = total - notes
+  # Only coins on hand: deposit all and withdraw one note for the full budget.
+  amount = (notes.zero? && spendable_silver >= total) ? total : shortfall
+  bank_get_note(amount, debug)
+  true
+end
+
+# Top up with a note only when we cannot afford `total` yet.
+def ensure_funds(total, allow_bank, debug)
+  total = total.to_i
+  return true if total < 1
+  notes = note_silver
+  return true if notes >= total
+  spend = spendable_silver
+  return false unless allow_bank
+  return bank_get_note(total, debug) if spend >= total && notes.zero? # coins only, too heavy
+  return false if spend < total
+  bank_get_note(total - notes, debug)
+  true
+end
+
+# Ask the current shop for its catalog. Returns the lines (Array of String).
+def order_catalog(debug)
+  lines = issue("order",
+                /\d+[\.\)]|ORDER|catalog|for sale|no shop|can't do that|isn't a shop|not.*\bshop\b|nothing to order|no one here|Buy what/i,
+                timeout: 5)
+  respond "    [debug] ORDER: #{lines.inspect}" if debug
+  lines
+end
+
+# Find the ORDER catalog number for the apothecary kit. Rogue guild catalogs are
+# two-column HTML lines like:
+#   16. <d cmd="order 16 ...">back-sheaths</d>   33. <d cmd="order 33 ...">apothecary kit</d>
+# Never take the first number on the line -- bind to the kit's own entry.
+def kit_order_number(catalog)
+  text = catalog.join("\n")
+
+  # StormFront/HTML: order cmd on the same anchor as the kit name.
+  m = text.match(/order\s+(\d+)\s+color\s+\d+\s+material\s+\d+[^>]*>[^<]*apothecary kit/i)
+  return m[1] if m
+
+  # Plain "33. ... apothecary kit" (allows HTML between the dot and the name).
+  m = text.match(/(\d+)\.\s*(?:<[^>]*>)*[^<]*apothecary kit/i)
+  return m[1] if m
+
+  # Shared catalog line: last "N." before "apothecary kit" on that line.
+  catalog.each do |line|
+    next unless line =~ KIT_RX
+    pre = line.split(/apothecary kit/i, 2).first
+    nums = pre.scan(/(\d+)\./)
+    return nums.last[0] if nums.any?
+  end
+  nil
+end
+
+# Buy a single apothecary kit. When `assist` is true the script may travel to
+# the shop and withdraw silver from the bank as needed. The kit lands in a hand.
+# Returns [success_bool, reason_symbol_or_nil].
+def buy_one_kit(assist, debug)
+  return [false, :no_hand] unless free_hand?
+  return [false, :no_shop] unless ensure_at_shop(assist, debug)
+
+  catalog = order_catalog(debug)
+  joined  = catalog.join(" ")
+  if catalog.empty? || joined =~ /no shop|can't do that|isn't a shop|not.*\bshop\b|nothing to order|no one here/i
+    return [false, :no_shop]
+  end
+  num = kit_order_number(catalog)
+  return [false, :no_kit] unless num
+
+  # Top up funds if needed; banking moves us away, so return to the shop after.
+  unless ensure_funds(KIT_PRICE, assist, debug)
+    return [false, :no_silver]
+  end
+  unless in_shop?
+    return [false, :no_shop] unless ensure_at_shop(assist, debug)
+    return [false, :no_shop] unless in_shop?
+  end
+
+  # Confirm the order resolves to an apothecary kit BEFORE buying, so a bad
+  # catalog number can never make us purchase the wrong item.
+  ord = issue("order #{num}",
+              /apothecary kit|would cost|costs?|silver|price|no such|not for sale|isn't (?:for sale|available)|Buy what/i,
+              timeout: 5)
+  respond "    [debug] ORDER #{num}: #{ord.inspect}" if debug
+  unless ord.join(" ") =~ /apothecary kit/i
+    return [false, :wrong_item]
+  end
+
+  before = count_kits
+  res = issue("buy",
+              /You (?:buy|purchase|hand|pay|pick up)|apothecary kit|don't have enough|can't afford|sold out|haven't ordered|Buy what|free hand/i,
+              timeout: 6)
+  respond "    [debug] BUY: #{res.inspect}" if debug
+  waitrt?
+
+  rjoined = res.join(" ")
+  bought  = count_kits > before || !holding_kit.nil? ||
+            rjoined =~ /hands you an? .*apothecary kit/i
+  return [true, nil] if bought
+  return [false, :too_heavy] if rjoined =~ /buckle under this weight|properly accept the purchase|too (?:heavy|encumbered)/i
+  return [false, :no_silver] if rjoined =~ /don't have enough|can't afford/i
+  return [false, :sold_out]  if rjoined =~ /sold out/i
+  return [false, :no_hand]   if rjoined =~ /free hand/i
+  [false, :buy_failed]
+end
+
+# Make sure an apothecary kit is in a hand, buying one if needed and allowed.
+# Returns [success_bool, reason_symbol_or_nil].
+def ensure_kit_held(autobuy, debug)
+  return [true, nil] unless holding_kit.nil?
+  unless free_hand?
+    return [false, :poison_in_hand] if held_poison_vials.any?
+    return [false, :no_hand]
+  end
+
+  kit = all_items.find { |o| o.id && o.name.to_s =~ KIT_RX }
+
+  if kit.nil?
+    if autobuy
+      respond "    -> out of kits; buying one..."
+      ok, reason = buy_one_kit(autobuy, debug)
+      return [false, reason] unless ok
+      return [true, nil] unless holding_kit.nil?
+      kit = all_items.find { |o| o.id && o.name.to_s =~ KIT_RX }
+    else
+      return [false, :no_kit_no_autobuy]
+    end
+  end
+
+  if kit && holding_kit.nil?
+    issue("get ##{kit.id}",
+          /You get|pick up|remove|already|What were|don't see|can't|free hand/i, timeout: 3)
+    waitrt?
+  end
+
+  holding_kit.nil? ? [false, :get_failed] : [true, nil]
+end
+
+KIT_FAIL_MSG = {
+  no_shop:           "couldn't reach the Rogue Guild shop -- make sure go2 works and your rogue_password is saved in go2 (;vars set rogue_password=...).",
+  no_kit:            "the shop here doesn't sell apothecary kits.",
+  no_silver:         "couldn't afford a kit (~10,000 silver between coins and the bank).",
+  sold_out:          "the shop is sold out of apothecary kits.",
+  no_hand:           "need a free hand to buy/hold a kit.",
+  poison_in_hand:    "still holding poison from an incomplete APPLY -- finish applying or stow it before crafting again.",
+  no_kit_no_autobuy: "out of apothecary kits (autobuy is OFF; ';toxicologist autobuy on', or buy some at the Rogue Guild shop).",
+  get_failed:        "couldn't get an apothecary kit into your hand.",
+  too_heavy:         "too encumbered to accept the purchase -- the script pays with a weightless bank note, so deposit some of your loose coins and try again.",
+  buy_failed:        "the purchase didn't go through.",
+  wrong_item:        "couldn't confirm the apothecary kit's catalog number (ORDER named a different item), so I did NOT buy anything. Re-run with `debug` and check the [debug] ORDER line, or buy a kit manually.",
+}
+
+# Find a container object by noun across worn/held inventory, the room, and any
+# already-opened containers.
+def find_container(noun)
+  noun = noun.to_s.strip.downcase
+  pools = []
+  pools.concat(Array(GameObj.inv))
+  pools.concat(Array(GameObj.loot))
+  pools.concat(held_objs)
+  GameObj.containers.each_key { |cid| obj = GameObj[cid]; pools << obj if obj }
+  pools.compact!
+  pools.find { |o| o.noun.to_s.downcase == noun } ||
+    pools.find { |o| o.name.to_s.downcase.include?(noun) }
+end
+
+# Create a single vial. Returns [vial_obj_or_nil, error_string_or_nil].
+# CREATE consumes the kit in hand and leaves the vial in that same hand; your
+# other hand can hold the armament to be poisoned.
+def create_one(tag, autobuy, debug)
+  ok, reason = ensure_kit_held(autobuy, debug)
+  unless ok
+    return [nil, KIT_FAIL_MSG[reason] || "no apothecary kit available."]
+  end
+
+  kit = holding_kit
+  kit_hand = kit ? stow_hand_for(kit) : nil
+  before_vial_ids = held_vials.map(&:id)
+
+  waitrt?
+  lines = issue("feat poisoncraft create #{tag}", CREATE_RX, timeout: 7)
+  respond "    [debug] CREATE: #{lines.inspect}" if debug
+  waitrt?
+
+  find_new_poison = proc {
+    v = held_poison_vials.find { |o| !before_vial_ids.include?(o.id) }
+    next v if v
+    if kit_hand
+      obj = kit_hand == "right" ? GameObj.right_hand : GameObj.left_hand
+      next obj if poison_vial?(obj)
+    end
+    held_poison_vials.first
+  }
+
+  new_vial = find_new_poison.call
+  # GameObj can lag the inventory stream that issue() already captured.
+  if new_vial.nil? && lines.join(" ") =~ /noun="poison"/i
+    sleep 0.4
+    new_vial = find_new_poison.call
+  end
+  if new_vial
+    [new_vial, nil]
+  else
+    msg = strip_game_xml(lines.join(" "))
+    msg = "no poison appeared in hand after CREATE" if msg.empty?
+    [nil, msg[0, 200]]
+  end
+end
+
+# APPLY is a two-step flow: the first command selects the target, then you must
+# confirm with a second APPLY within a minute. Returns [success_bool, message].
+def apply_vial(debug)
+  poison_ids = held_poison_vials.map(&:id)
+  waitrt?
+  lines = issue("feat poisoncraft apply", APPLY_RX, timeout: 8)
+  joined  = lines.join(" ")
+
+  if joined =~ APPLY_CONFIRM_RX
+    waitrt?
+    confirm = issue("feat poisoncraft apply", APPLY_RX, timeout: 8)
+    lines.concat(confirm)
+    joined = lines.join(" ")
+  end
+
+  respond "    [debug] APPLY: #{lines.inspect}" if debug
+  waitrt?
+  sleep 0.3
+
+  poison_gone = poison_ids.any? &&
+                held_poison_vials.none? { |p| poison_ids.include?(p.id) }
+  text = strip_game_xml(joined)
+  ok   = poison_gone || joined =~ APPLY_SUCCESS_RX
+  [ok, text]
+end
+
+# Which hand holds `obj`? Used to pick STOW left/right when no container is named.
+def stow_hand_for(obj)
+  return "right" if GameObj.right_hand&.id == obj.id
+  return "left"  if GameObj.left_hand&.id == obj.id
+  "right"
+end
+
+# Stow a held item. With `container_noun`, PUT into that container; otherwise
+# STOW left/right (your default container). Returns [success_bool, message].
+def stow_object(obj, container_noun, debug)
+  return [false, "nothing to stow"] unless obj&.id
+  waitrt?
+  if container_noun.nil? || container_noun.to_s.strip.empty?
+    hand = stow_hand_for(obj)
+    cmd  = "stow #{hand}"
+    lines = issue(cmd, STOW_HAND_RX, timeout: 4)
+    respond "    [debug] #{cmd.upcase}: #{lines.inspect}" if debug
+  else
+    cont = find_container(container_noun)
+    return [false, "couldn't find a container nouned '#{container_noun}'"] unless cont
+    lines = issue("put ##{obj.id} in ##{cont.id}",
+                  /You put|You place|already in|won't fit|can't|cannot|There's no room|isn't a container/i, timeout: 4)
+    respond "    [debug] PUT: #{lines.inspect}" if debug
+  end
+  waitrt?
+  still_held = held_objs.any? { |o| o.id == obj.id }
+  [!still_held, lines.join(" ").gsub(/\s+/, " ").strip]
+end
+
+# Returns [success_bool, message].
+def stow_vial(vial, container_noun, debug)
+  stow_object(vial, container_noun, debug)
+end
+
+# Put an arbitrary held item away. Returns true on success.
+def stow_held(obj, container_noun, debug)
+  ok, _msg = stow_object(obj, container_noun, debug)
+  ok
+end
+
+def resolve_poison(input)
+  key = input.to_s.strip.downcase
+  return key if POISONS.key?(key)
+  return POISON_ALIASES[key] if POISON_ALIASES.key?(key)
+  # fuzzy: match the start of a tag or anywhere in the name
+  POISONS.keys.find { |k| k.start_with?(key) } ||
+    POISONS.keys.find { |k| POISONS[k][:name].downcase.include?(key) }
+end
+
+def usage
+  respond <<~HELP
+    toxicologist -- craft poison vials (FEAT POISONCRAFT) and apply or stow them.
+
+    Usage:
+      ;toxicologist <poison>                 create one vial and APPLY it (default)
+      ;toxicologist <poison> apply           create one vial and APPLY it
+      ;toxicologist <poison> stow            create one vial, STOW it (default container)
+      ;toxicologist <poison> stow <noun>     create + PUT into container <noun>
+      ;toxicologist <poison> x5              create five (combine with stow/apply)
+      ;toxicologist <poison> stow x5 <noun>  order of options doesn't matter
+      ;toxicologist <poison> ... debug       also dump raw CREATE/APPLY game output
+      ;toxicologist kits                     show kit count + saved settings
+      ;toxicologist buy [N] [container]      buy N kits; STOW them (or PUT into <noun>)
+      ;toxicologist autobuy on|off          auto-buy missing kits (persistent)
+      ;toxicologist list                     list poison names + short codes
+      ;toxicologist help                     this help
+
+    Auto-buying kits:
+      With AUTOBUY ON (a per-character setting that persists between sessions), if
+      you run out of apothecary kits the script will go2 'rogue guild shop'
+      (nearest guild shop), DEPOSIT ALL and withdraw a weightless bank NOTE for
+      payment, and ORDER -> BUY a kit. With AUTOBUY OFF (default) it just warns
+      you and stops when you run out.
+
+      For travel into the guild, save your rogue_password in go2:
+        ;vars set rogue_password=rub, tap, kick, punch, scream, flail
+
+    Each vial consumes one unremarkable apothecary kit (Rogue Guild shop, 10k).
+    Hold the kit in one hand and your armament in the other; CREATE transforms
+    the kit into a vial in that hand, then APPLY coats the armament.
+  HELP
+end
+
+def list_poisons
+  respond "toxicologist: available poisons (code -- name [rank]):"
+  respond "  Disabling poisons:"
+  POISONS.select { |_, v| v[:type] == :disabling }.each do |tag, v|
+    respond sprintf("    %-12s %s  [rank %d]", tag, v[:name], v[:rank])
+  end
+  respond "  Deadly poisons:"
+  POISONS.select { |_, v| v[:type] == :deadly }.each do |tag, v|
+    respond sprintf("    %-12s %s  [rank %d]", tag, v[:name], v[:rank])
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+tokens = Array(script.vars)[1..-1].to_a.map { |t| t.to_s.strip }.reject(&:empty?)
+
+if tokens.empty? || tokens[0] =~ /\A(?:help|\?|-h|--help)\z/i
+  usage
+  exit
+end
+
+# Set a boolean CharSettings flag from a subcommand argument.
+def handle_toggle(label, key, arg)
+  case arg.to_s.downcase
+  when "on", "enable", "true", "yes", "1"   then set_bool(key, true)
+  when "off", "disable", "false", "no", "0" then set_bool(key, false)
+  when "status", "?"                         then # just report
+  else
+    respond "toxicologist: usage -- ;toxicologist #{label} on|off"
+    return
+  end
+  respond "toxicologist: #{label} is #{CharSettings[key] == true ? 'ON' : 'OFF'} (saved for #{(Char.name rescue XMLData.name)})."
+end
+
+def show_settings
+  respond "toxicologist settings (saved for #{(Char.name rescue XMLData.name)}):"
+  respond "  autobuy  #{autobuy_enabled? ? 'ON' : 'OFF'}   when out of kits: go2 '#{SHOP_DEST}', bank, and buy"
+  respond "  kits on hand: #{count_kits}"
+end
+
+case tokens[0].downcase
+when "list", "poisons"
+  list_poisons
+  exit
+when "kits", "kit", "settings", "config", "status"
+  show_settings
+  exit
+when "autobuy", "auto", "buykits"
+  handle_toggle("autobuy", "autobuy", tokens[1])
+  exit
+when "buy"
+  rest    = tokens[1..-1].to_a
+  dbg     = rest.any? { |t| t =~ /\Adebug\z/i }
+  $toxicologist_debug = dbg
+  rest    = rest.reject { |t| t =~ /\Adebug\z/i }
+  qty     = 1
+  contwds = []
+  rest.each do |t|
+    if t =~ /\Ax?(\d+)\z/i then qty = [$1.to_i, 1].max else contwds << t end
+  end
+  container = contwds.empty? ? nil : contwds.join(" ")
+  stow_desc = container ? "stowing into '#{container}'" : "STOWing (default container)"
+  respond "toxicologist: buying #{qty} apothecary kit#{'s' unless qty == 1}, #{stow_desc}."
+  prepare_funds(qty * KIT_PRICE, true, dbg)
+  bought = 0
+  qty.times do
+    unless free_hand?
+      respond "toxicologist: need a free hand to buy; stopping after #{bought}."
+      break
+    end
+    ok, reason = buy_one_kit(true, dbg)
+    unless ok
+      respond "toxicologist: stopped after #{bought} kit(s) -- #{KIT_FAIL_MSG[reason] || reason}."
+      break
+    end
+    bought += 1
+    kit = holding_kit
+    if kit && !stow_held(kit, container, dbg)
+      where = container ? "'#{container}'" : "your default container (STOW)"
+      respond "toxicologist: couldn't stow the kit into #{where}; it's in your hand. Stopping."
+      break
+    end
+  end
+  respond "toxicologist: bought #{bought} kit(s); you now have #{count_kits} total."
+  exit
+end
+
+poison_input = tokens.shift
+tag = resolve_poison(poison_input)
+if tag.nil?
+  respond "toxicologist: unknown poison '#{poison_input}'."
+  respond "  Use ;toxicologist list to see valid poisons."
+  exit
+end
+
+action     = :apply         # default per the request: create then apply
+count      = 1
+debug      = false
+stow_words = []
+
+tokens.each do |tok|
+  case tok
+  when /\A(?:apply|coat)\z/i        then action = :apply
+  when /\A(?:stow|store|save|put)\z/i then action = :stow
+  when /\Adebug\z/i                 then debug = true
+  when /\Ax(\d+)\z/i                then count = [$1.to_i, 1].max
+  when /\A(\d+)\z/                  then count = [tok.to_i, 1].max
+  else stow_words << tok            # leftover words = container noun for stow
+  end
+end
+
+stow_container = stow_words.empty? ? nil : stow_words.join(" ")
+poison = POISONS[tag]
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+action_label = case action
+               when :apply then "apply to your readied armament"
+               when :stow  then stow_container ? "stow in '#{stow_container}'" : "STOW (default container)"
+               end
+
+$toxicologist_debug = debug
+autobuy = autobuy_enabled?
+kits    = count_kits
+
+respond "toxicologist: making #{count} vial#{'s' unless count == 1} of #{poison[:name]} [#{tag}], then #{action_label}."
+respond "toxicologist: #{kits} apothecary kit#{'s' unless kits == 1} on hand (autobuy #{autobuy ? 'ON' : 'OFF'})."
+
+if kits < count
+  shortfall = count - kits
+  if autobuy
+    respond "toxicologist: short #{shortfall} kit(s); will buy as needed."
+    # Bulk-prepare so we only bank/travel once: convert funds to a (weightless)
+    # note, then go to the shop.
+    prepare_funds(shortfall * KIT_PRICE, true, debug)
+    unless in_shop?
+      respond "toxicologist: heading to the Rogue Guild shop (#{SHOP_DEST})..."
+      ensure_at_shop(true, debug)
+    end
+  else
+    respond "toxicologist: only #{kits} kit(s) for #{count} vial(s); will stop when they run out. (;toxicologist autobuy on to buy more.)"
+    if kits.zero?
+      respond "toxicologist: no kits and autobuy is OFF -- aborting."
+      exit
+    end
+  end
+end
+
+made    = 0
+applied = 0
+stowed  = 0
+
+count.times do |i|
+  respond "  [#{i + 1}/#{count}] creating #{poison[:name]}..."
+  vial, err = create_one(tag, autobuy, debug)
+  if vial.nil?
+    respond "    -> create failed: #{err}"
+    respond "    -> stopping (likely out of kits or untrained for this poison)."
+    break
+  end
+  made += 1
+  respond "    -> created: #{vial.name}"
+
+  case action
+  when :apply
+    ok, result = apply_vial(debug)
+    if ok
+      applied += 1
+      respond "    -> applied."
+    else
+      respond "    -> APPLY failed: #{result.empty? ? '(no output captured)' : result}"
+      respond "    -> stopping (poison still in hand; fix APPLY or stow it before continuing)."
+      break
+    end
+  else # :stow
+    ok, msg = stow_vial(vial, stow_container, debug)
+    if ok
+      stowed += 1
+      respond stow_container ? "    -> stowed in '#{stow_container}'." : "    -> STOWed (default container)."
+    else
+      respond "    -> couldn't stow: #{msg}"
+      respond "    -> stopping so the vial isn't lost; it's in your hand."
+      break
+    end
+  end
+end
+
+respond ""
+summary = "toxicologist: done. Created #{made}/#{count} vial(s) of #{poison[:name]}."
+summary += " Applied #{applied}." if action == :apply
+summary += stow_container ? " Stowed #{stowed} in '#{stow_container}'." : " STOWed #{stowed}." if action == :stow
+respond summary
+respond "toxicologist: #{count_kits} apothecary kit(s) remaining."
