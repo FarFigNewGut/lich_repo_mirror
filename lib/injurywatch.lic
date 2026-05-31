@@ -20,18 +20,26 @@
   Dead people show their injury status too, e.g. "Dead - Bleeding", so you
   know what they will need before they are raised.
 
+  Empaths are marked with [E] and sorted lower in the list since they can
+  heal themselves. Dead empaths are still shown at the top - they can't
+  raise themselves.
+
   The display updates automatically when:
       - Someone arrives or leaves the room
       - You change rooms (clears and rescans)
       - You manually appraise someone
-      - A dead person is raised (checked every 15 seconds)
+      - A dead person is raised
+      - Someone in the room is healed (script watches for healing activity
+        and updates or re-checks status automatically)
 
-  Note: The window only updates when an appraise is performed. In active
-  combat situations statuses may lag behind until you manually appraise
-  the person.
+  Healing detection is best-effort. The script catches most healing activity
+  including the standard messages and common custom styles, but empaths with
+  fully custom messaging may be missed. A manual appraise always corrects it.
 
-  To update someone's status after they have been healed, simply appraise
-  them manually and the window will update automatically.
+  Empath identification uses three sources (any combination works):
+      1. Your Highlight-manager character data, if you have that script installed
+      2. A silent WHO PROFESSION EMPATH check run when the script starts
+      3. Live detection - anyone seen performing a wound transfer in-room
 
   To start with debug output:
       ;injurywatch debug
@@ -57,17 +65,35 @@
   Known issues:
       - Dead person detection and revival tracking are still being refined.
         If someone shows incorrect Dead status manually appraise them to correct it.
-      - Cannot auto-detect when another empath heals someone.
-        Manually appraise them to update their status in the window.
       - Bodies fogged or dragged in may briefly show ? before resolving.
       - Poisoned and Diseased statuses are not yet fully tested.
+      - Empaths using fully custom transfer messaging may not be detected
+        as healers until they perform a transfer in-room.
 
        author: Mystienne
          game: gs
          tags: heal, empath, triage, injury, window, hud
+      version: 0.1.0
      required: Lich >= 5.11.0
         email: Mystienne@mystienne.com
       discord: Mystienne
+
+  Version Control:
+    Major_change.feature_addition.bugfix
+
+  v0.1.0 (2026-05-31)
+    - The window now tries to update on its own when someone is being healed,
+      without needing a manual appraise. It watches for healing activity in
+      the room (someone healing a patient, an empath healing their own
+      transferred wounds, or standard heal completion messages) and
+      re-checks the patient's status automatically once things go quiet.
+      Covers most situations but cannot catch every custom empath style.
+    - Known empaths are now marked with [E] in the window and sorted toward
+      the bottom of the list since they can heal themselves. Dead empaths
+      still show at the top where they belong.
+    - The script now figures out who is an empath three ways: your
+      namehighlights data if you have it, a silent WHO check at startup,
+      and watching who performs transfers while you are in the room.
 
 =end
 
@@ -80,6 +106,92 @@ module InjuryWatch
 
   CHECK_EVERY = 1.0
 
+  # ---------------------------------------------------------------------------
+  # Optional namehighlights empath database integration
+  #
+  # If the user has namehighlights.lic installed, load its character data YAML
+  # to get a fast Set of known empath nouns. Used to reduce false positives in
+  # healing detection (e.g. don't treat a Warrior's herb-heal as empath TRAN).
+  #
+  # Gracefully returns an empty Set if the script isn't installed or the file
+  # doesn't exist — all detection logic falls back to "assume could be empath".
+  # ---------------------------------------------------------------------------
+  def self.load_empath_db
+    require 'yaml'
+    require 'set'
+
+    nh_script = defined?(SCRIPT_DIR) ? File.join(SCRIPT_DIR, 'namehighlights.lic') : nil
+    return Set.new unless nh_script && File.exist?(nh_script)
+
+    windows    = ENV['OS'].to_s =~ /windows/i || File::ALT_SEPARATOR == '\\'
+    export_dir = windows ? 'C:/Gemstone IV Highlights' : File.join(Dir.home, 'GemStone IV Highlights')
+    data_path  = File.join(export_dir, 'namehighlights-characterdata.yml')
+    return Set.new unless File.exist?(data_path)
+
+    data   = YAML.safe_load(File.read(data_path)) || {}
+    names  = data.is_a?(Hash) ? (data['names'] || {}) : {}
+    result = Set.new
+    names.each do |key, record|
+      next unless record.is_a?(Hash)
+      result << key.downcase if record['profession'].to_s.strip == 'Empath'
+    end
+    result
+  rescue StandardError => e
+    respond "[InjuryWatch] empath DB load failed: #{e.message}" if @debug
+    Set.new
+  end
+
+  # ---------------------------------------------------------------------------
+  # WHO PROFESSION EMPATH scan
+  #
+  # Runs once at startup in a background thread. Parses the columnar name list
+  # and adds every result to the session_empaths Set.
+  # Output format:
+  #   Brave Adventurers Questing:
+  #   Serevyn           Mystienne         Channell          ...
+  #   Total: 37
+  # ---------------------------------------------------------------------------
+  def self.who_empath_scan(session_empaths)
+    require 'set'
+
+    # Mirror namehighlights' proven quiet WHO approach exactly.
+    lines = Lich::Util.quiet_command_xml(
+      "who profession empath",
+      /Brave Adventurers Questing:|Total:\s*\d+|There are no adventurers/i,
+      /<prompt/i,
+      true,
+      8,
+      true
+    )
+
+    count    = 0
+    in_list  = false
+    lines.each do |raw|
+      plain = raw.gsub(/<[^>]+>/, '').strip
+      next if plain.empty?
+      if plain =~ /Brave Adventurers Questing:/i
+        in_list = true
+        next
+      end
+      break if plain =~ /^Total:\s*\d+/i
+      next unless in_list
+      plain.scan(/\b[A-Z][A-Za-z'-]{1,29}\b/) do |name|
+        session_empaths << name.downcase
+        count += 1
+      end
+    end
+    count
+  rescue StandardError => e
+    respond "[InjuryWatch] WHO scan failed: #{e.message}" if @debug
+    0
+  end
+
+  # True if noun is in the unified empath Set, or if the Set is empty
+  # (can't rule anyone out — safe fallback preserves detection coverage).
+  def self.empath_candidate?(noun, session_empaths)
+    session_empaths.empty? || session_empaths.include?(noun.downcase)
+  end
+
   WOUND_SCAN = /a (?:black-and-blue|severe bruises and swelling around|missing|blinded|swollen|bruised) (?:left|right) eye|old battle scars on (?:his|her) (?:left|right) (?:hand|arm|leg)|mangled (?:left|right) (?:hand|arm|leg)|missing (?:left|right) (?:hand|arm|leg)|deep lacerations across (?:his|her) \w+|deep gashes and serious bleeding (?:on|from|across) (?:his|her) \w+|minor cuts and bruises on (?:his|her) (?:left|right) (?:hand|arm|leg)|a (?:fractured and bleeding|completely severed) (?:left|right) (?:hand|arm|leg)|moderate bleeding from (?:his|her) neck|snapped bones and serious bleeding from the neck|minor bruises on (?:his|her) neck|scar across (?:his|her) neck|some old neck wounds|terrible scars from some serious neck injury|minor (?:bruises|lacerations) about the head|minor cuts and bruises on (?:his|her) (?:chest|back|abdominal(?: area)?)|severe head trauma and bleeding from the ears|strange case of muscle twitching|case of (?:sporadic|uncontrollable) convulsions|scar across (?:his|her) face|several facial scars|old mutilation wounds about (?:his|her) head|old battle scar across (?:his|her) (?:chest|back|abdominal(?: area)?)|several painful-looking scars across (?:his|her) (?:chest|back|abdominal(?: area)?)|terrible, permanent mutilation of (?:his|her) (?:chest|back|abdominal(?: area)?) muscles|developed slurred speech|constant muscle spasms|a very difficult time with muscle control|overexerted/i
 
   SCAR_WORDS  = /scar|old battle|old mutilation|mutilat|painful-looking|permanent mutilation/i
@@ -87,15 +199,43 @@ module InjuryWatch
   NERVE_WORDS = /muscle twitching|convulsions|slurred speech|muscle spasms|muscle control/i
   WOUND_WORDS = /fractured|severed|mangled|missing|crushed|broken|bruise|bruises|trauma/i
 
+  # Matches the "all blood restored" bystander message across all known custom themes:
+  #   Default:        "X appears entirely restored."
+  #   Pain (#232):    "X takes on a much healthier tint, leaving Empath waxen and dizzy."
+  #   Clinical (#233):"X appears entirely refreshed under Empath's care."
+  #   Light Touch:    "Empath pales slightly, but X takes on the flush of full health."
+  #   Mental (#235):  "X appears fully revitalized under Empath's gentle minstrations."
+  #   Spiritual (#236):"Nebulous wisps drift around X, entirely revitalizing her..."
+  #   Blood Magic:    "A faint crimson haze...restoring her to full vigor."
+  # Used with a name-anchored scan so we check for a known PC noun in the same line.
+  HEALED_FULLY = /
+    (?:entirely|fully)\s+(?:restored|refreshed|revitalized) |
+    flush\s+of\s+full\s+health                              |
+    entirely\s+revitalizing                                 |
+    full\s+vigor                                            |
+    healthier\s+tint
+  /xi
+
   @debug           = false
   @bulk_appraising = false
   @warned_mode     = false
+  @session_empaths = Set.new
 
   def self.debug?;            @debug;            end
   def self.debug=(v);         @debug = v;        end
   def self.dbg(msg);          respond "[IW] #{msg}" if @debug; end
   def self.bulk_appraising?;  @bulk_appraising;  end
   def self.bulk_appraising=(v); @bulk_appraising = v; end
+  def self.session_empaths;     @session_empaths;   end
+  def self.session_empaths=(v); @session_empaths = v; end
+
+  # Returns the display label for a person, prefixing known empaths with [E].
+  # Cross-platform text marker — no Unicode, no color, works on Mac/Win/Linux
+  # in all display modes (dock, popup, text).
+  def self.person_label(noun, status)
+    prefix = @session_empaths.include?(noun.downcase) ? '[E] ' : ''
+    "#{prefix}#{noun}: #{status}"
+  end
 
   # ---------------------------------------------------------------------------
   # Triage priority - lower = higher priority = shown first
@@ -113,7 +253,13 @@ module InjuryWatch
   end
 
   def self.sort_people(people_status)
-    people_status.values.sort_by { |p| [status_priority(p[:status]), p[:noun].downcase] }
+    people_status.values.sort_by { |p|
+      # Dead empaths stay at top — they can't self-raise.
+      # All other empaths sort after non-empaths of the same status (they can self-heal).
+      dead      = p[:status] =~ /^Dead/ ? true : false
+      is_empath = !dead && @session_empaths.include?(p[:noun].downcase)
+      [status_priority(p[:status]), is_empath ? 1 : 0, p[:noun].downcase]
+    }
   end
 
   # Count people needing healing (anything that isn't OK, ..., or ?)
@@ -250,7 +396,7 @@ module InjuryWatch
           @vbox.pack_start(lbl, expand: false, fill: false, padding: 1)
         else
           rows.each do |person|
-            lbl = Gtk::Label.new("#{person[:noun]}: #{person[:status]}")
+            lbl = Gtk::Label.new(InjuryWatch.person_label(person[:noun], person[:status]))
             lbl.set_alignment(0.0, 0.5)
             @vbox.pack_start(lbl, expand: false, fill: false, padding: 1)
           end
@@ -396,7 +542,7 @@ module InjuryWatch
     xml += "<openDialog type='dynamic' id='InjuryWatch' title='Injury Watch' "
     xml += "target='InjuryWatch' location='main' height='#{height}' width='220' resident='true'>"
     xml += "<dialogData id='InjuryWatch' clear='t'>"
-    xml += "<label id='iw_title' value='~ Triage Summary ~' justify='4' top='2' left='5' height='14' width='210'/>"
+    xml += "<label id='iw_title' value='~ Triage Summary ~' justify='4' top='2' left='20' height='14' width='190'/>"
     xml += "<label id='iw_h1a' value='Here:' justify='4' top='20' left='5'   height='14' width='45'/>"
     xml += "<label id='iw_h1b' value='Need:' justify='4' top='20' left='75'  height='14' width='45'/>"
     xml += "<label id='iw_h1c' value='OK:'   justify='4' top='20' left='145' height='14' width='40'/>"
@@ -410,7 +556,7 @@ module InjuryWatch
     else
       rows.each_with_index do |person, i|
         top   = top_pad + (i * row_height)
-        label = "#{person[:noun]}: #{person[:status]}"
+        label = InjuryWatch.person_label(person[:noun], person[:status])
         xml += "<label id='iw#{i}' value='#{xml_escape(label)}' justify='4' "
         xml += "top='#{top}' left='5' height='#{row_height}' width='200'/>"
       end
@@ -439,7 +585,7 @@ module InjuryWatch
         respond "~ Triage Summary ~"
         respond "Here: #{total}  Need: #{needs}  OK: #{ok_count}"
         respond "--------------------"
-        rows.empty? ? respond("  No one here.") : rows.each { |p| respond "  #{p[:noun]}: #{p[:status]}" }
+        rows.empty? ? respond("  No one here.") : rows.each { |p| respond "  #{InjuryWatch.person_label(p[:noun], p[:status])}" }
         respond "--------------------"
       end
     end
@@ -460,30 +606,153 @@ module InjuryWatch
     checked       = {}
     people_status = {}
     refresh_queue = []
+    heal_pending  = {}  # noun.downcase => Time deadline for debounced re-appraise
+
+    # Single unified empath Set: YAML history + WHO online scan + live observations.
+    # All three layers write to the same Set so empath_candidate? has one place to check.
+    # Assigning to the module attribute lets display methods reach it without extra params.
+    session_empaths = InjuryWatch.load_empath_db  # seed with YAML history
+    InjuryWatch.session_empaths = session_empaths  # same object — mutations shared
+    yaml_count      = session_empaths.size
+
+    if @debug
+      if session_empaths.empty?
+        dbg "empath DB not available (namehighlights not installed or no data yet)"
+      else
+        dbg "empath DB loaded: #{yaml_count} known empaths"
+      end
+    end
+
+    # WHO scan runs in background and merges into the same Set.
+    Thread.new do
+      sleep 3
+      before = session_empaths.size
+      count  = InjuryWatch.who_empath_scan(session_empaths)
+      added  = session_empaths.size - before
+      dbg "WHO scan complete: #{count} online (#{added} new), #{session_empaths.size} total known empaths"
+    end
 
     # get is called in main loop each tick to check for refresh commands
 
-    # Combat injury detection and other-empath heal detection
+    # ---------------------------------------------------------------------------
+    # Combat watch: injury detection + activity-based healing detection
+    #
+    # Healing strategy: we can't enumerate all 400+ custom transfer message
+    # variants, so we use two complementary signals:
+    #
+    #   1. HEALED_FULLY keyword scan (name-anchored) — covers the default message
+    #      and all 6 known Rumor Woods custom themes by vocabulary. When a known
+    #      PC's noun appears in a line with a full-heal keyword, set OK immediately.
+    #
+    #   2. "X's [body part] looks better." — a fixed engine message (not part of
+    #      the customizable TRAN messaging system). Fires when:
+    #        a) An empath uses a direct heal spell on a patient (patient's name)
+    #        b) An empath heals their own transferred wounds (empath's name)
+    #      In case (a) we debounce a re-appraise for that person.
+    #      In case (b) the name isn't injured/not in our window — we debounce
+    #      re-appraises for everyone currently injured in the room.
+    #
+    #   3. Default wound-transfer text — supplemental, fires early so the display
+    #      shows "..." while healing is in progress even before it completes.
+    # ---------------------------------------------------------------------------
     DownstreamHook.add("iw_combat_watch", proc { |line|
       plain = line.gsub(/<[^>]+>/, ' ').gsub(/\s+/, ' ').strip
       noun  = nil
 
-      # Other empath healing: "Devantis's head wound gradually fades..."
-      # Target is being healed - queue re-appraise after a delay
-      if plain =~ /^(\w+)'s \w+ wound gradually fades/i
-        noun = Regexp.last_match(1)
+      # --- Full-heal detection: name-anchored keyword scan ---
+      # Covers default + all known Rumor Woods custom themes via shared vocabulary.
+      # Any future custom that uses similar language is caught automatically.
+      if plain =~ HEALED_FULLY
+        people_status.each do |id, p|
+          next if p[:status] =~ /^Dead/
+          next unless plain =~ /\b#{Regexp.escape(p[:noun])}\b/i
+          dbg "full-heal keyword -> #{p[:noun]} = OK"
+          people_status[id][:status] = "OK"
+          heal_pending.delete(p[:noun].downcase)
+          display(people_status)
+          break
+        end
+        next line
+      end
+
+      # --- "X's [body part] looks better." ---
+      # Fixed engine message — not part of the customizable TRAN system.
+      if plain =~ /^(\w+)'s .+ looks better\.?$/i
+        noun  = Regexp.last_match(1)
         entry = people_status.find { |_id, p| p[:noun].downcase == noun.downcase }
-        if entry && entry[1][:status] !~ /^OK$/
-          dbg "other empath heal -> #{noun} being healed, queuing re-appraise (5s delay)"
-          Thread.new do
-            sleep 5
-            refresh_queue << "refresh #{noun}"
+
+        if entry && entry[1][:status] !~ /^OK$|^Dead/
+          # Tracked injured person — direct heal in progress on them
+          dbg "looks better (patient) -> #{noun}, debouncing re-appraise"
+          entry[1][:status] = "..."
+          heal_pending[noun.downcase] = Time.now + 4
+          display(people_status)
+        elsif entry.nil? || entry[1][:status] =~ /^OK$/
+          # Name not injured / not in our window — could be empath healing
+          # their own transferred wounds. Only trigger if they're a known empath
+          # (or we have no DB, in which case we can't rule it out).
+          if InjuryWatch.empath_candidate?(noun, session_empaths)
+            injured = people_status.select { |id, p|
+              (entry.nil? || id != entry[0]) &&
+              p[:status] !~ /^OK$|^\.\.\.$|\?|^Dead/
+            }
+            unless injured.empty?
+              dbg "looks better (empath self-heal #{noun}) -> #{injured.length} injured, debouncing"
+              injured.each do |id, p|
+                people_status[id][:status] = "..."
+                heal_pending[p[:noun].downcase] = Time.now + 5
+              end
+              display(people_status)
+            end
+          else
+            dbg "looks better (#{noun}) -> not a known empath, ignoring"
           end
         end
         next line
       end
 
-      # Combat injury detection - only triggers if person is currently OK
+      # --- Empath initial focus detection ---
+      # Default TRAN start: "Serevyn focuses on Whispergrass with intense concentration."
+      # Customizable, so we only act on it when we can confirm the actor is an empath.
+      # Pre-sets the patient to "..." so the display shows activity immediately,
+      # and arms a longer debounce in case the full-heal keyword never fires.
+      if plain =~ /^(\w+) focuses on (\w+) with/i
+        actor   = Regexp.last_match(1)
+        patient = Regexp.last_match(2)
+        if InjuryWatch.empath_candidate?(actor, session_empaths)
+          # Live confirmation — tag actor as empath for this session
+          unless session_empaths.include?(actor.downcase)
+            session_empaths << actor.downcase
+            dbg "empath confirmed (TRAN focus): #{actor} added to session cache"
+          end
+          patient_entry = people_status.find { |_id, p| p[:noun].downcase == patient.downcase }
+          if patient_entry && patient_entry[1][:status] !~ /^Dead|\.\.\./
+            dbg "empath focus -> #{actor} targeting #{patient}, setting ..."
+            patient_entry[1][:status] = "..."
+            heal_pending[patient.downcase] = Time.now + 10
+            display(people_status)
+          end
+        end
+        next line
+      end
+
+      # --- Default wound-transfer text (supplemental signal) ---
+      # Customizable, so not reliable — but catches the majority who use defaults
+      # and gives early "..." feedback before the heal completes.
+      if plain =~ /^(\w+)'s \w+(?:\s+\w+)? wound gradually fades/i
+        noun  = Regexp.last_match(1)
+        entry = people_status.find { |_id, p| p[:noun].downcase == noun.downcase }
+        if entry && entry[1][:status] !~ /^OK$|^Dead/
+          dbg "wound fades (default text) -> #{noun} healing in progress"
+          entry[1][:status] = "..."
+          heal_pending[noun.downcase] ||= Time.now + 6
+          display(people_status)
+        end
+        next line
+      end
+
+      # --- Combat injury detection ---
+      # Only promotes someone from OK to "..." — never overwrites a worse status.
       if plain =~ /^(\w+)'s? (?:left |right )?(?:arm|leg|hand|eye|chest|neck|back|head|abdomen)/i
         noun = Regexp.last_match(1)
       elsif plain =~ /^(\w+) is (?:stunned|bleeding|knocked|struck|hit|burned|frozen|electrified)/i
@@ -789,6 +1058,33 @@ module InjuryWatch
             display(people_status)
           end
         end
+      end
+
+      # --- Debounced re-appraise timers ---
+      # heal_pending entries are set by the healing detection hooks.
+      # Each entry fires once, after no new healing signal has been seen
+      # for that person for N seconds (4s direct heal, 5s empath self-heal,
+      # 6s default wound-fade). This avoids stacking appraises mid-heal.
+      now = Time.now
+      heal_pending.keys.each do |noun|
+        next unless now >= heal_pending[noun]
+        heal_pending.delete(noun)
+        entry = people_status.find { |_id, p| p[:noun].downcase == noun }
+        next unless entry
+        next if people_status[entry[0]][:status] =~ /^OK$/  # already resolved
+        dbg "debounced re-appraise firing: #{noun}"
+        InjuryWatch.bulk_appraising = true
+        result = appraise(entry[1][:noun])
+        InjuryWatch.bulk_appraising = false
+        next if result == "?"
+        if result =~ /^Dead/
+          injury = result.gsub(/^Dead\s*-?\s*/i, '').strip
+          injury = "Unknown" if injury.empty?
+          people_status[entry[0]][:status] = "Dead - #{injury}"
+        else
+          people_status[entry[0]][:status] = result
+        end
+        display(people_status)
       end
 
       exit if display_mode == :popup && PopupDisplay.exit_requested?
