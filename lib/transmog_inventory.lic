@@ -3,8 +3,8 @@
 
   Inspects every transmogrification (appearance-transfer) item stored in a
   container -- by default a chest in your locker -- and writes a catalog to a
-  CSV file listing each item's noun, full name, and where it is worn. The CSV
-  opens directly in Excel and imports cleanly into Google Sheets.
+  CSV file listing each item's noun, full name, where it is worn, and quantity.
+  The CSV opens directly in Excel and imports cleanly into Google Sheets.
 
   Usage:
     Scan (MERGES results into the saved list, deduped by full name):
@@ -35,6 +35,10 @@
 
       ;transmog_inventory help          this help
 
+    Let others search your catalog via THINK (companion script):
+      ;thinkmog                  listen for THINK TO searches
+      ;thinkmog ad                 post merchant notice once
+
   How it works:
     - Each candidate item is briefly pulled into your hand so it can be
       ANALYZEd (to confirm it is a transmog) and INSPECTed (to learn where it
@@ -56,28 +60,35 @@
 
   Output:
     <lich>/scripts/transmog/transmog_inventory_<character>.csv
-    Columns: Noun, Full Name, Worn Location
+    Columns: Noun, Full Name, Worn Location, Quantity
 
          author: Mara
            game: Gemstone
            tags: transmog, inventory, locker, items
-        version: 1.1.0
-
-  Version Control:
-    1.1.0 (2026-05-31)
-      Scans now MERGE results into the saved list by default (deduped by full
-        name), so you can build a catalog across multiple containers.
-      Added "new" (aliases fresh/reset/rebuild) to wipe the saved list and scan
-        from scratch.
-      Added "remove" (aliases rm/delete/del) to delete catalog entries using the
-        same search syntax; refuses to remove when more than one entry matches
-        unless prefixed with "all" (guards against accidental mass deletion).
-      Refactored search/remove onto a shared catalog reader/writer and matcher.
-    1.0.0 (2026-05-31)
-      Initial release.
+        version: 1.1.1
 =end
 
 require 'csv'
+
+# Changelog:
+# 1.1.1 (2026-05-31)
+#   - Bugfix: each scanned item is now returned in an ensure block so exceptions
+#     or interrupted logic do not leave it stranded in hand.
+#   - Bugfix: quantity is now persisted to CSV (new "Quantity" column) instead of
+#     only being shown in console output.
+#   - Backward compatible: older CSV files without "Quantity" are read as qty=1.
+#
+# 1.1.0 (2026-05-31)
+#   - Scans now MERGE results into the saved list by default (deduped by full
+#     name), so you can build a catalog across multiple containers.
+#   - Added "new" (aliases fresh/reset/rebuild) to wipe the saved list and scan
+#     from scratch.
+#   - Added "remove" (aliases rm/delete/del) to delete catalog entries using the
+#     same search syntax; refuses to remove when more than one entry matches
+#     unless prefixed with "all" (guards against accidental mass deletion).
+#   - Refactored search/remove onto a shared catalog reader/writer and matcher.
+# 1.0.0 (2026-05-31)
+#   - Initial release.
 
 # Candidate Lich item types that can ever be a transmog item (mirrors eloot/foreach).
 TRANSMOG_TYPES   = /jewelry|clothing|armor|weapon|uncommon/i
@@ -158,6 +169,8 @@ def usage
 
       ;transmog_inventory help          this help
 
+    Let others search via THINK: ;thinkmog  |  merchant ad: ;thinkmog ad
+
     Stand at your open locker with the chest accessible (or have the container
     worn/held), with at least one free hand. Output (CSV, opens in Excel /
     Google Sheets) is written to:
@@ -165,22 +178,35 @@ def usage
   HELP
 end
 
-# Read the saved CSV into an array of {noun:, name:, location:} hashes.
+# Read the saved CSV into an array of {noun:, name:, location:, quantity:} hashes.
 def read_catalog
   path = csv_path
   return [] unless File.exist?(path)
   CSV.read(path, headers: true).map do |r|
-    { noun: r["Noun"].to_s, name: r["Full Name"].to_s, location: r["Worn Location"].to_s }
+    qty = r["Quantity"].to_s.strip
+    qty = qty =~ /\A\d+\z/ ? qty.to_i : 1
+    qty = 1 if qty < 1
+    {
+      noun:     r["Noun"].to_s,
+      name:     r["Full Name"].to_s,
+      location: r["Worn Location"].to_s,
+      quantity: qty,
+    }
   end
 end
 
-# Write an array of {noun:, name:, location:} hashes to the CSV. Returns the path.
+# Write an array of {noun:, name:, location:, quantity:} hashes to the CSV.
+# Returns the path.
 def write_catalog(rows)
   out_file = csv_path
   FileUtils.mkdir_p(File.dirname(out_file))
   CSV.open(out_file, "w") do |csv|
-    csv << ["Noun", "Full Name", "Worn Location"]
-    rows.each { |r| csv << [r[:noun], r[:name], r[:location]] }
+    csv << ["Noun", "Full Name", "Worn Location", "Quantity"]
+    rows.each do |r|
+      qty = r[:quantity].to_i
+      qty = 1 if qty < 1
+      csv << [r[:noun], r[:name], r[:location], qty]
+    end
   end
   out_file
 end
@@ -209,7 +235,7 @@ def entry_matches?(entry, terms)
     if col
       entry[col].to_s.downcase.include?(needle)
     else
-      [entry[:noun], entry[:name], entry[:location]].any? { |f| f.to_s.downcase.include?(needle) }
+      [entry[:noun], entry[:name], entry[:location], entry[:quantity]].any? { |f| f.to_s.downcase.include?(needle) }
     end
   end
 end
@@ -223,7 +249,10 @@ def pretty_terms(terms)
 end
 
 def show_entry(prefix, e)
-  respond "  #{prefix}[#{e[:location]}]  #{e[:name]}  (#{e[:noun]})"
+  qty = e[:quantity].to_i
+  qty = 1 if qty < 1
+  qtag = qty > 1 ? " x#{qty}" : ""
+  respond "  #{prefix}[#{e[:location]}]  #{e[:name]}  (#{e[:noun]})#{qtag}"
 end
 
 # Print catalog rows matching the query (AND of all terms).
@@ -496,64 +525,75 @@ order.each_with_index do |name, idx|
   tag = qty[name] > 1 ? " (x#{qty[name]})" : ""
   respond "  [#{idx + 1}/#{order.size}] #{name}#{tag}..."
 
-  container, held = acquire_item(container, container_noun, name)
-  if held.nil?
-    respond "    -> couldn't retrieve it after retries (locker IDs may be rolling); skipping."
-    skipped << name
-    next
+  item_id = nil
+  begin
+    container, held = acquire_item(container, container_noun, name)
+    if held.nil?
+      respond "    -> couldn't retrieve it after retries (locker IDs may be rolling); skipping."
+      skipped << name
+      next
+    end
+
+    item_id   = held.id
+    item_noun = held.noun.to_s
+
+    analyze_lines = issue(
+      "analyze ##{item_id}",
+      /You analyze|cannot be analyzed|not a sound idea|isn't a sound idea|don't think/i
+    )
+    respond "    [debug] ANALYZE: #{analyze_lines.inspect}" if debug
+    is_transmog = analyze_lines.any? { |l| l =~ TRANSMOG_LINE }
+
+    unless is_transmog
+      respond "    -> not a transmog; returned."
+      next
+    end
+
+    inspect_lines = issue(
+      "inspect ##{item_id}",
+      /you could wear|not a sound idea|isn't a sound idea|cannot|You carefully inspect|You determine/i
+    )
+    respond "    [debug] INSPECT: #{inspect_lines.inspect}" if debug
+
+    # Match the worn location against the whole INSPECT text (phrasing varies and
+    # the sentence can be split across streamed lines).
+    inspect_text = inspect_lines.join(" ")
+    worn_slot, worn_code = slot_for(inspect_text)
+
+    # Raw location phrase straight from "...you could wear the <noun> <where>."
+    m = inspect_text.match(/you could wear (?:the |your |a |an |some )?(.+?)\.(?:\s|$)/i)
+    worn_phrase = m ? clean_location(m[1], held) : nil
+
+    # CSV location string: prefer the canonical label+code; otherwise fall back to
+    # the raw phrase so unmapped phrasings still show a useful location.
+    worn_location = if worn_code
+                      "#{worn_slot} (#{worn_code})"
+                    elsif worn_phrase && !worn_phrase.empty?
+                      worn_phrase
+                    else
+                      "unknown"
+                    end
+
+    results << {
+      noun:     item_noun,
+      name:     name,
+      location: worn_location,
+      quantity: qty[name],
+    }
+
+    respond "    -> transmog | worn: #{worn_location}"
+  rescue StandardError => e
+    respond "    -> ERROR while processing '#{name}': #{e.class} #{e.message}"
+    skipped << name unless skipped.include?(name)
+  ensure
+    if item_id
+      held_ids = [GameObj.right_hand&.id, GameObj.left_hand&.id]
+      if held_ids.include?(item_id)
+        container, ok = stow_item(container, container_noun, item_id)
+        respond "    -> WARNING: couldn't return '#{name}' to the container; it may be in your hand." unless ok
+      end
+    end
   end
-
-  item_id   = held.id
-  item_noun = held.noun.to_s
-
-  analyze_lines = issue(
-    "analyze ##{item_id}",
-    /You analyze|cannot be analyzed|not a sound idea|isn't a sound idea|don't think/i
-  )
-  respond "    [debug] ANALYZE: #{analyze_lines.inspect}" if debug
-  is_transmog = analyze_lines.any? { |l| l =~ TRANSMOG_LINE }
-
-  unless is_transmog
-    container, _ = stow_item(container, container_noun, item_id)
-    respond "    -> not a transmog; returned."
-    next
-  end
-
-  inspect_lines = issue(
-    "inspect ##{item_id}",
-    /you could wear|not a sound idea|isn't a sound idea|cannot|You carefully inspect|You determine/i
-  )
-  respond "    [debug] INSPECT: #{inspect_lines.inspect}" if debug
-
-  # Match the worn location against the whole INSPECT text (phrasing varies and
-  # the sentence can be split across streamed lines).
-  inspect_text = inspect_lines.join(" ")
-  worn_slot, worn_code = slot_for(inspect_text)
-
-  # Raw location phrase straight from "...you could wear the <noun> <where>."
-  m = inspect_text.match(/you could wear (?:the |your |a |an |some )?(.+?)\.(?:\s|$)/i)
-  worn_phrase = m ? clean_location(m[1], held) : nil
-
-  # CSV location string: prefer the canonical label+code; otherwise fall back to
-  # the raw phrase so unmapped phrasings still show a useful location.
-  worn_location = if worn_code
-                    "#{worn_slot} (#{worn_code})"
-                  elsif worn_phrase && !worn_phrase.empty?
-                    worn_phrase
-                  else
-                    "unknown"
-                  end
-
-  results << {
-    noun:     item_noun,
-    name:     name,
-    location: worn_location,
-  }
-
-  respond "    -> transmog | worn: #{worn_location}"
-
-  container, ok = stow_item(container, container_noun, item_id)
-  respond "    -> WARNING: couldn't return '#{name}' to the container; it may be in your hand." unless ok
 
   if debug && results.size >= 2
     respond "transmog_inventory: debug stop after 2 items. Paste the [debug] lines above."

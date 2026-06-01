@@ -8,14 +8,15 @@
   Each CREATE consumes one "unremarkable apothecary kit" (10,000 silver from the
   Rogue Guild shop). Kits are generic and work for any poison. Keep a stack of
   them in a worn container; the script will pull one into a free hand before each
-  create (and warns you when you run out).
+  create (and warns you when you run out). Kit lookup uses what Lich currently
+  knows (hands, visible inventory, and cached container contents), then falls back
+  to a plain GET by noun.
 
   Usage:
     ;toxicologist <poison>                 create one vial and APPLY it (default)
-    ;toxicologist <poison> apply           create one vial and APPLY it
     ;toxicologist <poison> stow            create one vial, STOW it (default container)
     ;toxicologist <poison> stow <noun>     create + PUT into container <noun>
-    ;toxicologist <poison> x5              create five (combine with stow/apply)
+    ;toxicologist <poison> x5              create five (combine with stow)
     ;toxicologist <poison> stow x5 <noun>  order of options doesn't matter
     ;toxicologist <poison> ... debug       also dump raw CREATE/APPLY game output
     ;toxicologist kits                     show kit count + saved settings
@@ -50,27 +51,33 @@
       messaging differs from the patterns below, run with `debug` and adjust the
       *_RX regexes near the top of this file.
 
-         author: Maraella + cla
+         author: Mara
            game: Gemstone
            tags: rogue, poison, poisoncraft, covert arts, crafting
        requires: Lich >= 5.9.0
-        version: 1.0.0
-
-  Version Control:
-    1.0.0 (2026-05-30)
-      Initial release.
+        version: 1.0.1
 =end
 
 # ---------------------------------------------------------------------------
 # Config / patterns (tweak the regexes if your game messaging differs).
 # ---------------------------------------------------------------------------
 
+# Changelog:
+# 1.0.1 (2026-05-31)
+#   - Clarified kit lookup behavior in header/help text.
+#   - Added KIT_NOUN fallback (`get kit`) when no specific kit id is resolved.
+#   - Tightened ORDER catalog parsing to bind the item number to "apothecary kit"
+#     entries, including two-column/shared lines.
+#   - Hardened autobuy funding prep: verify note value increases after withdraw and
+#     stop early with a clear message if bank-note funding cannot be prepared.
+# 1.0.0 (2026-05-30) Initial release.
+
 # When no container noun is given, items are stowed with the game's STOW verb
 # (into your configured default container). We stow whichever hand holds the item.
 STOW_HAND_RX = /You (?:put|place|stow|tuck)|already|can't|cannot|don't|What were|isn't|full|room|backpack|container|satchel|pack|sack|pouch/i
 
 # How an apothecary kit is recognized in your inventory, and the fallback noun
-# used to GET one if the script can't resolve a specific item id.
+# used to GET one if no specific item id can be resolved from known GameObj data.
 KIT_RX   = /apothecary kit/i
 KIT_NOUN = "kit"
 
@@ -277,7 +284,8 @@ def bank_get_note(amount, debug)
   amt = amount.to_i
   return false if amt < 1
   respond "    -> banking: depositing coins, withdrawing a #{comma_silver(amt)} silver note..."
-  go2_wait('bank')
+  return false unless go2_wait('bank')
+  before_notes = note_silver
   sleep 0.2
   fput 'deposit all'
   waitfor_deposit_all
@@ -285,7 +293,10 @@ def bank_get_note(amount, debug)
   fput "withdraw #{amt} note"
   waitfor_bank_withdraw
   sleep 0.3
-  true
+  after_notes = note_silver
+  ok = after_notes >= (before_notes + amt)
+  respond "    [debug] banking notes: before=#{before_notes}, after=#{after_notes}, need +#{amt}" if debug
+  ok
 end
 
 def comma_silver(n)
@@ -304,8 +315,8 @@ def prepare_funds(total, allow_bank, debug)
   shortfall = total - notes
   # Only coins on hand: deposit all and withdraw one note for the full budget.
   amount = (notes.zero? && spendable_silver >= total) ? total : shortfall
-  bank_get_note(amount, debug)
-  true
+  return false unless bank_get_note(amount, debug)
+  note_silver >= total
 end
 
 # Top up with a note only when we cannot afford `total` yet.
@@ -316,10 +327,13 @@ def ensure_funds(total, allow_bank, debug)
   return true if notes >= total
   spend = spendable_silver
   return false unless allow_bank
-  return bank_get_note(total, debug) if spend >= total && notes.zero? # coins only, too heavy
+  if spend >= total && notes.zero? # coins only, too heavy
+    return false unless bank_get_note(total, debug)
+    return note_silver >= total
+  end
   return false if spend < total
-  bank_get_note(total - notes, debug)
-  true
+  return false unless bank_get_note(total - notes, debug)
+  note_silver >= total
 end
 
 # Ask the current shop for its catalog. Returns the lines (Array of String).
@@ -336,20 +350,21 @@ end
 #   16. <d cmd="order 16 ...">back-sheaths</d>   33. <d cmd="order 33 ...">apothecary kit</d>
 # Never take the first number on the line -- bind to the kit's own entry.
 def kit_order_number(catalog)
-  text = catalog.join("\n")
-
-  # StormFront/HTML: order cmd on the same anchor as the kit name.
-  m = text.match(/order\s+(\d+)\s+color\s+\d+\s+material\s+\d+[^>]*>[^<]*apothecary kit/i)
-  return m[1] if m
-
-  # Plain "33. ... apothecary kit" (allows HTML between the dot and the name).
-  m = text.match(/(\d+)\.\s*(?:<[^>]*>)*[^<]*apothecary kit/i)
-  return m[1] if m
-
-  # Shared catalog line: last "N." before "apothecary kit" on that line.
   catalog.each do |line|
-    next unless line =~ KIT_RX
-    pre = line.split(/apothecary kit/i, 2).first
+    # StormFront/HTML anchors with "order N ...">item name</d>
+    line.scan(/order\s+(\d+)[^>]*>\s*([^<]+)\s*</i).each do |num, item|
+      return num if item =~ KIT_RX
+    end
+
+    # Plain text rows, including two-column output on a single line.
+    plain = strip_game_xml(line)
+    plain.scan(/(\d+)\.\s*(.*?)(?=(?:\s+\d+\.\s)|\z)/).each do |num, item|
+      return num if item =~ KIT_RX
+    end
+
+    # Last-ditch single-line fallback: nearest "N." before kit on this same line.
+    next unless plain =~ KIT_RX
+    pre = plain.split(/apothecary kit/i, 2).first
     nums = pre.scan(/(\d+)\./)
     return nums.last[0] if nums.any?
   end
@@ -418,6 +433,15 @@ def ensure_kit_held(autobuy, debug)
   end
 
   kit = all_items.find { |o| o.id && o.name.to_s =~ KIT_RX }
+
+  # Fallback path: try a plain noun GET in case Lich has stale/partial object
+  # cache data for containers.
+  if kit.nil?
+    issue("get #{KIT_NOUN}",
+          /You get|pick up|remove|already|What were|don't see|can't|free hand|from inside/i, timeout: 3)
+    waitrt?
+    return [true, nil] unless holding_kit.nil?
+  end
 
   if kit.nil?
     if autobuy
@@ -592,10 +616,9 @@ def usage
 
     Usage:
       ;toxicologist <poison>                 create one vial and APPLY it (default)
-      ;toxicologist <poison> apply           create one vial and APPLY it
       ;toxicologist <poison> stow            create one vial, STOW it (default container)
       ;toxicologist <poison> stow <noun>     create + PUT into container <noun>
-      ;toxicologist <poison> x5              create five (combine with stow/apply)
+      ;toxicologist <poison> x5              create five (combine with stow)
       ;toxicologist <poison> stow x5 <noun>  order of options doesn't matter
       ;toxicologist <poison> ... debug       also dump raw CREATE/APPLY game output
       ;toxicologist kits                     show kit count + saved settings
@@ -617,6 +640,8 @@ def usage
     Each vial consumes one unremarkable apothecary kit (Rogue Guild shop, 10k).
     Hold the kit in one hand and your armament in the other; CREATE transforms
     the kit into a vial in that hand, then APPLY coats the armament.
+    Kit lookup uses known GameObj data first (hands/inv/cached container contents),
+    then a plain GET by noun as a fallback.
   HELP
 end
 
@@ -685,7 +710,10 @@ when "buy"
   container = contwds.empty? ? nil : contwds.join(" ")
   stow_desc = container ? "stowing into '#{container}'" : "STOWing (default container)"
   respond "toxicologist: buying #{qty} apothecary kit#{'s' unless qty == 1}, #{stow_desc}."
-  prepare_funds(qty * KIT_PRICE, true, dbg)
+  unless prepare_funds(qty * KIT_PRICE, true, dbg)
+    respond "toxicologist: couldn't prepare enough bank-note funds for #{qty} kit(s); stopping before BUY."
+    exit
+  end
   bought = 0
   qty.times do
     unless free_hand?
@@ -724,7 +752,7 @@ stow_words = []
 
 tokens.each do |tok|
   case tok
-  when /\A(?:apply|coat)\z/i        then action = :apply
+  when /\A(?:apply|coat)\z/i          then nil # default action; token ignored
   when /\A(?:stow|store|save|put)\z/i then action = :stow
   when /\Adebug\z/i                 then debug = true
   when /\Ax(\d+)\z/i                then count = [$1.to_i, 1].max
@@ -758,7 +786,10 @@ if kits < count
     respond "toxicologist: short #{shortfall} kit(s); will buy as needed."
     # Bulk-prepare so we only bank/travel once: convert funds to a (weightless)
     # note, then go to the shop.
-    prepare_funds(shortfall * KIT_PRICE, true, debug)
+    unless prepare_funds(shortfall * KIT_PRICE, true, debug)
+      respond "toxicologist: couldn't prepare enough bank-note funds for autobuy; stopping before crafting."
+      exit
+    end
     unless in_shop?
       respond "toxicologist: heading to the Rogue Guild shop (#{SHOP_DEST})..."
       ensure_at_shop(true, debug)
