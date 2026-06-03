@@ -1,0 +1,459 @@
+=begin
+  spiritguard.lic
+
+  Rubs small statues until Spirit Guard (1712) reaches the target duration.
+  Assumes statues are already accessible, or pass a container name to open it
+  (if needed), get statues from it, and close it only when the script opened it.
+
+  Usage:
+    ;spiritguard                 rub until 4 hours (accessible statue)
+    ;spiritguard 3               target 3 hours instead
+    ;spiritguard backpack        get/put from a container
+    ;spiritguard 3 backpack      hours + container
+    ;spiritguard debug           same as normal, but shows all commands/output
+    ;spiritguard debug 3 backpack
+    ;spiritguard help
+
+         author: Mara
+           game: Gemstone IV
+           tags: buff, spirit guard, small statue, utility
+        version: 1.3.0
+=end
+
+no_kill_all
+
+SPIRIT_GUARD_NUM = 1712
+DEFAULT_TARGET_HOURS = 4.0
+STATUE_TERM = 'small statue'
+MISS_STREAK_LIMIT = 3
+PROGRESS_EVERY_N_RUBS = 5
+
+GET_RX = Regexp.union(
+  /^You (?:shield the opening of .*? from view as you |discreetly |carefully |deftly |just |slowly )?(?:remove|pick up|draw|grab|reach|slip|tuck|retrieve|already have|unsheathe|detach|swap|sling|withdraw)/,
+  /^You already have that/,
+  /You retrieve/,
+  /^Get what\?$/,
+  /^What were you referring to\?$/,
+  /^I could not find what you were referring to\./,
+  /^You need a free hand/,
+  /^Your hands are full/
+).freeze
+
+PUT_RX = Regexp.union(
+  /^You put/,
+  /^You stow/,
+  /^You tuck/,
+  /^You slip/,
+  /^You place/,
+  /^That is closed/,
+  /^What were you referring to\?$/,
+  /^I could not find what you were referring to\./
+).freeze
+
+OPEN_RX = /You open|already open|can't be opened|What were you referring/i
+CLOSE_RX = /You close|That is already closed|What were you referring/i
+LOOK_IN_RX = /In the|Inside the|There is nothing|That is closed|isn't a container|don't see|<container|<exposeContainer/i
+
+RUB_RX = Regexp.union(
+  /You rub/,
+  /faint silvery glow/,
+  /suddenly disintegrates/,
+  /nothing further happens/,
+  /dissipates ineffectually/,
+  /What were you referring to\?/
+).freeze
+
+STOW_FAIL_RX = /What were you trying to stow|Get what|What were you referring/i
+
+PROMPT_RX = /<prompt/
+GET_FAIL_RX = /Get what|What were you referring|I could not find|need a free hand|hands are full/i
+
+module SpiritGuardRub
+  module_function
+
+  def issue(cmd, start_rx, timeout: 5)
+    if @debug
+      Lich::Util.issue_command(
+        cmd, start_rx, PROMPT_RX,
+        include_end: false, timeout: timeout, silent: false, usexml: true, quiet: false
+      )
+    else
+      Lich::Util.issue_command(
+        cmd, start_rx, PROMPT_RX,
+        include_end: false, timeout: timeout, silent: true, usexml: true, quiet: true
+      )
+    end
+  end
+
+  def issue_lines(cmd, start_rx, timeout: 5)
+    Array(issue(cmd, start_rx, timeout: timeout))
+  end
+
+  def lines_fail?(lines, fail_rx)
+    Array(lines).any? { |line| line =~ fail_rx }
+  end
+
+  def get_success?(lines)
+    lines.any? { |line| line =~ GET_RX } && !lines_fail?(lines, GET_FAIL_RX)
+  end
+
+  def usage
+    default_hours = DEFAULT_TARGET_HOURS == DEFAULT_TARGET_HOURS.to_i ? DEFAULT_TARGET_HOURS.to_i : DEFAULT_TARGET_HOURS
+    respond "spiritguard: rub small statues until Spirit Guard reaches a target duration."
+    respond "  ;spiritguard                 #{default_hours} hours, statue already accessible"
+    respond "  ;spiritguard 3               target hours (decimal ok, e.g. 3.5)"
+    respond "  ;spiritguard backpack        opens container if needed, closes only if it opened it"
+    respond "  ;spiritguard 3 backpack      hours + container"
+    respond "  ;spiritguard debug           show all commands and game output"
+    respond "  ;spiritguard debug 3 backpack debug + hours + container"
+    respond "  ;spiritguard help"
+  end
+
+  def normalize_container(term)
+    term.to_s.strip.gsub(/\A(?:(?:my|the)\s+)+/i, '').strip
+  end
+
+  def parse_args(vars)
+    debug = vars.any? { |v| v.to_s =~ /^debug$/i }
+    vars = vars.reject { |v| v.to_s =~ /^debug$/i }
+
+    hours = DEFAULT_TARGET_HOURS
+    container = nil
+
+    case vars.size
+    when 0
+      # defaults
+    when 1
+      if vars[0] =~ /^\d+(?:\.\d+)?$/
+        hours = vars[0].to_f
+      else
+        container = vars[0]
+      end
+    else
+      if vars[0] =~ /^\d+(?:\.\d+)?$/
+        hours = vars[0].to_f
+        container = vars[1..].join(' ')
+      else
+        container = vars.join(' ')
+      end
+    end
+
+    container = normalize_container(container)
+    container = nil if container.empty?
+
+    [hours, container, debug]
+  end
+
+  def spirit_guard_minutes
+    spell = Spell[SPIRIT_GUARD_NUM]
+    return 0.0 unless spell&.active?
+
+    spell.timeleft.to_f
+  end
+
+  def small_statue?(item)
+    return false unless item
+
+    item.noun.to_s.downcase == 'statue' && item.name.to_s =~ /small statue/i
+  end
+
+  def statue_in_hand?
+    rh = GameObj.right_hand
+    return rh if small_statue?(rh)
+
+    lh = GameObj.left_hand
+    return lh if small_statue?(lh)
+
+    nil
+  end
+
+  def find_container(term)
+    needle = term.to_s.strip.downcase
+    Array(GameObj.inv).find { |o| o.noun.to_s.downcase == needle } ||
+      Array(GameObj.inv).find { |o| o.name.to_s.downcase.include?(needle) }
+  end
+
+  def snapshot_hands
+    saved = []
+    if checkright
+      obj = GameObj.right_hand
+      saved << { side: :right, id: obj.id, name: obj.name.to_s, noun: obj.noun.to_s } if obj&.id
+    end
+    if checkleft
+      obj = GameObj.left_hand
+      saved << { side: :left, id: obj.id, name: obj.name.to_s, noun: obj.noun.to_s } if obj&.id
+    end
+    saved
+  end
+
+  def hand_empty?(side)
+    side == :right ? !checkright : !checkleft
+  end
+
+  def stow_hand(side)
+    obj = side == :right ? GameObj.right_hand : GameObj.left_hand
+    return true unless obj&.id
+
+    waitrt?
+    issue("stow ##{obj.id}", PUT_RX)
+    waitrt?
+    hand_empty?(side)
+  end
+
+  def stow_both_hands
+    stow_hand(:right) if checkright
+    stow_hand(:left) if checkleft
+  end
+
+  def get_saved_item(saved)
+    return true if saved.nil?
+
+    side = saved[:side]
+    return true unless hand_empty?(side)
+
+    waitrt?
+    lines = issue_lines("get ##{saved[:id]}", GET_RX)
+    if get_success?(lines)
+      waitrt?
+      return true
+    end
+
+    term = saved[:noun].to_s.empty? ? saved[:name] : saved[:noun]
+    lines = issue_lines("get my #{term}", GET_RX)
+    waitrt?
+    get_success?(lines)
+  end
+
+  def restore_saved_hands(saved_hands)
+    return if saved_hands.nil? || saved_hands.empty?
+
+    stow_both_hands
+
+    right = saved_hands.find { |h| h[:side] == :right }
+    left  = saved_hands.find { |h| h[:side] == :left }
+
+    get_saved_item(right)
+    get_saved_item(left)
+  end
+
+  def setup_container
+    @container_obj = find_container(@container_noun)
+    return false unless @container_obj
+
+    lines = issue_lines("open my #{@container_noun}", OPEN_RX, timeout: 3)
+    return false if lines_fail?(lines, /can't be opened|What were you referring/i)
+    return false unless lines.any? { |line| line =~ /You open|already open/i }
+
+    @opened_container = lines.any? { |line| line =~ /You open/i }
+    @container_ready = true
+    issue("look in my #{@container_noun}", LOOK_IN_RX, timeout: 3)
+    true
+  end
+
+  def close_container
+    return if @container_closed
+    return unless @container_noun && @container_ready && @opened_container
+
+    issue("close my #{@container_noun}", CLOSE_RX, timeout: 3)
+    @container_closed = true
+  end
+
+  def make_free_hand
+    return true if !checkright || !checkleft
+
+    stow_hand(:right)
+    true
+  end
+
+  def get_cmd
+    @container_noun ? "get my #{STATUE_TERM} from my #{@container_noun}" : "get my #{STATUE_TERM}"
+  end
+
+  def get_statue
+    held = statue_in_hand?
+    return held if held
+
+    make_free_hand
+
+    lines = issue_lines(get_cmd, GET_RX)
+    if lines_fail?(lines, /hands are full|need a free hand/i)
+      stow_both_hands
+      lines = issue_lines(get_cmd, GET_RX)
+    end
+
+    return nil unless get_success?(lines)
+
+    waitrt?
+    statue_in_hand?
+  end
+
+  def release_statue(statue = nil)
+    statue ||= statue_in_hand?
+    return unless statue&.id
+
+    cmd = if @container_noun
+            "put ##{statue.id} in my #{@container_noun}"
+          else
+            "stow ##{statue.id}"
+          end
+    lines = issue_lines(cmd, PUT_RX)
+    waitrt? unless lines_fail?(lines, STOW_FAIL_RX)
+  end
+
+  def rub_once
+    statue = get_statue
+    return :missing unless statue
+
+    before = spirit_guard_minutes
+    waitcastrt?
+
+    pre_castrt = checkcastrt
+    rub_lines = issue_lines("rub ##{statue.id}", RUB_RX)
+    waitcastrt?
+
+    after = spirit_guard_minutes
+    rub_text = rub_lines.join("\n")
+    success = (after > before + 0.01) ||
+              rub_text =~ /faint silvery glow/i ||
+              checkcastrt > pre_castrt
+    depleted = rub_text =~ /nothing further happens|dissipates ineffectually/i
+    consumed = rub_text =~ /suddenly disintegrates/i
+
+    release_statue unless consumed
+
+    return :depleted if depleted && !success
+
+    success ? :rubbed : :failed
+  rescue StandardError => e
+    respond "spiritguard: error in rub_once: #{e.message}" if @debug
+    release_statue
+    :failed
+  end
+
+  def progress_message
+    remaining = (@target_minutes - spirit_guard_minutes).round(1)
+    respond "spiritguard: #{@statue_uses} rubs done, ~#{remaining} min remaining."
+  end
+
+  def finish
+    close_container
+    cleanup_hands unless @restored
+  end
+
+  def finish_message
+    n = @statue_uses.to_i
+    word = n == 1 ? 'rub' : 'rubs'
+
+    if @already_at_target && n.zero?
+      respond 'spiritguard: Spirit Guard already at target duration.'
+    elsif @gave_up
+      respond "spiritguard: gave up after #{n} small statue #{word} (#{MISS_STREAK_LIMIT} consecutive failures)."
+    else
+      successful = @rub_count.to_i
+      successful_word = successful == 1 ? 'rub' : 'rubs'
+      if successful == n
+        respond "spiritguard: used #{n} small statue #{word}."
+      else
+        respond "spiritguard: used #{n} small statue #{word} (#{successful} extended Spirit Guard)."
+      end
+    end
+  end
+
+  def run(target_minutes, container_noun, debug: false)
+    @debug = debug
+    @target_minutes = target_minutes
+    @container_noun = container_noun
+    @container_ready = false
+    @opened_container = false
+    @container_closed = false
+    @saved_hands = snapshot_hands
+    @rub_count = 0
+    @statue_uses = 0
+    @restored = false
+    @miss_streak = 0
+    @gave_up = false
+    @already_at_target = false
+    @setup_failed = false
+    @script_silenced_by_us = false
+
+    unless @debug || Script.current.silent
+      silence_me
+      @script_silenced_by_us = true
+    end
+
+    before_dying { finish }
+
+    begin
+      respond 'spiritguard: debug mode - commands and game output visible.' if @debug
+
+      if @container_noun && !setup_container
+        @setup_failed = true
+        return
+      end
+
+      stow_both_hands if @saved_hands.any?
+
+      if spirit_guard_minutes >= target_minutes
+        @already_at_target = true
+        return
+      end
+
+      loop do
+        break if spirit_guard_minutes >= target_minutes
+
+        result = rub_once
+        case result
+        when :rubbed
+          @rub_count += 1
+          @statue_uses += 1
+          @miss_streak = 0
+          progress_message if @debug && (@statue_uses % PROGRESS_EVERY_N_RUBS).zero?
+        when :depleted
+          @statue_uses += 1
+          @miss_streak += 1
+          sleep 0.2
+          @gave_up = true if @miss_streak >= MISS_STREAK_LIMIT
+          break if @gave_up
+        when :failed, :missing
+          @miss_streak += 1
+          sleep 0.2
+          @gave_up = true if @miss_streak >= MISS_STREAK_LIMIT
+          break if @gave_up
+        end
+      end
+    ensure
+      finish
+      silence_me if @script_silenced_by_us
+      if @setup_failed
+        respond "spiritguard: container '#{@container_noun}' not found or could not be opened."
+      else
+        finish_message
+      end
+    end
+  end
+
+  def cleanup_hands
+    return if @restored
+
+    restore_saved_hands(@saved_hands)
+    @restored = true
+  end
+end
+
+# ---- main -------------------------------------------------------------------
+
+vars = script.vars.to_a.map(&:to_s).reject(&:empty?)
+
+if vars[0].to_s =~ /^(?:help|\?|-h|--help)$/i
+  SpiritGuardRub.usage
+  exit
+end
+
+target_hours, container, debug = SpiritGuardRub.parse_args(vars)
+
+if target_hours <= 0
+  respond 'spiritguard: target hours must be greater than zero.'
+  exit
+end
+
+SpiritGuardRub.run(target_hours * 60.0, container, debug: debug)
