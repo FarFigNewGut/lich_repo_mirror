@@ -1,0 +1,417 @@
+=begin
+  jarcatch.lic
+
+  Background watcher that catches game messages when a gem cannot be placed in
+  a jar or bottle. Keeps a persistent per-character list of gem names so you
+  (and other scripts) can skip repeat mismatches.
+
+  Example message:
+    The tall glass jar does not appear to be a suitable container for an aster opal.
+
+  Usage:
+    ;jarcatch                 start background monitor
+    ;jarcatch list            show gems that cannot be jarred
+    ;jarcatch clear           clear all entries
+    ;jarcatch remove <gem>    remove entries whose gem name matches
+    ;jarcatch eloot           add recorded gems to ELoot's exclude list
+    ;jarcatch autoeloot on    auto-sync new gems to ELoot exclude list
+    ;jarcatch help
+
+  Other scripts can query:
+    JarCatch.rejected?("aster opal")   => true/false
+    JarCatch.rejected_gems             => array of normalized gem names
+
+         author: Mara
+           game: Gemstone IV
+           tags: gems, jars, hoarding, utility
+        version: 1.3.0
+=end
+
+no_kill_all
+hide_me
+
+require 'yaml'
+require 'set'
+
+module JarCatch
+  VERSION = '1.3.0'
+  AUTO_ELOOT_VAR = :jarcatch_auto_eloot
+  HOOK_ID = 'jarcatch_downstream'
+  UPSTREAM_HOOK_ID = 'jarcatch_upstream'
+  MATCH_HINT = 'suitable container'
+  COMMAND_RX = /^(?:<c>)?;jarcatch\s*(.*)$/i
+
+  UNSUITABLE_RX = /
+    The \s+
+    .+?
+    \s+does \s+not \s+appear \s+to \s+be \s+a \s+suitable \s+container \s+for \s+
+    (?:(?:an|some|a)\s+)?
+    (?<gem>.+?)
+    \.?
+    \z
+  /ix
+
+  @yaml_file = File.join(DATA_DIR, XMLData.game, XMLData.name, 'jarcatch.yaml')
+  @entries = []
+  @gem_set = Set.new
+  @command_queue = Queue.new
+  @loaded = false
+  @dirty = false
+
+  class << self
+    attr_reader :entries
+
+    def normalize_name(name)
+      name.to_s
+          .gsub(/<[^>]+>/, '')
+          .gsub(/^(?:a|an|some)\s+/i, '')
+          .gsub(/\b(?:large|medium|small|tiny)\s+/i, '')
+          .strip
+          .downcase
+    end
+
+    def rebuild_index!
+      @gem_set = Set.new(@entries.map { |entry| entry[:gem] })
+    end
+
+    def normalize_entries(raw)
+      seen = Set.new
+      Array(raw).filter_map do |entry|
+        gem = if entry.is_a?(String)
+                normalize_name(entry)
+              else
+                normalize_name(entry[:gem] || entry['gem'])
+              end
+        next if gem.empty? || seen.include?(gem)
+
+        seen << gem
+        when_at = entry.is_a?(Hash) ? (entry[:recorded_at] || entry['recorded_at']) : nil
+        { gem: gem, recorded_at: when_at }
+      end
+    end
+
+    def load_data
+      return if @loaded
+
+      raw = if File.exist?(@yaml_file)
+              if YAML.respond_to?(:safe_load_file)
+                YAML.safe_load_file(@yaml_file, permitted_classes: [Time, Date, Symbol], aliases: true) || []
+              else
+                YAML.load_file(@yaml_file) || []
+              end
+            else
+              []
+            end
+
+      @entries = normalize_entries(raw)
+      rebuild_index!
+      @loaded = true
+      @dirty = false
+    end
+
+    def save_data
+      return unless @dirty
+
+      load_data
+      dir = File.dirname(@yaml_file)
+      Dir.mkdir(dir) unless Dir.exist?(dir)
+      File.write(@yaml_file, @entries.to_yaml)
+      @dirty = false
+    end
+
+    def rejected?(gem_name)
+      load_data
+      @gem_set.include?(normalize_name(gem_name))
+    end
+
+    def rejected_gems
+      load_data
+      @gem_set.to_a.sort
+    end
+
+    def record_rejection(gem)
+      load_data
+      gem_key = normalize_name(gem)
+      return if gem_key.empty?
+      return if @gem_set.include?(gem_key)
+
+      @entries << { gem: gem_key, recorded_at: Time.now }
+      @gem_set << gem_key
+      @dirty = true
+      save_data
+      Lich::Messaging.msg('orange', "JarCatch: #{gem_key} cannot be jarred.")
+      sync_to_eloot(gems: [gem_key], quiet: true) if auto_eloot?
+    end
+
+    def auto_eloot?
+      val = UserVars[AUTO_ELOOT_VAR] rescue nil
+      val == true || %w[true on yes 1].include?(val.to_s.downcase)
+    end
+
+    def set_auto_eloot(enabled)
+      UserVars[AUTO_ELOOT_VAR] = enabled ? 'on' : 'off'
+    end
+
+    def toggle_auto_eloot(arg)
+      arg = arg.to_s.strip.downcase
+      case arg
+      when '', 'status'
+        respond "JarCatch: auto ELoot sync is #{auto_eloot? ? 'on' : 'off'}."
+      when 'on', 'true', 'yes', 'enable', '1'
+        set_auto_eloot(true)
+        respond 'JarCatch: auto ELoot sync enabled.'
+      when 'off', 'false', 'no', 'disable', '0'
+        set_auto_eloot(false)
+        respond 'JarCatch: auto ELoot sync disabled.'
+      else
+        respond 'JarCatch: usage is ;jarcatch autoeloot [on|off|status]'
+      end
+    end
+
+    def eloot_yaml_path
+      File.join(DATA_DIR, XMLData.game, Char.name, 'eloot.yaml')
+    end
+
+    def sync_to_eloot(enable_mode: true, gems: nil, quiet: false)
+      load_data
+      gems = Array(gems).map { |g| normalize_name(g) }.reject(&:empty?)
+      gems = rejected_gems if gems.empty?
+      if gems.empty?
+        respond 'JarCatch: nothing to sync to ELoot.' unless quiet
+        return
+      end
+
+      path = eloot_yaml_path
+      unless File.exist?(path)
+        msg = "JarCatch: #{path} not found. Run ;eloot load first."
+        quiet ? Lich::Messaging.msg('orange', msg) : respond(msg)
+        return
+      end
+
+      settings = YAML.load_file(path) || {}
+      settings = {} unless settings.is_a?(Hash)
+
+      exclude = Array(settings[:gem_everything])
+      known = Set.new(exclude.map { |name| normalize_name(name) })
+      added = []
+
+      gems.each do |gem|
+        next if known.include?(gem)
+
+        exclude << gem
+        known << gem
+        added << gem
+      end
+
+      exclude.sort!
+      exclude.uniq!
+      settings[:gem_everything] = exclude
+
+      enabled_mode = false
+      if enable_mode && !settings[:gem_only_list]
+        settings[:gem_everything_list] = true
+        enabled_mode = true
+      elsif enable_mode
+        msg = 'JarCatch: ELoot is in "only hoard listed gems" mode, so the exclude list will not apply until you switch modes.'
+        quiet ? Lich::Messaging.msg('orange', msg) : respond(msg)
+      end
+
+      File.write(path, settings.to_yaml)
+      sync_eloot_runtime(settings)
+
+      if added.empty?
+        respond 'JarCatch: all recorded gems were already in ELoot\'s exclude list.' unless quiet
+      elsif quiet
+        Lich::Messaging.msg('orange', "JarCatch: added #{added.join(', ')} to ELoot exclude list.")
+        Lich::Messaging.msg('orange', 'JarCatch: enabled hoard-all-except mode.') if enabled_mode
+      else
+        respond "JarCatch: added #{added.length} gem(s) to ELoot exclude list: #{added.join(', ')}."
+        respond 'JarCatch: enabled "hoard all gems except those excluded below".' if enabled_mode
+      end
+    end
+
+    def sync_eloot_runtime(settings)
+      return unless defined?(ELoot) && ELoot.data&.settings
+
+      ELoot.data.settings[:gem_everything] = settings[:gem_everything]
+      if settings.key?(:gem_everything_list)
+        ELoot.data.settings[:gem_everything_list] = settings[:gem_everything_list]
+      end
+
+      return unless ELoot.data.hoard_type == 'gem'
+
+      ELoot.data.everything = settings[:gem_everything]
+      if settings.key?(:gem_everything_list)
+        ELoot.data.everything_list = settings[:gem_everything_list]
+      end
+    rescue => e
+      respond "JarCatch: saved ELoot settings, but could not update running ELoot (#{e.message})."
+    end
+
+    def show_help
+      respond <<~HELP
+        JarCatch v#{VERSION} - track gems that cannot be jarred
+
+          ;jarcatch                 start background monitor
+          ;jarcatch list            show gems that cannot be jarred
+          ;jarcatch clear           clear all entries
+          ;jarcatch remove <gem>    remove entries matching a gem name
+          ;jarcatch eloot           add recorded gems to ELoot exclude list
+          ;jarcatch autoeloot on    auto-sync each new gem to ELoot
+          ;jarcatch autoeloot off   disable auto-sync
+          ;jarcatch help
+
+        ELoot integration:
+          Adds gems to Settings -> Hoarding -> "Gems to Exclude" and turns on
+          "Hoard all gems except those excluded below" unless ELoot is in
+          only-list mode. Set UserVars.jarcatch_auto_eloot to on/off, or use
+          ;jarcatch autoeloot.
+
+        Data file:
+          #{@yaml_file}
+      HELP
+    end
+
+    def show_list
+      load_data
+      if @entries.empty?
+        respond 'JarCatch: no rejected gems recorded.'
+        return
+      end
+
+      respond "JarCatch: #{@entries.length} gem(s) cannot be jarred:"
+      @entries.sort_by { |e| e[:gem] }.each do |entry|
+        when_str = entry[:recorded_at] ? entry[:recorded_at].to_s[0, 19] : 'unknown'
+        respond "  #{entry[:gem]}  (#{when_str})"
+      end
+    end
+
+    def clear_all
+      @entries = []
+      @gem_set = Set.new
+      @loaded = true
+      @dirty = true
+      save_data
+      respond 'JarCatch: cleared all rejected gems.'
+    end
+
+    def remove_matching(query)
+      query = query.to_s.strip
+      if query.empty?
+        respond 'JarCatch: usage is ;jarcatch remove <gem name>'
+        return
+      end
+
+      load_data
+      key = normalize_name(query)
+      before = @entries.length
+      @entries.reject! { |entry| entry[:gem].include?(key) }
+      removed = before - @entries.length
+
+      if removed.positive?
+        rebuild_index!
+        @dirty = true
+        save_data
+        respond "JarCatch: removed #{removed} entr#{removed == 1 ? 'y' : 'ies'} matching \"#{query}\"."
+      else
+        respond "JarCatch: no entries matched \"#{query}\"."
+      end
+    end
+
+    def dispatch(command, arg = '', running: false)
+      case command
+      when nil, '', 'start', 'watch', 'monitor'
+        if running
+          respond 'JarCatch is already running.'
+        else
+          run
+        end
+      when 'help', 'h', '?'
+        show_help
+      when 'list', 'ls'
+        show_list
+      when 'clear', 'reset'
+        clear_all
+      when 'remove', 'rm', 'delete', 'del'
+        remove_matching(arg)
+      when 'eloot', 'sync'
+        sync_to_eloot
+      when 'autoeloot', 'auto'
+        toggle_auto_eloot(arg)
+      else
+        respond "JarCatch: unknown command \"#{command}\". Type ;jarcatch help."
+      end
+    end
+
+    def process_command(command_str)
+      parts = command_str.to_s.strip.split(/\s+/, 2)
+      dispatch(parts[0]&.downcase, parts[1].to_s, running: true)
+    end
+
+    def handle_line(server_string)
+      return unless server_string.include?(MATCH_HINT)
+
+      plain = server_string.gsub(/<[^>]+>/, ' ').squeeze(' ').strip
+      match = plain.match(UNSUITABLE_RX)
+      return unless match
+
+      record_rejection(match[:gem])
+    rescue => e
+      respond "JarCatch error: #{e.message}"
+    end
+
+    def setup_hooks
+      DownstreamHook.add(HOOK_ID, proc { |line|
+        handle_line(line)
+        line
+      })
+
+      UpstreamHook.add(UPSTREAM_HOOK_ID, proc { |line|
+        if line =~ COMMAND_RX
+          @command_queue.push($1.to_s.strip)
+          nil
+        else
+          line
+        end
+      })
+    end
+
+    def remove_hooks
+      DownstreamHook.remove(HOOK_ID)
+      UpstreamHook.remove(UPSTREAM_HOOK_ID)
+    end
+
+    def run
+      setup_hooks
+      respond "JarCatch v#{VERSION} started. Watching for unsuitable jar messages..."
+      respond 'JarCatch: auto ELoot sync is on.' if auto_eloot?
+      respond 'Type ;jarcatch help for commands.'
+
+      loop do
+        until @command_queue.empty?
+          command_str = @command_queue.pop(true) rescue nil
+          process_command(command_str) if command_str
+        end
+        sleep 0.25
+      end
+    ensure
+      save_data if @dirty
+      remove_hooks
+    end
+  end
+end
+
+before_dying do
+  JarCatch.save_data if JarCatch.instance_variable_get(:@dirty)
+  JarCatch.remove_hooks
+end
+
+args = Script.current.vars[1..-1] || []
+command = args[0]&.downcase
+arg = args[1..-1]&.join(' ')
+
+if command.nil? || command.empty? || command =~ /^(?:start|watch|monitor)$/
+  JarCatch.run
+else
+  JarCatch.dispatch(command, arg)
+end
