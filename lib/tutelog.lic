@@ -409,28 +409,84 @@ sync_lumnis_est = proc do
   lumnis_remaining_est
 end
 
-refresh_xp2 = proc do |reason, min_interval = 600|
+refresh_lumnis_info = proc do |reason, min_interval = 120|
   now_i = Time.now.to_i
-  last_refresh = tutelog_state['last_xp2_refresh_at'].to_i
+  last_refresh = tutelog_state['last_lumnis_info_at'].to_i
   next false if (now_i - last_refresh) < min_interval
-  tutelog_state['last_xp2_refresh_at'] = now_i.to_s
-  tutelog_state['last_xp2_refresh_reason'] = reason.to_s
+  tutelog_state['last_lumnis_info_at'] = now_i.to_s
+  tutelog_state['last_lumnis_info_reason'] = reason.to_s
   save_tutelog_state.call
-  open_current_cycle_log.call
-  write_log.call({
-    'event' => 'xp2_refresh',
-    'reason' => reason,
-    'tutelage_state' => Vars['xp2_tutelage_state'] || 'unknown',
-    'lumnis_remaining_est' => lumnis_remaining_est
-  })
+
+  lumnis_lines = []
   begin
-    start_script('xp2') unless running?('xp2')
+    lumnis_lines = Lich::Util.quiet_command_xml(
+      'lumnis info',
+      /Gift of Lumnis|recent donation|Fash'lo'nae's Tutelage/i,
+      /<prompt/,
+      false,
+      6,
+      true
+    )
   rescue
-    begin
-      Script.start('xp2') unless Script.running?('xp2')
-    rescue
-    end
+    lumnis_lines = []
   end
+
+  lumnis_text = Array(lumnis_lines).join("\n").gsub(/<[^>]+>/, ' ').gsub(/\s+/, ' ').strip
+  phase = nil
+  remaining = nil
+  refresh = nil
+  expired = nil
+  days = nil
+
+  Array(lumnis_lines).join("\n").split(/\r?\n/).each do |raw_line|
+    line = raw_line.to_s.gsub(/<[^>]+>/, ' ').gsub(/\s+/, ' ').strip
+    next if line.empty?
+    if line =~ /([0-9,]+).*?points.*?of.*?(quintupled|quadrupled|tripled|doubled).*?experience.*?remaining/i
+      remaining = $1.gsub(',', '').to_i
+      phase = $2.downcase
+      expired = false
+    elsif line =~ /You have\s+([\d,]+)\s+points/i
+      remaining = $1.gsub(',', '').to_i
+    end
+    phase = $1.downcase if line =~ /points\s+of\s+(quintupled|quadrupled|tripled|doubled)\s+experience/i
+    refresh = $1.strip if line =~ /refresh in\s+([^.]*)\./i
+    expired = true if line =~ /Gift of Lumnis has expired/i
+    days = $1.gsub(',', '').to_i if line =~ /You are receiving Fash'lo'nae's Tutelage with ([0-9,]+) day\(s\) remaining\./
+  end
+
+  if remaining
+    lumnis_remaining_est = remaining
+    lumnis_source_remaining = remaining
+    tutelog_state['lumnis_remaining_est'] = remaining.to_s
+    tutelog_state['lumnis_source_remaining'] = remaining.to_s
+    Vars['xp2_lumnis_phase_remaining'] = remaining.to_s
+  elsif expired
+    lumnis_remaining_est = 0
+    lumnis_source_remaining = 0
+    tutelog_state['lumnis_remaining_est'] = '0'
+    tutelog_state['lumnis_source_remaining'] = '0'
+    Vars['xp2_lumnis_phase_remaining'] = '0'
+  end
+  Vars['xp2_lumnis_phase'] = phase.to_s if phase
+  Vars['xp2_lumnis_expired'] = expired.to_s unless expired.nil?
+  if days
+    Vars['xp2_tutelage_days'] = days.to_s
+    Vars['xp2_tutelage_state'] = 'active' if expired
+    Vars['xp2_tutelage_state'] = 'inactive' if !expired && Vars['xp2_tutelage_state'].to_s != 'active'
+    Vars['xp2_tutelage_state_at'] = now_i.to_s
+  end
+  save_vars.call
+  save_tutelog_state.call
+
+  write_log.call({
+    'event' => 'lumnis_info',
+    'reason' => reason,
+    'phase' => phase,
+    'remaining' => remaining,
+    'expired' => expired,
+    'tutelage_days' => days,
+    'refresh' => refresh
+  })
   true
 end
 
@@ -531,15 +587,16 @@ end
 
 tutelage_end_message = 'The feeling of heightened understanding departs, leaving behind a cold hunger for forbidden knowledge that is slow to fade.'
 tutelage_end_hook_name = "#{script.name}_tutelage_end"
+tutelage_end_seen = false
 begin
   DownstreamHook.remove(tutelage_end_hook_name)
   DownstreamHook.add(tutelage_end_hook_name, proc do |xml|
-    if clean_value.call(xml).include?(tutelage_end_message)
+    if !tutelage_end_seen && clean_value.call(xml).include?(tutelage_end_message)
+      tutelage_end_seen = true
       Vars['xp2_tutelage_state'] = 'inactive'
       Vars['xp2_tutelage_state_at'] = Time.now.to_i.to_s
       save_vars.call
       write_log.call({ 'event' => 'tutelage_end_message', 'message' => tutelage_end_message })
-      refresh_xp2.call('tutelage_end_message', 0)
       rollback_suspect_drop.call('tutelage_end_message')
       send_log_request.call('tutelage_end_message')
     end
@@ -622,8 +679,10 @@ loop do
   if valid_pulse
     saved_reset_at = Vars['xp2_tutelage_reset_at'].to_i
     if saved_reset_at > 0 && Time.now.to_i >= saved_reset_at
-      refresh_xp2.call('reset_time_passed_after_pulse', 120)
-      skip_active_log = true
+      refresh_lumnis_info.call('reset_time_passed_after_pulse', 120)
+      tutelage_state_now = Vars['xp2_tutelage_state'].to_s
+      has_tutelage = tutelage_available.call
+      skip_active_log = tutelage_state_now != 'active'
     elsif has_tutelage && tutelage_state_now != 'active'
       sync_lumnis_est.call
       lumnis_before = lumnis_remaining_est
@@ -651,7 +710,9 @@ loop do
             'lumnis_remaining_before' => lumnis_before,
             'lumnis_remaining_est' => lumnis_remaining_est
           })
-          refresh_xp2.call(lumnis_refresh_reason, lumnis_refresh_interval)
+          refresh_lumnis_info.call(lumnis_refresh_reason, lumnis_refresh_interval)
+          tutelage_state_now = Vars['xp2_tutelage_state'].to_s
+          has_tutelage = tutelage_available.call
         end
       end
     end
@@ -672,9 +733,9 @@ loop do
           'event' => 'pulse_drop_check',
           'pulse' => pulse,
           'recent_average' => recent_average.round(1),
-          'reason' => 'possible_tutelage_end'
+          'reason' => 'possible_tutelage_end',
+          'action' => 'logged_only'
         })
-        refresh_xp2.call('possible_tutelage_end_pulse_drop', 60)
       end
       pulse_window << pulse
       pulse_window.shift while pulse_window.length > 5
