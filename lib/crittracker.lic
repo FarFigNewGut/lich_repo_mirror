@@ -1,0 +1,1139 @@
+=begin
+  CritTracker (crittracker.lic) - GemStone IV / Lich (Ruby)
+ 
+  Created by "Kaelyr the Vaalorn Wolf" using Claude AI.
+  (This script was entirely AI generated, I am not a programmer.  As with any script, review it prior to use.)
+  (I have tested this for my personal use, there may be bugs or inaccuracies.)
+
+  Monitors your melee critical hits (CRUSH, PUNCTURE, SLASH only), and identifies the
+  hit location, critical rank, and effects from the in-game messaging, and:
+    * Sends a live one-line summary to the FAMILIAR window, e.g.
+        CRUSH HEAD: RANK 9 | FATAL | R3 WOUND | DMG: 56
+        SLASH RIGHT LEG: RANK 9 | STUN 12 ROUND | KNOCKDOWN | AMPUTATION | R3 WOUND | DMG: 88
+    * Tracks DAILY and LIFETIME stats in the MAIN window: per damage-type and
+      per location (hits, hit %, average/high damage, rank breakdown), an overall
+      RANK TOTALS summary, plus weapon-swing count and complete-miss percentage.
+
+  COMMANDS (type at the game prompt, NO leading semicolon - they are intercepted):
+        crit daily            show today's stats (main window)
+        crit life             show lifetime stats (main window)
+        crit familiar         toggle the live familiar-window output on/off
+        crit debug            toggle debug echo of unmatched post-hit lines
+        crit reset daily      reset today's stats
+        crit reset life       reset lifetime stats
+        crit reset all        reset both
+        crit help             show command help
+  (You can also use the ;send form, e.g.  ;send crit daily )
+
+  DATA SOURCE: messaging/damage/status/wounds transcribed verbatim from gswiki:
+        https://gswiki.play.net/Crush_critical_table     (rev 209174)
+        https://gswiki.play.net/Puncture_critical_table  (rev 209175)
+        https://gswiki.play.net/Slash_critical_table     (rev 111839)
+
+  NOTES / LIMITATIONS (see chat for full explanation):
+    * Detection works by matching the exact crit MESSAGE text, since the game
+      stream never prints type/location/rank explicitly.
+    * Some crit messages are identical for the LEFT and RIGHT version of a limb.
+      Those are genuinely side-less in the game text, so they are recorded under
+      the base location (e.g. ARM, HAND, LEG, EYE) rather than guessing a side.
+    * Complete misses use the d100 endroll (<=100 = miss) from the AS vs DS line.
+      DMG is always the weapon swing's "and hit for N" value, never a flare's.
+    * The player's own hit is detected via the "...and hit for N points of
+      damage!" line. Incoming hits ("hits you for...") and other players' hits
+      ("hits the X for...") are filtered out. CS/spell/ranged messaging differs
+      and is not the target of this melee tracker. Non-corporeal creatures use a
+      separate, non-injuring message set and are intentionally NOT tracked.
+    * Non-Corp and Flare crits are purposefully omitted.
+
+=end
+
+module CritTracker
+  extend self
+  no_kill_all
+
+  require 'yaml'
+
+  HOOK_ID = "crittracker-cmd"
+
+  # ---- Critical tables ---------------------------------------------------
+  # Each row: [rank, base_damage, message, status_effects, wounds]
+  # Rank 0 (love-tap / non-crit) is intentionally omitted.
+  TABLES = {
+    "CRUSH" => {
+      "HEAD" => [
+        [1, 5,  "Blow to the head causes the [target]'s ears to ring!", "none", "R1"],
+        [2, 10, "Hearty smack to the head.", "S1", "R1"],
+        [3, 15, "You broke the [target]'s nose!", "S4", "R2"],
+        [4, 20, "Skull cracks in several places.", "S8", "R3"],
+        [5, 25, "Solid strike caves the [target]'s skull in,resulting in instant death!", "F", "R3"],
+        [6, 30, "Mighty swing separates head from shoulders.", "F", "R3"],
+        [7, 35, "Tremendous blow crushes skull like a ripe melon.", "F", "R3"],
+        [8, 40, "Brain driven into neck by mammoth downswing!", "F", "R3"],
+        [9, 50, "Incredible blast shatters head into a red spray.", "F", "R3"],
+      ],
+      "NECK" => [
+        [1, 2,  "Whiplash!", "none", "R1"],
+        [2, 5,  "Neck vertebrae snap.", "S1", "R1"],
+        [3, 10, "Shot to the neck scrapes away skin. Some nasty bleeding.", "S3", "R2"],
+        [4, 12, "Throat nearly crushed. The [target] makes gurgling noises.", "S6", "R3"],
+        [5, 15, "Neck broken. The [target] twitches several times before dying.", "F", "R3"],
+        [6, 20, "You hear several snaps as the [target]'s neck is broken in several places.", "F", "R3"],
+        [7, 25, "Vertebrae in [target]'s neck disintegrate from impact! Neck sinks into shoulders.", "F", "R3"],
+        [8, 30, "Shot to neck sends [target] into shock which leads very quickly to death.", "F", "R3"],
+        [9, 40, "Neck removed, head falls to the ground.", "F", "R3"],
+      ],
+      "RIGHT EYE" => [
+        [1, 1,  "Cut over the [target]'s right eye.", "none", "R1"],
+        [2, 3,  "Strike to the eye clips the eyebrow.", "S1", "R2"],
+        [3, 5,  "Smack to the eye bursts blood vessels.", "S3", "R2"],
+        [4, 10, "Crack to the head swells eye shut.", "S5", "R2"],
+        [5, 15, "Eye crushed by a hard blow to the face!", "S10", "R3"],
+        [6, 20, "Crushing blow to head closes that eye for good.", "S12", "R3"],
+        [7, 40, "Blow to eye impacts the brain. [target] twitches violently, then dies.", "F", "R3 eye R3 head"],
+        [8, 45, "Right eye ripped from head, along with most of brain.", "F", "R3 eye R3 head"],
+        [9, 50, "Smash to cheek driving bone through the eye and into the brain.", "F", "R3 eye R3 head"],
+      ],
+      "LEFT EYE" => [
+        [1, 1,  "Cut over the [target]'s left eye.", "none", "R1"],
+        [2, 3,  "Strike to the eye clips the eyebrow.", "S1", "R2"],
+        [3, 5,  "Smack to the eye bursts blood vessels.", "S3", "R2"],
+        [4, 10, "Crack to the head swells eye shut.", "S5", "R2"],
+        [5, 15, "Eye crushed by a hard blow to the face!", "S10", "R3"],
+        [6, 20, "Crushing blow to head closes that eye for good.", "S12", "R3"],
+        [7, 40, "Blow to eye impacts the brain. [target] twitches violently,then dies.", "F", "R3 eye R3 head"],
+        [8, 45, "Left eye ripped from head, along with most of brain.", "F", "R3 eye R3 head"],
+        [9, 50, "Smash to cheek driving bone through the eye and into the brain.", "F", "R3 eye R3 head"],
+      ],
+      "CHEST" => [
+        [1, 5,  "Blow leaves an imprint on the [target]'s chest!", "none", "R1"],
+        [2, 10, "Mighty blow cracks several ribs.", "none", "R1"],
+        [3, 15, "Blow to chest causes the [target]'s heart to skip a beat.", "S1", "R1"],
+        [4, 20, "Whoosh! Several ribs driven into lungs.", "S3", "R2"],
+        [5, 25, "Whoosh! Several ribs driven into lungs.", "S5", "R2"],
+        [6, 45, "Awesome shot collapses a lung!", "S6", "R3"],
+        [7, 60, "Blow cracks a rib and punctures a lung. Breathing becomes a challenge.", "S8", "R3"],
+        [8, 65, "Massive blow punches a hole through the [target]'s chest!", "S10", "R3"],
+        [9, 70, "Massive blow smashes through ribs and drives [target]'s heart out the back.", "F", "R3"],
+      ],
+      "ABDOMEN" => [
+        [1, 5,  "Stomach shot lands with a hollow *thump*.", "none", "R1"],
+        [2, 10, "Grazing blow to the stomach.", "none", "R1"],
+        [3, 15, "Internal organs bruised.", "S1", "R2"],
+        [4, 20, "Stomach ripped open by mighty blow!", "S3", "R2"],
+        [5, 25, "Knocked back several feet by blow to abdomen.", "S5", "R2"],
+        [6, 30, "Blow ruptures the stomach!", "S6", "R3"],
+        [7, 50, "Blow to stomach rearranges some organs!", "S8", "R3"],
+        [8, 60, "Incredible smash to what used to be a stomach!", "F", "R3"],
+        [9, 75, "A mighty hit turns the [target]'s insides to outsides!", "F", "R3"],
+      ],
+      "BACK" => [
+        [1, 3,  "Jarring blow to the [target]'s back.", "none", "R1"],
+        [2, 10, "Blow to back cracks several vertebrae.", "none", "R1"],
+        [3, 15, "Respectable shot to the back.", "S1", "R1"],
+        [4, 20, "Flesh ripped from back, muscles exposed.", "S2", "R2"],
+        [5, 25, "Knocked sideways several feet by blow to back.", "S3", "R2"],
+        [6, 30, "Spinal cord damaged by smash to the back.", "S5", "R3"],
+        [7, 50, "Crushing blow to the spine! The [target] slumps to the ground.", "S6 K", "R3"],
+        [8, 60, "Body pulped to a gooey mass. Watch where you step!", "F", "R3 Back R3 Nerves"],
+        [9, 75, "A mighty blow cleaves a swath through the [target]'s back, taking the spine with it.", "F", "R3 Back R3 Nerves"],
+      ],
+      "RIGHT ARM" => [
+        [1, 3,  "Blow raises a welt on the [target]'s right arm.", "none", "R1"],
+        [2, 7,  "Bones in right arm crack.", "none", "R1"],
+        [3, 8,  "Large gash to the right arm, several muscles torn.", "S1", "R2"],
+        [4, 10, "Right elbow smashed into a thousand pieces.", "S2", "R2"],
+        [5, 15, "Weapon arm mangled horribly.", "S3", "R2"],
+        [6, 20, "Hard hit shatters weapon arm.", "S5", "R2"],
+        [7, 25, "Right arm ripped from socket at the elbow!", "S6 K A", "R3"],
+        [8, 35, "Lucky shot rips through bone and muscle sending weapon arm flying.", "S8 A", "R3"],
+        [9, 40, "Weapon arm removed at the shoulder!", "S10 A", "R3"],
+      ],
+      "LEFT ARM" => [
+        [1, 3,  "Blow raises a welt on the [target]'s left arm.", "none", "R1"],
+        [2, 7,  "Bones in left arm crack.", "none", "R1"],
+        [3, 8,  "Large gash to the left arm, several muscles torn.", "S1", "R2"],
+        [4, 10, "Left elbow smashed into a thousand pieces.", "S2", "R2"],
+        [5, 15, "Shield arm mangled horribly.", "S3", "R2"],
+        [6, 20, "Hard hit shatters shield arm.", "S5", "R2"],
+        [7, 25, "Left arm ripped from socket at the elbow!", "S6 A", "R3"],
+        [8, 35, "Lucky shot rips through bone and muscle sending shield arm flying.", "S8 A", "R3"],
+        [9, 40, "Shield arm removed at the shoulder!", "S10 A", "R3"],
+      ],
+      "RIGHT HAND" => [
+        [1, 1,  "Broken finger on the [target]'s right hand!", "none", "R1"],
+        [2, 3,  "Flattened the [target]'s right hand.", "none", "R1"],
+        [3, 5,  "Finger ripped away from right hand.", "none", "R1"],
+        [4, 7,  "Right hand smashed into a pulpy mass.", "S1", "R2"],
+        [5, 5,  "Right hand mangled horribly.", "S2", "R2"],
+        [6, 10, "Blast to hand reduces it to pulp!", "S3", "R2"],
+        [7, 15, "Blast to hand sends fingers flying in several different directions.", "S4 A", "R3"],
+        [8, 25, "Lucky shot severs right hand and sends it flying.", "S5 A", "R3"],
+        [9, 30, "Right hand severed at the wrist!", "S7 A", "R3"],
+      ],
+      "LEFT HAND" => [
+        [1, 1,  "Broken finger on the [target]'s left hand!", "none", "R1"],
+        [2, 3,  "Flattened the [target]'s left hand.", "none", "R1"],
+        [3, 5,  "Finger ripped away from left hand.", "none", "R1"],
+        [4, 7,  "Left hand smashed into a pulpy mass.", "S1", "R2"],
+        [5, 8,  "Left hand mangled horribly.", "S2", "R2"],
+        [6, 10, "Blast to hand reduces it to pulp!", "S3", "R2"],
+        [7, 15, "Blast to hand sends fingers flying in several different directions.", "S4 A", "R3"],
+        [8, 25, "Lucky shot severs left hand and sends it flying.", "S5 A", "R3"],
+        [9, 30, "Left hand severed at the wrist!", "S7 A", "R3"],
+      ],
+      "RIGHT LEG" => [
+        [1, 7,  "Torn muscle in the [target]'s right leg!", "none", "R1"],
+        [2, 10, "Smash to the kneecap.", "none", "R1"],
+        [3, 15, "You ripped a chunk out of the [target]'s right leg with that one.", "S1", "R2"],
+        [4, 17, "Right kneecap smashed into pulp.", "S3 K", "R2"],
+        [5, 20, "Right leg mangled horribly.", "S5 K", "R2"],
+        [6, 25, "Hard blow breaks the femur!", "S6 K", "R2"],
+        [7, 30, "Right leg ripped from socket at the knee!", "S8 K A", "R3"],
+        [8, 40, "Lucky shot rips through bone and muscle sending right leg flying.", "S10 K A", "R3"],
+        [9, 45, "Right hip pulped, severing the leg.", "S12 K A", "R3"],
+      ],
+      "LEFT LEG" => [
+        [1, 7,  "Torn muscle in the [target]'s left leg!", "none", "R1"],
+        [2, 10, "Smash to the kneecap.", "none", "R1"],
+        [3, 15, "You ripped a chunk out of the [target]'s left leg with that one.", "S1", "R2"],
+        [4, 17, "Left kneecap smashed into pulp.", "S3 K", "R2"],
+        [5, 20, "Left leg mangled horribly.", "S5 K", "R2"],
+        [6, 25, "Hard blow breaks the femur!", "S6 K", "R2"],
+        [7, 30, "Left leg ripped from socket at the knee!", "S8 K A", "R3"],
+        [8, 40, "Lucky shot rips through bone and muscle sending left leg flying.", "S10 K A", "R3"],
+        [9, 45, "Left hip pulped, severing the leg.", "S12 K A", "R3"],
+      ],
+    },
+
+    "PUNCTURE" => {
+      "HEAD" => [
+        [1, 5,  "Glancing strike to the head!", "none", "R1"],
+        [2, 8,  "Nice shot to the head gouges the [target]'s cheek!", "S2", "R2"],
+        [3, 10, "Beautiful head shot! That ear will be missed!", "S5", "R2"],
+        [4, 15, "Strike to temple! Saved by thick skull!", "S7", "R3"],
+        [5, 20, "Beautiful shot pierces skull! Amazing the [target] wasn't killed outright!", "S10", "R3"],
+        [6, 25, "Amazing shot through the [target]'s nose enters the brain!", "Fatal", "R3"],
+        [7, 30, "Strike through both ears, foe is quite dead!", "Fatal", "R3"],
+        [8, 35, "Strike pierces temple and kills foe instantly!", "Fatal", "R3"],
+        [9, 40, "Awesome shot skewers skull! The [target] blinks once and falls quite dead!", "Fatal", "R3"],
+      ],
+      "NECK" => [
+        [1, 3,  "Minor strike to neck.", "none", "R1"],
+        [2, 5,  "Well placed shot to the neck.", "S2", "R2"],
+        [3, 7,  "Strike just below the jaw, nice shot to the neck!", "S3", "R2"],
+        [4, 10, "Pierced through neck, a fine shot!", "S5", "R3"],
+        [5, 15, "Neck skewered, sliding past the throat and spine! That looks painful.", "S8", "R3"],
+        [6, 15, "Fine shot pierces jugular vein! The brain wonders where all its oxygen went, briefly.", "Fatal", "R3"],
+        [7, 20, "Strike clean through neck, what a shot! Good form!", "Fatal", "R3"],
+        [8, 25, "Strike punctures throat and ruins vocal cords!", "Fatal", "R3"],
+        [9, 30, "Incredible shot clean through the throat severs the spine!", "Fatal", "R3"],
+      ],
+      "RIGHT EYE" => [
+        [1, 1,  "Minor strike under the right eye, that was close!", "none", "R1"],
+        [2, 5,  "Well aimed shot almost removes an eye!", "S3", "R2"],
+        [3, 10, "Slash across right eye! Hope the left is working.", "S5", "R3"],
+        [4, 17, "Attack punctures the eye and connects with something really vital!", "Fatal", "R3 eye/head"],
+        [5, 20, "Shot knocks the [target]'s head back by pushing on the inside of the skull!", "Fatal", "R3 eye/head"],
+        [6, 25, "Incredible shot to the eye penetrates deep into skull!", "Fatal", "R3 eye/head"],
+        [7, 30, "Shot destroys eye and the brain behind it!", "Fatal", "R3 eye/head"],
+        [8, 35, "Strike through eye, the [target] is lobotomized!", "Fatal", "R3 eye/head"],
+        [9, 40, "Strike to the eye penetrates skull, ocular fluid sprays widely!", "Fatal", "R3 eye/head"],
+      ],
+      "LEFT EYE" => [
+        [1, 1,  "Minor strike under the left eye, that was close!", "none", "R1"],
+        [2, 5,  "Well aimed shot almost removes an eye!", "S3", "R2"],
+        [3, 10, "Surgical strike removes the [target]'s left eye!", "S5", "R3"],
+        [4, 17, "Attack punctures the eye and connects with something really vital!", "Fatal", "R3 eye/head"],
+        [5, 20, "Shot knocks the [target]'s head back by pushing on the inside of the skull!", "Fatal", "R3 eye/head"],
+        [6, 25, "Incredible shot to the eye penetrates deep into skull!", "Fatal", "R3 eye/head"],
+        [7, 30, "Shot destroys eye and the brain behind it!", "Fatal", "R3 eye/head"],
+        [8, 35, "Strike through eye, the [target] is lobotomized!", "Fatal", "R3 eye/head"],
+        [9, 40, "Strike to the eye penetrates skull, ocular fluid sprays widely!", "Fatal", "R3 eye/head"],
+      ],
+      "CHEST" => [
+        [1, 5,  "Minor puncture to the chest.", "none", "R1"],
+        [2, 10, "Strike to the chest breaks a rib!", "none", "R1"],
+        [3, 15, "Loud *crack* as the [target]'s sternum breaks!", "S2", "R1"],
+        [4, 20, "Well placed strike shatters a rib!", "S3", "R2"],
+        [5, 25, "Damaging strike to chest, several ribs shattered!", "S5", "R2"],
+        [6, 30, "Strong strike, punctures lung!", "S6", "R3"],
+        [7, 35, "Awesome shot shatters ribs and punctures lung!", "S8", "R3"],
+        [8, 40, "Beautiful shot pierces both lungs, the [target] makes a wheezing noise, and drops dead!", "Fatal", "R3"],
+        [9, 50, "Incredible strike pierces heart and runs the [target] clean through!", "Fatal", "R3"],
+      ],
+      "ABDOMEN" => [
+        [1, 5,  "Minor puncture to abdomen.", "none", "R1"],
+        [2, 10, "Nice puncture to the abdomen, just missed vital organs!", "none", "R1"],
+        [3, 15, "Strike pierces gall bladder! That's gotta hurt!", "S3", "R2"],
+        [4, 20, "Strike to abdomen punctures stomach!", "S3", "R2"],
+        [5, 25, "Vicious strike punctures intestines!", "S5", "R2"],
+        [6, 30, "Deft strike to abdomen penetrates several useful organs!", "S6", "R3"],
+        [7, 35, "Bladder impaled, what a mess!", "S8", "R3"],
+        [8, 40, "Strike to abdomen skewers the [target] quite nicely!", "Fatal", "R3"],
+        [9, 50, "Perfect strike to abdomen. The [target] howls in pain and drops quite dead!", "Fatal", "R3"],
+      ],
+      "BACK" => [
+        [1, 5,  "Minor puncture to the back.", "none", "R1"],
+        [2, 10, "Nice puncture to the back, just grazed the spine!", "none", "R1"],
+        [3, 15, "Strike connects with shoulder blade!", "S2", "R1"],
+        [4, 20, "Nailed in lower back!", "S3", "R2"],
+        [5, 25, "Well placed strike to back shatters vertebrae!", "S5 K", "R2"],
+        [6, 30, "Deft strike to the back cracks vertebrae!", "S6", "R3"],
+        [7, 35, "Awesome shot shatters spine and punctures lung!", "S8 K", "R3"],
+        [8, 40, "Shot to back shatters bone and vertebrae!", "Fatal", "R3 N3"],
+        [9, 50, "Incredible shot impales a kidney. Too painful to even scream.", "Fatal", "R3"],
+      ],
+      "RIGHT ARM" => [
+        [1, 3,  "Minor puncture to the right arm.", "none", "R1"],
+        [2, 5,  "Strike pierces upper arm!", "none", "R1"],
+        [3, 7,  "Well aimed shot, punctures upper arm!", "S1", "R1"],
+        [4, 10, "Strike pierces forearm!", "S2", "R2"],
+        [5, 14, "Elbow punctured, oh what pain!", "S3", "R2"],
+        [6, 17, "Well aimed strike shatters bone in right arm!", "S5", "R2"],
+        [7, 22, "Strike to right arm cleanly severs it at the shoulder!", "S6 A", "R3"],
+        [8, 25, "Strike to right arm shatters elbow and severs forearm!", "S8 A", "R3"],
+        [9, 25, "Shot shatters shoulder and severs right arm!", "S10 A", "R3"],
+      ],
+      "LEFT ARM" => [
+        [1, 3,  "Minor puncture to the left arm.", "none", "R1"],
+        [2, 5,  "Strike pierces upper arm!", "none", "R1"],
+        [3, 7,  "Well aimed shot, punctures upper arm!", "S1", "R1"],
+        [4, 10, "Strike pierces forearm!", "S2", "R2"],
+        [5, 14, "Elbow punctured, oh what pain!", "S3", "R2"],
+        [6, 17, "Well aimed strike shatters bone in left arm!", "S5", "R2"],
+        [7, 22, "Strike to left arm cleanly severs it at the shoulder!", "S6 A", "R3"],
+        [8, 25, "Strike to left arm shatters elbow and severs forearm!", "S8 A", "R3"],
+        [9, 25, "Shot shatters shoulder and severs left arm!", "S10 A", "R3"],
+      ],
+      "RIGHT HAND" => [
+        [1, 1,  "Strike to right hand breaks a fingernail!", "none", "R1"],
+        [2, 3,  "Strike through the palm!", "none", "R1"],
+        [3, 5,  "Shot to the hand slices a finger to the bone!", "none", "R1"],
+        [4, 7,  "Shot pierces a wrist!", "S1", "R2"],
+        [5, 9,  "Slash across back of hand, tendons sliced!", "S2", "R2"],
+        [6, 12, "Impressive shot shatters wrist!", "S3", "R2"],
+        [7, 15, "Strike to wrist severs right hand!", "S4 A", "R3"],
+        [8, 18, "Strike to wrist severs right hand!", "S5 A", "R3"],
+        [9, 20, "Strike to wrist severs right hand quite neatly!", "S10 A", "R3"],
+      ],
+      "LEFT HAND" => [
+        [1, 1,  "Strike to left hand breaks a fingernail!", "none", "R1"],
+        [2, 3,  "Strike through the palm!", "none", "R1"],
+        [3, 5,  "Shot to the hand slices a finger to the bone!", "none", "R1"],
+        [4, 7,  "Shot pierces a wrist!", "S1", "R2"],
+        [5, 9,  "Slash across back of hand, tendons sliced!", "S2", "R2"],
+        [6, 12, "Impressive shot shatters wrist!", "S3", "R2"],
+        [7, 15, "Strike to wrist severs left hand!", "S4 A", "R3"],
+        [8, 18, "Strike to wrist severs left hand!", "S5 A", "R3"],
+        [9, 20, "Strike to wrist severs left hand quite neatly!", "S10 A", "R3"],
+      ],
+      "RIGHT LEG" => [
+        [1, 5,  "Minor puncture to the right leg.", "none", "R1"],
+        [2, 9,  "Strike pierces thigh!", "K", "R1"],
+        [3, 13, "Well aimed shot, punctures calf!", "S1", "R1"],
+        [4, 17, "Strike pierces calf!", "S3 K", "R2"],
+        [5, 20, "Well placed shot pierces knee, that hurt!", "S5 K", "R2"],
+        [6, 23, "Great shot penetrates thigh and shatters bone!", "S6 K", "R2"],
+        [7, 27, "Blow shatters knee and severs lower leg!", "S8 K A", "R3"],
+        [8, 30, "Strike punctures thigh and shatters femur!", "S10 K A", "R3"],
+        [9, 35, "Shot shatters hip and severs right leg!", "S10 K A", "R3"],
+      ],
+      "LEFT LEG" => [
+        [1, 5,  "Minor puncture to the left leg.", "none", "R1"],
+        [2, 9,  "Strike pierces thigh!", "K", "R1"],
+        [3, 13, "Well aimed shot, punctures calf!", "S1", "R2"],
+        [4, 17, "Strike pierces calf!", "S3 K", "R2"],
+        [5, 20, "Well placed shot pierces knee, that hurt!", "S5 K", "R2"],
+        [6, 23, "Great shot penetrates thigh and shatters bone!", "S6 K", "R2"],
+        [7, 27, "Blow shatters knee and severs lower leg!", "S8 K A", "R3"],
+        [8, 30, "Strike punctures thigh and shatters femur!", "S10 K A", "R3"],
+        [9, 35, "Shot shatters hip and severs left leg!", "S10 K A", "R3"],
+      ],
+    },
+
+    "SLASH" => {
+      "HEAD" => [
+        [1, 5,  "Quick slash catches the [target]'s cheek! Dimples are always nice.", "none", "R1"],
+        [2, 10, "Blade slashes across the [target]'s face! Nice nose job.", "S1", "R1"],
+        [3, 15, "Blow to head!", "S3", "R2"],
+        [4, 20, "Quick flick of the wrist! The [target] is slashed across its forehead!", "S6", "R2"],
+        [5, 25, "Hard blow to the [target's] ear! Deep gash and a terrible headache!", "S8", "R3"],
+        [6, 30, "Gruesome slash opens the [target]'s forehead! Grey matter spills forth!", "F", "R3"],
+        [7, 35, "Wild upward slash removes the [target]'s face from its skull! Interesting way to die.", "F", "R3"],
+        [8, 40, "Horrible slash to the [target]'s head! Brain matter goes flying! Looks like it never felt a thing.", "F", "R3"],
+        [9, 50, "Gruesome, slashing blow to the side of the [target]'s head! Skull split open! Brain (and life) vanishes in a fine mist.", "F", "R3"],
+      ],
+      "NECK" => [
+        [1, 2,  "Attack hits the [target]'s throat but doesn't break the skin. Close!", "none", "R1"],
+        [2, 5,  "Strike dents the [target]'s larynx. Swallowing will be fun.", "S1", "R1"],
+        [3, 10, "Deft swing strikes the [target]'s neck. Maybe not fatal but it's sure distracting.", "S2", "R2"],
+        [4, 12, "Strong slash to throat nicks a few blood vessels.", "S4", "R3"],
+        [5, 15, "Fast slash to the [target]'s neck exposes its windpipe. Quick anatomy lesson, anyone?", "S8", "R3"],
+        [6, 20, "Deep slash to the [target]'s neck severs an artery! The [target] chokes to death on its own blood.", "F", "R3"],
+        [7, 25, "Gruesome slash to the [target]'s throat! That stings... for about a second.", "F", "R3"],
+        [8, 30, "Awful slash nearly decapitates the [target]! That's one way to lose your head.", "F", "R3"],
+        [9, 40, "Incredible slash to the [target]'s neck! Throat and vocal cords destroyed! Zero chance of survival.", "F", "R3"],
+      ],
+      "RIGHT EYE" => [
+        [1, 3,  "Slashing strike near forehead nicks an eyebrow! That must sting!", "none", "R1"],
+        [2, 3,  "Gash to the [target]'s right eyebrow. That's going to be quite a shiner!", "S1", "R2"],
+        [3, 5,  "Grazing slash to the [target]'s face! Scratch to its eyelids. \"When blood gets in your eyes...\"", "S3", "R2"],
+        [4, 20, "Upward slash gouges the [target]'s cheek! Right eye lost! Pity.", "S5", "R3 eye R2 head"],
+        [5, 25, "Slash strikes the [target]'s right eye. Seems there was a brain there after all.", "F", "R3 eye R3 head"],
+        [6, 30, "Slash to head destroys the [target]'s right eye! Doesn't do its brain any good either.", "F", "R3 eye R3 head"],
+        [7, 40, "Slash to the [target]'s right eye! Vitreous fluid spews forth! Seeya!", "F", "R3 eye R3 head"],
+        [8, 45, "Horrifying slash to the [target]'s head! Right eye sliced open! Brain pureed!", "F", "R3 eye R3 head"],
+        [9, 50, "Blast to the [target]'s head destroys right eye! Brain obliterated! Disgusting, but painful only for a second.", "F", "R3 eye R3 head"],
+      ],
+      "LEFT EYE" => [
+        [1, 3,  "Slashing strike near forehead nicks an eyelid! That must sting!", "none", "R1"],
+        [2, 3,  "Gash to the [target]'s left eyebrow. That's going to be quite a shiner!", "S1", "R2"],
+        [3, 5,  "Grazing slash to the [target]'s face! Scratches its left eye. Ouch!", "S3", "R2"],
+        [4, 20, "Upward slash gouges the [target]'s cheek! Left eye lost! Pity.", "S5", "R3 eye R2 head"],
+        [5, 25, "Slash strikes the [target]'s left eye. Seems there was a brain there after all.", "F", "R3 eye R3 head"],
+        [6, 30, "Slash to head destroys the [target]'s left eye! Doesn't do its brain any good either.", "F", "R3 eye R3 head"],
+        [7, 40, "Slash to the [target]'s left eye! Vitreous fluid spews forth! Seeya!", "F", "R3 eye R3 head"],
+        [8, 45, "Horrifying slash to the [target]'s head! Left eye sliced open! Brain pureed!", "F", "R3 eye R3 head"],
+        [9, 50, "Blast to the [target]'s head destroys left eye! Brain obliterated! Disgusting, but painful only for a second.", "F", "R3 eye R3 head"],
+      ],
+      "CHEST" => [
+        [1, 1,  "Deft slash across chest draws blood! The [target] takes a deep breath.", "none", "R1"],
+        [2, 10, "Slash to the [target]'s chest! That heart's not broken, it's only scratched.", "none", "R1"],
+        [3, 15, "Slash to [target]'s chest. Breathe deep, it'll feel better in a minute.", "S1", "R1"],
+        [4, 20, "Slashing blow to chest knocks the [target] back a few paces!", "S3", "R2"],
+        [5, 25, "Crossing slash to the chest catches the [target]'s attention!", "S5", "R2"],
+        [6, 45, "Hard slash to the [target]'s side opens its spleen!", "S6", "R3 chest R2 back"],
+        [7, 60, "Quick, powerful slash! The [target]'s chest is ripped open!", "S8", "R3 chest R2 back"],
+        [8, 65, "Slash to the [target]'s ribs opens a sucking chest wound!", "F", "R3 chest R3 abdomen"],
+        [9, 70, "Wicked slash slices open the [target]'s chest! Heart and lung pureed! Sickening!", "F", "R3 chest R3 abdomen"],
+      ],
+      "ABDOMEN" => [
+        [1, 5,  "Awkward slash to the [target]'s stomach! Everyone needs another belly button.", "none", "R1"],
+        [2, 10, "Smooth slash to the [target]'s hip! Nice crunching sound.", "none", "R1"],
+        [3, 15, "Hard slash to belly severs a few nerve endings.", "S3", "R2 R1 nerve"],
+        [4, 20, "Diagonal slash leaves a bloody trail across the [target]'s torso.", "S3", "R2"],
+        [5, 25, "The [target] is backed up by a strong slash to its abdomen!", "S5", "R2"],
+        [6, 30, "Deep slash to the [target]'s right side! Several inches of padding sliced off hip.... From the inside!", "S6 K", "R3 abs R2 back"],
+        [7, 50, "Amazing slash to the [target]'s belly! Nothing quite like that empty feeling inside.", "S8", "R3 abs R2 back"],
+        [8, 60, "Bloody slash to the [target]'s side! Instant death, due to lack of intestines.", "F", "R3 abs R3 back"],
+        [9, 75, "Terrible slash to the [target]'s side! Entrails spill out, onto the ground! Death can be SO messy.", "F", "R3 abs R3 back"],
+      ],
+      "BACK" => [
+        [1, 3,  "Weak slash to the [target]'s lower back!", "none", "R1"],
+        [2, 10, "Feint to the left goes astray as the [target] dodges! You scratch my back...", "none", "R1"],
+        [3, 15, "Slash along the [target]'s lower back.", "S2", "R1"],
+        [4, 20, "Slash to the [target]'s lower back! Pain shoots up along [target]'s spine.", "S2", "R1"],
+        [5, 25, "Feint left spins the [target] around! Jagged slash to lower back.", "S3", "R2"],
+        [6, 30, "The [target] twists away but is caught with a hard slash! Back is broken!", "S5 K", "R3"],
+        [7, 50, "Deft slash! The [target] is spun around and hit hard in its lower back.", "S6 K", "R3 back R2 abs"],
+        [8, 60, "Slash to the [target]'s lower back! Kidneys sliced and diced! Death is slow and painful.", "F", "R3 back/nerves"],
+        [9, 75, "Masterful slash to the [target]'s lower back! Spinal cord and life are just memories now.", "F", "R3 back/nerves"],
+      ],
+      "RIGHT ARM" => [
+        [1, 3,  "Quick slash to the [target]'s upper right arm! Just a nick.", "none", "R1"],
+        [2, 7,  "Hesitant slash to the [target]'s upper right arm! Just a scratch.", "none", "R1"],
+        [3, 8,  "Slash to the [target]'s right arm! Slices neatly through the skin and meets bone!", "S1", "R1"],
+        [4, 10, "Powerful slash just cracks the [target]'s weapon arm!", "S2", "R2"],
+        [5, 15, "Deep slash to the [target]'s right forearm!", "S3", "R2"],
+        [6, 20, "Quick, hard slash to the [target]'s right arm! \"CRACK\"", "S5", "R2"],
+        [7, 25, "Hard slash to the [target]'s side! Right arm no longer available for use.", "S6 A", "R3"],
+        [8, 35, "Spectacular slash! The [target]'s right arm is neatly amputated!", "S8 A", "R3"],
+        [9, 40, "Awesome slash severs the [target]'s right arm! A jagged stump is all that remains!", "S10 A", "R3"],
+      ],
+      "LEFT ARM" => [
+        [1, 3,  "Quick slash to the [target]'s upper left arm! Just a nick.", "none", "R1"],
+        [2, 7,  "Slash to the [target]'s shield arm! Shears off a thin layer of skin!", "none", "R1"],
+        [3, 8,  "Glancing slash to the [target]'s shield arm!", "S1", "R1"],
+        [4, 10, "Powerful slash just cracks the [target]'s shield arm!", "S2", "R2"],
+        [5, 15, "Deep slash to the [target]'s left forearm!", "S3", "R2"],
+        [6, 20, "Off-balance slash to the [target]'s left arm shatters its elbow. \"CRUNCH\"", "S5", "R2"],
+        [7, 25, "Hard slash to the [target]'s side! Left arm no longer available for use.", "S6 A", "R3"],
+        [8, 35, "Spectacular slash! The [target]'s left arm is neatly amputated!", "S8 A", "R3"],
+        [9, 40, "Awesome slash severs the [target]'s left arm! A jagged stump is all that remains!", "S10 A", "R3"],
+      ],
+      "RIGHT HAND" => [
+        [1, 1,  "Diagonal slash to the [target]'s weapon arm. Strike misses but bruises a few knuckles.", "none", "R1"],
+        [2, 3,  "Wild slash bounces off the back of the [target]'s hand.", "none", "R1"],
+        [3, 5,  "Feint to the [target]'s head! Quick flick at its weapon hand! Nasty cut to right hand!", "none", "R1"],
+        [4, 7,  "Strong slash to the [target]'s right hand cuts deep.", "S1", "R2"],
+        [5, 5,  "Slash to the [target]'s weapon hand! Several fingers fly!", "S2", "R2"],
+        [6, 10, "Rapped the [target]'s knuckles hard! Right hand sounds broken.", "S3", "R2"],
+        [7, 15, "Jagged slash to the [target]'s right arm! Cut clean through at the wrist. Need a hand?", "S4 A", "R3"],
+        [8, 25, "Powerful slash trims the [target]'s fingernails... and the remainder of its right hand!", "S5 A", "R3"],
+        [9, 30, "Off-balanced slash! Enough force to sever the [target]'s right hand! Amazing!", "S10 A", "R3"],
+      ],
+      "LEFT HAND" => [
+        [1, 1,  "Slash to the [target]'s shield arm. Strike trims off a few fingernails.", "none", "R1"],
+        [2, 3,  "Wild slash scratches the back of the [target]'s hand.", "none", "R1"],
+        [3, 5,  "Slice to the [target]'s left fingers. Nice move.", "none", "R1"],
+        [4, 7,  "Deep cut to the [target]'s left hand! Seems to have broken some fingers too.", "S1", "R2"],
+        [5, 8,  "Slash to the [target]'s shield hand! Several fingers fly!", "S2", "R2"],
+        [6, 10, "Rapped the knuckles hard! Left hand sounds broken.", "S3", "R2"],
+        [7, 15, "Jagged slash to the [target]'s left arm! Cut clean through at the wrist. Need a hand?", "S4 A", "R3"],
+        [8, 25, "Powerful slash trims the [target]'s fingernails... and the remainder of its left hand!", "S5 A", "R3"],
+        [9, 30, "Off-balanced slash! Enough force to sever the [target]'s left hand! Amazing!", "S10 A", "R3"],
+      ],
+      "RIGHT LEG" => [
+        [1, 5,  "Slash to the [target]'s right leg hits high! Kinda makes your knees weak, huh?", "none", "R1"],
+        [2, 10, "Banged the [target]'s right shin. That'll raise a good welt.", "none", "R1"],
+        [3, 10, "Downward slash across the [target]'s right thigh! Might not scar.", "S1", "R1"],
+        [4, 17, "Deep, bloody slash to the [target]'s right thigh!", "S3 K", "R2"],
+        [5, 20, "Quick, powerful slash to the [target]'s right knee!", "S5 K", "R2"],
+        [6, 25, "Strong slash to the [target]'s right leg! Muscles exposed! Not a pretty sight.", "S6 K", "R2"],
+        [7, 30, "Wild downward slash severs the [target]'s right foot! Bloody stump, anyone?", "S8 K A", "R3"],
+        [8, 40, "Powerful slash! The [target]'s right leg is severed at the knee!", "S10 K A", "R3"],
+        [9, 45, "Powerful slash leaves the [target] without a right leg!", "S12 K A", "R3"],
+      ],
+      "LEFT LEG" => [
+        [1, 5,  "Slash to the [target]'s left leg hits high! Kinda makes your knees weak, huh?", "none", "R1"],
+        [2, 10, "Banged the [target]'s left shin. That'll raise a good welt.", "none", "R1"],
+        [3, 10, "Downward slash across the [target]'s left thigh! Gouges bone!", "S1", "R1"],
+        [4, 17, "Deft slash to the [target]'s left leg digs deep! Bone is chipped!", "S3 K", "R2"],
+        [5, 20, "Quick, powerful slash to the [target]'s left knee!", "S5 K", "R2"],
+        [6, 25, "Weak diagonal slash catches the [target]'s left knee! It is dislocated.", "S6 K", "R2"],
+        [7, 30, "Wild downward slash severs the [target]'s left foot! Bloody stump, anyone?", "S8 K A", "R3"],
+        [8, 40, "Powerful slash! The [target]'s left leg is severed at the knee!", "S10 K A", "R3"],
+        [9, 45, "Powerful slash leaves the [target] without a left leg!", "S12 K A", "R3"],
+      ],
+    },
+  }
+
+  # ---- Regex compilation -------------------------------------------------
+  # Turn a crit message template into a tolerant regex that matches the raw
+  # game line regardless of [target] substitution, punctuation, or spacing.
+  def compile_regex(msg)
+    sentinel = "\u0001"
+    tmp = msg.dup
+    # All target placeholder variants -> single sentinel (the live name may
+    # carry a trailing possessive 's, which the wildcard will absorb).
+    tmp = tmp.gsub(/\[target's\]/i, sentinel)
+    tmp = tmp.gsub(/\[target\]'s/i, sentinel)
+    tmp = tmp.gsub(/\[target\]/i, sentinel)
+
+    tokens = []
+    buf = +""
+    tmp.each_char do |c|
+      if c == sentinel
+        tokens << buf unless buf.empty?
+        buf = +""
+        tokens << :T
+      elsif c =~ /[A-Za-z0-9]/
+        buf << c
+      else
+        tokens << buf unless buf.empty?
+        buf = +""
+      end
+    end
+    tokens << buf unless buf.empty?
+
+    # Drop article words; the gap pattern makes them optional in matching.
+    sig = tokens.reject { |t| t.is_a?(String) && ARTICLES.include?(t.downcase) }
+    sig = tokens if sig.empty?
+
+    parts = sig.map do |t|
+      if t == :T
+        "[A-Za-z][A-Za-z0-9'\\- ]*?"
+      elsif PRONOUNS.include?(t.downcase)
+        # Tables use it/its for the creature; gendered foes show he/she/his/her.
+        PRONOUN_ALT
+      else
+        Regexp.escape(t)
+      end
+    end
+    Regexp.new(parts.join(GAP), Regexp::IGNORECASE)
+  end
+
+  PRONOUNS = %w[it its itself he him his she her hers herself himself they them their themselves].freeze
+  PRONOUN_ALT = "(?:#{PRONOUNS.join('|')})".freeze
+  ARTICLES = %w[the a an].freeze
+  # Separator between significant words, optionally swallowing a dropped article.
+  GAP = "(?:[^A-Za-z0-9]+(?:the|a|an)\\b)*[^A-Za-z0-9]+".freeze
+
+  # Lines that mean a creature is attacking YOU; their crits/swings are never
+  # yours. Keyed on GemStone's universal pronoun grammar (you/your), not on any
+  # creature name, so it generalizes to any monster.
+  INCOMING_RE = /\bat you\b|\bMDR result:|\bhits? you\b|\byou are struck\b|partially deflects the onslaught|fend off (?:the|this) attack|manage to (?:parry|block|evade)|\btries to\b[^.!]*\byou\b|\b(?:bites?|claws?|gnaws?|mauls?|gores?|rakes?|stabs?|spits?|breathes?) you\b/i
+  # Lines that mark a clearly player-initiated attack (you are the subject, or
+  # the hit resolves with "and hit for", which only your own attacks ever say).
+  PLAYER_RE = /\band hit for \d+ points? of damage|\bYou (?:swing|take aim|leap|uncoil|crouch|angle|rotate|advance|attack|lunge|thrust|jab|slash|chop|hack|stab|punch|kick|fire|hurl|throw|lob|deftly switch|slip|spring|whirl|carve|sweep|round|guide|weave)\b|\byou (?:carve|sweep|round on|guide|weave|lick out|swing|slip|thrust|jab)\b|\bYour blades\b/i
+
+  # Build the flat entry list, merging genuinely side-less LEFT/RIGHT pairs.
+  def build_entries
+    list = []
+    TABLES.each do |type, locs|
+      locs.each do |loc, rows|
+        rows.each do |row|
+          rank, dmg, message, status, wound = row
+          list << {
+            type: type, loc: loc, rank: rank, dmg: dmg,
+            status: status, wound: wound, msg: message,
+            re: compile_regex(message), disp: nil
+          }
+        end
+      end
+    end
+
+    grouped = Hash.new { |h, k| h[k] = [] }
+    list.each { |e| grouped[[e[:type], e[:rank], e[:msg]]] << e }
+    grouped.each_value do |grp|
+      locs = grp.map { |e| e[:loc] }.uniq
+      next unless locs.size == 2
+      has_left  = locs.any? { |l| l.start_with?("LEFT ") }
+      has_right = locs.any? { |l| l.start_with?("RIGHT ") }
+      bases     = locs.map { |l| l.sub(/\A(LEFT|RIGHT) /, "") }.uniq
+      if has_left && has_right && bases.size == 1
+        grp.each { |e| e[:disp] = bases.first }
+      end
+    end
+    list.each { |e| e[:disp] ||= e[:loc] }
+    list
+  end
+
+  # ---- Matching ----------------------------------------------------------
+  def match_line(line, observed_dmg)
+    hits = @entries.select { |e| e[:re].match?(line) }
+    return nil if hits.empty?
+    return hits.first if hits.size == 1
+    if observed_dmg
+      hits.min_by { |e| [(e[:dmg] - observed_dmg).abs, e[:rank]] }
+    else
+      hits.min_by { |e| e[:rank] }
+    end
+  end
+
+  # ---- Effects formatting ------------------------------------------------
+  def format_effects(status, wound)
+    parts = []
+    st = status.to_s
+    parts << "STUN #{$1} ROUND" if st =~ /S(\d+)/
+    parts << "KNOCKDOWN"        if st =~ /\bK\b/
+    parts << "AMPUTATION"       if st =~ /\bA\b/
+    parts << "FATAL"            if st =~ /\bF\b/ || st =~ /fatal/i
+    w = wound.to_s.strip
+    parts << "#{w.upcase} WOUND" unless w.empty? || w.downcase == "none"
+    parts
+  end
+
+  # ---- Output ------------------------------------------------------------
+  def echo_to_familiar_window(message)
+    if $frontend =~ /stormfront|profanity/i
+      b = "<pushStream id=\"familiar\" ifClosedStyle=\"watching\"/><output class=\"mono\"/>\n"
+      e = "\n<output class=\"\"/><popStream/>\r\n"
+    else
+      b = "\034GSe\r\n"
+      e = "\034GSf\r\n"
+    end
+    _respond("#{b}#{message}#{e}")
+  end
+
+  def echo_to_main(message)
+    if $frontend =~ /stormfront|profanity/i
+      _respond("<output class=\"mono\"/>\n#{message}\n<output class=\"\"/>\r\n")
+    else
+      respond(message)
+    end
+  end
+
+  def live_output(e, dmg = nil)
+    header = "#{e[:type]} #{e[:disp]}: RANK #{e[:rank]}"
+    parts = format_effects(e[:status], e[:wound])
+    parts << "DMG: #{dmg}" if dmg
+    msg = parts.empty? ? header : "#{header} | #{parts.join(' | ')}"
+    if @data['prefs']['familiar']
+      echo_to_familiar_window(msg)
+    else
+      echo(msg)
+    end
+  end
+
+  # ---- Data --------------------------------------------------------------
+  def blank_dataset
+    {
+      'date'           => Time.now.strftime('%Y-%m-%d'),
+      'total_hits'     => 0,
+      'by_type'        => {},
+      'by_location'    => {},
+      'total_attacks'  => 0,   # melee swings resolved (AS vs DS endroll lines)
+      'misses'         => 0,   # swings with endroll <= 100 (complete misses)
+      'aimed_attacks'  => 0,   # swings made while aiming a location (pending sample)
+      'aimed_misses'   => 0    # aimed swings that did not land on the aimed area
+    }
+  end
+
+  def ensure_dataset(ds)
+    ds = {} unless ds.is_a?(Hash)
+    ds['date']           ||= Time.now.strftime('%Y-%m-%d')
+    ds['total_hits']     ||= 0
+    ds['by_type']        ||= {}
+    ds['by_location']    ||= {}
+    ds['total_attacks']  ||= 0
+    ds['misses']         ||= 0
+    ds['aimed_attacks']  ||= 0
+    ds['aimed_misses']   ||= 0
+    # Migration: older versions stored by_location as a flat {LOC => rec} hash,
+    # mixing damage types. The new format nests by type {TYPE => {LOC => rec}}.
+    # Old entries can't be re-typed, so reset just the crit tallies (attacks and
+    # misses are kept). Detected when a value looks like a location record.
+    if ds['by_location'].values.any? { |v| v.is_a?(Hash) && v.key?('hits') }
+      ds['by_location'] = {}
+      ds['by_type']     = {}
+      ds['total_hits']  = 0
+      @migrated = true
+    end
+    ds
+  end
+
+  def blank_location
+    { 'hits' => 0, 'dmg_sum' => 0, 'dmg_high' => 0, 'dmg_count' => 0, 'ranks' => {} }
+  end
+
+  def load_data
+    base = "#{$data_dir}#{XMLData.game}"
+    dir  = "#{base}/#{Char.name}"
+    Dir.mkdir(base) unless Dir.exist?(base)
+    Dir.mkdir(dir)  unless Dir.exist?(dir)
+    @datafile = "#{dir}/crittracker.yaml"
+
+    if File.exist?(@datafile)
+      begin
+        @data = YAML.load_file(@datafile)
+      rescue StandardError => ex
+        echo("CritTracker: could not read data file (#{ex.message}); starting fresh.")
+        @data = nil
+      end
+    end
+    @data = {} unless @data.is_a?(Hash)
+    @data['lifetime'] = ensure_dataset(@data['lifetime'])
+    @data['daily']    = ensure_dataset(@data['daily'])
+    @data['prefs']  ||= {}
+    @data['prefs']['familiar'] = true  if @data['prefs']['familiar'].nil?
+    @data['prefs']['debug']    = false if @data['prefs']['debug'].nil?
+    @save_counter = 0
+  end
+
+  def save
+    begin
+      tmp = @datafile + ".tmp"
+      File.open(tmp, "w") do |f|
+        f.write(@data.to_yaml)
+        f.fsync
+      end
+      File.rename(tmp, @datafile)
+    rescue StandardError => ex
+      echo("CritTracker: failed to save data: #{ex.message}")
+    end
+  end
+
+  def check_daily_reset
+    today = Time.now.strftime('%Y-%m-%d')
+    if @data['daily']['date'] != today
+      @data['daily'] = blank_dataset
+    end
+  end
+
+  def record(ds, type, loc, rank, dmg)
+    ds['total_hits'] += 1
+    ds['by_type'][type] = (ds['by_type'][type] || 0) + 1
+    tl = (ds['by_location'][type] ||= {})
+    l = (tl[loc] ||= blank_location)
+    l['hits'] += 1
+    l['ranks'][rank] = (l['ranks'][rank] || 0) + 1
+    if dmg
+      l['dmg_sum']   += dmg
+      l['dmg_count'] += 1
+      l['dmg_high']   = dmg if dmg > l['dmg_high']
+    end
+  end
+
+  def record_crit(e, dmg)
+    check_daily_reset
+    record(@data['lifetime'], e[:type], e[:disp], e[:rank], dmg)
+    record(@data['daily'],    e[:type], e[:disp], e[:rank], dmg)
+    @save_counter += 1
+    save if (@save_counter % 10).zero?
+  end
+
+  # Tally a resolved melee swing. is_miss = endroll <= 100 (complete miss).
+  def record_attack(is_miss)
+    check_daily_reset
+    [@data['lifetime'], @data['daily']].each do |ds|
+      ds['total_attacks'] += 1
+      ds['misses'] += 1 if is_miss
+    end
+    @save_counter += 1
+    save if (@save_counter % 10).zero?
+  end
+
+  # Tally an aimed swing whose crit location is known. missed = landed off-target.
+  def record_aim(missed)
+    check_daily_reset
+    [@data['lifetime'], @data['daily']].each do |ds|
+      ds['aimed_attacks'] += 1
+      ds['aimed_misses'] += 1 if missed
+    end
+    @save_counter += 1
+    save if (@save_counter % 10).zero?
+  end
+
+  # Valid aim phrases, longest first so "right leg" is matched before "leg".
+  AIM_LOCATIONS = [
+    "right eye", "left eye", "right arm", "left arm", "right hand", "left hand",
+    "right leg", "left leg", "head", "neck", "chest", "abdomen", "back",
+    "eye", "arm", "hand", "leg"
+  ].sort_by { |s| -s.length }
+
+  # Reduce a location to its side-less base (so a sided crit can be compared to
+  # a possibly side-less aim, since crit messaging is unreliable about sides).
+  def base_location(loc)
+    loc.to_s.downcase.sub(/\A(left|right)\s+/, '').strip
+  end
+
+  # Extract a trailing aim location from a manually-typed attack command.
+  def parse_attack_aim(cmd)
+    c = cmd.to_s.downcase.strip
+    return nil unless c =~ /\A(attack|kill|ambush|waylay|fire|hurl)\b/
+    AIM_LOCATIONS.each { |loc| return loc if c =~ /\b#{Regexp.escape(loc)}\z/ }
+    nil
+  end
+
+  # ---- Stats display -----------------------------------------------------
+  def show_stats(ds, label)
+    lines = []
+    lines << ("=" * 64)
+    title = "CRITICAL STATS - #{label}"
+    title += "  (#{ds['date']})" if label == "DAILY"
+    lines << title
+    lines << "Total hits: #{ds['total_hits']}"
+    unless ds['by_type'].empty?
+      tline = ds['by_type'].sort_by { |_, v| -v }.map { |k, v| "#{k}: #{v}" }.join("   ")
+      lines << "By type: #{tline}"
+    end
+
+    atk = ds['total_attacks'].to_i
+    miss = ds['misses'].to_i
+    miss_pct = atk > 0 ? (miss * 100.0 / atk).round : 0
+    lines << "Attacks: #{atk} | TOTAL MISS: #{miss_pct}% (#{miss})"
+    aimed = ds['aimed_attacks'].to_i
+    if aimed > 0
+      amiss = ds['aimed_misses'].to_i
+      apct = (amiss * 100.0 / aimed).round
+      lines << "Aimed attacks: #{aimed} | AIMED MISSES: #{apct}% (#{amiss})"
+    end
+    lines << ("-" * 64)
+
+    bl = ds['by_location']
+    if bl.nil? || bl.empty? || bl.values.all? { |t| t.nil? || t.empty? }
+      lines << "No critical hits recorded yet."
+    else
+      type_order = ["CRUSH", "PUNCTURE", "SLASH"]
+      ordered = type_order + (bl.keys - type_order)
+      ordered.each do |type|
+        locs = bl[type]
+        next if locs.nil? || locs.empty?
+        type_total = locs.values.sum { |d| d['hits'].to_i }
+        lines << "[ #{type} CRITS ]  (#{type_total})"
+        locs.sort_by { |_, d| -d['hits'].to_i }.each do |loc, d|
+          hits = d['hits'].to_i
+          pct  = type_total > 0 ? (hits * 100.0 / type_total).round : 0
+          avg  = d['dmg_count'].to_i > 0 ? (d['dmg_sum'].to_f / d['dmg_count']).round : 0
+          high = d['dmg_high'].to_i
+          lines << "  #{loc} | HIT %: #{pct}% (#{hits}) | AVG DMG: #{avg} | HIGH DMG: #{high}"
+          ranks = d['ranks'] || {}
+          keys  = ranks.keys.map { |k| k.to_i }.sort
+          rstrs = keys.map do |r|
+            c  = ranks[r] || ranks[r.to_s] || 0
+            rp = hits > 0 ? (c * 100.0 / hits).round : 0
+            "RANK #{r}: #{rp}% (#{c})"
+          end
+          lines << ("     " + rstrs.join(" / ")) unless rstrs.empty?
+        end
+      end
+
+      # Aggregate rank distribution across all locations/types.
+      rank_totals = Hash.new(0)
+      bl.each_value do |locs|
+        next unless locs.is_a?(Hash)
+        locs.each_value do |d|
+          (d['ranks'] || {}).each do |r, c|
+            rank_totals[r.to_i] += c.to_i
+          end
+        end
+      end
+      grand = rank_totals.values.sum
+      if grand > 0
+        lines << ("-" * 64)
+        lines << "[ RANK TOTALS ]  (#{grand})"
+        rank_totals.keys.sort.each do |r|
+          c = rank_totals[r]
+          rp = (c * 100.0 / grand).round
+          lines << "  RANK #{r} | #{c} TOTAL | #{rp}%"
+        end
+      end
+
+      # Aggregate hit distribution across all damage types, per body location.
+      loc_totals = Hash.new(0)
+      bl.each_value do |locs|
+        next unless locs.is_a?(Hash)
+        locs.each do |loc, d|
+          loc_totals[loc] += d['hits'].to_i
+        end
+      end
+      lgrand = loc_totals.values.sum
+      if lgrand > 0
+        lines << ("-" * 64)
+        lines << "[ LOCATION TOTALS ]  (#{lgrand})"
+        loc_totals.sort_by { |loc, c| [-c, loc] }.each do |loc, c|
+          lp = (c * 100.0 / lgrand).round
+          lines << "  #{loc} | #{c} TOTAL | #{lp}%"
+        end
+      end
+    end
+    lines << ("=" * 64)
+    echo_to_main(lines.join("\n"))
+  end
+
+  def show_help
+    msg = [
+      "CritTracker commands (type at the prompt, no semicolon):",
+      "  crit daily          today's stats",
+      "  crit life           lifetime stats",
+      "  crit familiar       toggle live familiar-window output (now: #{@data['prefs']['familiar'] ? 'ON' : 'OFF'})",
+      "  crit debug          toggle unmatched-line debug (now: #{@data['prefs']['debug'] ? 'ON' : 'OFF'})",
+      "  crit reset daily | life | all",
+      "  crit help           this help"
+    ].join("\n")
+    echo_to_main(msg)
+  end
+
+  # ---- Command handling --------------------------------------------------
+  def handle_command(raw)
+    cmd = raw.to_s.strip.downcase.gsub(/\s+/, ' ')
+    @mutex.synchronize do
+      case cmd
+      when "crit daily"
+        check_daily_reset
+        show_stats(@data['daily'], "DAILY")
+      when "crit life", "crit lifetime"
+        show_stats(@data['lifetime'], "LIFETIME")
+      when "crit familiar"
+        @data['prefs']['familiar'] = !@data['prefs']['familiar']
+        save
+        echo("CritTracker: live familiar output #{@data['prefs']['familiar'] ? 'ON' : 'OFF'}")
+      when "crit debug"
+        @data['prefs']['debug'] = !@data['prefs']['debug']
+        save
+        echo("CritTracker: debug #{@data['prefs']['debug'] ? 'ON' : 'OFF'}")
+      when "crit reset daily"
+        @data['daily'] = blank_dataset
+        save
+        echo("CritTracker: DAILY stats reset.")
+      when "crit reset life", "crit reset lifetime"
+        @data['lifetime'] = blank_dataset
+        save
+        echo("CritTracker: LIFETIME stats reset.")
+      when "crit reset all"
+        @data['daily']    = blank_dataset
+        @data['lifetime'] = blank_dataset
+        save
+        echo("CritTracker: ALL stats reset.")
+      else
+        show_help
+      end
+    end
+  end
+
+  def install_hook
+    UpstreamHook.add(HOOK_ID, proc do |client_string|
+      # Wrayth/Stormfront prefix client input with "<c>"; strip it before matching.
+      cmd = client_string.to_s.sub(/\A<c>/i, '').strip
+      if cmd =~ /\Acrit(?:\s+.*)?\z/i
+        begin
+          handle_command(cmd)
+        rescue StandardError => ex
+          echo("CritTracker command error: #{ex.message}")
+        end
+        nil # swallow so the game never sees it
+      else
+        # Not a crit command: pass through, but note any aimed attack location
+        # the player typed (script-issued commands are not seen here).
+        loc = parse_attack_aim(cmd)
+        @mutex.synchronize { @aim_oneshot = loc } if loc
+        client_string
+      end
+    end)
+  end
+
+  def remove_hook
+    UpstreamHook.remove(HOOK_ID)
+  rescue StandardError
+    nil
+  end
+
+  def shutdown
+    @mutex.synchronize { save } if @mutex && @data
+  rescue StandardError
+    nil
+  ensure
+    remove_hook
+  end
+
+  # Rough filter: lines worth reporting as "unmatched" while debugging.
+  DEBUG_HINT = /\b(slash|slashes|slashing|strike|strikes|blow|shot|crush|crushing|pierce|pierces|punctures?|sever|severs|smash|smashes|gash|shatters?|skewers?|gouges?|vapor|ethereal|mist|misty|reform|reforms|reseals|whistles|wisp|tendrils|vaporizes|amputates|obliterates)\b/i
+
+  # ---- Main loop ---------------------------------------------------------
+  def run
+    @mutex = Mutex.new
+    load_data
+    @entries = build_entries
+    install_hook
+    echo("CritTracker active. Tracking CRUSH/PUNCTURE/SLASH melee crits. Type 'crit help' for commands.")
+    if @migrated
+      echo("CritTracker: stats format updated; prior per-location crit counts were cleared so types could be separated. Attack/miss totals were kept.")
+    end
+
+    pending = 0       # lines remaining in which to look for a crit message
+    hit_dmg = nil     # damage of OUR weapon swing this round (never a flare's)
+    buf = +""         # rolling buffer so crits split across lines still match
+    swing_aim = nil   # aim location in effect for the swing currently resolving
+    flare_pending = false   # next bare "... N points" is flare damage (skip it)
+    prev_announce = false   # the previous line was a "** ... **" flare banner
+    attacker = :mine        # whose attack is currently resolving (:mine / :incoming)
+    @aim_pref = nil   # persistent AIM preference (from downstream echo)
+    @aim_oneshot = nil # location typed on a single attack command (hook-set)
+    begin
+      while true
+        line = get
+
+        # Persistent AIM preference, echoed by the game for AIM <loc> / clear.
+        if line =~ /[Yy]ou.?re now aiming at the (.+?) of your target/
+          @aim_pref = $1.strip.downcase
+          next
+        elsif line =~ /no longer aiming at anything/i
+          @aim_pref = nil
+          next
+        end
+
+        # Track attack ownership. Incoming attacks (a creature striking YOU) must
+        # never be counted as your crits or swings. Your attacks say "at a/the
+        # <creature>" and resolve with "and hit for"; incoming say "at you", etc.
+        if line =~ INCOMING_RE
+          attacker = :incoming
+        elsif line =~ PLAYER_RE
+          attacker = :mine
+        end
+
+        # Incoming creature maneuver (Maneuver Defense Roll): its bite/crit is on
+        # YOU. Mark incoming and drop any open window so it can't be captured.
+        if line =~ /\A\s*\[MDR result:/i
+          attacker = :incoming
+          pending = 0
+          hit_dmg = nil
+          buf = +""
+          next
+        end
+
+        # Flare banner "** ... **": the next bare "... N points" is flare damage.
+        if line =~ /\A\s*\*\*.*\*\*\s*\z/
+          flare_pending = true
+          prev_announce = true
+          next
+        end
+
+        # SMR maneuver result. If it directly follows a flare banner, this SMR
+        # belongs to that flare. Otherwise it's a weapon maneuver (eviscerate,
+        # etc.) whose damage prints as a bare "... N points" with no AS/DS line.
+        if line =~ /\A\s*\[SMR result:/i
+          flare_pending = prev_announce
+          unless prev_announce
+            pending = 0
+            hit_dmg = nil
+            buf = +""
+          end
+          prev_announce = false
+          next
+        end
+        prev_announce = false
+
+        # New weapon swing resolution: "AS: +N vs DS: +N ... = +ENDROLL"
+        # Endroll <= 100 is a complete miss (standard GS d100 mechanic).
+        if line =~ /\bAS:\s*[+-]?\d+\s+vs\s+DS:.*?=\s*([+-]?\d+)/i
+          endroll = $1.to_i
+          if attacker == :mine
+            # Snapshot the aim for this swing, then consume any one-shot location.
+            @mutex.synchronize do
+              swing_aim = @aim_oneshot || @aim_pref
+              @aim_oneshot = nil
+            end
+            @mutex.synchronize { record_attack(endroll <= 100) }
+          else
+            swing_aim = nil   # incoming swing: not ours, don't count or aim-check
+          end
+          pending = 0          # close any prior crit window at the swing boundary
+          hit_dmg = nil
+          buf = +""
+          flare_pending = false
+          next
+        end
+
+        # Our weapon hit damage (drives the DMG figure; flares never do).
+        if line =~ /\band hit for (\d+) points? of damage/i
+          hit_dmg = $1.to_i
+          pending = 8
+          buf = +""
+          flare_pending = false
+          next
+        # Bare "... N points of damage!": flare damage if flagged (skip it),
+        # otherwise a weapon maneuver strike -> open a crit window.
+        elsif line =~ /\A\s*\.\.\.\s*(\d+) points? of damage/i
+          if flare_pending
+            flare_pending = false
+          elsif attacker == :mine
+            hit_dmg = $1.to_i
+            pending = 8
+            buf = +""
+          end
+          next
+        # Incoming hit on us: not ours.
+        elsif line =~ /\bhits? you\b.*?\d+ points? of damage/i
+          pending = 0
+          hit_dmg = nil
+          buf = +""
+          next
+        # Any other "points of damage" line (e.g. another player): leave state alone.
+        elsif line =~ /points? of damage/i
+          next
+        end
+
+        next if pending <= 0
+
+        buf << " " << line
+        buf = buf[-600..-1].to_s if buf.length > 600
+
+        e = match_line(buf, hit_dmg)
+        if e
+          @mutex.synchronize do
+            record_crit(e, hit_dmg)
+            if swing_aim
+              record_aim(base_location(swing_aim) != base_location(e[:disp]))
+            end
+          end
+          live_output(e, hit_dmg)
+          swing_aim = nil
+          pending = 0
+          buf = +""
+        else
+          pending -= 1
+          if @data['prefs']['debug'] && line.strip =~ DEBUG_HINT
+            echo("[crit-debug unmatched] #{line.strip}")
+          end
+        end
+      end
+    ensure
+      shutdown
+    end
+  end
+
+  before_dying { CritTracker.shutdown }
+end
+
+CritTracker.run
