@@ -1,0 +1,315 @@
+#quiet
+=begin
+  SpellFade watches the active spell and effect list that Lich already knows
+  about. When something disappears from that list, it tells you what ended.
+
+  It does not send commands to the game.
+
+  Start it with:
+    ;spellfade
+
+  Show commands with:
+    ;spellfade help
+=end
+
+no_pause_all
+no_kill_all
+
+%i[
+  SPELLFADE_VERSION
+  SPELLFADE_SETTINGS_KEY
+  SPELLFADE_RUNNING_KEY
+  SPELLFADE_STOP_KEY
+  SPELLFADE_DEFAULT_INTERVAL
+  SPELLFADE_DUPLICATE_SECONDS
+  SPELLFADE_EFFECT_SPELL_NUMBERS
+  SPELLFADE_NAME_ALIASES
+  SPELLFADE_HOOK_NAME
+].each { |const_name| remove_const(const_name) rescue nil }
+
+SPELLFADE_VERSION = '1.1.0'
+
+SPELLFADE_SETTINGS_KEY = 'spellfade'
+SPELLFADE_RUNNING_KEY = 'spellfade_running'
+SPELLFADE_STOP_KEY = 'spellfade_stop_requested'
+SPELLFADE_DEFAULT_INTERVAL = 1.0
+SPELLFADE_DUPLICATE_SECONDS = 10
+SPELLFADE_HOOK_NAME = 'spellfade_end_message_watch'
+SPELLFADE_EFFECT_SPELL_NUMBERS = {
+  'beacon of courage' => 1608,
+}.freeze
+SPELLFADE_NAME_ALIASES = {
+  'multi-strike cooldown' => 'MStrike Cooldown',
+}.freeze
+
+def spellfade_settings
+  saved = CharSettings[SPELLFADE_SETTINGS_KEY]
+  saved = {} unless saved.is_a?(Hash)
+
+  saved['mode'] = 'loud' unless %w[loud quiet].include?(saved['mode'].to_s)
+  saved['interval'] = SPELLFADE_DEFAULT_INTERVAL unless saved['interval'].to_f.positive?
+  saved
+end
+
+def spellfade_save_settings(settings)
+  CharSettings[SPELLFADE_SETTINGS_KEY] = settings
+end
+
+def spellfade_monsterbold(message)
+  if defined?(Lich::Messaging) && Lich::Messaging.respond_to?(:monsterbold)
+    Lich::Messaging.monsterbold(message)
+  elsif defined?(monsterbold_start) && defined?(monsterbold_end)
+    "#{monsterbold_start}#{message}#{monsterbold_end}"
+  else
+    message
+  end
+end
+
+def spellfade_say(message, loud = nil)
+  loud = spellfade_settings['mode'] == 'loud' if loud.nil?
+  _respond(loud ? spellfade_monsterbold(message) : message)
+end
+
+def spellfade_lookup_spell(name)
+  clean_name = spellfade_normalize_name(name)
+  return nil if clean_name.empty?
+
+  if clean_name =~ /\A\d+\z/
+    return Spell[clean_name.to_i] rescue nil
+  end
+
+  return nil unless defined?(Spell) && Spell.respond_to?(:list)
+
+  Spell.list.find { |spell| spell.name.to_s.downcase == clean_name.downcase } rescue nil
+end
+
+def spellfade_label(name)
+  clean_name = spellfade_normalize_name(name)
+  source_spell_num = SPELLFADE_EFFECT_SPELL_NUMBERS[clean_name.downcase]
+  return "#{clean_name} (#{source_spell_num})" if source_spell_num
+
+  spell = spellfade_lookup_spell(name)
+  return name.to_s unless spell && spell.respond_to?(:num) && spell.respond_to?(:name)
+  return clean_name if spell.respond_to?(:type) && spell.type.to_s.downcase == 'timer'
+
+  "#{spell.name} (#{spell.num})"
+end
+
+def spellfade_plain_text(text)
+  text.to_s.gsub(/<[^>]+>/, '').gsub('&apos;', "'").gsub('&quot;', '"').gsub('&gt;', '>').gsub('&lt;', '<').gsub('&amp;', '&').strip
+end
+
+def spellfade_normalize_name(name)
+  clean_name = name.to_s.strip.gsub(/\s+/, ' ')
+  SPELLFADE_NAME_ALIASES.fetch(clean_name.downcase, clean_name)
+end
+
+def spellfade_end_message_patterns
+  @spellfade_end_message_patterns ||= begin
+    patterns = []
+    if defined?(Spell) && Spell.respond_to?(:list)
+      Spell.list.each do |spell|
+        next unless spell && spell.respond_to?(:msgdn) && spell.msgdn
+
+        spell.msgdn.to_s.split('$|^').each do |pattern_text|
+          next if pattern_text.to_s.empty?
+
+          patterns << [Regexp.new("\\A(?:#{pattern_text})\\z", Regexp::IGNORECASE), spell.name]
+        rescue RegexpError
+          next
+        end
+      end
+    end
+    patterns
+  end
+end
+
+def spellfade_snapshot
+  active = {}
+
+  if defined?(XMLData) && XMLData.respond_to?(:active_spells)
+    XMLData.active_spells.each_key do |name|
+      clean_name = spellfade_normalize_name(name)
+      active[clean_name.downcase] = clean_name unless clean_name.empty?
+    end
+  end
+
+  if defined?(Spell) && Spell.respond_to?(:active)
+    Spell.active.each do |spell|
+      next unless spell && spell.respond_to?(:name)
+
+      clean_name = spellfade_normalize_name(spell.name)
+      active[clean_name.downcase] = clean_name unless clean_name.empty?
+    end
+  end
+
+  active
+rescue StandardError => error
+  spellfade_say("[SpellFade: snapshot error: #{error.class}: #{error.message}]", false)
+  {}
+end
+
+def spellfade_status_line
+  settings = spellfade_settings
+  state = SessionVars[SPELLFADE_RUNNING_KEY] ? 'running' : 'stopped'
+  "SpellFade #{SPELLFADE_VERSION}: #{state}, #{settings['mode']} mode, interval #{settings['interval'].to_f}s"
+end
+
+def spellfade_help
+  output = []
+  output << "SpellFade watches Lich's active spell and effect list and tells you when something ends."
+  output << ''
+  output << "Available commands:"
+  output << "  ;spellfade                  start watching"
+  output << "  ;spellfade help             show this help"
+  output << "  ;spellfade status           show current mode and interval"
+  output << "  ;spellfade stop             stop the running watcher"
+  output << "  ;spellfade quiet            use plain local text"
+  output << "  ;spellfade loud             monsterbold the whole notice"
+  output << "  ;spellfade interval <secs>  set scan interval, minimum 0.2"
+  output << "  ;spellfade changelog        show changes by day"
+  output << ''
+  output << "Autostart:"
+  output << "  ;autostart add --global spellfade"
+  output.join("\n")
+end
+
+def spellfade_changelog
+  output = []
+  output << "SpellFade changelog"
+  output << ''
+  output << "2026-06-02"
+  output << "  1.1.0"
+  output << "  - Added immediate local matching for known Lich end messages."
+  output << "  - Kept active-list watching as a fallback for odd effects without known end messages."
+  output << ''
+  output << "2026-06-01"
+  output << "  1.0.2"
+  output << "  - Collapsed raw and normalized cooldown names so the same ending is not announced twice."
+  output << "  1.0.1"
+  output << "  - Fixed timer effects so they do not show internal Lich timer numbers."
+  output << "  - Beacon of Courage now shows the player-facing spell number 1608."
+  output << "  1.0.0"
+  output << "  - Added local-only watcher for Lich's active spell and effect list."
+  output << "  - Added loud, quiet, interval, status, help, and changelog commands."
+  output << "  - Added stop command for a clean exit."
+  output << "  - Added duplicate suppression and startup baseline so it does not spam."
+  output.join("\n")
+end
+
+args = Array(script.vars[1..-1]).compact
+command = args[0].to_s.downcase
+
+case command
+when 'help', '--help', '-h'
+  respond spellfade_help
+  exit
+when 'status'
+  respond spellfade_status_line
+  exit
+when 'stop'
+  if SessionVars[SPELLFADE_RUNNING_KEY]
+    SessionVars[SPELLFADE_STOP_KEY] = true
+    respond "SpellFade stop requested."
+  else
+    respond "SpellFade is not running."
+  end
+  exit
+when 'quiet'
+  settings = spellfade_settings
+  settings['mode'] = 'quiet'
+  spellfade_save_settings(settings)
+  respond "SpellFade will use plain local text."
+  exit
+when 'loud'
+  settings = spellfade_settings
+  settings['mode'] = 'loud'
+  spellfade_save_settings(settings)
+  respond "SpellFade will monsterbold notices."
+  exit
+when 'interval'
+  interval = args[1].to_f
+  if interval < 0.2
+    respond "SpellFade interval must be at least 0.2 seconds."
+  else
+    settings = spellfade_settings
+    settings['interval'] = interval
+    spellfade_save_settings(settings)
+    respond "SpellFade interval set to #{interval}s."
+  end
+  exit
+when 'changelog'
+  respond spellfade_changelog
+  exit
+when ''
+  # Start watcher below.
+else
+  respond spellfade_help
+  exit
+end
+
+if SessionVars[SPELLFADE_RUNNING_KEY]
+  respond spellfade_status_line
+  exit
+end
+
+SessionVars[SPELLFADE_RUNNING_KEY] = true
+SessionVars[SPELLFADE_STOP_KEY] = nil
+before_dying do
+  DownstreamHook.remove(SPELLFADE_HOOK_NAME) if defined?(DownstreamHook)
+  SessionVars[SPELLFADE_RUNNING_KEY] = nil
+  SessionVars[SPELLFADE_STOP_KEY] = nil
+end
+
+previous = spellfade_snapshot
+announced_at = {}
+
+if defined?(DownstreamHook)
+  DownstreamHook.remove(SPELLFADE_HOOK_NAME)
+  DownstreamHook.add(SPELLFADE_HOOK_NAME, proc do |server_string|
+    plain_text = spellfade_plain_text(server_string)
+    match = spellfade_end_message_patterns.find { |pattern, _name| pattern =~ plain_text }
+
+    if match
+      _pattern, name = match
+      key = spellfade_normalize_name(name).downcase
+      now = Time.now.to_i
+      unless announced_at[key] && (now - announced_at[key]) < SPELLFADE_DUPLICATE_SECONDS
+        announced_at[key] = now
+        spellfade_say("[SpellFade: #{spellfade_label(name)} ended]")
+      end
+    end
+
+    server_string
+  end)
+end
+
+spellfade_say("[SpellFade: watching active spells and effects]", false)
+
+loop do
+  settings = spellfade_settings
+  interval = [settings['interval'].to_f, 0.2].max
+  sleep interval
+
+  break if SessionVars[SPELLFADE_STOP_KEY]
+
+  current = spellfade_snapshot
+  ended_keys = previous.keys - current.keys
+  now = Time.now.to_i
+
+  ended_keys.each do |key|
+    name = previous[key]
+    next if name.to_s.empty?
+    next if announced_at[key] && (now - announced_at[key]) < SPELLFADE_DUPLICATE_SECONDS
+
+    announced_at[key] = now
+    spellfade_say("[SpellFade: #{spellfade_label(name)} ended]")
+  end
+
+  announced_at.delete_if { |_key, timestamp| (now - timestamp) > 300 }
+  previous = current
+end
+
+SessionVars[SPELLFADE_RUNNING_KEY] = nil
+SessionVars[SPELLFADE_STOP_KEY] = nil
+spellfade_say("[SpellFade: stopped]", false)
