@@ -1,7 +1,7 @@
-# HuntSuggest recommends huntpro hunting areas based on your level by reading a Google Sheet
-# and presenting huntpro-compatible options in a manual GTK GUI or text fallback.
+# HuntSuggest recommends hunting areas based on your level by reading a Google Sheet
+# and presenting HuntPro- or Ashborne-compatible options in a manual GTK GUI or text fallback.
 #
-# Designed for use with the huntpro script.
+# Designed for use with the HuntPro and Ashborne scripts.
 #
 # Usage:
 #   ;huntsuggest
@@ -9,6 +9,10 @@
 #   ;huntsuggest <town>
 #   ;huntsuggest <level> <town>
 #   ;huntsuggest <level> <range> <town>
+#   ;huntsuggest scan on <area-name>
+#   ;huntsuggest importmap <area-name>
+#   ;huntsuggest importlog <area-name> <log-file>
+#   ;huntsuggest scans
 #   ;huntsuggest help
 #   ;huntsuggest styles
 #
@@ -16,9 +20,25 @@
 #           game: gs
 #           tags: hunting, huntpro, recommendations, clickable, utility, gui
 #       required: Lich > 5.0.1
-#        version: 1.8.1
+#        version: 2.2.0
 #
 # changelog:
+#   2.2.0 (2026-06-11):
+#     Added opt-in local mob-map imports with level and map-area boundaries
+#     Added a GUI button for importing the connected mapped area around the current room
+#   2.1.0 (2026-06-11):
+#     Added a New Area Scan button to the GTK menu
+#     Discovery now learns compact creature action and spell-casting behavior
+#   2.0.1 (2026-06-11):
+#     Made discovery explicitly opt-in and reduced its polling and disk activity
+#   2.0.0 (2026-06-11):
+#     Added clickable sorting for every results column
+#     Added low-overhead live hunting-ground discovery and offline log review
+#     Added Lich map metadata and conservative boundary-room discovery
+#   1.9.0 (2026-06-11):
+#     Added offline sheet caching and a local supplemental hunting-ground catalog
+#     Added missing quick-town filters and data-source reporting
+#     Local catalog entries override matching Google Sheet area names
 #   1.8.1 (2026-04-12):
 #     Fixed GTK single-click selection syncing to the right-hand details pane
 #     Removed background close thread; GUI close now stops cleanly
@@ -36,6 +56,8 @@ require 'uri'
 require 'cgi'
 require 'yaml'
 require 'fileutils'
+require 'set'
+require 'json'
 
 begin
   require 'gtk3'
@@ -51,6 +73,20 @@ module HuntSuggestCore
   DEFAULT_RANGE = 5
   TEXT_LIMIT = 12
   SETTINGS_FILE = File.join(BASE_DATA_DIR, 'huntsuggest_settings.yaml')
+  CACHE_FILE = File.join(BASE_DATA_DIR, 'huntsuggest_cache.csv')
+  CUSTOM_FILE = File.join(BASE_DATA_DIR, 'huntsuggest_custom.csv')
+  DISCOVERY_DIR = File.join(BASE_DATA_DIR, 'huntsuggest_scans')
+  DISCOVERY_INDEX_FILE = File.join(BASE_DATA_DIR, 'huntsuggest_scan_candidates.csv')
+  DISCOVERY_HEADERS = [
+    'Scanned At', 'Area Name', 'Character Level', 'Creature Names',
+    'Caster Creatures', 'Observed Locations', 'Map Images', 'Anchor Room ID',
+    'Hunting Room IDs', 'Boundary Room IDs', 'Source File'
+  ].freeze
+  CSV_HEADERS = [
+    'Creature Level', 'Area Name', 'Creature Names', 'Bounty Location',
+    'Type', 'Town', 'Spawn Rate', 'Silver Farm', 'Skin Name',
+    'Estimated Skin Value', 'Bounty Status', 'Anchor Room ID', 'Go2 Target'
+  ].freeze
 
   STYLE_OPTIONS = {
     1 => 'UAC Jab',
@@ -82,6 +118,7 @@ module HuntSuggestCore
     'solhaven'   => ['solhaven', 'sol', 'haven'],
     'icemule'    => ['icemule', 'icemule trace', 'imt'],
     'illistim'   => ['illistim', "ta'illistim", 'ti'],
+    'tavaalor'   => ['tavaalor', "ta'vaalor", 'ta vaalor', 'tv'],
     'tafaendryl' => ['tafaendryl', 'tf', 'faendryl'],
     'teras'      => ['teras', 'kharam-dzu', 'kharam', 'teras isle'],
     'riverrest'  => ['riverrest', 'rr'],
@@ -108,6 +145,10 @@ module HuntSuggestCore
 
   module_function
 
+  def data_source
+    @data_source || 'unknown'
+  end
+
   def enable_status_tags
     return if @status_tags_enabled
 
@@ -122,6 +163,7 @@ module HuntSuggestCore
 
   def default_settings
     {
+      'engine' => 'huntpro',
       'style' => DEFAULT_STYLE,
       'range' => DEFAULT_RANGE,
       'town_filter' => '',
@@ -135,6 +177,8 @@ module HuntSuggestCore
 
   def normalize_settings_hash(data)
     settings = default_settings.merge(data.is_a?(Hash) ? data : {})
+    settings['engine'] = normalize_text(settings['engine']).downcase
+    settings['engine'] = 'huntpro' unless %w[huntpro ashborne].include?(settings['engine'])
     settings['style'] = settings['style'].to_i
     settings['style'] = DEFAULT_STYLE unless STYLE_OPTIONS.key?(settings['style'])
     settings['range'] = settings['range'].to_i
@@ -319,12 +363,57 @@ module HuntSuggestCore
   end
 
   def load_hunts
-    csv_text = URI.open(SHEET_URL, &:read)
-    rows = CSV.parse(csv_text, headers: true)
-    hunts = rows.map { |row| build_hunt(row) }.compact
-    raise 'no valid rows found in sheet' if hunts.empty?
+    ensure_custom_catalog
 
+    remote_hunts = []
+    source = nil
+
+    begin
+      csv_text = URI.open(SHEET_URL, open_timeout: 8, read_timeout: 15, &:read)
+      remote_hunts = parse_hunts_csv(csv_text)
+      raise 'no valid rows found in sheet' if remote_hunts.empty?
+
+      write_cache(csv_text)
+      source = 'Google Sheet'
+    rescue StandardError => error
+      if File.exist?(CACHE_FILE)
+        remote_hunts = parse_hunts_csv(File.read(CACHE_FILE))
+        source = "offline cache (#{File.mtime(CACHE_FILE).strftime('%Y-%m-%d')})"
+        safe_echo("huntsuggest: sheet unavailable, using #{source}: #{error.message}")
+      else
+        raise "sheet unavailable and no cache exists: #{error.message}"
+      end
+    end
+
+    custom_hunts = parse_hunts_csv(File.read(CUSTOM_FILE))
+    @data_source = source
+    @data_source += " + #{custom_hunts.length} local" if custom_hunts.any?
+
+    hunts = dedupe_hunts(custom_hunts + remote_hunts)
+    raise 'no valid hunting grounds found' if hunts.empty?
     hunts
+  end
+
+  def parse_hunts_csv(csv_text)
+    CSV.parse(csv_text.to_s, headers: true).map { |row| build_hunt(row) }.compact
+  end
+
+  def ensure_custom_catalog
+    return if File.exist?(CUSTOM_FILE)
+
+    FileUtils.mkdir_p(File.dirname(CUSTOM_FILE))
+    File.write(CUSTOM_FILE, CSV.generate_line(CSV_HEADERS))
+  rescue StandardError => error
+    safe_echo("huntsuggest: could not create local catalog: #{error.message}")
+  end
+
+  def write_cache(csv_text)
+    FileUtils.mkdir_p(File.dirname(CACHE_FILE))
+    temporary_file = "#{CACHE_FILE}.tmp"
+    File.write(temporary_file, csv_text)
+    FileUtils.mv(temporary_file, CACHE_FILE)
+  rescue StandardError => error
+    safe_echo("huntsuggest: could not update cache: #{error.message}")
   end
 
   def build_hunt(row)
@@ -429,8 +518,13 @@ module HuntSuggestCore
     end
   end
 
+  def hunting_command(hunt, style_number, engine = 'huntpro')
+    script_name = normalize_text(engine).downcase == 'ashborne' ? 'ashborne' : 'huntpro'
+    ";#{script_name} #{style_number} #{hunt_area_key(hunt)}"
+  end
+
   def huntpro_command(hunt, style_number)
-    ";huntpro #{style_number} #{hunt_area_key(hunt)}"
+    hunting_command(hunt, style_number, 'huntpro')
   end
 
   def hunt_area_key(hunt)
@@ -463,33 +557,34 @@ module HuntSuggestCore
     send_line("#{prefix}: #{click(command, command)}")
   end
 
-  def start_huntpro(style_number, area_name)
+  def start_hunting_script(style_number, area_name, engine = 'huntpro')
     style = style_number.to_i
     area = normalize_text(area_name)
-    raise 'blank huntpro area name' if area.empty?
+    script_name = normalize_text(engine).downcase == 'ashborne' ? 'ashborne' : 'huntpro'
+    raise "blank #{script_name} area name" if area.empty?
 
-    command = ";huntpro #{style} #{area}"
+    command = ";#{script_name} #{style} #{area}"
     safe_echo("huntsuggest: starting #{command}")
     emit_backup_clickable(command, 'Backup')
 
     args = [style.to_s, area]
 
     begin
-      start_script('huntpro', args)
+      start_script(script_name, args)
       return true
     rescue StandardError
       nil
     end
 
     begin
-      Script.start('huntpro', args)
+      Script.start(script_name, args)
       return true
     rescue StandardError
       nil
     end
 
     begin
-      Script.run('huntpro', *args)
+      Script.run(script_name, *args)
       return true
     rescue StandardError
       nil
@@ -504,8 +599,12 @@ module HuntSuggestCore
 
     false
   rescue StandardError => e
-    safe_echo("huntsuggest: failed to start huntpro: #{e.message}")
+    safe_echo("huntsuggest: failed to start #{script_name || engine}: #{e.message}")
     false
+  end
+
+  def start_huntpro(style_number, area_name)
+    start_hunting_script(style_number, area_name, 'huntpro')
   end
 
   def send_line(text)
@@ -555,6 +654,467 @@ module HuntSuggestCore
   end
 end
 
+module HuntSuggestDiscovery
+  POLL_SECONDS = 2
+  CHECKPOINT_SECONDS = 300
+
+  class Session
+    attr_reader :output_file
+
+    def initialize(area_name, source_file = nil)
+      @area_name = HuntSuggestCore.normalize_text(area_name)
+      raise 'an area name is required' if @area_name.empty?
+
+      @source_file = source_file
+      @started_at = Time.now
+      @rooms = {}
+      @creatures = Set.new
+      @caster_creatures = Set.new
+      @action_counts = {}
+      @spell_events = []
+      @finished = false
+      @dirty = false
+      @last_checkpoint = Time.now
+
+      FileUtils.mkdir_p(HuntSuggestCore::DISCOVERY_DIR)
+      slug = @area_name.downcase.gsub(/[^a-z0-9]+/, '-').gsub(/^-|-$/, '')
+      slug = 'area' if slug.empty?
+      merge_previous_scan(slug)
+      stamp = @started_at.strftime('%Y%m%d-%H%M%S')
+      @output_file = File.join(HuntSuggestCore::DISCOVERY_DIR, "#{slug}-#{stamp}.yaml")
+    end
+
+    def observe_current
+      room = Room.current
+      return unless room && room.respond_to?(:id) && room.id.to_i.positive?
+
+      observe_room_id(room.id.to_i, room)
+      Array(GameObj.targets).each do |target|
+        next if target.respond_to?(:status) && target.status.to_s =~ /dead|gone/i
+
+        name = target.respond_to?(:name) ? target.name : target.to_s
+        observe_creature(name, room.id.to_i)
+      end
+      checkpoint_if_due
+    rescue StandardError => error
+      HuntSuggestCore.safe_echo("huntsuggest scan warning: #{error.message}")
+    end
+
+    def observe_room_id(room_id, room = nil, title = nil)
+      room ||= map_room(room_id)
+      room_key = room_id.to_s
+      @dirty = true unless @rooms.key?(room_key)
+      record = (@rooms[room_key] ||= { 'creatures' => [] })
+      record['title'] = room_title(room, title)
+      record['location'] = room.location.to_s if room && room.respond_to?(:location)
+      record['image'] = room.image.to_s if room && room.respond_to?(:image)
+      record['tags'] = Array(room.tags).map(&:to_s) if room && room.respond_to?(:tags)
+      record
+    end
+
+    def observe_creature(name, room_id = nil)
+      creature = clean_creature_name(name)
+      return if creature.empty?
+
+      unless @creatures.include?(creature)
+        @creatures << creature
+        @dirty = true
+      end
+      return unless room_id
+
+      record = observe_room_id(room_id)
+      record['creatures'] ||= []
+      unless record['creatures'].include?(creature)
+        record['creatures'] << creature
+        @dirty = true
+      end
+    end
+
+    def observe_line(line)
+      text = HuntSuggestCore.normalize_text(line)
+      return text if text.empty?
+
+      target = matching_target(text)
+      return line unless target
+
+      category = action_category(text)
+      return line unless category
+
+      creature = clean_creature_name(target.name)
+      @action_counts[creature] ||= Hash.new(0)
+      @action_counts[creature][category] += 1
+      if category == 'spell'
+        @caster_creatures << creature
+        @spell_events << text if @spell_events.length < 100 && !@spell_events.include?(text)
+      end
+      @dirty = true
+      line
+    rescue StandardError
+      line
+    end
+
+    def finish
+      return @output_file if @finished
+
+      @finished = true
+      write_snapshot
+      append_candidate
+      HuntSuggestCore.safe_echo(
+        "huntsuggest: discovery saved #{@rooms.length} rooms, #{@creatures.length} creatures, " \
+        "#{boundary_room_ids.length} boundaries"
+      )
+      HuntSuggestCore.safe_echo("huntsuggest: review #{@output_file}")
+      @output_file
+    rescue StandardError => error
+      HuntSuggestCore.safe_echo("huntsuggest: could not finish discovery: #{error.message}")
+      nil
+    end
+
+    private
+
+    def merge_previous_scan(slug)
+      previous = Dir[File.join(HuntSuggestCore::DISCOVERY_DIR, "#{slug}-*.yaml")].sort.last
+      return unless previous
+
+      data = YAML.load_file(previous)
+      return unless data.is_a?(Hash)
+
+      @rooms.merge!(data['rooms']) if data['rooms'].is_a?(Hash)
+      Array(data['creatures']).each { |name| @creatures << name.to_s }
+    rescue StandardError
+      nil
+    end
+
+    def map_room(room_id)
+      Room[room_id.to_i]
+    rescue StandardError
+      nil
+    end
+
+    def room_title(room, fallback)
+      titles = room && room.respond_to?(:title) ? Array(room.title) : []
+      HuntSuggestCore.normalize_text(titles.first || fallback)
+    end
+
+    def clean_creature_name(value)
+      text = HuntSuggestCore.normalize_text(value)
+      text = text.sub(/^(?:a|an|the)\s+/i, '')
+      text.gsub(/[!.,;:]+\z/, '')
+    end
+
+    def matching_target(text)
+      Array(GameObj.targets).find do |target|
+        names = [target.respond_to?(:name) ? target.name : nil, target.respond_to?(:noun) ? target.noun : nil]
+        names.compact.any? { |name| text.match?(/\b#{Regexp.escape(name.to_s)}\b/i) }
+      end
+    rescue StandardError
+      nil
+    end
+
+    def action_category(text)
+      return 'spell' if text =~ /\b(?:prepar(?:e|es|ing)|incant(?:s|ing)?|chant(?:s|ing)?|gesture(?:s|d)?|invok(?:e|es|ing)|summon(?:s|ing)?|spell)\b/i
+      return 'maneuver' if text =~ /\b(?:charges?|rushes?|sweeps?|tramples?|tackles?|grapples?|pounces?|roars?)\b/i
+      return 'physical' if text =~ /\b(?:attacks?|swings?|slashes?|jabs?|punches?|kicks?|bites?|claws?|strikes?|fires?|shoots?)\b/i
+
+      nil
+    end
+
+    def observed_room_ids
+      @rooms.keys.map(&:to_i).select(&:positive?).uniq.sort
+    end
+
+    def boundary_room_ids
+      observed = observed_room_ids.to_set
+      observed.each_with_object(Set.new) do |room_id, boundaries|
+        room = map_room(room_id)
+        next unless room && room.respond_to?(:wayto) && room.wayto
+
+        room.wayto.keys.each do |destination|
+          destination_id = destination.to_i
+          boundaries << destination_id if destination_id.positive? && !observed.include?(destination_id)
+        end
+      end.to_a.sort
+    end
+
+    def snapshot
+      {
+        'version' => 1,
+        'area_name' => @area_name,
+        'started_at' => @started_at.strftime('%Y-%m-%d %H:%M:%S %z'),
+        'updated_at' => Time.now.strftime('%Y-%m-%d %H:%M:%S %z'),
+        'character_level' => character_level,
+        'source_file' => @source_file,
+        'anchor_room_id' => observed_room_ids.first,
+        'hunting_room_ids' => observed_room_ids,
+        'boundary_room_ids' => boundary_room_ids,
+        'creatures' => @creatures.to_a.sort,
+        'caster_creatures' => @caster_creatures.to_a.sort,
+        'action_counts' => @action_counts,
+        'spell_events' => @spell_events,
+        'locations' => @rooms.values.map { |room| room['location'].to_s }.reject(&:empty?).uniq.sort,
+        'map_images' => @rooms.values.map { |room| room['image'].to_s }.reject(&:empty?).uniq.sort,
+        'rooms' => @rooms
+      }
+    end
+
+    def character_level
+      Char.level.to_i
+    rescue StandardError
+      nil
+    end
+
+    def checkpoint_if_due
+      return unless @dirty
+      return if Time.now - @last_checkpoint < CHECKPOINT_SECONDS
+
+      write_snapshot
+      @dirty = false
+      @last_checkpoint = Time.now
+    end
+
+    def write_snapshot
+      temporary_file = "#{@output_file}.tmp"
+      File.write(temporary_file, snapshot.to_yaml)
+      FileUtils.mv(temporary_file, @output_file)
+    end
+
+    def append_candidate
+      create_index = !File.exist?(HuntSuggestCore::DISCOVERY_INDEX_FILE)
+      data = snapshot
+      CSV.open(HuntSuggestCore::DISCOVERY_INDEX_FILE, 'ab') do |csv|
+        csv << HuntSuggestCore::DISCOVERY_HEADERS if create_index
+        csv << [
+          data['updated_at'], data['area_name'], data['character_level'],
+          data['creatures'].join(' | '), data['caster_creatures'].join(' | '),
+          data['locations'].join(' | '),
+          data['map_images'].join(' | '), data['anchor_room_id'],
+          data['hunting_room_ids'].join(' '), data['boundary_room_ids'].join(' '),
+          data['source_file']
+        ]
+      end
+    end
+  end
+
+  module_function
+
+  def live_scan(area_name)
+    session = Session.new(area_name)
+    hook_name = "huntsuggest_discovery_#{Char.name}"
+    HuntSuggestCore.safe_echo("huntsuggest discovery ON for '#{area_name}'")
+    HuntSuggestCore.safe_echo(
+      "huntsuggest: sampling every #{POLL_SECONDS} seconds; changed data checkpoints every " \
+      "#{CHECKPOINT_SECONDS / 60} minutes"
+    )
+    HuntSuggestCore.safe_echo('huntsuggest: OFF automatically after HuntPro or Ashborne exits, or use ;kill huntsuggest')
+    saw_hunting_script = Script.running?('huntpro') || Script.running?('ashborne')
+
+    begin
+      DownstreamHook.add(hook_name, proc { |line| session.observe_line(line) })
+      loop do
+        session.observe_current
+        running = Script.running?('huntpro') || Script.running?('ashborne')
+        saw_hunting_script ||= running
+        break if saw_hunting_script && !running
+        sleep POLL_SECONDS
+      end
+    ensure
+      begin
+        DownstreamHook.remove(hook_name)
+      rescue StandardError
+        nil
+      end
+      session.finish
+    end
+  end
+
+  def import_log(area_name, path)
+    expanded_path = File.expand_path(path.to_s)
+    raise "log file not found: #{expanded_path}" unless File.file?(expanded_path)
+
+    session = Session.new(area_name, expanded_path)
+    current_room_id = nil
+    File.open(expanded_path, 'r:BOM|UTF-8', invalid: :replace, undef: :replace, replace: '') do |file|
+      file.each_line do |line|
+        room_match = line.match(/^\[(.+?)(?:\s+-\s+(\d+))?\]\s+\(u\d+\)/)
+        if room_match
+          current_room_id = room_match[2].to_i if room_match[2]
+          session.observe_room_id(current_room_id, nil, room_match[1]) if current_room_id.to_i.positive?
+          next
+        end
+
+        target_match =
+          line.match(/You are now targeting (?:an?|the)?\s*(.+?)\./i) ||
+          line.match(/attempts to \w+ (?:an?|the)?\s*(.+?)!/i)
+        session.observe_creature(target_match[1], current_room_id) if target_match
+      end
+    end
+    session.finish
+  end
+
+  def list_scans
+    files = Dir[File.join(HuntSuggestCore::DISCOVERY_DIR, '*.yaml')].sort.reverse.first(10)
+    if files.empty?
+      HuntSuggestCore.safe_echo('huntsuggest: no discovery scans saved yet')
+      return
+    end
+
+    HuntSuggestCore.safe_echo('=== Recent Huntsuggest Scans ===')
+    files.each do |path|
+      data = YAML.load_file(path)
+      HuntSuggestCore.safe_echo(
+        "#{data['area_name']}: #{Array(data['hunting_room_ids']).length} rooms, " \
+        "#{Array(data['creatures']).join(', ')}"
+      )
+    rescue StandardError
+      HuntSuggestCore.safe_echo(File.basename(path))
+    end
+    HuntSuggestCore.safe_echo("Candidate index: #{HuntSuggestCore::DISCOVERY_INDEX_FILE}")
+  end
+end
+
+module HuntSuggestLocalMapImport
+  MAX_IMPORTED_ROOMS = 500
+
+  module_function
+
+  def mob_data_file
+    candidates = [
+      File.join(HuntSuggestCore::BASE_DATA_DIR, 'mob_list_out_dict.yaml'),
+      File.join($lich_dir, 'data', 'mob_list_out_dict.yaml')
+    ]
+    candidates.find { |path| File.file?(path) }
+  end
+
+  def ebestiary_file
+    path = File.join($lich_dir, 'scripts', 'ebestiary.lic')
+    File.file?(path) ? path : nil
+  end
+
+  def creature_levels
+    path = ebestiary_file
+    return {} unless path
+
+    source = File.read(path)
+    marker = 'creature_str = %Q('
+    start_at = source.index(marker)
+    finish_at = source.index('JSON.parse(creature_str)', start_at.to_i)
+    return {} unless start_at && finish_at
+
+    json_start = source.index('{', start_at)
+    json_text = source[json_start...finish_at].to_s.strip.sub(/\)\s*\z/, '')
+    JSON.parse(json_text).each_with_object({}) do |(name, data), levels|
+      levels[HuntSuggestCore.normalize_text(name).downcase] = data['level'].to_i
+    end
+  rescue StandardError => error
+    HuntSuggestCore.safe_echo("huntsuggest: could not read ebestiary levels: #{error.message}")
+    {}
+  end
+
+  def room_creatures(mob_data, room_id)
+    values = mob_data[room_id.to_i] || mob_data[room_id.to_s]
+    Array(values).map { |name| HuntSuggestCore.normalize_text(name) }
+      .reject { |name| name.empty? || name.casecmp('NONE').zero? }
+      .uniq
+  end
+
+  def room_level(creatures, levels)
+    creatures.map { |name| levels[name.downcase] }.compact.max
+  end
+
+  def room_context(room)
+    {
+      location: room.respond_to?(:location) ? HuntSuggestCore.normalize_text(room.location) : '',
+      image: room.respond_to?(:image) ? HuntSuggestCore.normalize_text(room.image) : ''
+    }
+  end
+
+  def same_mapped_area?(origin_context, room)
+    context = room_context(room)
+    if !origin_context[:image].empty? && !context[:image].empty?
+      return false unless origin_context[:image] == context[:image]
+    end
+    if !origin_context[:location].empty? && !context[:location].empty?
+      return false unless origin_context[:location] == context[:location]
+    end
+    true
+  end
+
+  def import_current_area(area_name)
+    normalized_area = HuntSuggestCore.normalize_text(area_name)
+    raise 'usage: ;huntsuggest importmap <area-name>' if normalized_area.empty?
+
+    source_file = mob_data_file
+    raise 'mob_list_out_dict.yaml was not found in the Lich data folder' unless source_file
+
+    origin = Room.current
+    raise 'current room is not mapped' unless origin && origin.respond_to?(:id) && origin.id.to_i.positive?
+
+    HuntSuggestCore.safe_echo("huntsuggest: loading local mob map for '#{normalized_area}'")
+    mob_data = YAML.load_file(source_file)
+    raise 'local mob map did not contain room data' unless mob_data.is_a?(Hash)
+
+    levels = creature_levels
+    origin_creatures = room_creatures(mob_data, origin.id)
+    raise 'the current room has no creatures in the local mob map' if origin_creatures.empty?
+
+    origin_level = room_level(origin_creatures, levels)
+    character_level = HuntSuggestCore.detect_level
+    safe_level = [character_level, origin_level || character_level].max + 2
+    origin_context = room_context(origin)
+    session = HuntSuggestDiscovery::Session.new(normalized_area, source_file)
+
+    queue = [origin.id.to_i]
+    queued = Set.new(queue)
+    visited = Set.new
+    unknown_level_creatures = Set.new
+
+    until queue.empty? || visited.length >= MAX_IMPORTED_ROOMS
+      room_id = queue.shift
+      next if visited.include?(room_id)
+
+      room = Room[room_id]
+      next unless room && same_mapped_area?(origin_context, room)
+
+      creatures = room_creatures(mob_data, room_id)
+      next if creatures.empty?
+
+      level = room_level(creatures, levels)
+      next if level && level > safe_level
+
+      visited << room_id
+      session.observe_room_id(room_id, room)
+      creatures.each do |creature|
+        session.observe_creature(creature, room_id)
+        unknown_level_creatures << creature unless levels.key?(creature.downcase)
+      end
+
+      next unless room.respond_to?(:wayto) && room.wayto
+
+      room.wayto.keys.each do |destination|
+        destination_id = destination.to_i
+        next unless destination_id.positive?
+        next if visited.include?(destination_id) || queued.include?(destination_id)
+        next if room_creatures(mob_data, destination_id).empty?
+
+        queue << destination_id
+        queued << destination_id
+      end
+    end
+
+    output_file = session.finish
+    HuntSuggestCore.safe_echo(
+      "huntsuggest: imported #{visited.length} connected rooms with a maximum creature level of #{safe_level}"
+    )
+    unless unknown_level_creatures.empty?
+      HuntSuggestCore.safe_echo(
+        "huntsuggest: review unknown creature levels: #{unknown_level_creatures.to_a.sort.join(', ')}"
+      )
+    end
+    HuntSuggestCore.safe_echo("huntsuggest: import capped at #{MAX_IMPORTED_ROOMS} rooms") if visited.length >= MAX_IMPORTED_ROOMS
+    output_file
+  end
+end
+
 module HuntSuggest
   module_function
 
@@ -570,6 +1130,30 @@ module HuntSuggest
       print_help
     when 'styles'
       print_styles
+    when 'engine'
+      engine = args[1].to_s.downcase
+      raise 'usage: ;huntsuggest engine huntpro|ashborne' unless %w[huntpro ashborne].include?(engine)
+      settings['engine'] = engine
+      HuntSuggestCore.save_settings(settings)
+      HuntSuggestCore.safe_echo("huntsuggest will now start #{engine == 'ashborne' ? 'Ashborne' : 'HuntPro'}.")
+    when 'scan'
+      scan_action = args[1].to_s.downcase
+      if scan_action == 'off'
+        HuntSuggestCore.safe_echo('huntsuggest discovery is only active while its scan script is running.')
+        HuntSuggestCore.safe_echo('Use ;kill huntsuggest to turn an active scan OFF immediately.')
+      else
+        area_name = scan_action == 'on' ? args[2] : args[1]
+        raise 'usage: ;huntsuggest scan on <area-name>' if HuntSuggestCore.blank_text?(area_name)
+        HuntSuggestDiscovery.live_scan(area_name)
+      end
+    when 'importlog'
+      raise 'usage: ;huntsuggest importlog <area-name> <log-file>' if args.length < 3
+      HuntSuggestDiscovery.import_log(args[1], args[2..].join(' '))
+    when 'importmap'
+      raise 'usage: ;huntsuggest importmap <area-name>' if HuntSuggestCore.blank_text?(args[1])
+      HuntSuggestLocalMapImport.import_current_area(args[1..].join(' '))
+    when 'scans'
+      HuntSuggestDiscovery.list_scans
     else
       level, level_range, town_filter, style, type_filter, creature_filter, local_only =
         HuntSuggestCore.parse_query_args(args, settings)
@@ -579,7 +1163,7 @@ module HuntSuggest
 
       if gui_available?
         begin
-          HuntSuggestGUI::Window.new(
+          window = HuntSuggestGUI::Window.new(
             hunts: hunts,
             level: level,
             level_range: level_range,
@@ -591,6 +1175,11 @@ module HuntSuggest
             current_context: current_context,
             settings: settings
           )
+          if window.scan_area
+            HuntSuggestDiscovery.live_scan(window.scan_area)
+          elsif window.import_area
+            HuntSuggestLocalMapImport.import_current_area(window.import_area)
+          end
         rescue StandardError => e
           HuntSuggestCore.safe_echo("huntsuggest: gui failed, falling back to text: #{e.class}: #{e.message}")
           show_text_suggestions(
@@ -618,19 +1207,35 @@ module HuntSuggest
 
   def print_help
     HuntSuggestCore.safe_echo('=== huntsuggest help ===')
-    HuntSuggestCore.safe_echo('Built for use with the huntpro script.')
+    HuntSuggestCore.safe_echo('Built for use with HuntPro or Ashborne.')
     HuntSuggestCore.safe_echo('Manual GTK GUI, saved settings, favorites, blacklist.')
-    HuntSuggestCore.safe_echo('Starts huntpro directly through Lich.')
+    HuntSuggestCore.safe_echo('Starts the selected hunting engine directly through Lich.')
+    HuntSuggestCore.safe_echo('GUI selector: Hunting Engine = HuntPro or Ashborne.')
+    HuntSuggestCore.safe_echo('Text command: ;huntsuggest engine huntpro|ashborne')
+    HuntSuggestCore.safe_echo("Add hunting grounds in: #{HuntSuggestCore::CUSTOM_FILE}")
+    HuntSuggestCore.safe_echo('Local rows override Google Sheet rows with the same Area Name.')
+    HuntSuggestCore.safe_echo('Click any Creature, Lvl, Area, Town, Type, Spawn, Bounty, or Flags header to sort.')
+    HuntSuggestCore.safe_echo('Discovery is OFF by default and never runs during normal huntsuggest use.')
+    HuntSuggestCore.safe_echo('Turn ON: ;huntsuggest scan on <area-name>')
+    HuntSuggestCore.safe_echo('Turn OFF: ;kill huntsuggest (also stops automatically when the selected hunt ends)')
+    HuntSuggestCore.safe_echo('The GUI also has a Start New Area Scan button.')
+    HuntSuggestCore.safe_echo('Active scans count creature attacks, maneuvers, and spell behavior without saving full logs.')
+    HuntSuggestCore.safe_echo('Local map import: ;huntsuggest importmap <area-name>')
+    HuntSuggestCore.safe_echo('Map imports run only on demand and stop at higher-level or different map areas.')
+    HuntSuggestCore.safe_echo('Log review: ;huntsuggest importlog <area-name> <log-file>')
+    HuntSuggestCore.safe_echo('Recent discoveries: ;huntsuggest scans')
+    HuntSuggestCore.safe_echo("Discovery candidates: #{HuntSuggestCore::DISCOVERY_INDEX_FILE}")
   end
 
   def print_styles
-    HuntSuggestCore.safe_echo('=== Hunt Styles for huntpro ===')
+    HuntSuggestCore.safe_echo('=== Hunt Styles for HuntPro and Ashborne ===')
     HuntSuggestCore::STYLE_OPTIONS.each do |number, name|
       HuntSuggestCore.safe_echo("  #{number} = #{name}")
     end
   end
 
   def show_text_suggestions(hunts, level, level_range, town_filter, type_filter, creature_filter, local_only, current_context, settings, style)
+    engine = settings['engine']
     results = HuntSuggestCore.filter_hunts(
       hunts,
       level: level,
@@ -648,6 +1253,7 @@ module HuntSuggest
     HuntSuggestCore.send_line('')
     HuntSuggestCore.send_line('=== Hunt Suggestions ===')
     HuntSuggestCore.send_line("Current Area: #{HuntSuggestCore.present_text(current_context[:area_text])}")
+    HuntSuggestCore.send_line("Data Source: #{HuntSuggestCore.data_source}")
     HuntSuggestCore.send_line("Level: #{level}")
     HuntSuggestCore.send_line("Range: +/- #{level_range}")
     HuntSuggestCore.send_line("Town Filter: #{town_filter || 'Auto-local'}")
@@ -655,6 +1261,7 @@ module HuntSuggest
     HuntSuggestCore.send_line("Creature Filter: #{creature_filter.empty? ? 'Any' : creature_filter}")
     HuntSuggestCore.send_line("Local Only: #{local_only ? 'Yes' : 'No'}")
     HuntSuggestCore.send_line("Style: #{style}")
+    HuntSuggestCore.send_line("Hunting Engine: #{engine == 'ashborne' ? 'Ashborne' : 'HuntPro'}")
     HuntSuggestCore.send_line('')
 
     results.each_with_index do |hunt, index|
@@ -665,7 +1272,7 @@ module HuntSuggest
       HuntSuggestCore.send_line("  Type: #{HuntSuggestCore.present_text(hunt.creature_type)}")
       HuntSuggestCore.send_line("  Spawn: #{HuntSuggestCore.present_text(hunt.spawn_rate)}")
       quick = HuntSuggestCore::QUICK_STYLES.map do |label, style_num|
-        cmd = HuntSuggestCore.huntpro_command(hunt, style_num)
+        cmd = HuntSuggestCore.hunting_command(hunt, style_num, engine)
         HuntSuggestCore.click("#{label}: #{cmd}", cmd)
       end.join('  ')
       HuntSuggestCore.send_line("  Quick: #{quick}")
@@ -677,6 +1284,8 @@ end
 if defined?(Gtk)
   module HuntSuggestGUI
     class Window
+      attr_reader :scan_area, :import_area
+
       INDEX_COL = 0
       CREATURE_COL = 1
       LEVEL_COL = 2
@@ -691,6 +1300,10 @@ if defined?(Gtk)
         ['WL', 'landing'],
         ['Sol', 'solhaven'],
         ['IMT', 'icemule'],
+        ['TI', 'illistim'],
+        ['TV', 'ta vaalor'],
+        ['TF', 'tafaendryl'],
+        ['Zul', 'zul logoth'],
         ['Mist', 'mist harbor'],
         ['RR', 'riverrest'],
         ['Teras', 'teras'],
@@ -735,7 +1348,9 @@ if defined?(Gtk)
 
         outer = Gtk::Box.new(:vertical, 8)
 
-        current_area_label = Gtk::Label.new("Current Area: #{HuntSuggestCore.present_text(@current_context[:area_text])}")
+        current_area_label = Gtk::Label.new(
+          "Current Area: #{HuntSuggestCore.present_text(@current_context[:area_text])} | Data: #{HuntSuggestCore.data_source}"
+        )
         current_area_label.xalign = 0.0
         outer.pack_start(current_area_label, false, true, 0)
 
@@ -799,6 +1414,21 @@ if defined?(Gtk)
         filter_box.pack_start(filter_grid, false, true, 0)
 
         quick_row = Gtk::Box.new(:horizontal, 6)
+        quick_row.pack_start(label('Hunting Engine:'), false, false, 0)
+
+        @engine_combo = Gtk::ComboBoxText.new
+        @engine_combo.append_text('HuntPro')
+        @engine_combo.append_text('Ashborne')
+        @engine_combo.active = @settings['engine'] == 'ashborne' ? 1 : 0
+        @engine_combo.set_tooltip_text(
+          'Choose which hunting script HuntSuggest starts. This choice is saved for the next time you open HuntSuggest.'
+        )
+        @engine_combo.signal_connect('changed') do
+          persist_settings
+          populate_details_from_selection
+        end
+        quick_row.pack_start(@engine_combo, false, false, 0)
+
         quick_row.pack_start(label('Quick Towns:'), false, false, 0)
 
         QUICK_TOWNS.each do |button_label, town_value|
@@ -949,6 +1579,21 @@ if defined?(Gtk)
 
         footer = Gtk::Box.new(:horizontal, 6)
 
+        footer.pack_start(label('New area name:'), false, false, 0)
+
+        @scan_area_entry = Gtk::Entry.new
+        @scan_area_entry.placeholder_text = 'Select a hunt or enter a new area key'
+        @scan_area_entry.width_chars = 30
+        footer.pack_start(@scan_area_entry, false, false, 0)
+
+        @scan_button = make_button('Start New Area Scan')
+        @scan_button.signal_connect('clicked') { start_new_area_scan }
+        footer.pack_start(@scan_button, false, false, 0)
+
+        @import_button = make_button('Import Current Map Area')
+        @import_button.signal_connect('clicked') { start_current_map_import }
+        footer.pack_start(@import_button, false, false, 0)
+
         refresh_button = make_button('Refresh')
         refresh_button.signal_connect('clicked') { refresh_results }
         footer.pack_end(refresh_button, false, false, 0)
@@ -987,6 +1632,8 @@ if defined?(Gtk)
         renderer = Gtk::CellRendererText.new
         column = Gtk::TreeViewColumn.new(title)
         column.resizable = true
+        column.sort_column_id = index
+        column.clickable = true if column.respond_to?(:clickable=)
         column.pack_start(renderer, true)
         column.add_attribute(renderer, 'text', index)
         view.append_column(column)
@@ -1000,6 +1647,38 @@ if defined?(Gtk)
         rescue StandardError
           nil
         end
+      end
+
+      def start_new_area_scan
+        area_name = selected_or_entered_area
+
+        if area_name.empty?
+          @status_label.text = 'Enter a new area name, or select a hunt first.'
+          return
+        end
+
+        @scan_area = area_name
+        @status_label.text = "Discovery will start for #{area_name} after this window closes."
+        request_close
+      end
+
+      def start_current_map_import
+        area_name = selected_or_entered_area
+
+        if area_name.empty?
+          @status_label.text = 'Enter a new area name, or select a hunt first.'
+          return
+        end
+
+        @import_area = area_name
+        @status_label.text = "The connected local map area will import as #{area_name} after this window closes."
+        request_close
+      end
+
+      def selected_or_entered_area
+        entered_area = HuntSuggestCore.normalize_text(@scan_area_entry.text)
+        selected_area = @selected_hunt ? HuntSuggestCore.hunt_area_key(@selected_hunt) : ''
+        entered_area.empty? ? selected_area : entered_area
       end
 
       def finish_close
@@ -1024,7 +1703,12 @@ if defined?(Gtk)
         match ? match[1].to_i : HuntSuggestCore::DEFAULT_STYLE
       end
 
+      def selected_engine
+        @engine_combo && @engine_combo.active == 1 ? 'ashborne' : 'huntpro'
+      end
+
       def persist_settings
+        @settings['engine'] = selected_engine
         @settings['style'] = selected_style
         @settings['range'] = integer_or_default(@range_entry.text, HuntSuggestCore::DEFAULT_RANGE)
         @settings['town_filter'] = HuntSuggestCore.normalize_text(@town_entry.text)
@@ -1132,7 +1816,7 @@ if defined?(Gtk)
 
       def current_command(style_override = nil)
         return nil unless @selected_hunt
-        HuntSuggestCore.huntpro_command(@selected_hunt, style_override || selected_style)
+        HuntSuggestCore.hunting_command(@selected_hunt, style_override || selected_style, selected_engine)
       end
 
       def populate_details_from_selection
@@ -1154,6 +1838,8 @@ if defined?(Gtk)
           "Skin: #{HuntSuggestCore.present_text(hunt.skin_name)}",
           "Skin Value: #{HuntSuggestCore.present_text(hunt.estimated_skin_value)}",
           "Bounty Status: #{HuntSuggestCore.present_text(hunt.bounty_status)}",
+          "Anchor Room: #{HuntSuggestCore.present_text(hunt.anchor_room_id)}",
+          "Go2 Target: #{HuntSuggestCore.present_text(hunt.go2_target)}",
           "Local Match: #{local_text}"
         ].join("\n")
 
@@ -1206,18 +1892,18 @@ if defined?(Gtk)
       def quick_send(style_num)
         hunt = @selected_hunt
         return unless hunt
-        command = HuntSuggestCore.huntpro_command(hunt, style_num)
+        command = HuntSuggestCore.hunting_command(hunt, style_num, selected_engine)
         @status_label.text = "Starting #{command}"
-        HuntSuggestCore.start_huntpro(style_num, hunt.area_name)
+        HuntSuggestCore.start_hunting_script(style_num, hunt.area_name, selected_engine)
       end
 
       def send_selected_hunt
         hunt = @selected_hunt
         return false unless hunt
         style_num = selected_style
-        command = HuntSuggestCore.huntpro_command(hunt, style_num)
+        command = HuntSuggestCore.hunting_command(hunt, style_num, selected_engine)
         @status_label.text = "Starting #{command}"
-        HuntSuggestCore.start_huntpro(style_num, hunt.area_name)
+        HuntSuggestCore.start_hunting_script(style_num, hunt.area_name, selected_engine)
       end
 
       def favorite_selected
