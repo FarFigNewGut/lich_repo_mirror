@@ -5,7 +5,7 @@ Please adhere to POLICY 18 & 19.
 Owner and maintainer: NecroDeus
 author: NecroDeus
 game: Gemstone
-version: 0.4.0-rc25
+version: 0.4.0-rc38
 tags: hunting, combat, group, gui, utility, automation
 required: Lich >= 5.0
 
@@ -26,7 +26,7 @@ before_dying do
   Ashborne_toolkit.mark_group_not_ready if defined?(Ashborne_toolkit)
   Ashborne_toolkit.remove_anti_caster_hook if defined?(Ashborne_toolkit)
 end
-ashborne_version = "0.4.0-rc25"
+ashborne_version = "0.4.0-rc38"
 ashborne_last_update = "6/15/2026"
 # ashborne_latest_changes = ""
 # Hide Command Inputs
@@ -1992,7 +1992,29 @@ module Ashborne_toolkit
     return nil unless Ashborne_toolkit.group_wait_for_followers_to_move
     return nil unless Ashborne_toolkit.movement_guard
 
-    walk
+    if !GameObj.targets.empty?
+      respond "Movement paused because a hostile creature arrived."
+      Ashborne_toolkit.target_check
+      $ashborne_action = 7 unless $ashborne_action == 98
+      $ashborne_own_this_room = 1 unless $ashborne_action == 98
+      return nil
+    end
+
+    starting_room = Room.current && Room.current.id ? Room.current.id.to_s : nil
+    result = walk
+    sleep 0.10
+    if starting_room && Room.current && Room.current.id.to_s == starting_room && !GameObj.targets.empty?
+      respond "Movement failed into combat; engaging before trying to move again."
+      Ashborne_toolkit.target_check
+      $ashborne_action = 7 unless $ashborne_action == 98
+      $ashborne_own_this_room = 1 unless $ashborne_action == 98
+    end
+    result
+  rescue => error
+    respond "Movement warning: #{error.message}" if $ashborne_qc_debug == "1"
+    Ashborne_toolkit.stance_defensive
+    Ashborne_toolkit.defend_while_waiting_for_group unless GameObj.targets.empty?
+    nil
   end
 
   def target_reset_check
@@ -3356,6 +3378,33 @@ module Ashborne_toolkit
     end
   end
 
+  def unstable_dead_creature_present?
+    GameObj.dead.any? do |dead|
+      text = [dead.name, dead.noun, dead.to_s].join(" ")
+      text =~ /incubus/i
+    end
+  rescue
+    false
+  end
+
+  def loot_safe_to_start?
+    return false unless GameObj.targets.empty?
+
+    if Ashborne_toolkit.unstable_dead_creature_present?
+      respond "Ashborne is pausing loot briefly because this creature may reform."
+      settle_deadline = Time.now + 8
+      until Time.now >= settle_deadline
+        return false unless GameObj.targets.empty?
+        sleep 0.5
+      end
+      return false unless GameObj.targets.empty?
+    end
+
+    true
+  rescue
+    GameObj.targets.empty?
+  end
+
   def loot_script(scriptname)
     return nil unless Ashborne_toolkit.group_looter?
 
@@ -3365,9 +3414,15 @@ module Ashborne_toolkit
     # respond "Debug Output - Loot Script is Running."
     else
       if GameObj.dead.length >= 1
+        return nil unless Ashborne_toolkit.loot_safe_to_start?
+
         Ashborne_toolkit.put_wand_manager
+        $ashborne_looting_active = "1"
+        Ashborne_toolkit.publish_group_state(true) if $ashborne_group_ai != "0"
         do_client ";#{scriptname}"
         wait_while { running? "#{scriptname}" }
+        $ashborne_looting_active = "0"
+        Ashborne_toolkit.publish_group_state(true) if $ashborne_group_ai != "0"
 
         if $ashborne_aim_fail != 0
           waitrt?
@@ -3386,6 +3441,11 @@ module Ashborne_toolkit
     Ashborne_toolkit.cock_support
 
     # Ashborne_toolkit.get_wand_manager
+  ensure
+    if $ashborne_looting_active == "1"
+      $ashborne_looting_active = "0"
+      Ashborne_toolkit.publish_group_state(true) if defined?($ashborne_group_ai) && $ashborne_group_ai != "0"
+    end
   end
 
   def cman_control
@@ -6953,6 +7013,10 @@ module Ashborne_toolkit
     flags << "stunned" if checkstunned
     flags << "webbed" if webbed?
     flags << "bound" if bound?
+    if $ashborne_looting_active == "1" ||
+        ($ashborne_loot_script.to_s != "" && Script.running?($ashborne_loot_script.to_s))
+      flags << "looting"
+    end
     flags.join(",")
   rescue
     "unknown"
@@ -7212,8 +7276,23 @@ module Ashborne_toolkit
     return false unless Ashborne_toolkit.valid_character_name?(captain)
 
     names = Ashborne_toolkit.actual_group_names
-    captain_present = names.any? { |name| name.casecmp(captain).zero? }
-    captain_present && Ashborne_toolkit.actual_group_leader_name.casecmp(captain).zero?
+    captain_present = names.any? { |name| name.casecmp(captain).zero? } ||
+      ($ashborne_follower_group_confirmed.to_s == "1" && checkpcs(captain))
+    captain_present && Ashborne_toolkit.expected_group_leader_verified?(captain)
+  rescue
+    false
+  end
+
+  def expected_group_leader_verified?(captain_name)
+    captain = Ashborne_toolkit.canonical_character_name(captain_name)
+    return false unless Ashborne_toolkit.valid_character_name?(captain)
+
+    leader_name = Ashborne_toolkit.actual_group_leader_name
+    return true if !leader_name.empty? && leader_name.casecmp(captain).zero?
+
+    $ashborne_follower_group_confirmed.to_s == "1" &&
+      $ashborne_group_ai == "2" &&
+      checkpcs(captain)
   rescue
     false
   end
@@ -7234,7 +7313,16 @@ module Ashborne_toolkit
       Ashborne_toolkit.defend_while_waiting_for_group
       if checkpcs(captain) && Time.now >= next_join_attempt
         waitrt?
-        fput "join #{captain}"
+        join_result = dothistimeout(
+          "join #{captain}",
+          2,
+          /currently a member of your group|You (?:join|are now following)|joins your group|already (?:joined|following)/i
+        ).to_s
+        if join_result =~ /currently a member of your group|You (?:join|are now following)|joins your group|already (?:joined|following)/i
+          $ashborne_follower_group_confirmed = "1"
+          Ashborne_toolkit.publish_group_state(true)
+          return true if Ashborne_toolkit.follower_in_expected_group?
+        end
         next_join_attempt = Time.now + 2
       end
       sleep 0.5
@@ -7332,7 +7420,7 @@ module Ashborne_toolkit
     until GameObj.targets.empty? || Time.now >= defense_deadline
       Ashborne_toolkit.target_check
       Ashborne_toolkit.combat_unique_to_ashborne
-      break if checkdead || $ashborne_group_danger_active == "1"
+      break if checkdead
     end
     unless GameObj.targets.empty?
       Ashborne_toolkit.stance_defensive
@@ -7342,6 +7430,248 @@ module Ashborne_toolkit
   rescue => error
     Ashborne_toolkit.stance_defensive
     respond "Group wait defense warning: #{error.message}" if $ashborne_qc_debug == "1"
+    false
+  end
+
+  def recover_from_emergency_blocker(blockers = [])
+    return false if blockers.empty?
+
+    Ashborne_toolkit.stance_defensive
+    if blockers.include?("webbed") || blockers.include?("bound")
+      fput "struggle"
+      sleep 0.5
+      waitrt? if checkrt.to_f > 0
+      return true
+    end
+
+    if blockers.include?("stunned")
+      sleep 0.5
+      return true
+    end
+
+    if blockers.include?("roundtime")
+      waitrt?
+      return true
+    end
+
+    if blockers.include?("cast roundtime")
+      waitcastrt?
+      return true
+    end
+
+    if blockers.include?("not standing")
+      Ashborne_toolkit.stand_check
+      return true
+    end
+
+    false
+  rescue => error
+    respond "Emergency recovery warning: #{error.message}" if $ashborne_qc_debug == "1"
+    false
+  end
+
+  def fight_or_recover_for_emergency_retreat(blockers = [])
+    return false if GameObj.targets.empty?
+
+    if blockers.any? { |blocker| %w[webbed bound stunned roundtime cast\ roundtime not\ standing].include?(blocker) }
+      return Ashborne_toolkit.recover_from_emergency_blocker(blockers)
+    end
+
+    Ashborne_toolkit.target_check
+    Ashborne_toolkit.combat_unique_to_ashborne
+    true
+  rescue => error
+    Ashborne_toolkit.stance_defensive
+    respond "Emergency combat recovery warning: #{error.message}" if $ashborne_qc_debug == "1"
+    false
+  end
+
+  def visible_group_pc(name)
+    safe_name = Ashborne_toolkit.canonical_character_name(name)
+    return nil if safe_name.empty?
+
+    GameObj.pcs.find do |pc|
+      pc_name = pc.name.to_s
+      pc_noun = pc.noun.to_s
+      pc_name.casecmp(safe_name).zero? || pc_noun.casecmp(safe_name).zero?
+    end
+  rescue
+    nil
+  end
+
+  def emergency_retreat_context?(context)
+    context.to_s =~ /emergency retreat/i
+  end
+
+  def stabilize_for_emergency_retreat
+    begin
+      fput "stance defensive" unless checkstance == "defensive"
+    rescue
+      nil
+    end
+
+    true
+  rescue => error
+    respond "Emergency retreat stabilization warning: #{error.message}" if $ashborne_qc_debug == "1"
+    false
+  end
+
+  def rescue_visible_groupmate(target_name, reason = "group danger")
+    return false if $ashborne_group_ai == "0"
+    return false if target_name.to_s.casecmp(Char.name.to_s).zero?
+    return false if checkdead || checkstunned || webbed? || bound?
+
+    pc = Ashborne_toolkit.visible_group_pc(target_name)
+    return false if pc.nil?
+
+    rescue_key = "rescue_#{target_name.to_s.downcase.gsub(/[^a-z0-9_\\-]/, '')}"
+    return false unless Ashborne_toolkit.group_spell_claim(rescue_key, true)
+
+    assisted = false
+    respond "#{Char.name} is stabilizing #{target_name} before group retreat: #{reason}."
+
+    if pc.status.to_s =~ /stun/i && Spell[108].known? && Spell[108].affordable? && Stats.level >= 8
+      waitcastrt?
+      fput "prep 108"
+      fput "cast #{pc.noun}"
+      sleep 2
+      assisted = true
+    end
+
+    if pc.status.to_s =~ /lying down|prone|kneeling/i
+      waitrt?
+      fput "pull #{pc.noun}"
+      sleep 2
+      assisted = true
+    end
+
+    Ashborne_toolkit.stance_defensive
+    Ashborne_toolkit.defend_while_waiting_for_group unless GameObj.targets.empty?
+    assisted
+  rescue => error
+    Ashborne_toolkit.stance_defensive
+    respond "Group rescue warning: #{error.message}" if $ashborne_qc_debug == "1"
+    false
+  end
+
+  def rescue_current_group_danger
+    danger = Ashborne_toolkit.current_group_danger
+    return false if danger.nil?
+
+    danger_name, danger_reason, danger_room = danger
+    current_room = Room.current && Room.current.id ? Room.current.id.to_s : "0"
+    return false unless danger_room.to_s == current_room.to_s
+
+    Ashborne_toolkit.rescue_visible_groupmate(danger_name, danger_reason)
+  rescue
+    false
+  end
+
+  def dead_group_danger?(danger = nil)
+    danger ||= Ashborne_toolkit.current_group_danger
+    return false if danger.nil?
+
+    danger[1].to_s =~ /\bdead\b/i
+  rescue
+    false
+  end
+
+  def dead_group_rescue_transport(danger = nil)
+    danger ||= Ashborne_toolkit.current_group_danger
+    return false unless Ashborne_toolkit.dead_group_danger?(danger)
+
+    danger_name, _danger_reason, danger_room = danger
+    current_room = Room.current && Room.current.id ? Room.current.id.to_s : "0"
+    return false unless danger_room.to_s == current_room.to_s
+    return false if checkdead || checkstunned || webbed? || bound?
+    return false unless Spell[130].known? && Stats.level >= 30 && Spell[130].affordable?
+    return false unless Ashborne_toolkit.group_spell_claim("dead_rescue_130_#{danger_name.to_s.downcase.gsub(/[^a-z0-9_\\-]/, '')}", true)
+
+    Ashborne_toolkit.stance_defensive
+    waitcastrt?
+    respond "#{Char.name} is using Spirit Guide (130) for dead group rescue on #{danger_name}."
+    Spell[130].cast()
+    sleep 3
+    Ashborne_toolkit.script_kill
+    Ashborne_toolkit.top_menu
+    respond "Ashborne used Spirit Guide (130) for dead group rescue. Verify the body is safe before restarting."
+    Ashborne_toolkit.bottom_menu
+    true
+  rescue => error
+    respond "Dead group rescue warning: #{error.message}" if $ashborne_qc_debug == "1"
+    false
+  end
+
+  def stop_unsafe_dead_group_drag(danger = nil)
+    danger ||= Ashborne_toolkit.current_group_danger
+    danger_name = danger && danger[0] ? danger[0] : "a group member"
+
+    Ashborne_toolkit.stance_defensive
+    Ashborne_toolkit.script_kill
+    Ashborne_toolkit.top_menu
+    respond "Ashborne will not drag #{danger_name}'s corpse through active hunting terrain."
+    respond "A live rescuer with Spirit Guide (130) can transport the group, or handle the rescue manually."
+    Ashborne_toolkit.bottom_menu
+    exit
+  rescue
+    exit
+  end
+
+  def travel_departure_ready?(context = "travel")
+    deadline = Time.now + 45
+    last_notice = 0
+    emergency_retreat = Ashborne_toolkit.emergency_retreat_context?(context)
+
+    loop do
+      return false if checkdead
+
+      blockers = []
+      blockers << "stunned" if checkstunned
+      blockers << "webbed" if webbed?
+      blockers << "bound" if bound?
+      blockers << "roundtime" if checkrt.to_f > 0
+      blockers << "cast roundtime" if checkcastrt.to_f > 0
+      blockers << "not standing" if !$ashborne_my_area.to_s.match?(/moonmagru/) && !checkstanding
+      blockers << "hostile creatures present" if !emergency_retreat && !GameObj.targets.empty?
+
+      if blockers.empty?
+        if emergency_retreat && !GameObj.targets.empty?
+          Ashborne_toolkit.stabilize_for_emergency_retreat
+          respond "Ashborne emergency retreat is leaving with hostile creatures present."
+        end
+        return Ashborne_toolkit.movement_guard
+      end
+
+      if Time.now.to_f - last_notice.to_f >= 10
+        respond "Ashborne is holding #{context} until safe to move: #{blockers.join(', ')}."
+        last_notice = Time.now.to_f
+      end
+
+      begin
+        fput "stance defensive" unless checkstance == "defensive"
+      rescue
+        nil
+      end
+
+      if emergency_retreat && !GameObj.targets.empty?
+        Ashborne_toolkit.fight_or_recover_for_emergency_retreat(blockers)
+      else
+        Ashborne_toolkit.defend_while_waiting_for_group if !GameObj.targets.empty?
+        Ashborne_toolkit.stand_check if blockers.include?("not standing")
+        waitrt? if checkrt.to_f > 0
+      end
+
+      if Time.now >= deadline
+        Ashborne_toolkit.stance_defensive
+        respond "Ashborne will not start #{context}; travel is still blocked by #{blockers.join(', ')}."
+        return false
+      end
+
+      sleep 0.5
+    end
+  rescue => error
+    Ashborne_toolkit.stance_defensive
+    respond "Travel departure warning: #{error.message}" if $ashborne_qc_debug == "1"
     false
   end
 
@@ -7369,7 +7699,7 @@ module Ashborne_toolkit
 
     respond "Starting Ashborne group mode on each follower with that character's saved combat style."
     Ashborne_toolkit.launch_group_followers(members)
-    wait_until = Time.now + 8
+    wait_until = Time.now + 35
     until Time.now >= wait_until
       Ashborne_toolkit.hold_present_group_members
       Ashborne_toolkit.defend_while_waiting_for_group
@@ -7383,7 +7713,7 @@ module Ashborne_toolkit
       Ashborne_toolkit.launch_group_followers(missing_starts)
     end
 
-    wait_until = Time.now + 15
+    wait_until = Time.now + 45
     until Time.now >= wait_until
       Ashborne_toolkit.hold_present_group_members
       Ashborne_toolkit.defend_while_waiting_for_group
@@ -7443,13 +7773,18 @@ module Ashborne_toolkit
       if actual_names.empty?
         issues << "no active game group could be verified"
       else
-        absent = names.reject { |name| actual_names.any? { |actual| actual.casecmp(name).zero? } }
+        absent = names.reject do |name|
+          actual_names.any? { |actual| actual.casecmp(name).zero? } ||
+            ($ashborne_group_ai == "2" &&
+              Ashborne_toolkit.expected_group_leader_verified?(name) &&
+              name.casecmp($ashborne_captain.to_s).zero?)
+        end
         issues << "not currently in the game group: #{absent.join(', ')}" unless absent.empty?
 
         if defined?(Group) && Group.respond_to?(:leader) && $ashborne_captain.to_s != "0"
           leader_name = Ashborne_toolkit.actual_group_leader_name
           captain_name = Ashborne_toolkit.canonical_character_name($ashborne_captain)
-          unless leader_name.empty? || leader_name.casecmp(captain_name).zero?
+          unless leader_name.empty? || Ashborne_toolkit.expected_group_leader_verified?(captain_name)
             issues << "game group leader is #{leader_name}, expected #{$ashborne_captain}"
           end
         end
@@ -7927,6 +8262,29 @@ module Ashborne_toolkit
     false
   end
 
+  def group_wait_for_loot_to_settle(timeout_seconds = 8)
+    return true unless $ashborne_group_ai == "1"
+    return true unless GameObj.targets.empty?
+    return true if GameObj.dead.empty?
+
+    wait_until = Time.now + timeout_seconds
+    notice_sent = false
+    until Time.now >= wait_until
+      Ashborne_toolkit.publish_group_state(true)
+      Ashborne_toolkit.group_wait_for_followers_to_move(2)
+      break if GameObj.dead.empty?
+
+      unless notice_sent
+        respond "Group movement paused briefly while loot/search finishes."
+        notice_sent = true
+      end
+      sleep 0.5
+    end
+    true
+  rescue
+    true
+  end
+
   def injury_parts
     ["head", "neck", "abs", "lhand", "rhand", "larm", "rarm", "chest", "back", "rleg", "lleg", "nerves", "torso", "leye", "reye"]
   end
@@ -7968,6 +8326,17 @@ module Ashborne_toolkit
   end
 
   def run_post_hunt_healing_rc8
+    if $ashborne_group_ai != "0"
+      request = Ashborne_toolkit.current_town_service_request
+      reunion_room = request && request["room"].to_s
+      current_room = Room.current && Room.current.id
+      unless request && reunion_room != "0" && current_room &&
+          current_room.to_s == reunion_room && GameObj.targets.empty?
+        respond "#{Char.name} will not begin post-hunt healing until safely home at the group reunion room."
+        return false
+      end
+    end
+
     unless Ashborne_toolkit.post_hunt_needs_healing_rc9?
       respond "#{Char.name} has no wounds and is above the #{Ashborne_toolkit.health_floor}% safety floor; skipping ;eherbs."
       return true
@@ -8209,15 +8578,20 @@ module Ashborne_toolkit
 
     reunion_room = request["room"]
     Ashborne_toolkit.stow_all
-    service_healed = !request["heal"] ||
-      !Ashborne_toolkit.post_hunt_needs_healing_rc9? ||
-      Ashborne_toolkit.run_post_hunt_healing_rc8
-    service_sold = !request["sell"] || Ashborne_toolkit.run_post_hunt_sale(true)
 
     if reunion_room != "0" && (!Room.current || Room.current.id.to_s != reunion_room)
       Script.run("go2", reunion_room)
       wait_while { Script.running?("go2") }
     end
+    unless Room.current && Room.current.id.to_s == reunion_room && GameObj.targets.empty?
+      respond "#{Char.name} could not reach the safe town reunion room and will not begin healing or selling."
+      return false
+    end
+
+    service_healed = !request["heal"] ||
+      !Ashborne_toolkit.post_hunt_needs_healing_rc9? ||
+      Ashborne_toolkit.run_post_hunt_healing_rc8
+    service_sold = !request["sell"] || Ashborne_toolkit.run_post_hunt_sale(true)
 
     regroup_deadline = Time.now + 300
     until checkpcs($ashborne_captain) || Time.now >= regroup_deadline
@@ -8266,15 +8640,20 @@ module Ashborne_toolkit
     $ashborne_rest_sell = request["sell"] ? "1" : "0"
     fput "disband"
     fput "group open"
-    service_healed = !request["heal"] ||
-      !Ashborne_toolkit.post_hunt_needs_healing_rc9? ||
-      Ashborne_toolkit.run_post_hunt_healing_rc8
-    service_sold = !request["sell"] || Ashborne_toolkit.run_post_hunt_sale(true)
 
     if !Room.current || Room.current.id.to_s != reunion_room
       Script.run("go2", reunion_room)
       wait_while { Script.running?("go2") }
     end
+    unless Room.current && Room.current.id.to_s == reunion_room && GameObj.targets.empty?
+      respond "#{Char.name} could not reach the safe town reunion room and will not begin healing or selling."
+      return false
+    end
+
+    service_healed = !request["heal"] ||
+      !Ashborne_toolkit.post_hunt_needs_healing_rc9? ||
+      Ashborne_toolkit.run_post_hunt_healing_rc8
+    service_sold = !request["sell"] || Ashborne_toolkit.run_post_hunt_sale(true)
     if checkpcs($ashborne_captain)
       fput "join #{$ashborne_captain}"
       sleep 1
@@ -8593,9 +8972,11 @@ module Ashborne_toolkit
       )
     end
 
-    Ashborne_toolkit.script_kill
     return nil unless Ashborne_toolkit.group_wait_for_followers_to_move
-    return nil unless Ashborne_toolkit.movement_guard
+    until Ashborne_toolkit.travel_departure_ready?("emergency retreat")
+      return nil if checkdead
+      sleep 1
+    end
 
     retreat_origin = Room.current && Room.current.id
     retreat_attempt = 0
@@ -8607,6 +8988,7 @@ module Ashborne_toolkit
         nil
       end
 
+      Ashborne_toolkit.group_wait_for_loot_to_settle(8)
       do_client ";go2 town"
       Ashborne_toolkit.unpause_go2
       wait_while { running? "go2" }
@@ -8617,8 +8999,13 @@ module Ashborne_toolkit
 
       respond "Emergency retreat did not reach safety; retrying go2 town." if retreat_attempt == 1 || retreat_attempt % 3 == 0
       sleep 1
+      until Ashborne_toolkit.travel_departure_ready?("emergency retreat retry")
+        return nil if checkdead
+        sleep 1
+      end
     end
 
+    Ashborne_toolkit.script_kill
     Ashborne_toolkit.top_menu
     respond "I returned to town because: #{$ashborne_return_why}"
     Ashborne_toolkit.bottom_menu
@@ -8649,6 +9036,24 @@ module Ashborne_toolkit
   def group_danger_retreat_if_needed
     Ashborne_toolkit.apply_group_danger_abort
     return false unless $ashborne_group_danger_active == "1"
+
+    danger = Ashborne_toolkit.current_group_danger
+    if Ashborne_toolkit.dead_group_danger?(danger)
+      exit if Ashborne_toolkit.dead_group_rescue_transport(danger)
+      Ashborne_toolkit.stop_unsafe_dead_group_drag(danger)
+    end
+
+    Ashborne_toolkit.rescue_current_group_danger
+    if $ashborne_group_ai == "2" && danger
+      danger_name, _danger_reason, danger_room = danger
+      current_room = Room.current && Room.current.id ? Room.current.id.to_s : "0"
+      if !danger_name.to_s.casecmp(Char.name.to_s).zero? &&
+          danger_room.to_s == current_room.to_s &&
+          !GameObj.targets.empty?
+        Ashborne_toolkit.fight_or_recover_for_emergency_retreat([])
+        return true
+      end
+    end
 
     Ashborne_toolkit.group_return_to_town
     true
@@ -8842,7 +9247,67 @@ module Ashborne_toolkit
     wait_while { Script.running?("go2") }
     nil
   end
-def group_follower_attack_priority
+
+  def leader_obstacle_follow_command(event_text)
+    text = event_text.to_s
+
+    return "climb landslide" if text =~ /#{$ashborne_captain} .*climbs? (?:up|down) (?:the |a |an )?landslide/i
+    return "climb rockslide" if text =~ /#{$ashborne_captain} .*climbs? (?:up|down) (?:the |a |an )?rockslide/i
+    return "climb rockslide" if text =~ /#{$ashborne_captain} begins to climb down the rockslide/i
+
+    nil
+  rescue
+    nil
+  end
+
+  def rejoin_captain_group(timeout_seconds = 8)
+    return true unless $ashborne_group_ai == "2"
+    captain = Ashborne_toolkit.canonical_character_name($ashborne_captain)
+    return false unless Ashborne_toolkit.valid_character_name?(captain)
+
+    deadline = Time.now + timeout_seconds
+    next_join_attempt = Time.at(0)
+    until Time.now >= deadline
+      Ashborne_toolkit.publish_group_state(true)
+      return true if Ashborne_toolkit.follower_in_expected_group?
+      if checkpcs(captain) && Time.now >= next_join_attempt
+        waitrt?
+        fput "join #{captain}"
+        next_join_attempt = Time.now + 2
+      end
+      sleep 0.5
+    end
+    false
+  rescue
+    false
+  end
+
+  def handle_leader_obstacle_event(event_text)
+    return nil unless $ashborne_group_ai == "2"
+
+    command = Ashborne_toolkit.leader_obstacle_follow_command(event_text)
+    if command
+      respond "Group obstacle sync: mirroring #{$ashborne_captain}'s #{command} before regrouping."
+      return nil unless Ashborne_toolkit.movement_guard
+      fput command
+      waitrt?
+      sleep 0.5
+      Ashborne_toolkit.rejoin_captain_group(8)
+      return true if checkpcs("#{$ashborne_captain}")
+    end
+
+    if checkpcs("#{$ashborne_captain}")
+      Ashborne_toolkit.rejoin_captain_group(8)
+    else
+      Ashborne_toolkit.group_follow_sync(true)
+      Ashborne_toolkit.rejoin_captain_group(8)
+    end
+    true
+  rescue => error
+    respond "Group obstacle sync warning: #{error.message}" if $ashborne_qc_debug == "1"
+    false
+  end
+  def group_follower_attack_priority
     if $ashborne_my_area =~ /group|follow|qfollow/ && $ashborne_captain != "0"
       true
     else
@@ -9199,6 +9664,19 @@ def group_follower_attack_priority
   end
 
   def safe_room_default
+    if $ashborne_group_ai == "1"
+      Ashborne_toolkit.group_wait_for_loot_to_settle(8)
+      until Ashborne_toolkit.group_wait_for_followers_to_move(5)
+        Ashborne_toolkit.defend_while_waiting_for_group
+        unless GameObj.targets.empty?
+          Ashborne_toolkit.stance_defensive
+          respond "Ashborne will not leave visible followers behind while combat is active."
+        end
+      end
+      return false unless Ashborne_toolkit.movement_guard
+    end
+    return false unless Ashborne_toolkit.travel_departure_ready?("safe return")
+
     if $ashborne_my_area =~ /moonmagru/
       fput "move clear"
     end
@@ -12376,6 +12854,7 @@ $ashborne_rest_ask_empath = ashborne_setting_rest_ask_empath.to_s == "0" ? "0" :
 $ashborne_rest_sell = ashborne_setting_rest_sell.to_s == "0" ? "0" : "1"
 $ashborne_group_end_heal = "0"
 $ashborne_group_end_sell = "0"
+$ashborne_follower_group_confirmed = "0"
 $ashborne_original_style = script.vars[1].to_s
 $ashborne_original_area = script.vars[2].to_s
 $ashborne_hunt_cycle = script.vars[3].to_s[/\Acycle=(\d+)\z/i, 1].to_i
@@ -19770,6 +20249,7 @@ ashborne_group_check = proc {
       Ashborne_toolkit.group_follow_sync
 
       respond "Waiting for group members to arrive."
+      Ashborne_toolkit.defend_while_waiting_for_group unless GameObj.targets.empty?
       do_client ";queen rally"
       ashborne_group_wait_counter = 1
       sleep 3
@@ -19867,6 +20347,7 @@ ashborne_group_check = proc {
   else
     respond "Not all group members are here.  Holding hands and waiting for more."
     $ashborne_group_counter = 0
+    Ashborne_toolkit.defend_while_waiting_for_group unless GameObj.targets.empty?
     sleep 3
   end
 }
@@ -19986,6 +20467,7 @@ ashborne_group_cluster = proc {
   if $ashborne_group_ai == "1"
     ashborne_soft_group.call
     if $ashborne_group_counter == 0
+      Ashborne_toolkit.defend_while_waiting_for_group unless GameObj.targets.empty?
       until $ashborne_group_counter == $ashborne_group_array.length
         ashborne_group_check.call
         sleep 0.5
@@ -20013,24 +20495,17 @@ ashborne_group_support = proc {
       end
     end
 
-    # Thanks to Darkcipher for making ;unstun.  This routine is a slightly modified version of it.
-    if (!checkstunned && !checkdead && players = GameObj.pcs)
-      players.each do |p|
-        waitcastrt?
+    Ashborne_toolkit.rescue_current_group_danger
 
-        if p.status =~ /stun/i
-          # respond "#{p.noun} is stunned."
-          if Spell[108].known? && Spell[108].affordable? && Stats.level >= 8
-            fput "prep 108"
-            fput "cast " + p.noun
-          end
-          sleep 3
-        elsif p.status =~ /dead/i
-        # respond "#{p.noun} is dead."
-        elsif p.status =~ /lying down/i
-          fput "pull " + p.noun
-          sleep 3
-        end
+    if !checkstunned && !checkdead
+      Ashborne_toolkit.group_session_names.each do |member_name|
+        next if member_name.to_s.casecmp(Char.name.to_s).zero?
+
+        pc = Ashborne_toolkit.visible_group_pc(member_name)
+        next if pc.nil?
+        next unless pc.status.to_s =~ /stun|lying down|prone|kneeling/i
+
+        Ashborne_toolkit.rescue_visible_groupmate(member_name, "visible groupmate needs help")
       end
       pause 0.1
     end
@@ -23109,6 +23584,7 @@ if $ashborne_group_ai == "2"
     ashborne_kill_script.call
     exit
   end
+  Ashborne_toolkit.publish_group_state(true)
 end
 
 # Assemble the physical group and require follower Ashborne acknowledgments before hunting.
@@ -23165,8 +23641,9 @@ end
 # Stop looking for your cman abilities.
 $ashborne_cman_watch = "0"
 
-# Go to the hunting zone and escape from a nil room
-ashborne_hunting_zones.call
+# Go to the hunting zone and escape from a nil room. Followers stay with the
+# leader instead of pathing to the hunting area on their own.
+ashborne_hunting_zones.call unless $ashborne_qfollow == "1" || $ashborne_group_ai == "2"
 
 
 
@@ -23529,16 +24006,13 @@ loop {
   # sleep 1
   # end
 
-  result = matchtimeout(1, /#{$ashborne_captain} (swings|gestures|fires|attempts to|skillfully weaves|punches with|channels|thrusts with|rushes forward|thrusts with a|lunges at|waves a|launches a .* bash|lashes out with an? awesome shield bash|attempts a shield bash|looping .*? lashes out in a strike|brings .*? around to pummel|sweeping .*? out low to .*? launches a quick bash|whirls in a fury of unrelenting strikes|mstrikes?|starts to climb|begins to climb|begins climbing|begins to descend|goes through|climbs up|climbs down|squeezes through|crawls through|pushes through|pulls open|opens .*door|enters)/).to_s
+  result = matchtimeout(1, /#{$ashborne_captain} (swings|gestures|fires|attempts to|skillfully weaves|punches with|channels|rushes forward|thrusts with|thrusts with a|lunges at|waves a|launches a .* bash|lashes out with an? awesome shield bash|attempts a shield bash|looping .*? lashes out in a strike|brings .*? around to pummel|sweeping .*? out low to .*? launches a quick bash|whirls in a fury of unrelenting strikes|mstrikes?|starts to climb|begins to climb|begins climbing|begins to descend|confidently climbs|gracefully climbs|climbs up|climbs down|goes through|squeezes through|crawls through|pushes through|pulls open|opens .*door|enters)/).to_s
 
   if result =~ /#{$ashborne_captain} (swings|gestures|fires|attempts to|skillfully weaves|punches with|channels|thrusts with|rushes forward|thrusts with a|lunges at|waves a|launches a .* bash|lashes out with an? awesome shield bash|attempts a shield bash|looping .*? lashes out in a strike|brings .*? around to pummel|sweeping .*? out low to .*? launches a quick bash|whirls in a fury of unrelenting strikes|mstrikes?)/
     Ashborne_toolkit.target_check unless $ashborne_group_peace == "1"
     Ashborne_toolkit.combat_unique_to_ashborne unless $ashborne_group_peace == "1"
-  elsif result =~ /#{$ashborne_captain} (starts to climb|begins to climb|begins climbing|begins to descend|goes through|climbs up|climbs down|squeezes through|crawls through|pushes through|pulls open|opens .*door|enters)/
-    if result =~ /#{$ashborne_captain} begins to climb down the rockslide/
-      fput "climb rockslide" if checkrt <= 0
-    end
-    Ashborne_toolkit.group_follow_sync(true)
+  elsif result =~ /#{$ashborne_captain} (starts to climb|begins to climb|begins climbing|begins to descend|confidently climbs|gracefully climbs|climbs up|climbs down|goes through|squeezes through|crawls through|pushes through|pulls open|opens .*door|enters)/
+    Ashborne_toolkit.handle_leader_obstacle_event(result)
   else
     Ashborne_toolkit.group_follow_sync
     if GameObj.targets.length >= 1 && $ashborne_group_peace != "1"
@@ -23565,16 +24039,13 @@ loop {
   Ashborne_toolkit.loot_script("#{$ashborne_loot_script}") if GameObj.dead.length >= 1
 
   # respond "I'm in qfollow"
-  result = matchtimeout(1, /#{$ashborne_captain} (swings|gestures|fires|attempts to|skillfully weaves|punches with|channels|thrusts with|rushes forward|thrusts with a|lunges at|waves a|launches a .* bash|lashes out with an? awesome shield bash|attempts a shield bash|looping .*? lashes out in a strike|brings .*? around to pummel|sweeping .*? out low to .*? launches a quick bash|whirls in a fury of unrelenting strikes|mstrikes?|starts to climb|begins to climb|begins climbing|begins to descend|goes through|climbs up|climbs down|squeezes through|crawls through|pushes through|pulls open|opens .*door|enters)/).to_s
+  result = matchtimeout(1, /#{$ashborne_captain} (swings|gestures|fires|attempts to|skillfully weaves|punches with|channels|rushes forward|thrusts with|thrusts with a|lunges at|waves a|launches a .* bash|lashes out with an? awesome shield bash|attempts a shield bash|looping .*? lashes out in a strike|brings .*? around to pummel|sweeping .*? out low to .*? launches a quick bash|whirls in a fury of unrelenting strikes|mstrikes?|starts to climb|begins to climb|begins climbing|begins to descend|confidently climbs|gracefully climbs|climbs up|climbs down|goes through|squeezes through|crawls through|pushes through|pulls open|opens .*door|enters)/).to_s
 
   if result =~ /#{$ashborne_captain} (swings|gestures|fires|attempts to|skillfully weaves|punches with|channels|thrusts with|rushes forward|thrusts with a|lunges at|waves a|launches a .* bash|lashes out with an? awesome shield bash|attempts a shield bash|looping .*? lashes out in a strike|brings .*? around to pummel|sweeping .*? out low to .*? launches a quick bash|whirls in a fury of unrelenting strikes|mstrikes?)/
     Ashborne_toolkit.target_check unless $ashborne_group_peace == "1"
     Ashborne_toolkit.combat_unique_to_ashborne unless $ashborne_group_peace == "1"
-  elsif result =~ /#{$ashborne_captain} (starts to climb|begins to climb|begins climbing|begins to descend|goes through|climbs up|climbs down|squeezes through|crawls through|pushes through|pulls open|opens .*door|enters)/
-    if result =~ /#{$ashborne_captain} begins to climb down the rockslide/
-      fput "climb rockslide" if checkrt <= 0
-    end
-    Ashborne_toolkit.group_follow_sync(true)
+  elsif result =~ /#{$ashborne_captain} (starts to climb|begins to climb|begins climbing|begins to descend|confidently climbs|gracefully climbs|climbs up|climbs down|goes through|squeezes through|crawls through|pushes through|pulls open|opens .*door|enters)/
+    Ashborne_toolkit.handle_leader_obstacle_event(result)
   else
     Ashborne_toolkit.group_follow_sync
     if GameObj.targets.length >= 1 && $ashborne_group_peace != "1"
