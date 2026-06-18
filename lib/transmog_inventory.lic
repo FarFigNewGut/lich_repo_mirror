@@ -35,9 +35,8 @@
 
       ;transmog_inventory help          this help
 
-    Let others search your catalog via THINK (companion script):
-      ;thinkmog                  listen for THINK TO searches
-      ;thinkmog ad                 post merchant notice once
+    Upload your catalog to the Transmog Exchange (shared web database):
+      ;transmog_inventory upload        push your saved CSV to the exchange
 
   How it works:
     - Each candidate item is briefly pulled into your hand so it can be
@@ -69,8 +68,28 @@
 =end
 
 require 'csv'
+require 'net/http'
+require 'openssl'
+require 'json'
+require 'securerandom'
 
 # Changelog:
+# 1.3.0 (2026-06-17)
+#   - Added "note" command with stable numeric item IDs for easy reference.
+#     Each catalog entry is assigned a persistent 9-digit ID (stored in CSV).
+#     Primary syntax: ;transmog_inventory note <id> <note text>
+#     Fallback:       ;transmog_inventory note <search terms> -- <note text>
+#     IDs are shown in search/remove output and survive re-scans via merge.
+#   - Notes (max 120 chars) are included in uploads and shown on the website.
+#   - Notes and ID columns added to CSV (backward compatible).
+#   - QTY column retained in CSV for local tracking but no longer shown on site.
+#
+# 1.2.0 (2026-06-17)
+#   - Added "upload" command: POSTs the local CSV to the Transmog Exchange
+#     central database (Supabase). Character names are claimed on first upload
+#     via a locally-stored UUID token; only the same machine can overwrite.
+#     See https://github.com/Lillymara/transmog-exchange for the web interface.
+#
 # 1.1.1 (2026-05-31)
 #   - Bugfix: each scanned item is now returned in an ensure block so exceptions
 #     or interrupted logic do not leave it stranded in hand.
@@ -125,6 +144,14 @@ SLOT_MAP = [
   [/as a pin|pin-worn|on your body/i,                                                   "As a pin", 1],
 ]
 
+# ---------------------------------------------------------------------------
+# Transmog Exchange -- https://github.com/Lillymara/transmog-exchange
+# After creating your free Supabase project, replace the two placeholder values
+# below with your Project URL and anon public key (Settings -> API).
+SUPABASE_URL      = "https://tljiaclwqhbpdfiqkokh.supabase.co".freeze
+SUPABASE_ANON_KEY = "sb_publishable_arwIDUqEwZL-jdqN4n9lhQ_ot6ABKbi".freeze
+EXCHANGE_WEB_URL  = "https://lillymara.github.io/transmog-exchange/".freeze
+
 # Folder + per-character CSV path for the catalog.
 def transmog_dir
   scripts_dir = ($script_dir rescue nil) || (SCRIPT_DIR rescue nil) || Dir.pwd
@@ -169,7 +196,15 @@ def usage
 
       ;transmog_inventory help          this help
 
-    Let others search via THINK: ;thinkmog  |  merchant ad: ;thinkmog ad
+    Add/clear a note on an entry (e.g. asking price), then upload to publish:
+      ;transmog_inventory note <id> Asking 2m silvers   set note by item ID
+      ;transmog_inventory note <id> clear               clear note by item ID
+      ;transmog_inventory note noun:ring -- Asking 2m   set note by search (-- required)
+      (IDs shown in search results; max #{NOTE_MAX_CHARS} characters)
+
+    Upload to the Transmog Exchange (shared web database):
+      ;transmog_inventory upload        push your saved CSV to the central catalog
+      Browse: #{EXCHANGE_WEB_URL}
 
     Stand at your open locker with the chest accessible (or have the container
     worn/held), with at least one free hand. Output (CSV, opens in Excel /
@@ -186,26 +221,45 @@ def read_catalog
     qty = r["Quantity"].to_s.strip
     qty = qty =~ /\A\d+\z/ ? qty.to_i : 1
     qty = 1 if qty < 1
+    raw_id = r["ID"].to_s.strip
     {
+      id:       raw_id =~ /\A\d+\z/ ? raw_id.to_i : nil,
       noun:     r["Noun"].to_s,
       name:     r["Full Name"].to_s,
       location: r["Worn Location"].to_s,
       quantity: qty,
+      note:     r["Notes"].to_s.strip,
     }
   end
 end
 
 # Write an array of {noun:, name:, location:, quantity:} hashes to the CSV.
 # Returns the path.
+def generate_unique_id(existing_ids)
+  loop do
+    n = rand(100_000_000..999_999_999)
+    return n unless existing_ids.include?(n)
+  end
+end
+
 def write_catalog(rows)
+  # Assign stable IDs to any entries that don't have one yet.
+  existing_ids = rows.map { |r| r[:id] }.compact.to_set
+  rows = rows.map do |r|
+    next r if r[:id].to_i > 0
+    id = generate_unique_id(existing_ids)
+    existing_ids << id
+    r.merge(id: id)
+  end
+
   out_file = csv_path
   FileUtils.mkdir_p(File.dirname(out_file))
   CSV.open(out_file, "w") do |csv|
-    csv << ["Noun", "Full Name", "Worn Location", "Quantity"]
+    csv << ["ID", "Noun", "Full Name", "Worn Location", "Quantity", "Notes"]
     rows.each do |r|
       qty = r[:quantity].to_i
       qty = 1 if qty < 1
-      csv << [r[:noun], r[:name], r[:location], qty]
+      csv << [r[:id], r[:noun], r[:name], r[:location], qty, r[:note].to_s]
     end
   end
   out_file
@@ -249,10 +303,12 @@ def pretty_terms(terms)
 end
 
 def show_entry(prefix, e)
-  qty = e[:quantity].to_i
-  qty = 1 if qty < 1
+  qty  = e[:quantity].to_i
+  qty  = 1 if qty < 1
   qtag = qty > 1 ? " x#{qty}" : ""
-  respond "  #{prefix}[#{e[:location]}]  #{e[:name]}  (#{e[:noun]})#{qtag}"
+  idtag  = e[:id].to_i > 0 ? "[#{e[:id]}] " : ""
+  notetag = e[:note].to_s.empty? ? "" : "  | #{e[:note]}"
+  respond "  #{prefix}#{idtag}[#{e[:location]}]  #{e[:name]}  (#{e[:noun]})#{qtag}#{notetag}"
 end
 
 # Print catalog rows matching the query (AND of all terms).
@@ -269,7 +325,11 @@ def run_search(query)
     return
   end
 
-  rows    = read_catalog
+  rows = read_catalog
+  if rows.any? { |r| r[:id].to_i == 0 }
+    write_catalog(rows)
+    rows = read_catalog
+  end
   matches = rows.select { |e| entry_matches?(e, terms) }
 
   if matches.empty?
@@ -455,6 +515,170 @@ def slot_for(text)
 end
 
 # ---------------------------------------------------------------------------
+# Transmog Exchange upload
+
+NOTE_MAX_CHARS = 120
+
+def apply_note(catalog, target_name, note_text)
+  new_note = note_text.strip.downcase == "clear" ? "" : note_text.strip[0, NOTE_MAX_CHARS]
+  updated  = catalog.map { |r| r[:name] == target_name ? r.merge(note: new_note) : r }
+  write_catalog(updated)
+  [new_note, updated]
+end
+
+def run_note(raw)
+  tokens = raw.to_s.strip.split(/\s+/, 2)
+
+  # ID-based: ;transmog_inventory note 485712843 Asking 25k
+  if tokens[0].to_s =~ /\A\d{6,9}\z/
+    item_id = tokens[0].to_i
+    note_text = tokens[1].to_s.strip
+    if note_text.empty?
+      respond "transmog_inventory: provide note text (or 'clear') after the ID."
+      respond "  Example: ;transmog_inventory note #{item_id} Asking 25k"
+      return
+    end
+    catalog = read_catalog
+    entry   = catalog.find { |r| r[:id].to_i == item_id }
+    if entry.nil?
+      respond "transmog_inventory: no item with ID #{item_id} in your catalog."
+      respond "  Use ;transmog_inventory search to find item IDs."
+      return
+    end
+    new_note, = apply_note(catalog, entry[:name], note_text)
+    if new_note.empty?
+      respond "transmog_inventory: note cleared for [#{item_id}] #{entry[:name]}."
+    else
+      respond "transmog_inventory: [#{item_id}] #{entry[:name]}"
+      respond "  Note (#{new_note.length}/#{NOTE_MAX_CHARS}): #{new_note}"
+      respond "  Run ;transmog_inventory upload to publish."
+    end
+    return
+  end
+
+  # Search-based fallback: ;transmog_inventory note noun:ring -- Asking 25k
+  unless raw =~ /\A(.+?)\s+--\s*(.*)\z/m
+    respond "transmog_inventory: set a note by item ID:"
+    respond "  ;transmog_inventory note <id> <note text>"
+    respond "  ;transmog_inventory note <id> clear"
+    respond "Or by search (use -- to separate terms from note):"
+    respond "  ;transmog_inventory note noun:ring loc:finger -- Asking 25k"
+    respond "Run ;transmog_inventory search to see item IDs."
+    return
+  end
+
+  search_part = $1.strip
+  note_text   = $2.strip
+  terms       = parse_terms(search_part)
+  catalog     = read_catalog
+  matches     = catalog.select { |e| entry_matches?(e, terms) }
+
+  if matches.empty?
+    respond "transmog_inventory: no entries match [#{pretty_terms(terms)}]."
+    return
+  end
+
+  if matches.size > 1
+    respond "transmog_inventory: #{matches.size} entries match -- refine your search or use an ID:"
+    matches.each { |e| show_entry("", e) }
+    return
+  end
+
+  target = matches.first
+  new_note, = apply_note(catalog, target[:name], note_text)
+  if new_note.empty?
+    respond "transmog_inventory: note cleared for [#{target[:id]}] #{target[:name]}."
+  else
+    respond "transmog_inventory: [#{target[:id]}] #{target[:name]}"
+    respond "  Note (#{new_note.length}/#{NOTE_MAX_CHARS}): #{new_note}"
+    respond "  Run ;transmog_inventory upload to publish."
+  end
+end
+
+def config_path
+  File.join(transmog_dir, "transmog_config.json")
+end
+
+def load_or_create_token
+  if File.exist?(config_path)
+    begin
+      cfg   = JSON.parse(File.read(config_path))
+      token = cfg["token"].to_s.strip
+      return token unless token.empty?
+    rescue JSON::ParserError
+    end
+  end
+  token = SecureRandom.uuid
+  FileUtils.mkdir_p(transmog_dir)
+  File.write(config_path, JSON.generate({ "token" => token }))
+  token
+end
+
+def run_upload
+  unless File.exist?(csv_path)
+    respond "transmog_inventory: no catalog at #{csv_path} -- run a scan first."
+    return
+  end
+
+  if SUPABASE_URL.include?("YOUR_PROJECT")
+    respond "transmog_inventory: upload is not configured yet."
+    respond "  Fill in SUPABASE_URL and SUPABASE_ANON_KEY near the top of this script."
+    respond "  Setup guide: #{EXCHANGE_WEB_URL}"
+    return
+  end
+
+  catalog = read_catalog
+  if catalog.empty?
+    respond "transmog_inventory: catalog is empty -- run a scan first."
+    return
+  end
+
+  char_name = (Char.name rescue nil) || XMLData.name
+  token     = load_or_create_token
+
+  respond "transmog_inventory: uploading #{catalog.size} item(s) for #{char_name}..."
+
+  items = catalog.map do |r|
+    { "noun" => r[:noun], "full_name" => r[:name], "worn_location" => r[:location], "quantity" => r[:quantity], "notes" => r[:note].to_s }
+  end
+
+  payload = JSON.generate({
+    "p_character_name" => char_name,
+    "p_token"          => token,
+    "p_items"          => items,
+  })
+
+  begin
+    uri  = URI("#{SUPABASE_URL}/rest/v1/rpc/upload_transmog")
+    req  = Net::HTTP::Post.new(uri)
+    req["Content-Type"]    = "application/json"
+    req["Accept-Encoding"] = "identity"
+    req["apikey"]          = SUPABASE_ANON_KEY
+    req["Authorization"]   = "Bearer #{SUPABASE_ANON_KEY}"
+    req.body = payload
+
+    resp = Net::HTTP.start(uri.hostname, uri.port,
+                           use_ssl: true, open_timeout: 10, read_timeout: 20) do |http|
+      http.request(req)
+    end
+
+    result = JSON.parse(resp.body) rescue {}
+
+    if result["success"]
+      respond "transmog_inventory: uploaded #{result['items_uploaded']} item(s) for #{char_name}."
+      respond "  Browse the exchange: #{EXCHANGE_WEB_URL}"
+    elsif result["error"]
+      respond "transmog_inventory: upload failed -- #{result['message'] || result['error']}"
+    else
+      respond "transmog_inventory: unexpected response (HTTP #{resp.code})."
+      respond "  #{resp.body.to_s[0..200]}" if resp.body
+    end
+  rescue => e
+    respond "transmog_inventory: upload error -- #{e.class}: #{e.message}"
+  end
+end
+
+# ---------------------------------------------------------------------------
 
 if script.vars[1].to_s =~ /^(?:help|\?|-h|--help)$/i
   usage
@@ -470,6 +694,17 @@ end
 if script.vars[1].to_s =~ /^(?:remove|rm|delete|del)$/i
   query = script.vars[0].to_s.sub(/\A\s*(?:remove|rm|delete|del)\s+/i, "")
   run_remove(query)
+  exit
+end
+
+if script.vars[1].to_s =~ /^(?:upload|push|sync)$/i
+  run_upload
+  exit
+end
+
+if script.vars[1].to_s =~ /^(?:note|notes|tag)$/i
+  raw = script.vars[0].to_s.sub(/\A\s*(?:note|notes|tag)\s+/i, "")
+  run_note(raw)
   exit
 end
 
