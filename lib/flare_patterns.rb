@@ -31,6 +31,8 @@
     - Updated for Rogue Feats Sidestep.
   1.7.2 (2026-2-16)
     - Updated for purified metals, Mirthbrand, and Greater Shadowdeath.
+  1.7.3 (2026-6-21)
+    - Updated for Mystic Resonance (Monk Tattoo Flare).
 	
 tags: tracking, item scripts, flares, data, abilities
 version: 1.7.2
@@ -88,7 +90,8 @@ NODMGFLARE_PATTERNS = {
   NightshroudCloak_Hide: /a cyclone of shadows emerge from your .*?.  The shadows swirl around in an attempt to conceal you/,
   NTouch625_ArcaneReflex: /Vital energy infuses you, hastening your arcane reflexes/,
   NTouch625_PhysicalProwess: /The vitality of nature bestows you with a burst of strength/,
-  Mirthbrand_JoyfulHeart: /Hints of an old\, joyful battle song at the edges of your hearing uplift your heart\, lending you preternatural prowess\./,
+  Mystic_Resonance: /thrums with mystic power, flooding you/,
+	Mirthbrand_JoyfulHeart: /Hints of an old\, joyful battle song at the edges of your hearing uplift your heart\, lending you preternatural prowess\./,
   MinorFire906_Ignite: /Some of the flames from the stream of fire linger around .*?/,
   MechanizedArm_Block: /Just as .*? attacks, your arm suddenly swings out and intercepts it!/,
   ManaArmor_ManaShield: /latticework springs up from the surface of your .*? and shields you from some of the damage/,
@@ -112,7 +115,6 @@ NODMGFLARE_PATTERNS = {
   Fyrswnava_Flares: /Translucent celadon sap pools into a globular spherule\, hurling away from your/,
   Ethereal_Armor: /ethereal chains encase your body against/,
   EonakArm_Block: /your arm suddenly swings out and intercepts it/,
-#  Ensorcell: /\*\* Necrotic energy from your/,
   Ensorcell_Health: /You feel healed/,
   Ensorcell_Mana: /You feel empowered/,
   Ensorcell_Spirit: /You feel rejuvenated/,
@@ -155,7 +157,7 @@ NODMGFLARE_PATTERNS = {
   Arboreal_AgonyFlare: /Ethereal .*? multiply in a profusion of flora over .*?\, spreading motes of sizzling verdant\-hued light\!/,
   Acuity_Flare: /Your .*? glows intensely with a verdant light\!|form before shifting its focus toward you, setting your .*? aflame for a brief momen/,
 	AdaptiveResistance_GS: /place holder/,
-	AdvancedSpellShielding_GS: /place holder/,
+	AdvancedSpellShielding_GS: /The anti\-magic is blocked by an unseen bulwark\, rapidly unraveling into nothingness\./,
 	ArcaneAegis_GS: /place holder/,
 	BindingShot_GS: /Released from the projectile\, a slim canister splits in flight and unfurls a net to envelop/,
 	BloodArtist_GS: /place holder/,
@@ -168,6 +170,7 @@ NODMGFLARE_PATTERNS = {
 	GrandTheftKobold_GS: /You feel like you could try that again/,
 	HW_WardenoftheDamned_GS: /\*\* Glinting golden and silver threads escape from the air around you and streak toward/,
 	HuntersAfterimage_GS: /A radiant afterimage of the arrow appears in your ready hand\, coalescing to replace its predecessor/,
+	Infusion_GS: /\*\* A burst of/,
 	ManaShield_GS: /place holder/,
 	MartialImpulse_GS: /place holder/,
 	MephiticBrume_GS: /A noxious brume\, murky and foul-smelling\, erupts from your body/,
