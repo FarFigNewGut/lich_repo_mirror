@@ -12,16 +12,33 @@
 			-Drafix
 
 =end
-@trackedlines = CharSettings[:lines] ||= Hash.new
+# Load tracked strings into a plain local Hash. Reading CharSettings directly
+# returns a SettingsProxy that writes to lich.db3 on EVERY mutation; counting
+# in-memory and saving on a debounce avoids hammering the database (one write
+# transaction per matched line otherwise).
+@trackedlines = (CharSettings[:lines] || {}).to_h
+# Drop any blank patterns. An empty key builds a regex that matches every line,
+# inflating the counter on all output and triggering a DB write per line.
+@trackedlines.reject! { |key, _value| key.to_s.empty? }
+
 @regex = ''
-regexbuild = proc {
-	next if @trackedlines.empty?
-	@regex = '('
-	@trackedlines.each{|key,value|
-		@regex << key << '|'
+@dirty = false
+@save_mutex = Mutex.new
+
+# Persists tracked counts to CharSettings, but only when something changed.
+save_settings = proc {
+	@save_mutex.synchronize {
+		next unless @dirty
+		CharSettings[:lines] = @trackedlines
+		@dirty = false
 	}
-	@regex.chop!
-	@regex << ')'
+}
+
+regexbuild = proc {
+	@regex = ''
+	keys = @trackedlines.keys.reject { |key| key.to_s.empty? }
+	next if keys.empty?
+	@regex = '(' << keys.join('|') << ')'
 }
 list = proc {
 	respond
@@ -76,27 +93,41 @@ action = proc { |client_string|
 				result = @trackedlines.delete(Regexp.escape(string))
 				if result
 					regexbuild.call
+					@dirty = true
+					save_settings.call
 					respond "[#{string}] removed from tracking list"
 				else
 					respond "could not find [#{string}] in tracking list"
 				end
 			when 'clear'
 				@trackedlines.clear
+				regexbuild.call
+				@dirty = true
+				save_settings.call
 				respond "removed all strings from tracking list"
 			when 'set'
 				string = args[1..-2].join(' ')
+				if string.empty?
+					respond "Can't track an empty string"
+					next
+				end
 				count = args[-1].to_i
 				respond "Setting [#{string}] to #{count} occurences."
 				@trackedlines[Regexp.escape(string)] = count
+				regexbuild.call
+				@dirty = true
+				save_settings.call
 			else
 				if args.empty?
 					respond "Can't track an empty string"
 					next
 				end
 				string = args[0..-1].join(' ')#.gsub(/([\-\^*?$.\/])/, '\\\\\1' )
-				
+
 				@trackedlines[Regexp.escape(string)] ||= 0
 				regexbuild.call
+				@dirty = true
+				save_settings.call
 				respond 'Now Tracking: '<< string
 			end
 		nil
@@ -109,18 +140,38 @@ action = proc { |client_string|
 }
 
 UpstreamHook.add('count', action)
-before_dying { UpstreamHook.remove('count'); }
+before_dying {
+	UpstreamHook.remove('count')
+	save_settings.call # flush any pending in-memory counts on exit
+}
 
-
-
+# Background thread debounces persistence: counts accumulate in memory and are
+# written to lich.db3 at most once every few seconds, instead of once per line.
+SAVE_INTERVAL = 5
+Thread.new {
+	loop {
+		sleep SAVE_INTERVAL
+		begin
+			save_settings.call
+		rescue StandardError => e
+			Lich.log "count: save error: #{e}\n\t#{e.backtrace[0..1].join("\n\t")}"
+		end
+	}
+}
 
 regexbuild.call
 
 while line = get
+	# An empty @regex means nothing is being tracked. Skip entirely so we never
+	# build /(?:)/ and match every line.
+	next if @regex.empty?
 	if result = line.scan(/#{@regex}/)
 		result = result.flatten
 		result.each{|thing|
-			@trackedlines[Regexp.escape(thing.to_s)] += 1
+			key = Regexp.escape(thing.to_s)
+			next if key.empty?
+			@trackedlines[key] = (@trackedlines[key] || 0) + 1
+			@dirty = true
 			#.gsub(/([\-\^*?$.\/])/, '\\\\\1' )
 		}
 	end
