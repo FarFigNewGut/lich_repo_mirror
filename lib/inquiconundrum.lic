@@ -1,0 +1,2059 @@
+=begin
+  InquiConundrum.lic
+
+  Automates the Zephyra Wilds Conundrum - the "repair the clockwerke
+  orangutan" timed minigame (Mistwarden Temple / Zephyra Wilds). Waits idle
+  until you are put anywhere with "Mistwarden Temple" or "Zephyra Wilds" in
+  the room title - not necessarily the guide's own room - then starts
+  working immediately:
+  logging parts, clearing traps/vines/wards, and exploring. It re-anchors its
+  navigation onto the guide's actual room as soon as exploration finds it,
+  listens for the floating spherical guide's piece announcements, kicks
+  matched pieces back to the guide room one at a time, and resets itself
+  to wait for the next run when the event ends. Stays running across many
+  back-to-back runs until you stop it.
+
+  Usage:
+    ;inquiconundrum                  - always run this way, no inline options
+    ;inquiconundrum set               - show current options
+    ;inquiconundrum set destroytraps=true debug=true
+    ;inquiconundrum help              - show usage and options
+
+  Hostiles are never fought during plain exploration - monsters out there
+  don't attack and can't be attacked anyway. Combat is only ever this
+  script's problem when a kick is rejected as "too dangerous" while
+  actively pushing a found piece home; that's the one and only time it
+  literally pauses itself (pause_script) and announces it. Kill whatever's
+  blocking the kick, then resume with ;unpause inquiconundrum. Blocked
+  plain movement (traps, etc.) is never paused for - it's just retried
+  quietly until it succeeds.
+
+ author: Kyrandos
+  other Scripts: Loresang, VolnRestore2, Merchantical
+  game: gs
+  tags: conundrum, Zephyra wilds, inquisition, minigame
+  version: 1.27.0
+  required: Lich > 5.0; go2.lic (mapdb required - ;repository download-mapdb)
+  \\Version\\
+			1.0.0 6/21/2026 - initial release
+=end
+
+module InquiConundrum
+  # Raised by check_for_available_piece! to unwind out of however deep
+  # continue_exploration's recursion (explore_exit/explore_new_exits) has
+  # gotten, back to tick's single rescue point - a piece becoming :located
+  # mid-exploration takes priority over finishing whatever exploration step
+  # was in progress. Not a real error - never propagates past tick.
+  class PieceBecameAvailable < StandardError; end
+
+  # Raised by check_for_run_end! the moment the run is actually over.
+  # Confirmed in the field: a surrendermania ejection landing mid-move got
+  # misread by wait_for_room_arrival's generic "a room description just
+  # arrived" check as the arrival confirmation for whatever direction
+  # explore_exit was busy walking - it recorded a bogus edge into the
+  # ejection room (which doesn't connect to anything) and kept trying to
+  # explore exits from there ("You can't go there" forever), since tick
+  # only checks maybe_end_run once, at its own top, and never got back
+  # around to it. This unwinds the same way PieceBecameAvailable does -
+  # straight back to tick's rescue - so maybe_end_run gets a fresh look on
+  # the very next tick instead of waiting for an action that may never
+  # actually finish.
+  class RunEnding < StandardError; end
+
+  PIECE_DESCRIPTOR_REGEX = /\b((?:[a-z]+ ){1,3}(?:gear|screw|lever|cog|spring))\b/i
+  VINE_REGEX             = /tangle of .*?vines|vine-tangled/i
+  # Confirmed in the field: a vine-tangled solid rock wall phrased its
+  # direction as "blocking the path east" - not "blocking the passage
+  # east" - so this missed it entirely (every directional lookup for that
+  # exact obstacle silently came back nil, including attempt_move's own
+  # obstacle-destroy check, which is how a return-trip move ended up
+  # retrying "you can't go there" against a wall that was still standing).
+  # Matches either wording now.
+  VINE_DIRECTION_REGEX   = /covering the (?:path|passage) (north|south|east|west|northeast|northwest|southeast|southwest|up|down|out)/i
+  WARD_REGEX             = /thornbound ward/i
+  WARD_DIRECTION_REGEX   = /blocking the (?:path|passage) (north|south|east|west|northeast|northwest|southeast|southwest|up|down|out)/i
+  TRAP_REGEX             = /formation of smooth bone spikes|twisting coral tendrils/i
+  MOSS_REGEX             = /slippery moss/i
+  # Not a TRAP_REGEX hazard - killing it doesn't help. Same deal as
+  # slippery moss: kneel and crawl through instead of walking it off.
+  MUSHROOM_REGEX         = /formation of large mushrooms/i
+
+  ANNOUNCE_REGEX    = /floating spherical guide say in the back of your mind.*?Please fetch (?:a|an) (.+?) at your earliest/i
+  DELIVERY_REGEX    = /(?:A|An) (.+?) has been brought to the orangutan\./i
+  COMPLETE_REGEX    = /we know all the components needed/i
+  TIME_WARNING_REGEX = /(\d+) minutes? (?:remain|left)|almost out of time/i
+
+  # Only matters with surrendermania on - once the guide says this, surrender
+  # twice and treat the run as over (it is, even though we're never moved to
+  # END_ROOM_REGEX's room for it).
+  SURRENDER_THRESHOLD_REGEX = /floating spherical guide say in the back of your mind.*?passed the threshold for winning a prize if you surrender/i
+
+  # "ask guide about status" answers with a header line, then each still-needed
+  # piece on its own line ("A colossal bronze spring"), until a blank line or
+  # an unrelated sentence ends the list.
+  STATUS_HEADER_REGEX = /you still need to bring the following pieces/i
+  STATUS_ITEM_REGEX   = /^(?:A|An) ((?:[a-z]+ ){1,3}(?:gear|screw|lever|cog|spring))\.?\s*$/i
+
+  # ZONE_REGEX is deliberately broader than START_ROOM_REGEX: the character
+  # can be dropped in anywhere in the zone when the event starts, not just
+  # the guide's own room. We start working immediately on zone entry and
+  # treat wherever we happen to be as a provisional anchor, then re-root
+  # onto the guide's actual room once exploration finds it (see
+  # reroot_tree).
+  ZONE_REGEX       = /Mistwarden Temple|Zephyra Wilds/i
+  START_ROOM_REGEX = /Mistwarden Temple, Inner Shrine/i
+  END_ROOM_REGEX   = /Testing Module Exit/i
+
+  MAX_RUN_SECONDS = 31 * 60
+  STATUS_UPDATE_INTERVAL_SECONDS = 30 # how often the idle status summary reprints
+
+  # Room id of the Arena Magister who grants entry, for go2 to walk back to
+  # from the post-ejection room. Only used when repeatevent is on.
+  ARENA_MAGISTER_UID = '36701'.freeze
+  GO2_TIMEOUT_SECONDS = 5 * 60
+
+  OPTION_KEYS = [:destroytraps, :debug, :repeatevent, :surrendermania, :pacifist].freeze
+  OPTION_DEFAULTS = { destroytraps: false, debug: false, repeatevent: false, surrendermania: false, pacifist: false }.freeze
+
+  # pacifist: confirmed in the field - resorting to violence the moment the
+  # only one or two announced pieces happen to be monster-blocked is too
+  # eager when there's still plenty of unexplored map and unlogged
+  # obstacles to work through instead, which would likely turn up an
+  # unblocked piece anyway. Only force combat once at least this many
+  # pieces have been announced (so "every located piece is blocked" means
+  # something) - below that, next_located_descriptor just returns nil and
+  # lets exploration/obstacle-clearing run instead, same as if nothing
+  # were located at all.
+  PACIFIST_FORCE_MIN_ANNOUNCED = 4
+
+  # pacifist: a monster that blocked a piece doesn't necessarily stay
+  # there forever - wanders off, dies to something else, etc. Re-eligible
+  # for a normal (non-forced) pickup attempt once this long has passed
+  # since it was last abandoned. check_for_available_piece! only lets a
+  # piece with any history in @blocked_pieces (still within its retry
+  # window via @forced_piece, or past it) interrupt exploration/obstacle-
+  # clearing if it's actually closer to the guide than wherever we
+  # currently are - a fresh, never-blocked piece still always interrupts
+  # unconditionally. maybe_abandon_for_closer_piece applies that same
+  # distance check to an active return-part job too.
+  PACIFIST_BLOCKED_RETRY_SECONDS = 1 * 60
+
+  # Friendly NPC the guide spawns, floats through rooms with - never counts
+  # as a hostile. Kept independent from inky.lic's own copy of this same
+  # regex on purpose - this script never depends on Inky being loaded.
+  FRIENDLY_NPC_REGEX = /floating spherical guide/i
+
+  @in_run        = false
+  @guide_room_id = nil
+  @guide_room_confirmed = false # whether @guide_room_id is the real guide room, not just our entry point
+  @run_started_at = nil
+  @completions    = 0 # total successful run completions this session, for repeatevent reporting
+  @last_room_id  = nil # last room we actually scanned - lets us notice the player moving us manually
+  @surrender_triggered = false # surrendermania: set once we've surrendered, so maybe_end_run treats the run as over
+
+  @needed         = {}   # descriptor => :needed/:located/:in_transit/:delivered
+  @seen           = {}   # descriptor => room_id (most recent sighting)
+  @piece_location = {}   # descriptor => room_id (while :located)
+  @transporting   = nil  # { descriptor:, } while actively pushing a piece
+  @delivered      = []
+
+  # pacifist: descriptor => { room:, blocked_at: } - room it's currently
+  # stuck in, kicked back there by "too dangerous" rather than fought
+  # through, and when that last happened. Deprioritized by next_located_
+  # descriptor in favor of anything not on this list, until either every
+  # other :located piece is ALSO blocked (see @forced_piece) or
+  # PACIFIST_BLOCKED_RETRY_SECONDS has passed since blocked_at, whichever
+  # comes first.
+  @blocked_pieces = {}
+  # pacifist: the one descriptor next_located_descriptor has decided is
+  # worth pushing through combat for, because every :located piece (this
+  # one included) is blocked. continue_transport checks this to tell "the
+  # one we're allowed to fight for" apart from "abandon and try elsewhere."
+  @forced_piece = nil
+  # pacifist: consecutive obstacle rooms process_obstacle_queue has skipped
+  # in a row for having a hostile present, used the same way @forced_piece
+  # is - once it's cycled through every logged obstacle without finding a
+  # clear one, the next one gets cleared anyway rather than stalling.
+  @obstacle_skip_streak = 0
+
+  @edges          = Hash.new { |h, k| h[k] = {} } # uid => { short_dir => dest_uid }
+  @parent         = {}   # uid => { from:, back: } (back = short dir toward guide room)
+  @exploration_cursor = nil # where the DFS was paused, so a piece detour back to the
+                             # guide room doesn't get mistaken for the whole maze being done
+  @fully_explored = false
+  @all_known      = false
+  @parsing_status = false # mid-way through reading an "ask guide about status" reply
+  @idle_announced = false # whether we've already told the player we're fully caught up
+  @last_location_report = nil # dedupes report_known_part_locations so it only reprints on change
+  @last_status_update_at = nil # throttles the idle progress/time-left summary
+
+  # What ;inqui status reports as the current operation. One of
+  # :destroying_obstacle, :fetching, :transporting, :exploring, :idle.
+  # @fetching_descriptor only applies while :fetching - @transporting
+  # already carries its own descriptor once we're actually :transporting.
+  @current_operation = :idle
+  @fetching_descriptor = nil
+
+  # True only across begin_transport's own navigate_to walk (the "fetching"
+  # phase, before @transporting is set) - check_for_available_piece! must
+  # not interrupt that walk just because the very piece it's walking toward
+  # is the one that "became available." @transporting itself already
+  # covers every other case where we're busy returning a piece.
+  @suppress_piece_interrupt = false
+
+  # DownstreamHook procs run on the socket-reading thread, not the script's
+  # own thread, so Script.current (and therefore echo) doesn't resolve
+  # there - it falls back to "(unknown script)". respond with an explicit
+  # prefix instead, so messages are always clearly self-identified.
+  # _respond (not respond) specifically - respond escapes '<'/'>' for mono
+  # /profanity frontends, which would turn monsterbold_start/end's raw
+  # <pushBold/>/<popBold/> tags into literal visible text instead of
+  # formatting. _respond sends the string through unescaped.
+  def self.say(message)
+    _respond("#{monsterbold_start}[InquiConundrum: #{message}]#{monsterbold_end}")
+  end
+
+  def self.debug?
+    !!setting(:debug)
+  end
+
+  # Plain, unformatted - debug output is diagnostic noise, never the
+  # monsterbold treatment say() gives real player-facing messages.
+  def self.debug_say(message)
+    return unless debug?
+
+    _respond("[InquiConundrum: DEBUG: #{message}]")
+  end
+
+  ## ---- persisted settings -----------------------------------------------
+  #
+  # Stored in UserVars (not local instance vars) so that ;inquiconundrum set
+  # can change behavior while the long-running ;inquiconundrum loop is
+  # already active - it just re-reads UserVars.inquiconundrum each time it
+  # checks.
+
+  def self.settings
+    UserVars.inquiconundrum ||= {}
+  end
+
+  def self.setting(key)
+    value = settings[key]
+    value.nil? ? OPTION_DEFAULTS[key] : value
+  end
+
+  def self.destroy_traps?
+    !!setting(:destroytraps)
+  end
+
+  def self.repeat_event?
+    !!setting(:repeatevent)
+  end
+
+  def self.surrender_mania?
+    !!setting(:surrendermania)
+  end
+
+  def self.pacifist?
+    !!setting(:pacifist)
+  end
+
+  # GameObj.npcs has no hostile/friendly distinction of its own - the guide
+  # itself shows up there too and has to be filtered out by name.
+  def self.hostile_present?
+    GameObj.npcs.any? { |npc| npc.name !~ FRIENDLY_NPC_REGEX }
+  end
+
+  def self.show_settings
+    settings_line = OPTION_KEYS.map { |key| "#{key}=#{setting(key)}" }.join(' | ')
+    say "Current settings: #{settings_line}"
+  end
+
+  def self.handle_set(args)
+    if args.empty?
+      show_settings
+      return
+    end
+
+    args.each do |pair|
+      key_str, value_str = pair.split('=', 2)
+      if key_str.nil? || value_str.nil?
+        say "invalid option '#{pair}' - expected option=value"
+        next
+      end
+
+      key = key_str.strip.downcase.to_sym
+      unless OPTION_KEYS.include?(key)
+        say "unknown option '#{key_str}' (valid: #{OPTION_KEYS.join(', ')})"
+        next
+      end
+
+      value = value_str.strip =~ /^(?:true|yes|on|1)$/i ? true : false
+      settings[key] = value
+      say "set #{key} = #{value}"
+    end
+  end
+
+  def self.strip_article(name)
+    name.to_s.sub(/^(?:a|an|the)\s+/i, '').strip
+  end
+
+  def self.kick_phrase(descriptor)
+    descriptor.split(' ').last(2).join(' ')
+  end
+
+  ## ---- message listener -------------------------------------------------
+
+  # DownstreamHook procs run on the socket-reading thread, not this script's
+  # own thread (same reasoning as say()'s _respond comment above) - fput
+  # can't be called from there, so just queue it and let main_loop's
+  # poll_background_events (on our own thread) do the actual surrendering.
+  SURRENDER_QUEUE = Queue.new
+
+  def self.install_listener
+    DownstreamHook.add('inquiconundrum_listener', proc { |line|
+      if (m = ANNOUNCE_REGEX.match(line))
+        announce(strip_article(m[1]))
+      end
+
+      if (m = DELIVERY_REGEX.match(line))
+        deliver(strip_article(m[1]))
+      end
+
+      if line =~ COMPLETE_REGEX && !@all_known
+        @all_known = true
+        say "guide has now announced all pieces needed (#{@needed.size})"
+      end
+
+      if line =~ SURRENDER_THRESHOLD_REGEX && surrender_mania?
+        SURRENDER_QUEUE.push(true)
+      end
+
+      if line =~ STATUS_HEADER_REGEX
+        @parsing_status = true
+      elsif @parsing_status
+        if line.strip.empty?
+          # blank line inside the list - keep reading
+        elsif (m = STATUS_ITEM_REGEX.match(line))
+          announce(strip_article(m[1]))
+        else
+          @parsing_status = false
+        end
+      end
+
+      line.scan(PIECE_DESCRIPTOR_REGEX).each do |(desc)|
+        observe_descriptor(desc) if @needed.key?(desc.downcase)
+      end
+
+      if line =~ TIME_WARNING_REGEX
+        say(line.gsub(/<[^>]+>/, '').strip)
+      end
+
+      line
+    })
+  end
+
+  def self.remove_listener
+    DownstreamHook.remove('inquiconundrum_listener')
+  end
+
+  ## ---- upstream command hook ---------------------------------------------
+  #
+  # ;send to <script> <msg> looks like the standard way to reach an
+  # already-running script, but it doesn't actually work here: every
+  # normal script (this one included) leaves Script#want_downstream at its
+  # default of true, since that's what feeds get/get? their game text - so
+  # ;send's payload lands in the same downstream_buffer as ordinary game
+  # output, not unique_buffer, and just vanishes without ever matching one
+  # of the regexes this script's DownstreamHook reads for. Killtracker.lic's
+  # approach is the one that actually works: intercept ";inquiconundrum
+  # .../;inqui ..." as the player types it, swallow it (return nil) so
+  # Lich's own ";<script>" dispatch - and its "already running" rejection -
+  # never even sees it, and queue whatever follows for main_loop to act on.
+  CMD_QUEUE = Queue.new
+  UPSTREAM_HOOK_ID = 'inquiconundrum_upstream'
+  HOOK_CMD_RX = /^(?:<c>)?;(?:#{Regexp.escape(Script.current.name)}|inqui)(?:\s+(.*))?$/i
+
+  def self.parse_upstream(command)
+    if (m = HOOK_CMD_RX.match(command))
+      CMD_QUEUE.push(m[1])
+      nil
+    else
+      command
+    end
+  end
+
+  def self.install_upstream_hook
+    UpstreamHook.add(UPSTREAM_HOOK_ID, proc { |command| parse_upstream(command) })
+  end
+
+  def self.remove_upstream_hook
+    UpstreamHook.remove(UPSTREAM_HOOK_ID)
+  end
+
+  def self.drain_cmd_queue
+    handle_command(CMD_QUEUE.pop) until CMD_QUEUE.empty?
+  end
+
+  # Drains SURRENDER_QUEUE (see install_listener) and actually sends the two
+  # surrenders here, on our own thread - fput can't be called from the
+  # DownstreamHook proc that detected the threshold message. Surrendering
+  # ends the run immediately regardless of room/timeout, same as winning -
+  # @surrender_triggered short-circuits maybe_end_run's usual conditions.
+  def self.check_surrender_threshold
+    triggered = false
+    until SURRENDER_QUEUE.empty?
+      SURRENDER_QUEUE.pop
+      triggered = true
+    end
+    return unless triggered
+
+    say "surrendermania: passed the prize threshold - surrendering to end the match"
+    fput('surrender')
+    pause 1
+    fput('surrender')
+    @surrender_triggered = true
+  end
+
+  # main_loop only drains CMD_QUEUE/SURRENDER_QUEUE between ticks, but a
+  # single tick can stay busy for a long time (a multi-hit obstacle, a long
+  # kick/move retry, a deep exploration recursion) without ever returning
+  # control back up to main_loop - confirmed in the field: ;inqui
+  # status/help/set typed mid-obstacle-kill just sat queued, looking exactly
+  # like the script was ignoring them. Called from inside the tight polling
+  # loops below (wait_for_destroy_outcome, wait_for_kick_outcome,
+  # wait_for_room_arrival, move's retry gap) so both upstream commands and
+  # the surrender threshold get handled within their ~0.05-0.1s poll
+  # interval instead of waiting for the whole tick to finish.
+  def self.poll_background_events
+    drain_cmd_queue
+    check_surrender_threshold
+  end
+
+  # Confirmed in the field: a piece becoming :located mid-exploration (the
+  # guide announces it, and we'd already seen it somewhere) didn't get
+  # acted on until continue_exploration's current recursive dig (explore_
+  # exit/explore_new_exits can chain through many rooms before naturally
+  # returning) finished on its own - looked like aimless wandering right
+  # past a piece we already knew the location of. Raises PieceBecameAvailable
+  # to unwind straight back to tick's rescue instead of waiting for that.
+  # Silent no-op while actively transporting (@transporting) or mid-fetch-
+  # walk for a piece (@suppress_piece_interrupt) - in both cases we're
+  # already doing exactly this, just not finished yet.
+  #
+  # A piece next_located_descriptor hands back that's ever been pacifist-
+  # blocked (still within its retry window via the @forced_piece fallback,
+  # or past it and just due for a recheck) only interrupts whatever's
+  # currently in progress (exploring, destroying an obstacle) if it's
+  # actually closer to the guide than wherever we currently are - a fresh,
+  # never-blocked piece still always interrupts unconditionally, same as
+  # ever. Finishing something already closer (or equally close) makes more
+  # sense than detouring for a recheck that doesn't even save a trip.
+  def self.check_for_available_piece!
+    return if @transporting || @suppress_piece_interrupt
+
+    descriptor = next_located_descriptor
+    return unless descriptor
+
+    if @blocked_pieces.key?(descriptor)
+      return unless distance_to_guide(@piece_location[descriptor]) < distance_to_guide(XMLData.room_id)
+    end
+
+    raise PieceBecameAvailable
+  end
+
+  # Mirrors maybe_end_run's own condition exactly, just without the side
+  # effects - maybe_end_run still does the actual ending (printing,
+  # @in_run, requeue_for_next_run) the next time tick's top runs it. This
+  # only needs to fire the instant ending becomes true, from wherever in
+  # tick's call tree we happen to be, so a stuck or misled move/explore
+  # loop can never block it.
+  def self.check_for_run_end!
+    return unless @in_run
+    ended_by_room = !!(XMLData.room_title =~ END_ROOM_REGEX)
+    raise RunEnding if ended_by_room || @surrender_triggered || (Time.now - @run_started_at) > MAX_RUN_SECONDS
+  end
+
+  # Same as poll_background_events, but also raises via
+  # check_for_available_piece!/check_for_run_end!. Only safe to call from inside tick's own
+  # call tree (continue_exploration, destroy_obstacle, begin_transport's
+  # navigate_to, continue_transport), which tick wraps in a rescue for
+  # exactly this. Confirmed in the field: main_loop's own top-level poll
+  # used to call this same combined check directly, BEFORE tick (and its
+  # rescue) ever runs - that raise had nowhere to go but main_loop's
+  # generic StandardError handler, which just logged it and retried
+  # forever without resolving anything, since nothing about the underlying
+  # condition (a piece sitting there :located) ever changes between
+  # retries. main_loop now calls the plain, non-raising poll_background_
+  # events instead; only the loops below (already inside tick's rescue)
+  # use this one.
+  def self.poll_background_events!
+    poll_background_events
+    check_for_run_end!
+    check_for_available_piece!
+  end
+
+  # The global wait_out_roundtime sleeps out the whole remaining roundtime in one
+  # uninterrupted call, with no chance to drain CMD_QUEUE/SURRENDER_QUEUE in
+  # between - confirmed in the field: ;inqui status/help typed during
+  # roundtime just sat there until the roundtime actually cleared, even
+  # though every poll loop elsewhere in this script was already fixed to
+  # answer immediately. checkrt (the same remaining-seconds value wait_out_roundtime
+  # itself reads) sliced into short waits instead, draining background
+  # events between each one.
+  def self.wait_out_roundtime
+    loop do
+      remaining = checkrt
+      break if remaining <= 0
+
+      poll_background_events!
+      sleep [remaining, 0.1].min
+    end
+  end
+
+  def self.announce(descriptor)
+    descriptor = descriptor.downcase
+    return if @needed.key?(descriptor)
+
+    @needed[descriptor] = :needed
+    @idle_announced = false
+    say "guide needs a #{descriptor}"
+
+    if @seen.key?(descriptor)
+      say "We know where this is, Let's go get it!"
+      debug_say "#{descriptor} already in memory (room #{@seen[descriptor]}) - will head there"
+    else
+      debug_say "#{descriptor} not yet seen - continuing to log rooms until it's found"
+    end
+
+    observe_descriptor(descriptor)
+  end
+
+  def self.deliver(descriptor)
+    descriptor = descriptor.downcase
+    return unless @needed.key?(descriptor)
+    return if @needed[descriptor] == :delivered # already counted - see continue_transport
+
+    @needed[descriptor] = :delivered
+    @delivered << descriptor
+    @transporting = nil if @transporting && @transporting[:descriptor] == descriptor
+    say "delivered #{descriptor} (#{@delivered.size}/#{@needed.size} known so far)"
+  end
+
+  def self.observe_descriptor(descriptor)
+    return unless @seen.key?(descriptor) && @needed[descriptor] == :needed
+
+    @needed[descriptor] = :located
+    @piece_location[descriptor] = @seen[descriptor]
+  end
+
+  ## ---- room scanning -----------------------------------------------------
+
+  # The "You also see ..." list (parts, traps, vines, moss formations) is
+  # the 'room objs' component, which Lich parses into GameObj.loot (and
+  # GameObj.npcs for anything bolded) - NOT GameObj.room_desc. room_desc
+  # only holds things embedded directly in the prose paragraph itself.
+  def self.scan_room(uid)
+    added = 0
+
+    GameObj.loot.each do |obj|
+      next if obj.name.nil?
+
+      if (m = PIECE_DESCRIPTOR_REGEX.match(strip_article(obj.name)))
+        descriptor = m[1].downcase
+
+        unless @seen.key?(descriptor)
+          added += 1
+          debug_say "new part seen: #{descriptor} (room #{uid})"
+        end
+
+        @seen[descriptor] = uid
+        if @needed[descriptor] == :needed
+          @needed[descriptor] = :located
+          @piece_location[descriptor] = uid
+          debug_say "#{descriptor} matches a needed piece - marking located"
+        end
+      end
+    end
+
+    say "added #{added} part#{'s' unless added == 1} to memory, total = #{@seen.size}"
+  end
+
+  # Both vines ("covering the passage X") and thornbound wards ("blocking
+  # the passage X") seal off a specific exit and are missing from
+  # checkpaths/short_exits entirely - the room description names the
+  # direction, but "Obvious paths" just won't list it.
+  def self.directional_obstacles(regex, direction_regex)
+    obstacles = {}
+    GameObj.loot.each do |obj|
+      next unless obj.name =~ regex
+
+      dir = obj.name[direction_regex, 1]
+      next unless dir
+
+      # SHORTDIR's keys are all lowercase - direction_regex is case
+      # insensitive, so without downcasing here, a capture with different
+      # casing silently looks up to nil. That nil then gets used as a real
+      # hash key/direction by every caller (candidate_exits, move, ...),
+      # which sends a blank command forever instead of ever moving - the
+      # script just sits there retrying "move  didn't go anywhere".
+      short = SHORTDIR[dir.downcase]
+      obstacles[short] = obj if short
+    end
+    obstacles
+  end
+
+  def self.current_vines
+    directional_obstacles(VINE_REGEX, VINE_DIRECTION_REGEX)
+  end
+
+  # Not every vine's text matches VINE_DIRECTION_REGEX, so current_vines
+  # alone misses some - those still seal off an exit (and silently hide
+  # any part behind it from exploration) even though we can't tell which
+  # direction from the wording. Used by handle_obstacles_on_entry to make
+  # sure every vine we can attack gets destroyed, named direction or not.
+  def self.all_vines
+    GameObj.loot.select { |obj| obj.name =~ VINE_REGEX }
+  end
+
+  def self.current_wards
+    directional_obstacles(WARD_REGEX, WARD_DIRECTION_REGEX)
+  end
+
+  # Same deal as all_vines - confirmed in the field that at least one
+  # obstacle variant phrases its direction as "blocking the path X"
+  # instead of "blocking the passage X" (a vine-tangled wall did this),
+  # so wards can't be assumed to always match WARD_DIRECTION_REGEX either.
+  # Used by handle_obstacles_on_entry so a ward we can't parse a direction
+  # from still gets killed instead of permanently sealing off whatever's
+  # behind it.
+  def self.all_wards
+    GameObj.loot.select { |obj| obj.name =~ WARD_REGEX }
+  end
+
+  def self.current_traps
+    GameObj.loot.select { |obj| obj.name =~ TRAP_REGEX }
+  end
+
+  # Ground hazards that aren't worth fighting through - kneel and crawl
+  # past them instead of risking a trigger by walking normally.
+  def self.crawl_hazard_in_room?
+    XMLData.room_description =~ MOSS_REGEX ||
+      XMLData.room_description =~ MUSHROOM_REGEX ||
+      GameObj.loot.any? { |o| o.name =~ MOSS_REGEX || o.name =~ MUSHROOM_REGEX }
+  end
+
+  ## ---- hazards ------------------------------------------------------------
+
+  # The kill's *first* response line is always "You attack ..." flavor
+  # text - the real outcome (destroyed, gird needed, or already gone)
+  # only arrives after that, possibly after the roundtime.
+  GIRD_NEEDED_REGEX     = /You'd probably have more luck with an appropriate weapon/i
+  DESTROY_SUCCESS_REGEX = /You have destroyed/i
+  DESTROY_GONE_REGEX    = /What were you referring to/i
+
+  # Polls (without ever resending the kill command) until the real outcome
+  # line shows up. wait_out_roundtime already absorbed the roundtime itself - an
+  # obstacle that's actually dead announces it within a line or two of
+  # that, so this only needs to cover server lag, not the swing that
+  # didn't finish it off. Confirmed in the field: a 20-second value here
+  # meant every single multi-hit obstacle (which never produces an outcome
+  # line for a swing that doesn't finish it) sat idle for a full 20 seconds
+  # per attempt before retrying, even though nothing was ever going to
+  # arrive - 3x that with the retry loop below. Even the 3-second value
+  # this was first dropped to (1.20.0) still added a flat 3 seconds of dead
+  # waiting on top of every single roundtime for that same common case
+  # (10 sec RT measured as 13-14 sec end to end). A short timeout costs
+  # nothing when the real text does arrive late (a noisy room can still
+  # delay it past this window) - it just means one extra harmless "kill"
+  # that the game answers with "What were you referring to?" (:gone),
+  # which resolves the obstacle anyway.
+  def self.wait_for_destroy_outcome(timeout = 1)
+    deadline = Time.now + timeout
+    next_yield_at = Time.now + 0.1
+    loop do
+      line = get?
+      if line
+        return :gird_needed if line =~ GIRD_NEEDED_REGEX
+        return :destroyed   if line =~ DESTROY_SUCCESS_REGEX
+        return :gone        if line =~ DESTROY_GONE_REGEX
+      end
+      return nil if Time.now > deadline
+
+      # A non-matching line must not loop straight back to the top with no
+      # sleep/poll at all - heavy unrelated combat text could keep this
+      # spinning with zero yield points for the entire timeout, freezing
+      # this script silently and delaying Script.kill until something
+      # finally gave it a checkpoint. But sleeping on *every* line is its
+      # own bug - confirmed in the field: it turned a room's whole burst of
+      # already-buffered description lines (title, paragraph, objects,
+      # exits) into one sleep apiece, adding the better part of a second
+      # to every single room move for no reason, since none of that was
+      # ever waiting on anything. Only actually sleep once per ~0.1s of
+      # wall-clock time - an empty buffer (nothing left to drain right
+      # now) always qualifies; a non-empty one only forces it past that
+      # cap, so a fast-arriving burst still drains at full speed.
+      next if line && Time.now < next_yield_at
+
+      poll_background_events!
+      sleep 0.1
+      next_yield_at = Time.now + 0.1
+    end
+  end
+
+  # GameObj.loot doesn't necessarily drop a destroyed object the instant
+  # it dies - the room's loot list only refreshes on its own schedule - so
+  # looping on "is obj still in GameObj.loot" can keep re-issuing "kill
+  # #id" against something already dead, which the game answers with
+  # "What were you referring to?" forever. Trust the game's own outcome
+  # text instead of GameObj.loot's staleness.
+  # Returns whether obj actually ended up destroyed/gone - process_obstacle_
+  # queue needs to know this, not just assume every kill worked, before
+  # treating the direction it was blocking as safe to walk into.
+  def self.destroy_obstacle(obj)
+    @current_operation = :destroying_obstacle
+    attempts = 0
+    loop do
+      wait_while_paused_externally
+      fput("kill ##{obj.id}")
+      wait_out_roundtime
+      outcome = wait_for_destroy_outcome
+
+      case outcome
+      when :gird_needed
+        fput('gird')
+        wait_out_roundtime
+      when :destroyed, :gone
+        return true
+      else
+        # An unclear (timed-out) outcome almost always just means this
+        # swing didn't finish the obstacle off, so no outcome line was ever
+        # coming - swing again right away. attempt_move's own retry-forever
+        # loop is the backstop for an obstacle that genuinely never
+        # resolves after several attempts here.
+        attempts += 1
+        if attempts >= 3
+          debug_say "kill ##{obj.id} outcome unclear (#{outcome.inspect}) after #{attempts} attempts - giving up on this obstacle"
+          return false
+        end
+        debug_say "kill ##{obj.id} outcome unclear (#{outcome.inspect}) - retrying (attempt #{attempts})"
+      end
+    end
+  end
+
+  def self.handle_traps
+    return unless destroy_traps?
+
+    current_traps.each { |trap| destroy_obstacle(trap) }
+  end
+
+  # Vines/wards are never destroyed on first sight anymore - logged for
+  # later instead. Destroying one is comparatively slow (a multi-hit kill
+  # plus roundtime, every time), and most needed pieces turn out to sit
+  # behind freely-walkable exits - fighting through every obstacle the
+  # instant the DFS first bumps into it meant slow combat was constantly
+  # interleaved with movement before we'd even confirmed it was necessary.
+  # Just records the room here; process_obstacle_queue works through the
+  # backlog once every freely-reachable room has actually been visited
+  # (see continue_exploration's @phase switch).
+  #
+  # Uses all_vines/all_wards (not current_vines/current_wards) specifically
+  # so an obstacle we can't parse a direction from still gets logged -
+  # otherwise checkpaths just never lists the exit it's sealing and it'd be
+  # invisible to this check entirely.
+  def self.handle_obstacles_on_entry
+    obstacles = all_vines + all_wards
+    return if obstacles.empty?
+
+    uid = XMLData.room_id
+    return if @obstacle_rooms.include?(uid)
+
+    @obstacle_rooms << uid
+    debug_say "room #{uid} has #{obstacles.size} obstacle(s) - logged for later clearing"
+  end
+
+  ## ---- combat ---------------------------------------------------------
+  #
+  # Monsters never get fought during plain exploration - they don't attack
+  # and can't be attacked at that point anyway. The ONLY time combat is
+  # ever this script's problem is when a kick is rejected as "too
+  # dangerous" while actively pushing a found piece home. That's the one
+  # and only place this gets called. Pause is literal (pause_script) and
+  # waits for the player to clear it rather than guessing at attack
+  # commands or assuming a particular combat script. pause_script only
+  # sets the paused flag - it doesn't block by itself - so explicitly
+  # sleep until the player runs ;unpause inquiconundrum.
+  def self.wait_for_player_to_clear_room(reason = "something here is blocking the way")
+    say "PAUSED: #{reason} - kill it, then ;unpause inquiconundrum to continue"
+    debug_say "pausing in room #{XMLData.room_id} (#{XMLData.room_title.to_s.strip}); npcs here: #{GameObj.npcs.map(&:name).join(', ')}"
+    pause_script
+    sleep 0.2 while Script.current.paused?
+    debug_say "unpaused, resuming"
+  end
+
+  # Script.pause/Script.unpause just flip a flag on the target script - they
+  # don't block anything by themselves (see the comment on
+  # wait_for_player_to_clear_room above). That's normally fine since this
+  # script only ever pauses itself. But it also means an outside script
+  # (e.g. inky.lic, clearing a hostile out of the way with bigshot while we'd
+  # otherwise blindly keep "kill"-ing an obstacle through it) can
+  # Script.pause('inquiconundrum') and have nothing actually happen unless we
+  # check for it ourselves. destroy_obstacle's retry loop calls this between
+  # every attempt for exactly that reason.
+  def self.wait_while_paused_externally
+    return unless Script.current.paused?
+
+    debug_say "paused externally - waiting to resume"
+    sleep 0.2 while Script.current.paused?
+    debug_say "resumed"
+  end
+
+  ## ---- movement -----------------------------------------------------------
+
+  # Always the last thing to arrive in a room description, so waiting for
+  # it (instead of returning on whatever line happens to come back first)
+  # guarantees the room's full object list - including any parts - has
+  # already been parsed into GameObj.loot before we go look at it.
+  ROOM_ARRIVED_REGEX = /Obvious (?:paths|exits)|You notice no obvious exits from here\.?/i
+
+  # fput's own waitingfor mechanism re-sends the command whenever a line
+  # doesn't match - exactly wrong here, since a room description is
+  # several lines and re-sending "north" partway through it would move us
+  # again. So send the command exactly once (plain fput, first-line
+  # return) and separately drain (without ever resending anything) until
+  # the arrival marker shows up or we give up waiting.
+  def self.fput_move(command)
+    fput(command)
+    wait_for_room_arrival
+  end
+
+  def self.wait_for_room_arrival(timeout = 2)
+    deadline = Time.now + timeout
+    next_yield_at = Time.now + 0.05
+    loop do
+      line = get?
+      return if line && line =~ ROOM_ARRIVED_REGEX
+      return if Time.now > deadline
+
+      # Same fix as wait_for_destroy_outcome/wait_for_kick_outcome - a
+      # non-matching line must not loop straight back to the top with no
+      # sleep/poll at all (heavy unrelated text could spin this with zero
+      # yield points for the whole timeout), but sleeping on *every* line
+      # is its own bug - confirmed in the field: this is called on every
+      # single room move, and a room's whole burst of already-buffered
+      # description lines (title, paragraph, objects, exits) turned into
+      # one sleep apiece, adding the better part of a second to every move
+      # for no reason. Only actually sleep once per ~0.05s of wall-clock
+      # time - a fast-arriving burst still drains at full speed.
+      next if line && Time.now < next_yield_at
+
+      poll_background_events!
+      sleep 0.05
+      next_yield_at = Time.now + 0.05
+    end
+  end
+
+  # Single attempt at moving; returns whether the room actually changed.
+  # Never pauses for traps or monsters here - see wait_for_player_to_clear_room
+  # for the one legitimate place combat can block this script.
+  def self.attempt_move(direction)
+    starting_room = XMLData.room_id
+
+    # Traps (the mushroom trap knockdown, moss fall, etc.) can leave us
+    # prone/sitting/kneeling outside of our own deliberate kneel-and-crawl
+    # handling below. That's always auto-recoverable - just stand up.
+    if checknotstanding
+      debug_say "not standing - standing up before moving #{direction}"
+      fput('stand')
+      wait_out_roundtime
+    end
+
+    obstacle = current_vines[direction] || current_wards[direction]
+    if obstacle
+      # Always destroyed, no matter what - it might be sealing off a room
+      # with a needed part in it.
+      destroy_obstacle(obstacle)
+      fput_move(direction)
+      wait_out_roundtime
+    elsif crawl_hazard_in_room?
+      fput('kneel')
+      wait_out_roundtime
+      fput_move("crawl #{direction}")
+      wait_out_roundtime
+      fput('stand')
+      wait_out_roundtime
+    else
+      fput_move(direction)
+      wait_out_roundtime
+    end
+
+    XMLData.room_id != starting_room
+  end
+
+  # Moves in a direction, retrying quietly (no pausing - traps and the
+  # like are never worth bothering the player over) until it actually
+  # succeeds. Callers can always assume the room changed by the time this
+  # returns.
+  def self.move(direction)
+    # A nil/blank direction (e.g. a bad SHORTDIR lookup somewhere upstream)
+    # would otherwise retry forever sending a blank command and never
+    # actually move - fail loudly instead of silently spamming the game.
+    raise "move called with a blank direction" if direction.to_s.empty?
+
+    attempts = 0
+    until attempt_move(direction)
+      attempts += 1
+      debug_say "move #{direction} didn't go anywhere (attempt #{attempts}), retrying"
+      poll_background_events!
+      pause 1
+    end
+  end
+
+  def self.record_edge(from_uid, direction, to_uid)
+    @edges[from_uid][direction] = to_uid
+    @edges[to_uid][reverse_direction(direction)] = from_uid
+  end
+
+  def self.find_direction(from_uid, to_uid)
+    @edges[from_uid].find { |_dir, dest| dest == to_uid }&.first
+  end
+
+  # We may start exploring before ever finding the guide's actual room, so
+  # the navigation tree gets provisionally rooted wherever we happen to
+  # start. Once the real guide room turns up, re-anchor the tree there by
+  # reversing parentage along the chain from the old root to it - every
+  # other branch of the tree is untouched.
+  def self.reroot_tree(new_root)
+    return if new_root == @guide_room_id || @parent[new_root].nil?
+
+    chain = []
+    node = new_root
+    while node
+      chain.unshift(node)
+      break if node == @guide_room_id
+
+      node = @parent[node] && @parent[node][:from]
+    end
+
+    (chain.length - 1).downto(1) do |i|
+      child = chain[i - 1]
+      parent_node = chain[i]
+      @parent[child] = { from: parent_node, back: find_direction(child, parent_node) }
+    end
+
+    @parent[new_root] = { from: nil, back: nil }
+  end
+
+  def self.short_exits
+    paths = checkpaths
+    paths ? paths.compact : []
+  end
+
+  ## ---- room entry handling -------------------------------------------------
+
+  def self.on_room_entered(uid)
+    @last_room_id = uid
+
+    if !@guide_room_confirmed && XMLData.room_title =~ START_ROOM_REGEX
+      debug_say "confirmed the guide's room is #{uid}"
+      reroot_tree(uid) if uid != @guide_room_id
+      @guide_room_id = uid
+      @guide_room_confirmed = true
+
+      # Worth a shot now that we're actually standing in front of the
+      # guide - it'll answer even before all pieces are known.
+      fput('ask guide about status')
+    end
+
+    scan_room(uid)
+    handle_traps
+    handle_obstacles_on_entry
+  end
+
+  ## ---- piece transport --------------------------------------------------
+
+  # The kick's *first* response line is always "you prepare to shove it...
+  # gathering your strength" flavor text - the real outcome only arrives
+  # after the roundtime, as one of these.
+  KICK_DANGER_REGEX  = /too dangerous/i
+  KICK_FAILED_REGEX  = /won't budge|can't kick|don't see|nothing happens/i
+  KICK_SUCCESS_REGEX = /pushing it into the (?:next|adjoining) room/i
+
+  # Polls (without ever resending the kick command - that would just
+  # shove it again) until the real post-roundtime outcome line shows up.
+  def self.wait_for_kick_outcome(timeout = 20)
+    deadline = Time.now + timeout
+    next_yield_at = Time.now + 0.1
+    loop do
+      line = get?
+      if line
+        return :danger  if line =~ KICK_DANGER_REGEX
+        return :failed  if line =~ KICK_FAILED_REGEX
+        return :success if line =~ KICK_SUCCESS_REGEX
+      end
+      return nil if Time.now > deadline
+
+      # A non-matching line must not loop straight back to the top with no
+      # sleep/poll at all - this has the longest timeout of the three
+      # (20s), so heavy unrelated combat text (bigshot actively fighting
+      # whatever made the kick "too dangerous" in the first place) could
+      # keep this spinning with zero yield points for the whole window,
+      # freezing this script silently and delaying Script.kill until the
+      # text let up. But sleeping on *every* line is its own bug -
+      # confirmed in the field: it added the better part of a second to
+      # every single room move elsewhere (see wait_for_room_arrival). Only
+      # actually sleep once per ~0.1s of wall-clock time - a fast-arriving
+      # burst still drains at full speed.
+      next if line && Time.now < next_yield_at
+
+      poll_background_events!
+      sleep 0.1
+      next_yield_at = Time.now + 0.1
+    end
+  end
+
+  def self.begin_transport(descriptor)
+    target_uid = @piece_location[descriptor]
+    @current_operation = :fetching
+    @fetching_descriptor = descriptor
+    @suppress_piece_interrupt = true
+    debug_say "heading from room #{XMLData.room_id} to room #{target_uid} to fetch #{descriptor}"
+    begin
+      navigate_to(target_uid)
+    ensure
+      # Must clear even if navigate_to raises (e.g. explore_new_exits'
+      # "expected to be in room X" guard) - otherwise check_for_available_
+      # piece! would stay permanently suppressed for the rest of the run.
+      @suppress_piece_interrupt = false
+    end
+    @needed[descriptor] = :in_transit
+    @transporting = { descriptor: descriptor }
+    @current_operation = :transporting
+    say "picked up trail of #{descriptor}, pushing it home"
+  end
+
+  def self.navigate_to(target_uid)
+    return if XMLData.room_id == target_uid
+
+    path = path_from_root(target_uid)
+    walk_to_root
+    path.each { |dir| move(dir); on_room_entered(XMLData.room_id) }
+  end
+
+  def self.walk_to_root
+    until XMLData.room_id == @guide_room_id
+      back = @parent[XMLData.room_id] && @parent[XMLData.room_id][:back]
+      break unless back
+
+      move(back)
+    end
+  end
+
+  def self.path_from_root(uid)
+    path = []
+    node = uid
+    while node && node != @guide_room_id
+      info = @parent[node]
+      break unless info
+
+      parent_uid = info[:from]
+      forward_dir = @edges[parent_uid].find { |_dir, dest| dest == node }&.first
+      path.unshift(forward_dir)
+      node = parent_uid
+    end
+    path.compact
+  end
+
+  # Same as rooms_remaining_to_guide, but Float::INFINITY instead of nil for
+  # an unreachable room - lets every distance comparison (min_by, <, etc.)
+  # just work without a separate nil check at every call site.
+  def self.distance_to_guide(uid)
+    rooms_remaining_to_guide(uid) || Float::INFINITY
+  end
+
+  # "Always err to return parts closest to the guide" - used everywhere a
+  # piece gets chosen among multiple located candidates (next_located_
+  # descriptor's normal pick, pacifist's unblocked/retry-eligible pick, and
+  # maybe_abandon_for_closer_piece's mid-transport comparison) so all of
+  # them agree on the same priority instead of drifting independently.
+  def self.closest_by_distance(descriptors)
+    descriptors.min_by { |d| distance_to_guide(@piece_location[d]) }
+  end
+
+  # Counts moves from uid back to the guide room along the same @parent
+  # breadcrumb trail walk_to_root/path_from_root walk - nil if uid isn't
+  # connected to the known map at all (no path to count).
+  def self.rooms_remaining_to_guide(uid)
+    steps = 0
+    node = uid
+    while node != @guide_room_id
+      info = @parent[node]
+      return nil unless info && info[:from]
+
+      node = info[:from]
+      steps += 1
+    end
+    steps
+  end
+
+  def self.continue_transport
+    @current_operation = :transporting
+    descriptor = @transporting[:descriptor]
+    uid = XMLData.room_id
+
+    if uid == @guide_room_id
+      # Confirmed in the field: DELIVERY_REGEX matching the guide's own
+      # dialogue was the only thing that ever marked a piece :delivered -
+      # when that text didn't match (wrong/incomplete wording), the piece
+      # sat at :in_transit forever even though we'd genuinely kicked it all
+      # the way into the guide's room, so @delivered stayed empty and
+      # "run ended - delivered 0 piece(s)" printed despite real deliveries.
+      # We already know we just kicked descriptor in here ourselves -
+      # deliver() (now idempotent against double-counting) doesn't need to
+      # wait on the guide's text to confirm what we just watched happen.
+      deliver(descriptor)
+      @transporting = nil
+      return
+    end
+
+    back = @parent[uid] && @parent[uid][:back]
+    unless back
+      say "lost the way back to the guide room with #{descriptor} in tow, stopping transport"
+      @transporting = nil
+      return
+    end
+
+    obstacle = current_vines[back] || current_wards[back]
+    if obstacle
+      debug_say "an obstacle blocks #{back} while transporting #{descriptor} - destroying"
+      destroy_obstacle(obstacle)
+    end
+
+    piece = GameObj.loot.find { |o| strip_article(o.name).downcase == descriptor }
+    unless piece
+      say "lost track of #{descriptor} in this room, re-scanning"
+      @transporting = nil
+      @needed[descriptor] = :needed
+      return
+    end
+
+    debug_say "kicking #{descriptor} #{back} from room #{uid}"
+    # The kick has roundtime, and the *first* line back is always the
+    # "you prepare to shove it" flavor text - which itself contains the
+    # word "shove", so matching on push|shove right away (the old
+    # approach) fired immediately on that line, before the real outcome
+    # (success, "too dangerous," monster interrupt, etc.) had even been
+    # decided server-side. Send the command once, then separately wait
+    # out the roundtime and poll (without ever resending anything) for
+    # whichever real outcome line shows up after it.
+    fput("kick #{kick_phrase(descriptor)} #{back}")
+    wait_out_roundtime
+    outcome = wait_for_kick_outcome
+    debug_say "kick result: #{outcome.inspect}"
+
+    if outcome == :danger
+      if pacifist? && descriptor != @forced_piece
+        # Still right here in room uid, just blocked from going further -
+        # update memory and abandon it for now rather than fight. Next
+        # tick's next_located_descriptor will pick something else (another
+        # part, exploration, or obstacle-clearing) and come back to this
+        # one later if nothing better turns up.
+        @piece_location[descriptor] = uid
+        @needed[descriptor] = :located
+        @blocked_pieces[descriptor] = { room: uid, blocked_at: Time.now }
+        @transporting = nil
+        say "pacifist: #{descriptor} is blocked by a monster #{back} of room #{uid} - abandoning it for now"
+        return
+      end
+
+      # descriptor == @forced_piece here (pacifist already announced and
+      # flipped pacifist_combat_allowed back in next_located_descriptor the
+      # moment every piece became blocked) - or pacifist is off entirely.
+      # Either way, fall through to the normal response.
+      wait_for_player_to_clear_room("too dangerous to push #{descriptor} #{back}")
+      return
+    end
+
+    unless outcome == :success
+      debug_say "kick didn't succeed (#{outcome.inspect}) - will retry next tick"
+      return
+    end
+
+    if XMLData.room_id == uid
+      # The shove didn't carry us along with it - follow it ourselves.
+      move(back)
+    else
+      # Some kicks carry the player into the next room right along with
+      # the piece. We're already there - moving "back" again would be
+      # wrong (it may not even be a valid exit from here) - just make
+      # sure the room's full description has finished arriving.
+      debug_say "kick carried us straight into room #{XMLData.room_id} along with #{descriptor}"
+      wait_for_room_arrival
+    end
+
+    on_room_entered(XMLData.room_id)
+
+    remaining = rooms_remaining_to_guide(XMLData.room_id)
+    if remaining.nil?
+      say "kicked #{descriptor} #{back} - lost track of how many rooms are left"
+    elsif remaining.zero?
+      say "kicked #{descriptor} into the guide's room"
+    else
+      say "kicked #{descriptor} #{back} - #{remaining} room#{'s' unless remaining == 1} left to the guide"
+    end
+  end
+
+  ## ---- exploration (DFS with breadcrumb parent pointers) ----------------
+
+  # Walks a single freshly-found exit and records it in @edges/@parent.
+  # Shared by continue_exploration's normal forward step and
+  # explore_new_exits below.
+  # Returns [new_uid, already_known] - already_known is true if new_uid
+  # had a @parent entry before this call, i.e. the maze looped back to a
+  # room some other path already reached (this maze has cycles - the
+  # ASCII overview shows grid-like loops, not a pure tree).
+  def self.explore_exit(from_uid, direction)
+    debug_say "room #{from_uid}: exploring #{direction}"
+    move(direction) # blocks (pausing for the player) until it actually succeeds
+    new_uid = XMLData.room_id
+    record_edge(from_uid, direction, new_uid)
+    already_known = !@parent[new_uid].nil?
+    @parent[new_uid] ||= { from: from_uid, back: reverse_direction(direction) }
+    on_room_entered(new_uid)
+    [new_uid, already_known]
+  end
+
+  # Recursively explores every *freely walkable* exit this room has that
+  # isn't already in @edges, then returns to this room - regardless of
+  # whether it's the active DFS cursor. process_obstacle_queue calls this
+  # right after destroying whatever was blocking a logged room, since the
+  # directions it just opened up (extra_candidates) never show up in
+  # short_exits/current_vines/current_wards on their own once the obstacle
+  # is gone. Never re-includes current_vines/current_wards itself - any
+  # *other* obstacle this reveal stumbles into gets logged by
+  # handle_obstacles_on_entry (via on_room_entered, called from
+  # explore_exit below) and queued for its own later pass, not chased
+  # immediately.
+  #
+  # Only recurses into new_uid when it's genuinely brand new - a cycle
+  # back to an already-visited room is just a new edge, not a new branch
+  # to explore. And it walks back via reverse_direction(unexplored) - the
+  # direction we actually just used - never via @parent[new_uid][:back],
+  # which (on a cycle) can belong to a completely different path than the
+  # one we took to get here, sending us off toward the wrong room instead
+  # of back to where this loop started. That mismatch is what caused the
+  # script to wander and lose track of where it was.
+  def self.explore_new_exits(uid, extra_candidates = [])
+    loop do
+      # Both candidate_exits and the eventual "go explore that direction"
+      # command only make sense if we're actually standing in uid right
+      # now. If a previous iteration's return-trip move landed somewhere
+      # else (a non-reciprocal exit - this maze isn't guaranteed to be
+      # symmetric), continuing anyway would read the WRONG room's exits
+      # as if they belonged to uid, sending nonsense directions and
+      # quietly corrupting @edges from there on - which is exactly what
+      # caused the script to wander in circles. Fail loudly instead so the
+      # next tick recovers using wherever we actually are.
+      if XMLData.room_id != uid
+        raise "explore_new_exits: expected to be in room #{uid} but actually in #{XMLData.room_id}"
+      end
+
+      candidate_exits = (short_exits + extra_candidates).uniq
+      unexplored = candidate_exits.find { |dir| @edges[uid][dir].nil? }
+      break unless unexplored
+
+      new_uid, already_known = explore_exit(uid, unexplored)
+      explore_new_exits(new_uid) unless already_known
+      move(reverse_direction(unexplored))
+    end
+  end
+
+  # Works through @obstacle_rooms - rooms logged by handle_obstacles_on_
+  # entry during free exploration - one at a time. Peeks rather than shifts
+  # up front so an interruption (e.g. check_for_available_piece! firing
+  # mid-destroy) leaves the room at the front of the queue instead of
+  # silently dropping it; only removed once its obstacles are confirmed
+  # gone. Directions are captured *before* destroying anything because the
+  # game doesn't push a fresh "Obvious paths"/compass update just because
+  # an obstacle died - confirmed in the field: a vine covering northeast
+  # was destroyed and the very next thing the script did was explore west,
+  # never touching northeast at all.
+  def self.process_obstacle_queue
+    @current_operation = :exploring
+    if @obstacle_rooms.empty?
+      debug_say "all logged obstacles cleared - maze considered fully explored"
+      @fully_explored = true
+      return
+    end
+
+    uid = @obstacle_rooms.first
+    navigate_to(uid)
+
+    obstacles = all_vines + all_wards
+    if obstacles.empty?
+      debug_say "room #{uid} obstacles already gone (cleared incidentally earlier) - dropping from queue"
+      @obstacle_rooms.shift
+      @obstacle_skip_streak = 0
+      return
+    end
+
+    # pacifist: a hostile sharing the room with the obstacle never gets
+    # fought through here the way it does for a kick (the game won't
+    # reject "kill #id" the way it rejects a kick, so InquiConundrum would
+    # otherwise just attack the obstacle while ignoring the hostile - see
+    # inky.lic). Abandon this block and rotate to another logged one,
+    # unless every single one of them has already been tried this pass -
+    # then clear this one anyway rather than stall forever.
+    if pacifist? && hostile_present?
+      if @obstacle_skip_streak < @obstacle_rooms.size - 1
+        debug_say "room #{uid} has a hostile present and pacifist is on - abandoning this block for now, trying another"
+        @obstacle_rooms.rotate!
+        @obstacle_skip_streak += 1
+        return
+      end
+
+      # Every logged obstacle has a hostile present - pacifist allows
+      # clearing this one rather than stalling forever. Flip the shared
+      # flag inky.lic (or any other combat-assist script) reads, so it
+      # knows clearing this one is actually sanctioned.
+      settings[:pacifist_combat_allowed] = true
+      say "Pacifism can only attained through aggression! KILL!!!"
+    end
+
+    # Captured *before* destroying anything, same reasoning as ever - once
+    # an obstacle's dead, GameObj.loot drops it and Obvious paths still
+    # won't mention the direction it was covering, so this is the only
+    # place that direction is ever visible. Keyed by id (not the GameObj
+    # instance itself) since current_vines/current_wards and all_vines/
+    # all_wards come from separate GameObj.loot scans - nothing guarantees
+    # they hand back the same object instances for the same in-game thing.
+    id_to_dir = {}
+    current_vines.merge(current_wards).each { |dir, obj| id_to_dir[obj.id] = dir }
+
+    # Confirmed in the field: blindly trusting every kill to have worked
+    # and force-feeding every direction into explore_new_exits regardless
+    # sent it walking into a direction that was actually still blocked - a
+    # vine-tangled solid rock wall gave up after 3 unclear outcomes while
+    # still standing, and explore_exit's move(:e) then retried "You can't
+    # go there" forever, since move's own retry-forever loop has no escape
+    # for a direction that's never going to open. Only a direction whose
+    # obstacle destroy_obstacle actually confirmed destroyed/gone gets
+    # force-fed in now.
+    opened_directions = []
+    all_cleared = true
+    obstacles.each do |obstacle|
+      cleared = destroy_obstacle(obstacle)
+      all_cleared &&= cleared
+      dir = id_to_dir[obstacle.id]
+      opened_directions << dir if cleared && dir
+    end
+
+    @obstacle_skip_streak = 0
+    if all_cleared
+      @obstacle_rooms.shift
+    else
+      debug_say "room #{uid} still has an obstacle standing after giving up on it - leaving queued to retry later"
+    end
+
+    @current_operation = :exploring
+    explore_new_exits(uid, opened_directions.uniq) if opened_directions.any?
+  end
+
+  def self.continue_exploration
+    @current_operation = :exploring
+    # A piece delivery shortcuts straight back to the guide room via
+    # navigate_to, skipping the normal one-step-at-a-time backtrack that
+    # would otherwise re-check every ancestor room along the way. Walk back
+    # to wherever the DFS actually left off before resuming it, so the
+    # guide room being "exhausted" doesn't get mistaken for the whole maze
+    # being exhausted.
+    if @exploration_cursor && XMLData.room_id != @exploration_cursor
+      debug_say "returning to exploration cursor room #{@exploration_cursor} from #{XMLData.room_id}"
+      navigate_to(@exploration_cursor)
+    end
+
+    uid = XMLData.room_id
+    @exploration_cursor = uid
+
+    # Freely-walkable exits only - a vine/ward-blocked direction never
+    # shows up in short_exits at all ("Obvious paths" omits it even though
+    # the room description names the exact direction it's blocking), so
+    # this naturally skips them without needing to filter anything out.
+    # Obstacle rooms get logged by handle_obstacles_on_entry instead and
+    # worked through afterward by process_obstacle_queue, once every
+    # freely-reachable room here has actually been visited - see the
+    # @phase switch below.
+    candidate_exits = short_exits
+    unexplored = candidate_exits.find { |dir| @edges[uid][dir].nil? }
+
+    if unexplored
+      @exploration_cursor, = explore_exit(uid, unexplored)
+    elsif uid == @guide_room_id
+      if @obstacle_rooms.empty?
+        debug_say "guide room has no unexplored exits left and no logged obstacles - maze considered fully explored"
+        @fully_explored = true
+      else
+        debug_say "free exploration exhausted - switching to clearing #{@obstacle_rooms.size} logged obstacle room(s)"
+        @phase = :clearing_obstacles
+      end
+    else
+      back = @parent[uid] && @parent[uid][:back]
+      if back
+        debug_say "room #{uid} exhausted, backtracking #{back}"
+        move(back)
+        @exploration_cursor = XMLData.room_id
+        # Without this, @last_room_id never updates for a backtrack step,
+        # so the next tick's "did the player move us" check in tick
+        # misfires - it thinks something else moved us into this (already
+        # fully-explored) room and re-scans/re-decides to backtrack again,
+        # producing a confusing "room changed without the script moving
+        # us" message for a move the script itself just made.
+        on_room_entered(@exploration_cursor)
+      else
+        @fully_explored = true
+      end
+    end
+  end
+
+  ## ---- run lifecycle -------------------------------------------------------
+
+  def self.maybe_start_run
+    # ZONE_REGEX (not just START_ROOM_REGEX) so we start working - logging
+    # parts, clearing traps - the moment we're dropped anywhere in the
+    # zone, rather than sitting idle until manually walked to the guide.
+    # Wherever we land becomes a provisional anchor; on_room_entered
+    # re-roots onto the guide's real room as soon as exploration finds it.
+    return unless XMLData.room_title =~ ZONE_REGEX
+
+    @in_run         = true
+    @guide_room_id  = XMLData.room_id
+    @guide_room_confirmed = false
+    @run_started_at = Time.now
+    @needed         = {}
+    @seen           = {}
+    @piece_location = {}
+    @transporting   = nil
+    @delivered      = []
+    @edges          = Hash.new { |h, k| h[k] = {} }
+    @parent         = { @guide_room_id => { from: nil, back: nil } }
+    @exploration_cursor = nil
+    @phase          = :exploring_free
+    @obstacle_rooms = []
+    @all_known      = false
+    @fully_explored = false
+    @parsing_status = false
+    @idle_announced = false
+    @last_location_report = nil
+    @last_status_update_at = nil
+    @surrender_triggered = false
+    @current_operation = :idle
+    @fetching_descriptor = nil
+    @blocked_pieces = {}
+    @forced_piece = nil
+    @obstacle_skip_streak = 0
+
+    # Inky (or any other combat-assist script) reads this directly out of
+    # UserVars rather than calling into this module - same independence
+    # inky.lic's own VINE_REGEX/WARD_REGEX copies are kept for. Not an
+    # OPTION_KEYS entry - it's derived run state, not something ;inqui set
+    # should ever take directly from the player.
+    settings[:pacifist_combat_allowed] = !pacifist?
+
+    say "run started in #{XMLData.room_title}"
+    say "PACIFIST RUN! KIL.... err.. peeeeace.... ehh." if pacifist?
+    debug_say "provisional anchor room id = #{@guide_room_id}"
+    on_room_entered(@guide_room_id)
+  end
+
+  def self.maybe_end_run
+    return unless @in_run
+
+    ended_by_room = !!(XMLData.room_title =~ END_ROOM_REGEX)
+    return unless ended_by_room || @surrender_triggered || (Time.now - @run_started_at) > MAX_RUN_SECONDS
+
+    say "run ended - delivered #{@delivered.size} piece(s): #{@delivered.join(', ')}"
+    debug_say(if ended_by_room
+                "ended: exit room title matched"
+              elsif @surrender_triggered
+                "ended: surrendermania surrendered"
+              else
+                "ended: MAX_RUN_SECONDS timeout reached"
+              end)
+    @in_run = false
+    @transporting = nil
+    @surrender_triggered = false
+    @completions += 1
+
+    if repeat_event?
+      say "Completed run - #{@completions} total completions"
+      requeue_for_next_run
+    else
+      # repeatevent is off - stop dead in the post-ejection room. Never walk
+      # back toward the arena on our own; that's requeue_for_next_run's job
+      # only, and only when repeatevent is on. Literal pause_script (not
+      # just idling in main_loop) so the player has to explicitly opt back
+      # in, instead of the script silently re-arming itself the moment
+      # ZONE_REGEX happens to match again (e.g. just walking through on
+      # the way somewhere else).
+      say "repeatevent is off - stopping here. Run ;unpause inquiconundrum when you're ready to go again."
+      pause_script
+      sleep 0.2 while Script.current.paused?
+      debug_say "unpaused, resuming"
+    end
+  end
+
+  # running?()'s loose start-anchored fallback match would also catch
+  # something like a hypothetical go2-prefixed script name - exact match
+  # only, same reasoning as inky.lic's bigshot_running?.
+  def self.go2_running?
+    Script.running.any? { |s| s.name =~ /^go2$/i } || Script.hidden.any? { |s| s.name =~ /^go2$/i }
+  end
+
+  # go2 can get muckled/stuck waiting on a confirmation prompt - bounded
+  # wait so a stuck go2 doesn't strand requeue_for_next_run (and therefore
+  # the whole repeatevent loop) forever.
+  def self.run_go2_to_arena
+    start_script('go2', [ARENA_MAGISTER_UID])
+    pause 0.2 # give Script.start a moment to register before polling for it
+
+    deadline = Time.now + GO2_TIMEOUT_SECONDS
+    while go2_running?
+      if Time.now > deadline
+        say "go2 #{ARENA_MAGISTER_UID} didn't finish within #{GO2_TIMEOUT_SECONDS}s - giving up waiting, continuing anyway"
+        break
+      end
+      pause 0.2
+    end
+  end
+
+  # Walks back from the post-ejection room to the Arena Magister (via go2)
+  # and asks for entry twice (the second confirms entering without an
+  # aevarch), putting us back into the minigame. Only called when
+  # repeatevent is on.
+  def self.requeue_for_next_run
+    fput('stow hands')
+    fput('get package')
+    pause 1
+    fput('stow hands')
+    fput('gird')
+
+    run_go2_to_arena
+
+    pause 1
+    fput('ask magister about entry')
+    pause 1
+    fput('ask magister about entry')
+  end
+
+  # A room only has a usable path back to the guide room if the DFS
+  # actually reached it - navigate_to has nothing to walk otherwise.
+  def self.reachable?(uid)
+    uid == @guide_room_id || !@parent[uid].nil?
+  end
+
+  # pacifist: still considered blocked if it's on @blocked_pieces and
+  # PACIFIST_BLOCKED_RETRY_SECONDS hasn't passed since it was abandoned -
+  # the monster that blocked it might easily be long gone by now, so a
+  # stale entry doesn't get to deprioritize it forever.
+  def self.pacifist_blocked?(descriptor)
+    blocked = @blocked_pieces[descriptor]
+    return false unless blocked
+
+    (Time.now - blocked[:blocked_at]) < PACIFIST_BLOCKED_RETRY_SECONDS
+  end
+
+  def self.next_located_descriptor
+    candidates = @needed.select { |d, status| status == :located && reachable?(@piece_location[d]) }.keys
+    return closest_by_distance(candidates) unless pacifist?
+
+    # pacifist: anything not currently blocked by a monster takes priority
+    # over anything that is, no matter what - exploration/obstacle-clearing
+    # already wins by virtue of running whenever this returns nil. A
+    # piece's retry timer elapsing makes it count as unblocked again here
+    # too - it's just a normal pickup attempt at that point, not the
+    # @forced_piece combat fallback below, and never interrupts an actual
+    # return-part job to happen, since this is only ever consulted while
+    # @transporting is nil to begin with. Ranked by distance the same as
+    # the non-pacifist case - among whichever pieces are currently
+    # eligible (never blocked, or blocked but past its retry timer), the
+    # closest one always wins.
+    unblocked = candidates.reject { |d| pacifist_blocked?(d) }
+    if unblocked.any?
+      @forced_piece = nil
+      return closest_by_distance(unblocked)
+    end
+
+    return nil if candidates.empty?
+
+    # Confirmed in the field: forcing combat the moment the only one or two
+    # announced pieces happen to be blocked was too eager - there was still
+    # plenty of unexplored map and unlogged obstacles left to try instead,
+    # which would likely have turned up an unblocked piece anyway. Below
+    # the threshold, just return nil here - same as "nothing located at
+    # all" - so exploration/obstacle-clearing runs instead, and don't
+    # disturb @forced_piece (no transition has actually happened yet).
+    if @needed.size < PACIFIST_FORCE_MIN_ANNOUNCED
+      debug_say "pacifist: #{candidates.size} located piece(s) blocked, but only #{@needed.size} announced so far (need #{PACIFIST_FORCE_MIN_ANNOUNCED}) - exploring/clearing instead of forcing combat"
+      return nil
+    end
+
+    # Every :located piece is blocked - pacifist still allows pushing
+    # through combat for exactly one of them rather than stalling forever.
+    # continue_transport checks @forced_piece to tell this case apart from
+    # the normal "blocked, abandon it" pacifist response. Only announce on
+    # the actual transition into this state, not every single tick it
+    # stays true while @forced_piece's kick is still being retried/paused.
+    forced = closest_by_distance(candidates)
+    if @forced_piece != forced
+      @forced_piece = forced
+      settings[:pacifist_combat_allowed] = true
+      say "Pacifism can only attained through aggression! KILL!!!"
+    end
+    @forced_piece
+  end
+
+  # "Always err to return parts closest to the guide" - applies even
+  # mid-transport, pacifist on or off: if a piece announced (and already
+  # known-located) while we're pushing a different one turns out to be
+  # closer to the guide than wherever we currently are, abandon the
+  # current piece right here (same bookkeeping pacifist's own "blocked,
+  # abandon it" path uses) and let the dispatch below pick the closer one
+  # up via next_located_descriptor instead. Checked once at the top of
+  # tick, never mid-kick - continue_transport already sent (or is about
+  # to send) at most one "kick" command per tick, so there's no in-flight
+  # server response this could land on top of and desync from.
+  def self.maybe_abandon_for_closer_piece
+    return unless @transporting
+
+    current_descriptor = @transporting[:descriptor]
+    current_distance = distance_to_guide(XMLData.room_id)
+
+    alternatives = @needed.select { |d, status| status == :located && reachable?(@piece_location[d]) }.keys
+    alternatives = alternatives.reject { |d| pacifist_blocked?(d) } if pacifist?
+    closest = closest_by_distance(alternatives)
+    return unless closest
+
+    closest_distance = distance_to_guide(@piece_location[closest])
+    return unless closest_distance < current_distance
+
+    uid = XMLData.room_id
+    @piece_location[current_descriptor] = uid
+    @needed[current_descriptor] = :located
+    @transporting = nil
+    say "#{closest} is closer to the guide (#{closest_distance} room#{'s' unless closest_distance == 1}) than #{current_descriptor} is from here (#{current_distance} room#{'s' unless current_distance == 1}) - abandoning #{current_descriptor} here to go get it instead"
+  end
+
+  # Room number for whatever's left (anything not yet :delivered), with
+  # whichever location we've got for it - last :located room, otherwise
+  # the last room it was ever seen in, otherwise unknown entirely.
+  def self.debug_report_remaining_parts
+    remaining = @needed.reject { |_, status| status == :delivered }
+    return if remaining.empty?
+
+    remaining.each do |descriptor, status|
+      location = @piece_location[descriptor] || @seen[descriptor]
+      where = location ? "room #{location}" : "location unknown"
+      debug_say "remaining: #{descriptor} (#{status}) - #{where}"
+    end
+  end
+
+  # Only pieces the guide has actually announced (@needed, minus ones
+  # already :delivered) - @seen on its own holds every part ever logged
+  # (dozens, most irrelevant), which used to get dumped here wholesale.
+  # Printed (not debug-gated) while idle so the player can walk out and
+  # manually grab anything the script can't currently reach or move itself
+  # (e.g. stuck behind something it can't clear). Deduped against the last
+  # report so it doesn't reprint every 2 seconds while waiting.
+  def self.report_known_part_locations
+    wanted = @needed.reject { |_, status| status == :delivered }.keys
+    located = wanted.select { |d| @seen.key?(d) }
+    return if located.empty?
+
+    lines = located.map { |d| "u#{@seen[d]}: #{d}" }.sort
+    report = lines.join('; ')
+    return if report == @last_location_report
+
+    @last_location_report = report
+    say "known part locations (investigate any that are stuck):"
+    lines.each { |line| say "  #{line}" }
+  end
+
+  # "Remaining" was never a real number - @needed only contains pieces the
+  # guide has announced SO FAR, and more keep arriving until @all_known, so
+  # @needed.size - delivered is a constantly shifting denominator, not a
+  # real total. Reports each announced piece individually instead (its
+  # status and, if known, room) plus what's currently being done about it.
+  # Time left is this script's own MAX_RUN_SECONDS budget, not a
+  # game-confirmed figure - the TIME_WARNING_REGEX listener already relays
+  # the game's own warnings verbatim when they arrive.
+  def self.report_status_now
+    unless @in_run
+      say "status: no run currently active - waiting to be placed in the zone."
+      say "completions this session: #{@completions}"
+      return
+    end
+
+    minutes_left = [(MAX_RUN_SECONDS - (Time.now - @run_started_at)) / 60, 0].max.round
+    say "status: #{@seen.size} part#{'s' unless @seen.size == 1} logged in memory, ~#{minutes_left} minute#{'s' unless minutes_left == 1} left"
+    say "Still waiting on more part announcements" unless @all_known
+
+    if @needed.empty?
+      say "no pieces announced yet"
+    else
+      @needed.each do |descriptor, status|
+        if status == :delivered
+          say "  #{descriptor}: delivered"
+        else
+          location = @piece_location[descriptor] || @seen[descriptor]
+          if location
+            distance = rooms_remaining_to_guide(location)
+            where = distance ? "room #{location} (#{distance} room#{'s' unless distance == 1} from guide)" : "room #{location} (unreachable)"
+          else
+            where = "location unknown"
+          end
+          blocked = pacifist_blocked?(descriptor) ? " (blocked by a monster - pacifist)" : ""
+          say "  #{descriptor}: #{status} - #{where}#{blocked}"
+        end
+      end
+    end
+
+    case @current_operation
+    when :destroying_obstacle
+      say "current operation: destroying room blockers"
+    when :fetching
+      say "current operation: fetching #{@fetching_descriptor}"
+    when :transporting
+      descriptor = @transporting && @transporting[:descriptor]
+      if descriptor
+        remaining = rooms_remaining_to_guide(XMLData.room_id)
+        if remaining
+          say "current operation: returning #{descriptor} to guide, #{remaining} room#{'s' unless remaining == 1} left"
+        else
+          say "current operation: returning #{descriptor} to guide"
+        end
+      end
+    when :exploring
+      say "current operation: exploring rooms"
+    else
+      say "current operation: waiting on next announcement"
+    end
+
+    say "completions this session: #{@completions}"
+  end
+
+  # Throttled to STATUS_UPDATE_INTERVAL_SECONDS so it summarizes progress
+  # periodically while idle instead of spamming every tick.
+  def self.maybe_report_status
+    now = Time.now
+    return if @last_status_update_at && (now - @last_status_update_at) < STATUS_UPDATE_INTERVAL_SECONDS
+
+    @last_status_update_at = now
+    report_status_now
+  end
+
+  # ;inqui reset - manual recovery: walk back to the guide room (abandoning
+  # any piece currently mid-transport, since walking doesn't bring a piece
+  # along - only kicking does), report status, wait 5 seconds, then re-ask
+  # the guide for its current list of needed pieces. Doesn't otherwise touch
+  # @needed/@seen - tick's existing priority order (transport > located >
+  # explore) already heads for any known piece first on the very next tick,
+  # so there's nothing extra to do to "proceed to any known first."
+  def self.handle_reset
+    unless @in_run
+      say "reset: no run currently active"
+      return
+    end
+
+    if @transporting
+      descriptor = @transporting[:descriptor]
+      @needed[descriptor] = @piece_location[descriptor] ? :located : :needed
+      @transporting = nil
+      debug_say "reset: abandoned in-progress transport of #{descriptor}"
+    end
+
+    say "reset: heading back to the guide"
+    # reset overrides everything, including a piece becoming available
+    # mid-walk - without this, check_for_available_piece! could interrupt
+    # this very walk back to the guide (the moment @transporting clears
+    # above, any already-:located piece looks fair game again).
+    @suppress_piece_interrupt = true
+    begin
+      navigate_to(@guide_room_id)
+    ensure
+      @suppress_piece_interrupt = false
+    end
+    report_status_now
+
+    say "waiting for 5 seconds"
+    pause 5
+
+    fput('ask guide about status')
+  end
+
+  # Commands intercepted by the upstream hook (see parse_upstream) land in
+  # CMD_QUEUE; main_loop drains it and calls here. parse_upstream swallows
+  # EVERY ";inquiconundrum ..."/";inqui ..." the player types while a run is
+  # already active - not just "status" - so set/help (and a bare retry of
+  # the start command itself) have to be handled here too, or they silently
+  # fall through to "unrecognized message" instead of doing anything (and a
+  # bare retry loses Lich's own "already running!" notice, since the hook
+  # swallowed the command before Lich's dispatch ever saw it).
+  def self.handle_command(msg)
+    text = msg.to_s.strip
+    case text
+    when ''
+      say "already running - try: status, set, help, reset"
+    when /^status$/i
+      report_status_now
+    when /^set$/i
+      show_settings
+    when /^set\s+(.+)$/i
+      handle_set($1.split(/\s+/))
+    when /^help$/i
+      show_settings
+      respond(INQUICONUNDRUM_HELP)
+    when /^reset$/i
+      handle_reset
+    else
+      say "unrecognized message: '#{text}' (try: status, set, help, reset)"
+    end
+  end
+
+  def self.tick
+    maybe_end_run
+    return unless @in_run
+
+    # check_for_available_piece! (called via poll_background_events deep
+    # inside continue_exploration's own recursive room-walking) raises this
+    # the moment a piece becomes :located mid-exploration, rather than
+    # waiting for that whole recursive dig to finish on its own - confirmed
+    # in the field: it otherwise kept wandering for many more rooms past a
+    # piece we already knew the location of. Just let this tick end early;
+    # the next tick re-evaluates from scratch and picks next_located_
+    # descriptor up normally below.
+    begin
+      # The player can move around manually too - while idle waiting on the
+      # next announcement, during a combat pause, anywhere. Catch any room
+      # change we didn't already scan ourselves so a part sitting in a room
+      # the player walked into isn't permanently invisible to us.
+      if XMLData.room_id != @last_room_id
+        uid = XMLData.room_id
+        debug_say "room changed to #{uid} without the script moving us there - scanning it"
+        on_room_entered(uid)
+
+        # scan_room will have marked anything needed here :located, but if
+        # this room has no recorded path back to the guide room (the DFS
+        # never actually reached it), navigate_to has nothing to walk and
+        # would silently fail later. Flag it rather than let begin_transport
+        # find that out the hard way.
+        if @parent[uid].nil?
+          debug_say "room #{uid} isn't connected to the known map - can't push anything home from here yet"
+        end
+      end
+
+      maybe_abandon_for_closer_piece
+
+      if @transporting
+        continue_transport
+      elsif (descriptor = next_located_descriptor)
+        begin_transport(descriptor)
+      elsif !@fully_explored
+        if @phase == :clearing_obstacles
+          process_obstacle_queue
+        else
+          continue_exploration
+        end
+      else
+        @current_operation = :idle
+        debug_report_remaining_parts
+        report_known_part_locations
+        maybe_report_status
+
+        still_needed  = @needed.select { |_, status| status == :needed }.keys
+        unreachable   = @needed.select { |d, status| status == :located && !reachable?(@piece_location[d]) }.keys
+
+        # A piece can fall back to :needed without ever really vanishing -
+        # e.g. losing track of it mid-transport. If we've already seen it
+        # somewhere, that's still our best lead: take another run at it
+        # instead of waiting forever with a known location sitting unused.
+        recoverable = still_needed.find { |d| @seen.key?(d) }
+        if recoverable
+          debug_say "re-attempting #{recoverable} from its last known room #{@seen[recoverable]}"
+          @needed[recoverable] = :located
+          @piece_location[recoverable] = @seen[recoverable]
+        elsif still_needed.any? || unreachable.any?
+          unreachable_desc = unreachable.map { |d| "#{d} (u#{@piece_location[d]})" }.join(', ')
+          debug_say "fully explored with nothing deliverable; still missing: #{still_needed.join(', ')}; seen but unreachable: #{unreachable_desc}"
+          pause 2
+        else
+          unless @idle_announced
+            say "All currently announced pieces delivered. Waiting on next announcement! Watch for monsters!"
+            say "Completed so far (#{@delivered.size}): #{@delivered.join(', ')}"
+            @idle_announced = true
+          end
+          pause 2
+        end
+      end
+    rescue PieceBecameAvailable
+      debug_say "a piece's location just became known - abandoning exploration to go fetch it"
+    rescue RunEnding
+      debug_say "run is over - abandoning whatever action was in progress so maybe_end_run can actually end it"
+    end
+  end
+
+  def self.main_loop
+    loop do
+      begin
+        poll_background_events
+
+        if @in_run
+          tick
+        else
+          maybe_start_run
+          pause 1
+        end
+      rescue PieceBecameAvailable
+        # Should normally be caught inside tick's own rescue - this is a
+        # safety net for the rare path that can reach here uncaught instead
+        # (e.g. ;inqui reset's own navigate_to walk, run via drain_cmd_queue
+        # from outside tick entirely). Confirmed in the field: letting this
+        # fall through to the generic StandardError handler below printed
+        # the same error forever without ever resolving anything, since
+        # nothing about the underlying condition changes between retries -
+        # only tick's normal dispatch (on the very next loop iteration)
+        # actually does that.
+        debug_say "a piece's location became known outside tick - retrying"
+      rescue RunEnding
+        # Same safety net as PieceBecameAvailable above, for the same kind
+        # of outside-tick path. Whichever case reaches here, @in_run is
+        # still true and nothing has been changed yet - the very next loop
+        # iteration's tick call runs maybe_end_run fresh and actually ends
+        # it correctly.
+        debug_say "run ending detected outside tick - retrying"
+      rescue StandardError => e
+        # An uncaught exception here would otherwise kill the script thread
+        # silently - no pause message, no error, it just stops reacting.
+        # Report it loudly instead of letting that happen invisibly.
+        say "error in main loop: #{e.class}: #{e.message}"
+        say e.backtrace.first(3).join(' | ') if e.backtrace
+        pause 1
+      end
+    end
+  end
+end
+
+INQUICONUNDRUM_HELP = <<~HELP
+  ============================================================
+   InquiConundrum - Zephyra Wilds Conundrum automation
+  ============================================================
+
+   Usage:
+     ;inquiconundrum                  Run it (always run this way - no inline options)
+     ;inquiconundrum set              Show current options
+     ;inquiconundrum help             Show this message
+     ;inquiconundrum status           Report progress on the run in progress
+     ;inquiconundrum reset            Walk back to the guide, report status,
+                                       wait 5 seconds, then re-ask the guide
+                                       for its current list of needed pieces
+
+   set/help/status/reset all work even while a run is already active
+   EX: ;inqui set option=state, ;inqui help, ;inqui status, ;inqui reset
+
+   Setting options:
+     ;inquiconundrum set option=value option=value
+     ;inquiconundrum set destroytraps=true debug=true
+
+   Options (persist until changed):
+     destroytraps   Always kill bone-spike/tendril traps on sight.
+     debug          Extra diagnostic messages - room ids, why exploration
+                     branched the way it did, kick results, pause causes.
+                     Turn this on if the script ever pauses or stalls and
+                     you're not sure why.
+     repeatevent    When a run ends, automatically stow hands, get the
+                     package, stow hands again, gird, and walk back to the
+                     Arena Magister to ask for entry again, queuing up the
+                     next run without you lifting a finger. Reports
+                     "Completed run - # total completions" each time. When
+                     off (default), the script stops dead in the
+                     post-ejection room and pause_scripts itself - it never
+                     walks back toward the arena on its own; resume with
+                     ;unpause inquiconundrum when you're ready to go again.
+     surrendermania When the guide says you've passed the threshold for
+                     winning a prize if you surrender (even though the
+                     contest isn't concluded), surrender twice and treat
+                     the run as over immediately - same as winning. Off by
+                     default.
+     pacifist       Avoid all combat. A kick rejected as "too dangerous"
+                     abandons that piece (remembers where it is, tries
+                     something else, comes back to it later) instead of
+                     pausing for you to clear the room. An obstacle room
+                     with a hostile in it gets skipped for another logged
+                     obstacle the same way. If every located piece is
+                     blocked by a monster AND at least 4 pieces have been
+                     announced so far, it gives up avoiding and pushes
+                     through one of them rather than stall forever -
+                     below 4 announced, it explores/clears obstacles
+                     instead, since there's likely still an unblocked
+                     piece to find. A blocked piece gets a normal (non-
+                     combat) retry attempt again every minute - the
+                     monster that blocked it might be long gone - and
+                     overrides whatever's currently happening (exploring,
+                     destroying an obstacle, or pushing a different piece)
+                     if it's actually closer to the guide than wherever
+                     you currently are; otherwise it just waits its turn
+                     normally. The same all-blocked rule applies to
+                     obstacles regardless of how many pieces are known.
+                     Off by default.
+   Freely traversed rooms explored first, Then
+
+   Vines and thornbound wards are destroyed to reveal sealed off a rooms with needed parts.
+
+   Combat is left to you, and only ever comes up when moving a part home. 
+   The only time it pauses is when a kick is rejected as "too dangerous" 
+   while pushing a found piece home. Kill whatever's blocking
+   the kick, then resume with ;u.
+
+   The script idles until you're placed anywhere in the zone (Mistwarden
+   Temple or Zephyra Wilds), then takes over automatically. Stop it with
+   ;exit inquiconundrum or ;kill inquiconundrum.
+  ============================================================
+HELP
+
+# --- Entry point ---
+
+args = Script.current.vars[1..-1] || []
+
+if args[0] =~ /^help$/i
+  InquiConundrum.show_settings
+  respond(INQUICONUNDRUM_HELP)
+  exit
+end
+
+if args[0] =~ /^set$/i
+  InquiConundrum.handle_set(args[1..-1] || [])
+  exit
+end
+
+# Only reachable here when no instance is already running - the upstream
+# hook installed below intercepts ";inquiconundrum status"/";inqui status"
+# (and set/help/reset) before Lich's own dispatch ever sees it whenever one
+# is.
+if args[0] =~ /^status$/i
+  InquiConundrum.report_status_now
+  exit
+end
+
+if args[0] =~ /^reset$/i
+  InquiConundrum.handle_reset
+  exit
+end
+
+InquiConundrum.install_listener
+InquiConundrum.install_upstream_hook
+
+before_dying do
+  InquiConundrum.remove_listener
+  InquiConundrum.remove_upstream_hook
+end
+
+respond("InquiConundrum is running!")
+InquiConundrum.main_loop
