@@ -1,0 +1,611 @@
+=begin
+  grinsawl.lic  --  Goal-driven Capture-the-Grinsawl assistant.
+
+  ============================================================================
+  *** WORK IN PROGRESS (v0.2.0-wip) -- name reserved, NOT finished. ***
+    WORKING:  ANALYZE-driven setup (verbs/cooldowns/tier), capture loop, foil
+              loop, unfoiled backlog (buffer 3), read-only status window,
+              partial-name target matching, id-based targeting.
+    TODO:     clickable control-panel window (click to set target + foil goal,
+              live counts), guided container setup (card sack + tome), pause
+              energywings during a capture/foil, tome filing/reading.
+    Expect rough edges; live game I/O is still being tuned.
+  ============================================================================
+
+  You task it with a goal -- e.g.  ;grinsawl gold kobold  -- and it works the
+  CURRENT ROOM ONLY (it never walks you anywhere), running two opportunistic loops
+  against the two arcaria's independent ~2-minute cooldowns:
+
+    * CAPTURE (aversaris arcarium) keeps a backlog of unfoiled <creature> cards.
+    * FOIL    (vangaris arcarium) foils an unfoiled <creature> card whenever an
+              identical creature is present, until one lands at/above your tier.
+
+  A grinsawl can be foiled only ONCE (a random roll weighted by vissi tier), so
+  "min = gold" means: keep foiling fresh cards until one rolls gold; lower rolls are
+  kept as byproducts. It announces and stops when the goal is hit.
+
+  The two activator verbs and cooldowns are read live by ANALYZE-ing each arcarium
+  (the verb is reassignable -- one of RUB/TAP/PUSH/PULL/POKE -- so nothing is
+  hardcoded).
+
+  USAGE:
+    ;grinsawl <minfoil> <creature>     set goal + start   (e.g. ;grinsawl silver grub)
+    grinsawl status                    goal, stock, cooldowns, byproducts (no semicolon)
+    grinsawl want <a, b> / avoid <a,b> capture filter for mixed rooms
+    grinsawl min <bronze|silver|gold>  change target tier
+    grinsawl goal <minfoil> <creature> retarget
+    grinsawl sack <name>               set the working sack for the unfoiled backlog
+    grinsawl stop                      idle without exiting
+    ;k grinsawl                        stop and exit
+
+  See docs/superpowers/specs/2026-06-22-grinsawl-design.md.
+
+  author: Zedarius
+  version: 0.2.0-wip
+=end
+
+module Grinsawl
+  VERSION = '0.2.0-wip'
+
+  TIER_RANK  = { bronze: 1, silver: 2, gold: 3 }.freeze
+  ACTIVATORS = %w[rub tap push pull poke].freeze
+
+  module Tier
+    module_function
+
+    def normalize(t)
+      return nil if t.nil?
+
+      s = t.to_s.strip.downcase.to_sym
+      TIER_RANK.key?(s) ? s : nil
+    end
+
+    def rank(t)
+      TIER_RANK[normalize(t)] || 0
+    end
+
+    # actual foil meets/exceeds the minimum acceptable foil (and is actually a foil)
+    def meets?(actual, minimum)
+      rank(actual).positive? && rank(actual) >= rank(minimum)
+    end
+  end
+
+  module Parse
+    module_function
+
+    # A Collector vissi row inside an arcarium ANALYZE table, e.g.
+    #   "     Collector       Primal      tap      3    Abilities: While holding..."
+    # An arcarium can slot several activatable vissi, so we key on the Collector row.
+    COLLECTOR_ROW = /^\s*Collector\s+\S+\s+(rub|tap|push|pull|poke)\s+(\d+)\s+Abilities:/i
+
+    def clean_creature(raw)
+      raw.to_s.sub(/\A(?:an?|the|some)\s+/i, '').strip.downcase
+    end
+
+    # Arcarium ANALYZE -> { verb:, tier:, cooldown:, active: } or nil (no Collector).
+    def analyze_collector(lines)
+      arr = Array(lines).map(&:to_s)
+      idx = arr.index { |l| l =~ COLLECTOR_ROW }
+      return nil unless idx
+
+      m = COLLECTOR_ROW.match(arr[idx])
+      cooldown = nil
+      arr[(idx + 1)..].to_a.each do |l|
+        if (cm = l.match(/(\d+)\s+second cooldown/i))
+          cooldown = cm[1].to_i
+          break
+        end
+      end
+      active = arr.any? { |l| l =~ /currently in the active state/i } &&
+               arr.none?  { |l| l =~ /currently in the inert state/i }
+      { verb: m[1].downcase, tier: m[2].to_i, cooldown: cooldown, active: active }
+    end
+
+    # LOOK at a grinsawl -> { creature:, foil: nil|:bronze|:silver|:gold } or nil.
+    def card(lines)
+      text = Array(lines).map(&:to_s).join(' ')
+      return nil unless text =~ /grinsawl/i
+
+      creature = nil
+      # Canonical card LOOK names the creature in its inscription ("A Grub from ...").
+      if (m = text.match(/reads,\s*["']?\s*(?:an?\s+)?(.+?)\s+from\s+/i))
+        creature = clean_creature(m[1])
+      elsif (m = text.match(/bearing the image of\s+(.+?)\s*\./i))
+        creature = clean_creature(m[1])
+      end
+      foil = (fm = text.match(/luxuriant\s+(bronze|silver|gold)\s+foil/i)) ? fm[1].downcase.to_sym : nil
+      { creature: creature, foil: foil }
+    end
+
+    # Capture attempt terminal line -> { creature: } on success, :fail, else nil.
+    def capture_result(line)
+      s = line.to_s
+      if (m = s.match(/solidifies into a radiant white grinsawl bearing the image of\s+(.+?)\./i))
+        return { creature: clean_creature(m[1]) }
+      end
+      return :fail if s =~ /failed card capture|the (?:magical )?link (?:fades|expires|dissipates|is broken)|fail(?:s|ed) to (?:capture|imprint|link)/i
+
+      nil
+    end
+
+    # Foil attempt terminal line -> { tier: } on success, :mismatch, else nil.
+    def foil_result(line)
+      s = line.to_s
+      if (m = s.match(/your card now bears a luxuriant\s+(bronze|silver|gold)\s+foil/i))
+        return { tier: m[1].downcase.to_sym }
+      end
+      return :mismatch if s =~ /only attempt to foil this grinsawl by establishing a link with an identical creature/i
+
+      nil
+    end
+  end
+
+  module Match
+    module_function
+
+    def normalize(name)
+      name.to_s.sub(/\A(?:an?|the|some)\s+/i, '').strip.downcase
+    end
+
+    # Foiling requires an IDENTICAL creature: full depicted-name match
+    # ("big ugly kobold" != "kobold").
+    def identical?(card_creature, present_creature)
+      a = normalize(card_creature)
+      !a.empty? && a == normalize(present_creature)
+    end
+
+    # The goal label may be a partial/base name: "hinterboar" should match the
+    # in-game "gold-bristled hinterboar". Used to pick what to CAPTURE and which
+    # cards count toward the goal (foiling itself still needs identical?).
+    def goal_match?(goal_creature, name)
+      g = normalize(goal_creature)
+      !g.empty? && normalize(name).include?(g)
+    end
+
+    def wanted?(creature, want, avoid)
+      c = normalize(creature)
+      return false if Array(avoid).any? { |a| !a.to_s.strip.empty? && c.include?(normalize(a)) }
+
+      w = Array(want).reject { |x| x.to_s.strip.empty? }
+      return true if w.empty?
+
+      w.any? { |x| c.include?(normalize(x)) }
+    end
+  end
+
+  module Planner
+    module_function
+
+    # state: { goal:{creature,min}, present:[names], unfoiled_creatures:[names],
+    #          stock:Int, aversaris_ready:Bool, vangaris_ready:Bool, buffer:Int }
+    # Foil takes priority (it is the scarce, goal-advancing step).
+    # => [:foil, present_name] | [:capture, present_name] | :idle
+    def next_action(state)
+      goal     = state[:goal] || {}
+      present  = Array(state[:present])
+      unfoiled = Array(state[:unfoiled_creatures])
+
+      # FOIL: a present creature IDENTICAL to one of our unfoiled goal cards.
+      if state[:vangaris_ready]
+        p = present.find { |name| unfoiled.any? { |cc| Match.identical?(cc, name) } }
+        return [:foil, p] if p
+      end
+      # CAPTURE: a present creature matching the goal, while backlog below buffer.
+      if state[:aversaris_ready] && state[:stock].to_i < state[:buffer].to_i
+        p = present.find { |name| Match.goal_match?(goal[:creature], name) }
+        return [:capture, p] if p
+      end
+      :idle
+    end
+  end
+
+  # Group ledger entries (each { creature:, foil: }) into per-creature counts for
+  # the status window. => { "kobold" => { unfoiled:, bronze:, silver:, gold: }, ... }
+  module Summary
+    module_function
+
+    def by_creature(entries)
+      out = {}
+      Array(entries).each do |e|
+        c = e[:creature].to_s.strip
+        next if c.empty?
+
+        h = (out[c] ||= { unfoiled: 0, bronze: 0, silver: 0, gold: 0 })
+        key = e[:foil].nil? ? :unfoiled : e[:foil].to_s.to_sym
+        h[key] += 1 if h.key?(key)
+      end
+      out
+    end
+
+    # Candidate targets for the control panel: creatures present in the room UNION
+    # creatures already tracked, filtered by want/avoid, each with its counts.
+    # => [{ creature:, unfoiled:, total: }] sorted by most-unfoiled then name.
+    def target_candidates(present, entries, want = [], avoid = [])
+      counts = by_creature(entries)
+      names  = (Array(present) + counts.keys).map { |n| n.to_s.strip }.reject(&:empty?).uniq
+      names.select { |n| Match.wanted?(n, want, avoid) }
+           .map do |n|
+             h = counts[n] || {}
+             { creature: n, unfoiled: h[:unfoiled].to_i, total: h.values.sum }
+           end
+           .sort_by { |c| [-c[:unfoiled], c[:creature]] }
+    end
+  end
+
+  def self.version
+    VERSION
+  end
+end
+
+# ------------------------------- runtime (Lich) -------------------------------
+# This layer drives the live game; the pure modules above are unit-tested. The
+# game I/O (exact failure/cooldown messages, hand juggling, sack/tome browsing)
+# is a first cut meant to be tuned live -- see the `# LIVE:` notes.
+if defined?(Script)
+  module Grinsawl
+    class << self
+      attr_accessor :state, :goal, :ledger, :cooldowns
+    end
+
+    def self.boot
+      self.ledger    = {}                         # card-id => { creature:, foil: }
+      self.cooldowns = { aversaris: 0.0, vangaris: 0.0 }
+      self.goal      = nil
+      self.state = {
+        running: true, active: false, want: [], avoid: [], buffer: 3,
+        byproducts: 0, sack_name: (CharSettings['sack'] || 'sack').to_s,
+        aversaris: nil, vangaris: nil, last_status: nil
+      }
+    end
+
+    # ---- small helpers ----
+    def self.strip(lines)
+      Array(lines).map { |l| l.to_s.gsub(/<[^>]+>/, '').rstrip }
+    end
+
+    def self.sack
+      GameObj.inv.to_a.compact.find { |o| o.name.to_s =~ /\b#{Regexp.escape(state[:sack_name])}\b/i }
+    end
+
+    def self.sack_contents
+      s = sack
+      s ? (GameObj.containers[s.id] || []).compact : []
+    end
+
+    def self.held
+      [GameObj.right_hand, GameObj.left_hand].compact.reject { |o| o.id.nil? }
+    end
+
+    def self.held_grinsawl
+      held.find { |o| o.name.to_s =~ /grinsawl/i }
+    end
+
+    def self.free_hand!
+      return true if GameObj.right_hand.id.nil? || GameObj.left_hand.id.nil?
+
+      g = held_grinsawl
+      stow_to_sack(g.id) if g
+      GameObj.right_hand.id.nil? || GameObj.left_hand.id.nil?
+    end
+
+    def self.stow_to_sack(id)
+      s = sack or return false
+      dothistimeout("put ##{id} in ##{s.id}", 5, /You put|already|no room|What were you/i)
+      true
+    end
+
+    def self.get_from_sack(id)
+      s = sack or return false
+      dothistimeout("get ##{id} from ##{s.id}", 5, /You (?:get|pick up|remove)|already|What were you/i)
+      held.any? { |o| o.id.to_s == id.to_s }
+    end
+
+    # ---- analyze / setup ----
+    def self.analyze_arcarium(which)
+      lines = Lich::Util.issue_command(
+        "analyze my #{which} arcarium",
+        /You analyze the/i, /<prompt/,
+        include_end: false, timeout: 8, usexml: true, quiet: true, use_fput: false
+      )
+      Parse.analyze_collector(strip(lines))
+    end
+
+    def self.setup
+      state[:aversaris] = analyze_arcarium('aversaris')
+      state[:vangaris]  = analyze_arcarium('vangaris')
+      %i[aversaris vangaris].each do |k|
+        info = state[k]
+        if info.nil?
+          respond "[grinsawl] WARNING: couldn't read a Collector vissi in your #{k} arcarium."
+        elsif info[:active] == false
+          respond "[grinsawl] WARNING: your #{k} arcarium reads INERT -- prod it active before running."
+        else
+          respond "[grinsawl] #{k}: verb=#{info[:verb]} tier=#{info[:tier]} cooldown=#{info[:cooldown] || '?'}s"
+        end
+      end
+      scan_sack
+    end
+
+    def self.cap_verb  = (state[:aversaris] && state[:aversaris][:verb]) || 'tap'
+    def self.foil_verb = (state[:vangaris]  && state[:vangaris][:verb])  || 'tap'
+    def self.cap_cd    = ((state[:aversaris] && state[:aversaris][:cooldown]) || 120).to_f
+    def self.foil_cd   = ((state[:vangaris]  && state[:vangaris][:cooldown])  || 120).to_f
+
+    # ---- cooldowns ----
+    def self.start_cd(which) = cooldowns[which] = Time.now.to_f
+    def self.ready?(which)
+      cd = which == :aversaris ? cap_cd : foil_cd
+      (Time.now.to_f - cooldowns[which].to_f) >= cd
+    end
+
+    def self.cd_left(which)
+      cd = which == :aversaris ? cap_cd : foil_cd
+      [0, (cd - (Time.now.to_f - cooldowns[which].to_f)).round].max
+    end
+
+    # ---- inventory / stock ----
+    # LIVE: LOOK at each grinsawl in the working sack to seed the ledger from cards
+    # you already own (creature + foil status). Slow; runs at setup and on demand.
+    def self.scan_sack
+      sack_contents.select { |o| o.name.to_s =~ /grinsawl/i }.each do |o|
+        next if ledger.key?(o.id.to_s)
+
+        info = look_card(o.id)
+        ledger[o.id.to_s] = info if info && info[:creature]
+      end
+    end
+
+    def self.look_card(id)
+      lines = Lich::Util.issue_command(
+        "look at ##{id}",
+        /grinsawl|could not find|What were you/i, /<prompt/,
+        include_end: false, timeout: 5, usexml: true, quiet: true, use_fput: false
+      )
+      Parse.card(strip(lines))
+    end
+
+    # unfoiled cards matching the goal (partial name) still in sack or hand
+    def self.unfoiled_goal_ids
+      return [] unless goal
+
+      here = (sack_contents + held).map { |o| o.id.to_s }
+      ledger.select do |id, info|
+        here.include?(id) && info[:foil].nil? && Match.goal_match?(goal[:creature], info[:creature])
+      end.keys
+    end
+
+    def self.unfoiled_goal_creatures
+      unfoiled_goal_ids.map { |id| ledger[id][:creature] }.compact.uniq
+    end
+
+    def self.stock = unfoiled_goal_ids.size
+
+    # ---- present creatures ----
+    def self.present_objs
+      (GameObj.targets.to_a + GameObj.npcs.to_a).compact.uniq(&:id)
+        .select { |o| !o.name.to_s.empty? && Match.wanted?(o.name, state[:want], state[:avoid]) }
+    end
+
+    # ---- executors ----
+    def self.do_capture(obj)
+      unless free_hand!
+        respond '[grinsawl] capture skipped: no free hand.'
+        return
+      end
+      result = dothistimeout(
+        "#{cap_verb} my aversaris arcarium at ##{obj.id}", 35,
+        /solidifies into a radiant white grinsawl bearing the image of|failed card capture|the (?:magical )?link (?:fades|expires)|you can't|cannot|no longer here|isn't here|What were you/i
+      )
+      start_cd(:aversaris)
+      res = Parse.capture_result(result)
+      if res.is_a?(Hash)
+        g = held_grinsawl
+        if g
+          ledger[g.id.to_s] = { creature: res[:creature], foil: nil }
+          stow_to_sack(g.id)
+        end
+        respond "[grinsawl] captured #{res[:creature]} (stock now #{stock})"
+      else
+        respond "[grinsawl] capture of #{Match.normalize(obj.name)} did not take (#{result.to_s.strip[0, 40]})"
+      end
+    end
+
+    def self.do_foil(obj)
+      cname = Match.normalize(obj.name)
+      id = unfoiled_goal_ids.find { |cid| Match.identical?(ledger[cid][:creature], cname) }
+      unless id && (held.any? { |o| o.id.to_s == id } || get_from_sack(id))
+        respond "[grinsawl] no unfoiled #{cname} card available to foil."
+        return
+      end
+      result = dothistimeout(
+        "#{foil_verb} my vangaris arcarium at ##{obj.id}", 35,
+        /your card now bears a luxuriant (?:bronze|silver|gold) foil|identical creature|you can't|cannot|no longer here|isn't here|What were you/i
+      )
+      start_cd(:vangaris)
+      res = Parse.foil_result(result)
+      if res.is_a?(Hash)
+        tier = res[:tier]
+        ledger[id] = { creature: cname, foil: tier }
+        if Grinsawl::Tier.meets?(tier, goal[:min])
+          respond ">>>> GRINSAWL GOAL: #{tier.to_s.upcase} #{cname} acquired! <<<<"
+          state[:active] = false
+        else
+          state[:byproducts] += 1
+          respond "[grinsawl] foiled #{cname} -> #{tier} (byproduct; goal is #{goal[:min]}+)"
+        end
+        g = held_grinsawl
+        stow_to_sack(g.id) if g
+      elsif res == :mismatch
+        respond '[grinsawl] foil rejected: that was not an identical creature.'
+      else
+        respond "[grinsawl] foil inconclusive (#{result.to_s.strip[0, 40]})"
+      end
+    end
+
+    # ---- command interface ----
+    def self.set_goal(args)
+      parts = args.to_s.split
+      min = Grinsawl::Tier.normalize(parts[0])
+      creature = parts[1..].to_a.join(' ').strip.downcase
+      if min.nil? || creature.empty?
+        respond '[grinsawl] usage: grinsawl <bronze|silver|gold> <creature>'
+        return false
+      end
+      self.goal = { creature: creature, min: min }
+      state[:active] = true
+      state[:byproducts] = 0
+      respond "[grinsawl] goal set: a #{min}+ #{creature} card. Working the current room."
+      true
+    end
+
+    def self.handle_command(sub)
+      cmd, rest = sub.to_s.strip.split(/\s+/, 2)
+      case cmd.to_s.downcase
+      when '', 'status' then print_status
+      when 'goal'       then set_goal(rest)
+      when 'min'
+        m = Grinsawl::Tier.normalize(rest)
+        if m && goal then goal[:min] = m; respond "[grinsawl] min foil -> #{m}"
+        else respond '[grinsawl] usage: grinsawl min <bronze|silver|gold> (set a goal first)' end
+      when 'want'  then state[:want]  = rest.to_s.split(/\s*,\s*/).reject(&:empty?); respond "[grinsawl] want: #{state[:want].join(', ')}"
+      when 'avoid' then state[:avoid] = rest.to_s.split(/\s*,\s*/).reject(&:empty?); respond "[grinsawl] avoid: #{state[:avoid].join(', ')}"
+      when 'sack'  then state[:sack_name] = rest.to_s.strip; CharSettings['sack'] = state[:sack_name]; respond "[grinsawl] working sack -> #{state[:sack_name]}"
+      when 'scan'  then scan_sack; respond "[grinsawl] sack scanned: #{stock} unfoiled #{goal ? goal[:creature] : 'goal'} card(s)."
+      when 'stop'  then state[:active] = false; respond '[grinsawl] stopped (idle). Set a goal to resume.'
+      else respond "[grinsawl] unknown sub-command '#{cmd}'. try: grinsawl status"
+      end
+    end
+
+    def self.print_status
+      if goal
+        odds = state[:vangaris] && state[:vangaris][:tier]
+        respond "[grinsawl] goal: #{goal[:min]}+ #{goal[:creature]} | stock #{stock}/#{state[:buffer]} | byproducts #{state[:byproducts]} | vissi tier #{odds || '?'}"
+      else
+        respond '[grinsawl] no goal set. ;grinsawl <bronze|silver|gold> <creature>'
+      end
+      respond "[grinsawl] cooldowns: capture #{cd_left(:aversaris)}s, foil #{cd_left(:vangaris)}s | verbs cap=#{cap_verb} foil=#{foil_verb} | #{state[:active] ? 'ACTIVE' : 'idle'}"
+      respond "[grinsawl] want: #{state[:want].join(', ')} | avoid: #{state[:avoid].join(', ')} | sack: #{state[:sack_name]}"
+    end
+
+    # ---- in-game status window (dynamic dialog, like esslevel -- no GTK) ----
+    def self.window_id = 'Grinsawl'
+
+    def self.open_window
+      puts("<closeDialog id='#{window_id}'/><openDialog type='dynamic' id='#{window_id}' " \
+           "title='Grinsawl' target='#{window_id}' scroll='manual' location='main' justify='3' " \
+           "height='200' resident='true'><dialogData id='#{window_id}'></dialogData></openDialog>")
+    end
+
+    def self.close_window
+      puts("<closeDialog id='#{window_id}'/>")
+    end
+
+    def self.sanitize(v)
+      v.to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;').gsub("'", '&apos;').gsub('"', '&quot;')
+    end
+
+    def self.window_lines
+      ls = []
+      ls << if goal
+              "Goal: #{goal[:min].to_s.upcase} #{goal[:creature]}   [#{state[:active] ? 'ACTIVE' : 'idle'}]"
+            else
+              'No goal.  ;grinsawl <tier> <creature>   [idle]'
+            end
+      ls << "Spares: #{stock}/#{state[:buffer]}    Byproducts: #{state[:byproducts]}"
+      cap = ready?(:aversaris) ? 'ready' : "#{cd_left(:aversaris)}s"
+      foil = ready?(:vangaris) ? 'ready' : "#{cd_left(:vangaris)}s"
+      ls << "Capture: #{cap}    Foil: #{foil}"
+      tier = state[:vangaris] && state[:vangaris][:tier]
+      ls << "Verbs: cap=#{cap_verb} foil=#{foil_verb}    Tier #{tier || '?'}"
+      ls << 'Tracking:'
+      summary = Summary.by_creature(ledger.values)
+      if summary.empty?
+        ls << '  (nothing captured yet)'
+      else
+        summary.sort_by { |c, _| c }.first(8).each do |c, h|
+          parts = []
+          parts << "#{h[:unfoiled]} unfoiled" if h[:unfoiled].positive?
+          %i[gold silver bronze].each { |t| parts << "#{h[t]} #{t}" if h[t].positive? }
+          ls << "  #{c}: #{parts.join(', ')}"
+        end
+      end
+      ls
+    end
+
+    def self.render_window
+      out = +"<dialogData id='#{window_id}' clear='t' >"
+      top = 0
+      window_lines.each_with_index do |ln, i|
+        out << "<label id='gs_#{i}' value='#{sanitize(ln)}' justify='left' left='0' top='#{top}' />"
+        top += 18
+      end
+      out << '</dialogData>'
+      puts(out)
+    rescue StandardError => e
+      respond "[grinsawl] window error: #{e.message}" if state[:debug]
+    end
+
+    # ---- main tick ----
+    def self.tick
+      return unless state[:active] && goal
+
+      objs  = present_objs
+      names = objs.map { |o| Match.normalize(o.name) }.reject(&:empty?).uniq
+      action = Planner.next_action(
+        goal: goal, present: names, unfoiled_creatures: unfoiled_goal_creatures,
+        stock: stock, aversaris_ready: ready?(:aversaris), vangaris_ready: ready?(:vangaris),
+        buffer: state[:buffer]
+      )
+      case action
+      when Array
+        kind, name = action
+        obj = objs.find { |o| Match.normalize(o.name) == name }
+        kind == :foil ? do_foil(obj) : do_capture(obj) if obj
+      else
+        msg = "idle (cap #{cd_left(:aversaris)}s / foil #{cd_left(:vangaris)}s, stock #{stock})"
+        if state[:last_status] != msg
+          respond "[grinsawl] #{msg}"
+          state[:last_status] = msg
+        end
+      end
+    end
+  end
+
+  Grinsawl.boot
+  Grinsawl.setup
+  Grinsawl.open_window
+
+  if (args = Script.current.vars[1..].to_a.join(' ').strip) && !args.empty?
+    Grinsawl.set_goal(args)
+  else
+    respond "[grinsawl v#{Grinsawl.version}] ready. Set a goal: ;grinsawl <bronze|silver|gold> <creature>"
+  end
+
+  UpstreamHook.add('grinsawl', proc do |cmd|
+    begin
+      if (m = /\A(?:<c>)?\s*grinsawl\b\s*(.*)\z/i.match(cmd))
+        Grinsawl.handle_command(m[1])
+        next nil
+      end
+    rescue StandardError => e
+      respond "[grinsawl] command error: #{e.message}"
+    end
+    cmd
+  end)
+
+  before_dying do
+    UpstreamHook.remove('grinsawl')
+    Grinsawl.close_window
+    respond '[grinsawl] stopped.'
+  end
+
+  loop do
+    begin
+      Grinsawl.tick
+      Grinsawl.render_window
+    rescue StandardError => e
+      respond "[grinsawl] tick error: #{e.class}: #{e.message}"
+    end
+    sleep 1.5
+  end
+end
