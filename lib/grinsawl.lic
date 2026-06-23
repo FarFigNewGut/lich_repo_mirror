@@ -1,51 +1,30 @@
 =begin
-  grinsawl.lic  --  Goal-driven Capture-the-Grinsawl assistant.
+  grinsawl.lic  --  A Friendly Grinsawl Assistant
 
-  ============================================================================
-  *** WORK IN PROGRESS (v0.2.0-wip) -- name reserved, NOT finished. ***
-    WORKING:  ANALYZE-driven setup (verbs/cooldowns/tier), capture loop, foil
-              loop, unfoiled backlog (buffer 3), read-only status window,
-              partial-name target matching, id-based targeting.
-    TODO:     clickable control-panel window (click to set target + foil goal,
-              live counts), guided container setup (card sack + tome), pause
-              energywings during a capture/foil, tome filing/reading.
-    Expect rough edges; live game I/O is still being tuned.
-  ============================================================================
+  Select the creature you want, and it attempts to capture the
+  creature to build a stock of unfoiled cards, then foils them until one reaches your
+  chosen tier (it accepts that tier or anything better).
 
-  You task it with a goal -- e.g.  ;grinsawl gold kobold  -- and it works the
-  CURRENT ROOM ONLY (it never walks you anywhere), running two opportunistic loops
-  against the two arcaria's independent ~2-minute cooldowns:
+  An in-game window is the control panel. From it you pick the target creature
+  and the foil goal, watch your capture and foil cooldowns and your collection, and
+  manage your tome: scan it and store finished cards into it.
 
-    * CAPTURE (aversaris arcarium) keeps a backlog of unfoiled <creature> cards.
-    * FOIL    (vangaris arcarium) foils an unfoiled <creature> card whenever an
-              identical creature is present, until one lands at/above your tier.
+  USAGE
+    ;grinsawl                                    open the control panel
+    ;grinsawl <bronze|silver|gold> <creature>    set a goal and start at once
+    ;k grinsawl                                  stop
 
-  A grinsawl can be foiled only ONCE (a random roll weighted by vissi tier), so
-  "min = gold" means: keep foiling fresh cards until one rolls gold; lower rolls are
-  kept as byproducts. It announces and stops when the goal is hit.
-
-  The two activator verbs and cooldowns are read live by ANALYZE-ing each arcarium
-  (the verb is reassignable -- one of RUB/TAP/PUSH/PULL/POKE -- so nothing is
-  hardcoded).
-
-  USAGE:
-    ;grinsawl <minfoil> <creature>     set goal + start   (e.g. ;grinsawl silver grub)
-    grinsawl status                    goal, stock, cooldowns, byproducts (no semicolon)
-    grinsawl want <a, b> / avoid <a,b> capture filter for mixed rooms
-    grinsawl min <bronze|silver|gold>  change target tier
-    grinsawl goal <minfoil> <creature> retarget
-    grinsawl sack <name>               set the working sack for the unfoiled backlog
-    grinsawl stop                      idle without exiting
-    ;k grinsawl                        stop and exit
-
-  See docs/superpowers/specs/2026-06-22-grinsawl-design.md.
+  FIRST-TIME SETUP
+    Click [Setup] in the window, then hold the bag you keep loose cards in, then your
+    tome, clicking to assign each. They are remembered by name between sessions. Your
+    Collector vissi must be slotted in both your aversaris and vangaris arcarium.
 
   author: Zedarius
-  version: 0.2.0-wip
+  version: 0.3.0
 =end
 
 module Grinsawl
-  VERSION = '0.2.0-wip'
+  VERSION = '0.3.0'
 
   TIER_RANK  = { bronze: 1, silver: 2, gold: 3 }.freeze
   ACTIVATORS = %w[rub tap push pull poke].freeze
@@ -113,7 +92,11 @@ module Grinsawl
       elsif (m = text.match(/bearing the image of\s+(.+?)\s*\./i))
         creature = clean_creature(m[1])
       end
-      foil = (fm = text.match(/luxuriant\s+(bronze|silver|gold)\s+foil/i)) ? fm[1].downcase.to_sym : nil
+      # Foiled card: "luxuriant <tier> foil" (in a leaf / capture) OR a loose card's
+      # name/look "radiant <tier> grinsawl" ("radiant white grinsawl" = unfoiled).
+      foil = if (fm = text.match(/luxuriant\s+(bronze|silver|gold)\s+foil/i)) then fm[1].downcase.to_sym
+             elsif (fm = text.match(/radiant\s+(bronze|silver|gold)\s+grinsawl/i)) then fm[1].downcase.to_sym
+             end
       { creature: creature, foil: foil }
     end
 
@@ -230,6 +213,173 @@ module Grinsawl
            end
            .sort_by { |c| [-c[:unfoiled], c[:creature]] }
     end
+
+    # Merge sack ledger {id=>{creature,foil}} and tome cards [{id,creature,foil,qty}]
+    # into {creature,foil} entries, deduped by exist-id (a card in both is counted
+    # once -- sack wins) and qty-expanded for stacked tome slots.
+    def dedup_inventory(ledger_hash, tome_cards)
+      seen = {}
+      entries = []
+      (ledger_hash || {}).each do |id, info|
+        seen[id.to_s] = true
+        entries << { creature: info[:creature], foil: info[:foil] }
+      end
+      Array(tome_cards).each do |c|
+        key = c[:id].to_s
+        next if !key.empty? && seen[key]
+
+        seen[key] = true unless key.empty?
+        [c[:qty].to_i, 1].max.times { entries << { creature: c[:creature], foil: c[:foil] } }
+      end
+      entries
+    end
+  end
+
+  # Tome reading: parse a verbose leaf into 12 slots. Mirrors reorder-spellbook's
+  # Parser/Scanner split. Pure (unit-tested against a real grimoire_capture fixture).
+  module Tome
+    DATE_RX  = /\b\w{3}\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+ET\b/.freeze
+    TIER_RX  = /\*\*\s*(Gold|Silver|Bronze)\s*\*\*/i.freeze
+    QTY_RX   = /\bQty\s+(\d+)\b/.freeze
+    ORDINALS = %w[first second third fourth fifth sixth seventh eighth ninth tenth eleventh twelfth].freeze
+
+    module_function
+
+    # Walk a raw leaf line -> [stripped, anchors[[off,exist,text]], taps[[off,slot_n]]].
+    # Captures each anchor/empty-tap's char offset in the STRIPPED text so we can
+    # place it in one of the leaf's 4 columns.
+    def scan_line(raw)
+      raw = raw.to_s
+      s = +''
+      anchors = []
+      taps = []
+      i = 0
+      while i < raw.length
+        if raw[i] == '<'
+          close = raw.index('>', i) or break
+          tag = raw[i..close]
+          if (m = tag.match(/\A<a\s+exist="([^"]+)"/))
+            endtag = raw.index('</a>', close + 1) or break
+            text = raw[(close + 1)...endtag]
+            anchors << [s.length, m[1], text]
+            s << text
+            i = endtag + 4
+          elsif (m = tag.match(/\A<d\s+cmd="tap\s+#\d+\s+at\s+(\d+)"/))
+            endtag = raw.index('</d>', close + 1) or break
+            text = raw[(close + 1)...endtag]
+            taps << [s.length, m[1].to_i]
+            s << text
+            i = endtag + 4
+          else
+            i = close + 1
+          end
+        else
+          s << raw[i]
+          i += 1
+        end
+      end
+      [s, anchors, taps]
+    end
+
+    def col_of(offset, textlen, width)
+      w = width / 4.0
+      [[((offset + (textlen / 2.0)) / w).floor, 0].max, 3].min
+    end
+
+    # Parse a leaf into { slots: [s1..s12] }, each nil (empty) or
+    # { slot:, id:, creature:, foil: nil|:bronze|:silver|:gold, qty: }. Handles BOTH
+    # TILT display modes: a numbered list and the 4-column grid.
+    def leaf(lines)
+      Array(lines).any? { |l| l.to_s =~ /^\s*\d+\.\s/ } ? leaf_list(lines) : leaf_grid(lines)
+    end
+
+    # Numbered-list leaf (post-TILT): one line per slot, slot number explicit, foil
+    # and qty inline -- e.g. "  1. ** Gold ** a slimy little grub (1) <date> <loc>"
+    # or "  5. (blank)".
+    def leaf_list(lines)
+      slots = {}
+      Array(lines).each do |raw|
+        m = raw.to_s.match(/^\s*(\d+)\.\s+(.*)$/) or next
+        n = m[1].to_i
+        next unless n.between?(1, 12)
+
+        rest = m[2]
+        stripped = rest.gsub(/<[^>]+>/, '')
+        if stripped =~ /\(blank\)/i || stripped.strip.empty?
+          slots[n] = nil
+          next
+        end
+        anchors = rest.scan(/<a\s+[^>]*\bexist="([^"]+)"[^>]*>([^<]*)<\/a>/)
+        name = anchors.map { |(_e, t)| t }.join(' ').strip
+        name = stripped.sub(/\*\*.*?\*\*/, '').sub(/\(\d+\).*/m, '').strip if name.empty?
+        foil = (fm = stripped.match(TIER_RX)) ? fm[1].downcase.to_sym : nil
+        qty  = (qm = stripped.match(/\((\d+)\)/)) ? qm[1].to_i : 1
+        slots[n] = { slot: n, id: anchors.first&.first, creature: Match.normalize(name), foil: foil, qty: qty }
+      end
+      { slots: (1..12).map { |n| slots[n] } }
+    end
+
+    # 4-column grid leaf: occupied slots anchored to each super-row's date line
+    # (banner 3 lines above, article 2, creature 1); foil/qty read by COLUMN.
+    def leaf_grid(lines)
+      scanned = Array(lines).map { |l| scan_line(l) }
+      width = scanned.map { |sx, _, _| sx.length }.max.to_i
+      width = 116 if width.zero?
+      slots = {}
+      scanned.each { |_sx, _a, taps| taps.each { |(_o, n)| slots[n] ||= nil } }
+
+      date_idxs = scanned.each_index.select { |i| scanned[i][0] =~ DATE_RX }
+      date_idxs.each_with_index do |d, band|
+        next if d < 2
+
+        cre = scanned[d - 1]
+        art = scanned[d - 2]
+        ban = scanned[d - 3] || ['', [], []]
+        qline = scanned[(d + 1)..].to_a.find { |sx, _, _| sx =~ QTY_RX } || ['', [], []]
+
+        foil_col = {}
+        ban[0].to_s.scan(TIER_RX) { foil_col[col_of(Regexp.last_match.begin(0), Regexp.last_match[0].length, width)] = Regexp.last_match[1].downcase.to_sym }
+        qty_col = {}
+        qline[0].to_s.scan(QTY_RX) { qty_col[col_of(Regexp.last_match.begin(0), Regexp.last_match[0].length, width)] = Regexp.last_match[1].to_i }
+
+        cre[1].each do |(off, exist, text)|
+          c = col_of(off, text.length, width)
+          article = (art[1].find { |(_o, e, _t)| e == exist } || [])[2]
+          n = (band * 4) + c + 1
+          slots[n] = { slot: n, id: exist, creature: Match.normalize("#{article} #{text}"),
+                       foil: foil_col[c], qty: (qty_col[c] || 1) }
+        end
+      end
+      { slots: (1..12).map { |n| slots[n] } }
+    end
+
+    # First empty slot number (1..12) on a parsed leaf, or nil if the leaf is full.
+    def first_empty_slot(leaf_result)
+      slots = (leaf_result.is_a?(Hash) ? leaf_result[:slots] : leaf_result) || []
+      (1..12).find { |n| slots[n - 1].nil? }
+    end
+
+    # Leaf number from a flip arrival ("arrive at the second leaf") OR an inspect
+    # header ("...over the ledger's first open leaf"). nil otherwise.
+    def flip_leaf(line)
+      s = line.to_s
+      m = s.match(/\b(\w+)\s+open\s+leaf\b/i) || s.match(/arrive at the (\w+)\s+leaf\b/i)
+      return nil unless m
+
+      idx = ORDINALS.index(m[1].downcase)
+      idx ? idx + 1 : nil
+    end
+
+    # Flavor-agnostic: a tier-2 tome's name/prose is user-customizable, so key on the
+    # grinsawl-system phrasing, never the item name.
+    def opened?(line)  = (line.to_s =~ /open leaf|is already open|ripple of crimson|easing the cover open|carefully flatten|You open a/i) ? true : false
+    def stored?(line)  = (line.to_s =~ /grafted likeness remains/i) ? true : false
+
+    # A retrieve's terminal line -> { creature:, foil: nil|:bronze|:silver|:gold } or nil.
+    def retrieved?(line)
+      m = line.to_s.match(/radiant\s+(?:(bronze|silver|gold)\s+)?(?:white\s+)?grinsawl bearing the image of\s+(.+?)\s+separates cleanly/i) or return nil
+      { foil: (m[1] ? m[1].downcase.to_sym : nil), creature: Match.normalize(m[2]) }
+    end
   end
 
   def self.version
@@ -253,8 +403,13 @@ if defined?(Script)
       self.goal      = nil
       self.state = {
         running: true, active: false, want: [], avoid: [], buffer: 3,
-        byproducts: 0, sack_name: (CharSettings['sack'] || 'sack').to_s,
-        aversaris: nil, vangaris: nil, last_status: nil
+        byproducts: 0, view: :status, last_status: nil, config_dirty: false,
+        default_min: (CharSettings['default_min'] ? CharSettings['default_min'].to_s.to_sym : :gold),
+        aversaris: nil, vangaris: nil,
+        card_sack_id: CharSettings['card_sack_id'], card_sack_name: CharSettings['card_sack_name'],
+        tome_id: CharSettings['tome_id'], tome_name: CharSettings['tome_name'],
+        tome_cards: (CharSettings['tome_cards'] || []), tome_scanned_at: CharSettings['tome_scanned_at'],
+        pause_list: (CharSettings['pause_list'] || ['energywings'])
       }
     end
 
@@ -263,13 +418,62 @@ if defined?(Script)
       Array(lines).map { |l| l.to_s.gsub(/<[^>]+>/, '').rstrip }
     end
 
-    def self.sack
-      GameObj.inv.to_a.compact.find { |o| o.name.to_s =~ /\b#{Regexp.escape(state[:sack_name])}\b/i }
+    # Configured containers, resolved by id with a name fallback (re-saving the id
+    # when Lich remaps it, like markscrolls' resolve_container).
+    def self.resolve_role(role)
+      idk = "#{role}_id".to_sym
+      nmk = "#{role}_name".to_sym
+      # Search worn inventory, BOTH hands, and inside known containers -- a tome is
+      # often kept in a pack and only pulled to hand to use, and neither hands nor
+      # pack contents live in GameObj.inv.
+      contained = (GameObj.containers.values.flatten rescue [])
+      pool = (GameObj.inv.to_a + [GameObj.right_hand, GameObj.left_hand] + contained)
+             .compact.select { |o| o.id }.uniq(&:id)
+      obj = (state[idk] && pool.find { |o| o.id.to_s == state[idk].to_s }) ||
+            (state[nmk] && pool.find { |o| o.name.to_s.casecmp?(state[nmk].to_s) })
+      if obj && obj.id.to_s != state[idk].to_s
+        state[idk] = obj.id.to_s     # refresh id from the remembered name
+        state[:config_dirty] = true  # main loop persists; CharSettings needs the script thread
+      end
+      obj
     end
 
+    def self.card_sack   = resolve_role('card_sack')
+    def self.tome        = resolve_role('tome')
+    def self.sack        = card_sack
+    def self.configured? = !card_sack.nil?
+
+    # Refer to the user's items by their real names ("bear hide pack", "amber gold
+    # ledger"), not the generic words -- their sack is a pack, their tome a ledger.
+    def self.sack_label = state[:card_sack_name] || 'card sack'
+    def self.tome_label = state[:tome_name] || 'tome'
+
     def self.sack_contents
-      s = sack
+      s = card_sack
       s ? (GameObj.containers[s.id] || []).compact : []
+    end
+
+    # Lich only knows a container's contents after a LOOK inside; populate
+    # GameObj.containers[sack] with a quiet `look in` (opening it first if closed).
+    # MAIN-THREAD ONLY (issue_command needs a valid Script.current).
+    def self.ensure_sack_loaded
+      s = card_sack or return false
+      look = tome_io("look in ##{s.id}", /In the|There (?:is|are)|nothing in|That is closed|You glance|empty|can't|don't/i)
+      if strip(look).any? { |l| l =~ /That is closed/i }
+        tome_io("open ##{s.id}", /You open|already open|can't|don't/i)
+        tome_io("look in ##{s.id}", /In the|There (?:is|are)|nothing in|You glance|empty/i)
+      end
+      20.times { break if GameObj.containers[s.id].is_a?(Array); sleep 0.05 }
+      GameObj.containers[s.id].is_a?(Array)
+    end
+
+    def self.running_scripts
+      (Script.running.map(&:name) rescue []).reject { |n| n.to_s == 'grinsawl' }.uniq
+    end
+
+    def self.find_inv(idstr)
+      id = idstr.to_s.sub('#', '').strip
+      GameObj.inv.to_a.compact.find { |o| o.id.to_s == id }
     end
 
     def self.held
@@ -278,6 +482,13 @@ if defined?(Script)
 
     def self.held_grinsawl
       held.find { |o| o.name.to_s =~ /grinsawl/i }
+    end
+
+    # The item in hand (right preferred), or nil. Powers "hold it and click" setup.
+    def self.held_item
+      r = GameObj.right_hand
+      l = GameObj.left_hand
+      (r && !r.id.nil? ? r : nil) || (l && !l.id.nil? ? l : nil)
     end
 
     def self.free_hand!
@@ -323,7 +534,11 @@ if defined?(Script)
           respond "[grinsawl] #{k}: verb=#{info[:verb]} tier=#{info[:tier]} cooldown=#{info[:cooldown] || '?'}s"
         end
       end
-      scan_sack
+      state[:scan_sack_request] = true if configured? # first sack scan runs on the main loop
+      unless configured?
+        state[:view] = :setup
+        respond '[grinsawl] no card-holder set -- opening Setup. Hold yours and click to assign it.'
+      end
     end
 
     def self.cap_verb  = (state[:aversaris] && state[:aversaris][:verb]) || 'tap'
@@ -343,16 +558,34 @@ if defined?(Script)
       [0, (cd - (Time.now.to_f - cooldowns[which].to_f)).round].max
     end
 
+    # Pause the configured scripts (e.g. energywings) around an activation so they
+    # can't act mid-capture, then ALWAYS unpause -- on success, failure, or error.
+    def self.with_pause
+      paused = state[:pause_list].select { |n| (Script.running?(n) rescue false) }
+      paused.each { |n| pause_script(n) rescue nil }
+      begin
+        yield
+      ensure
+        paused.each { |n| unpause_script(n) rescue nil }
+      end
+    end
+
     # ---- inventory / stock ----
     # LIVE: LOOK at each grinsawl in the working sack to seed the ledger from cards
     # you already own (creature + foil status). Slow; runs at setup and on demand.
     def self.scan_sack
-      sack_contents.select { |o| o.name.to_s =~ /grinsawl/i }.each do |o|
+      ensure_sack_loaded
+      grins = sack_contents.select { |o| o.name.to_s =~ /grinsawl/i }
+      here_ids = grins.map { |o| o.id.to_s }
+      ledger.keys.each { |id| ledger.delete(id) unless here_ids.include?(id) } # drop cards no longer in the sack
+      grins.each do |o|
         next if ledger.key?(o.id.to_s)
 
         info = look_card(o.id)
         ledger[o.id.to_s] = info if info && info[:creature]
       end
+      # a card now in the sack is NOT in the tome -- drop any stale tome copy
+      state[:tome_cards] = tome_cards.reject { |c| here_ids.include?(c[:id].to_s) }
     end
 
     def self.look_card(id)
@@ -380,6 +613,153 @@ if defined?(Script)
 
     def self.stock = unfoiled_goal_ids.size
 
+    # ---- tome snapshot (persisted, trusted, rescan-on-demand) ----
+    def self.tome_cards = state[:tome_cards] || []
+
+    def self.save_tome_cache
+      CharSettings['tome_cards']      = state[:tome_cards]
+      CharSettings['tome_scanned_at'] = state[:tome_scanned_at]
+    end
+
+    # Persist config to CharSettings. MUST run on the script's main thread (Script.current
+    # is nil in the UpstreamHook/client thread, which silently aborts the save), so the
+    # hook only flags :config_dirty and the main loop calls this.
+    def self.persist_config
+      CharSettings['card_sack_id']   = state[:card_sack_id]
+      CharSettings['card_sack_name'] = state[:card_sack_name]
+      CharSettings['tome_id']        = state[:tome_id]
+      CharSettings['tome_name']      = state[:tome_name]
+      CharSettings['pause_list']     = state[:pause_list]
+      CharSettings['default_min']    = state[:default_min].to_s
+      state[:config_dirty] = false
+    rescue StandardError => e
+      respond "[grinsawl] config save error: #{e.message}"
+    end
+
+    # Merged {creature, foil} entries across the loose sack ledger AND the cached
+    # tome (qty-expanded) -- the whole collection, for Tracking and target counts.
+    # Deduped (by card id) merge of the sack ledger and the tome cache; see
+    # Summary.dedup_inventory.
+    def self.inventory_entries
+      Summary.dedup_inventory(ledger, tome_cards)
+    end
+
+    def self.tome_io(cmd, start_rx, quiet: true)
+      Lich::Util.issue_command(cmd, start_rx, /<prompt/, include_end: false, timeout: 8, usexml: true, quiet: quiet, use_fput: false)
+    rescue StandardError => e
+      respond "[grinsawl] tome I/O error on '#{cmd}': #{e.message}"
+      []
+    end
+
+    # Scan every leaf -> persisted snapshot. INSPECT reads the current leaf (grid +
+    # "Nth open leaf"); flip advances; stop when a leaf repeats (wrap) or is unreadable.
+    # Flavor-agnostic: never parses the customizable open/close/name prose.
+    def self.scan_tome
+      t = tome
+      unless t
+        respond "[grinsawl] no #{tome_label} assigned -- assign it in Setup."
+        return false
+      end
+      respond "[grinsawl] scanning #{t.name}..."
+      # Open flavor varies per tome skin (a ledger says "a ripple of crimson light
+      # ... as you carefully open its ... cover"), so DON'T parse the open response:
+      # just fire it (idempotent -- "already open" is fine), then read each leaf with
+      # INSPECT, which reliably shows the grid + "Nth open leaf".
+      tome_io("open ##{t.id}", /ripple|cover|latch|flatten|You open|already open|leaf|can't|don't|What were you|seem to|no way/i)
+
+      cards = []
+      seen = {}
+      14.times do
+        insp = tome_io("inspect ##{t.id}", /open leaf|thumb your fingers|\bleaf\b|empty slot|grinsawl|study/i)
+        leafno = strip(insp).map { |l| Grinsawl::Tome.flip_leaf(l) }.compact.first
+        break if leafno.nil? || seen[leafno] # nil (unreadable) or wrapped back to a read leaf
+
+        seen[leafno] = true
+        Grinsawl::Tome.leaf(insp)[:slots].each { |sl| cards << sl.merge(leaf: leafno) if sl }
+        tome_io("flip ##{t.id}", /arrive at the|flip through|\bleaf\b|reached the end|back to the first|can't|What were you/i)
+      end
+      # leave the tome open (closing is unnecessary)
+
+      state[:tome_cards] = cards
+      state[:tome_scanned_at] = Time.now.to_i
+      tids = cards.map { |c| c[:id].to_s }
+      ledger.keys.each { |id| ledger.delete(id) if tids.include?(id) } # a card in the tome isn't in the sack
+      save_tome_cache
+      respond "[grinsawl] #{t.name} scan complete: #{cards.size} card(s) across #{seen.size} leaf/leaves."
+      true
+    end
+
+    # Navigate to a leaf with an empty slot; leaves us ON that leaf so a subsequent
+    # `tap #tome at N` targets the right slot. => [slot_n, leaf_n] or nil (tome full).
+    def self.find_empty_slot(t)
+      seen = {}
+      14.times do
+        insp = tome_io("inspect ##{t.id}", /open leaf|thumb your fingers|\bleaf\b|empty slot|grinsawl|study/i)
+        leafno = strip(insp).map { |l| Grinsawl::Tome.flip_leaf(l) }.compact.first
+        return nil if leafno.nil? || seen[leafno]
+
+        seen[leafno] = true
+        empty = Grinsawl::Tome.first_empty_slot(Grinsawl::Tome.leaf(insp))
+        return [empty, leafno] if empty
+
+        tome_io("flip ##{t.id}", /arrive at the|flip through|\bleaf\b|reached the end|back to the first|can't|What were you/i)
+      end
+      nil
+    end
+
+    # File grinsawl cards from the card sack INTO the tome. which = :foiled (default,
+    # finished cards) or :all. Updates the cached snapshot + ledger in place. Runs on
+    # the main loop (queued), wrapped in with_pause.
+    def self.store_cards(which = :foiled)
+      t = tome
+      return respond("[grinsawl] no #{tome_label} assigned -- assign it in Setup.") unless t
+
+      ensure_sack_loaded
+      # Source from the ACTUAL grinsawls in the sack (not just the ledger); read foil
+      # from the ledger, else LOOK at the card.
+      grins = sack_contents.select { |o| o.name.to_s =~ /grinsawl/i }
+      candidates = grins.map do |o|
+        info = ledger[o.id.to_s] || look_card(o.id) || {}
+        ledger[o.id.to_s] = info if info[:creature]
+        { id: o.id.to_s, creature: info[:creature], foil: info[:foil] }
+      end
+      candidates.select! { |c| which == :all || !c[:foil].nil? }
+      if candidates.empty?
+        respond "[grinsawl] nothing to store (#{which}) -- #{grins.size} grinsawl(s) in your #{sack_label}."
+        return
+      end
+
+      respond "[grinsawl] storing #{candidates.size} #{which} card(s) into #{t.name}..."
+      stored = 0
+      with_pause do
+        tome_io("open ##{t.id}", /ripple|cover|latch|flatten|You open|already open|leaf|can't|don't|What were you|seem to|no way/i)
+        candidates.each do |c|
+          slot, leafno = find_empty_slot(t)
+          unless slot
+            respond "[grinsawl] #{t.name} is full -- no empty slots left."
+            break
+          end
+          unless get_from_sack(c[:id])
+            respond "[grinsawl] couldn't pull #{c[:creature]} from your #{sack_label}; skipping."
+            next
+          end
+          res = tome_io("tap ##{t.id} at #{slot}", /grafted likeness remains|already|can't|full|no room|What were you/i)
+          if strip(res).any? { |l| Grinsawl::Tome.stored?(l) }
+            state[:tome_cards].reject! { |tc| tc[:id].to_s == c[:id].to_s } # no duplicate-id entries
+            state[:tome_cards] << { slot: slot, leaf: leafno, id: c[:id], creature: c[:creature], foil: c[:foil], qty: 1 }
+            ledger.delete(c[:id])
+            stored += 1
+          else
+            respond "[grinsawl] store of #{c[:creature]} didn't take (#{strip(res).reject(&:empty?).first}); stopping."
+            break
+          end
+        end
+        # leave the tome open (closing is unnecessary)
+      end
+      save_tome_cache
+      respond "[grinsawl] stored #{stored} card(s) into your #{t.name}."
+    end
+
     # ---- present creatures ----
     def self.present_objs
       (GameObj.targets.to_a + GameObj.npcs.to_a).compact.uniq(&:id)
@@ -392,10 +772,12 @@ if defined?(Script)
         respond '[grinsawl] capture skipped: no free hand.'
         return
       end
-      result = dothistimeout(
-        "#{cap_verb} my aversaris arcarium at ##{obj.id}", 35,
-        /solidifies into a radiant white grinsawl bearing the image of|failed card capture|the (?:magical )?link (?:fades|expires)|you can't|cannot|no longer here|isn't here|What were you/i
-      )
+      result = with_pause do
+        dothistimeout(
+          "#{cap_verb} my aversaris arcarium at ##{obj.id}", 35,
+          /solidifies into a radiant white grinsawl bearing the image of|failed card capture|the (?:magical )?link (?:fades|expires)|you can't|cannot|no longer here|isn't here|What were you/i
+        )
+      end
       start_cd(:aversaris)
       res = Parse.capture_result(result)
       if res.is_a?(Hash)
@@ -417,10 +799,12 @@ if defined?(Script)
         respond "[grinsawl] no unfoiled #{cname} card available to foil."
         return
       end
-      result = dothistimeout(
-        "#{foil_verb} my vangaris arcarium at ##{obj.id}", 35,
-        /your card now bears a luxuriant (?:bronze|silver|gold) foil|identical creature|you can't|cannot|no longer here|isn't here|What were you/i
-      )
+      result = with_pause do
+        dothistimeout(
+          "#{foil_verb} my vangaris arcarium at ##{obj.id}", 35,
+          /your card now bears a luxuriant (?:bronze|silver|gold) foil|identical creature|you can't|cannot|no longer here|isn't here|What were you/i
+        )
+      end
       start_cd(:vangaris)
       res = Parse.foil_result(result)
       if res.is_a?(Hash)
@@ -452,9 +836,12 @@ if defined?(Script)
         return false
       end
       self.goal = { creature: creature, min: min }
-      state[:active] = true
+      state[:default_min] = min
+      state[:config_dirty] = true
       state[:byproducts] = 0
-      respond "[grinsawl] goal set: a #{min}+ #{creature} card. Working the current room."
+      state[:active] = configured?
+      respond(configured? ? "[grinsawl] goal: a #{min}+ #{creature} card. Working the current room." \
+                          : "[grinsawl] goal: a #{min}+ #{creature} card. Set a card sack (Setup) to start.")
       true
     end
 
@@ -462,16 +849,77 @@ if defined?(Script)
       cmd, rest = sub.to_s.strip.split(/\s+/, 2)
       case cmd.to_s.downcase
       when '', 'status' then print_status
-      when 'goal'       then set_goal(rest)
+      when 'view'  then state[:view] = (rest.to_s.strip.downcase == 'setup' ? :setup : :status)
+      when 'goal'  then set_goal(rest)
+      when 'target'
+        cre = rest.to_s.strip.downcase
+        if cre.empty?
+          respond '[grinsawl] usage: grinsawl target <creature>'
+        else
+          self.goal ||= { creature: cre, min: state[:default_min] }
+          goal[:creature] = cre
+          goal[:min] ||= state[:default_min]
+          state[:active] = true if configured?
+          respond "[grinsawl] target: #{goal[:min]} #{cre}#{configured? ? '' : ' (set a card sack in Setup to start)'}"
+        end
       when 'min'
         m = Grinsawl::Tier.normalize(rest)
-        if m && goal then goal[:min] = m; respond "[grinsawl] min foil -> #{m}"
-        else respond '[grinsawl] usage: grinsawl min <bronze|silver|gold> (set a goal first)' end
+        if m
+          state[:default_min] = m
+          state[:config_dirty] = true
+          goal[:min] = m if goal
+          respond "[grinsawl] foil goal -> #{m}"
+        else
+          respond '[grinsawl] usage: grinsawl min <bronze|silver|gold>'
+        end
+      when 'go', 'start', 'resume'
+        if !configured? then respond '[grinsawl] set a card sack first (grinsawl view setup).'
+        elsif goal.nil?  then respond '[grinsawl] pick a target first.'
+        else state[:active] = true; respond '[grinsawl] running.' end
+      when 'setsack', 'settome'
+        role = cmd.downcase == 'setsack' ? 'card_sack' : 'tome'
+        arg = rest.to_s.strip
+        o = (arg.empty? || arg =~ /\A(?:hand|held)\z/i) ? held_item : find_inv(arg)
+        if o
+          state["#{role}_id".to_sym]   = o.id.to_s
+          state["#{role}_name".to_sym] = o.name.to_s
+          state[:config_dirty] = true
+          hint = role == 'card_sack' ? ' (stow it so I can reach its contents)' : ''
+          respond "[grinsawl] #{role.tr('_', ' ')} set to #{o.name}#{hint} (remembered by name)"
+          state[:scan_sack_request] = true if role == 'card_sack' # scan on the main thread
+        else
+          respond '[grinsawl] hold the item in a hand first, then click again.'
+        end
+      when 'pausetoggle'
+        n = rest.to_s.strip
+        unless n.empty?
+          state[:pause_list].include?(n) ? state[:pause_list].delete(n) : (state[:pause_list] << n)
+          state[:config_dirty] = true
+          respond "[grinsawl] pause-list: #{state[:pause_list].join(', ')}"
+        end
       when 'want'  then state[:want]  = rest.to_s.split(/\s*,\s*/).reject(&:empty?); respond "[grinsawl] want: #{state[:want].join(', ')}"
       when 'avoid' then state[:avoid] = rest.to_s.split(/\s*,\s*/).reject(&:empty?); respond "[grinsawl] avoid: #{state[:avoid].join(', ')}"
-      when 'sack'  then state[:sack_name] = rest.to_s.strip; CharSettings['sack'] = state[:sack_name]; respond "[grinsawl] working sack -> #{state[:sack_name]}"
-      when 'scan'  then scan_sack; respond "[grinsawl] sack scanned: #{stock} unfoiled #{goal ? goal[:creature] : 'goal'} card(s)."
-      when 'stop'  then state[:active] = false; respond '[grinsawl] stopped (idle). Set a goal to resume.'
+      when 'scan'
+        if rest.to_s =~ /tome|leaf|ledger|book/i
+          state[:scan_tome_request] = true
+          respond "[grinsawl] #{tome_label} scan queued..."
+        else
+          state[:scan_sack_request] = true
+          respond "[grinsawl] #{sack_label} scan queued..."
+        end
+      when 'rescan' then state[:scan_tome_request] = true; respond "[grinsawl] #{tome_label} rescan queued..."
+      when 'store'
+        state[:store_request] = (rest.to_s =~ /all/i ? :all : :foiled)
+        respond "[grinsawl] store (#{state[:store_request]}) queued..."
+      when 'dump'
+        respond "[grinsawl] tome: #{state[:tome_name].inspect} id=#{state[:tome_id].inspect} scanned_at=#{state[:tome_scanned_at].inspect}"
+        respond "[grinsawl] card sack: #{state[:card_sack_name].inspect} id=#{state[:card_sack_id].inspect}; resolves now? #{!tome.nil?}/#{!card_sack.nil?}"
+        respond "[grinsawl] tome_cards (#{tome_cards.size}): #{tome_cards.first(8).map { |c| "#{c[:creature]}/#{c[:foil] || 'none'}" }.join(', ')}"
+        respond "[grinsawl] sack ledger (#{ledger.size}): #{ledger.values.first(8).map { |v| "#{v[:creature]}/#{v[:foil] || 'none'}" }.join(', ')}"
+        sc = sack_contents
+        respond "[grinsawl] sack LIVE contents: #{sc.size} item(s), #{sc.count { |o| o.name.to_s =~ /grinsawl/i }} grinsawl(s); GameObj.containers loaded? #{!card_sack.nil? && GameObj.containers[card_sack.id].is_a?(Array)}"
+      when 'stop'  then state[:active] = false; respond '[grinsawl] stopped (idle).'
+      when 'clear' then self.goal = nil; state[:active] = false; state[:byproducts] = 0; respond '[grinsawl] goal cleared.'
       else respond "[grinsawl] unknown sub-command '#{cmd}'. try: grinsawl status"
       end
     end
@@ -493,7 +941,7 @@ if defined?(Script)
     def self.open_window
       puts("<closeDialog id='#{window_id}'/><openDialog type='dynamic' id='#{window_id}' " \
            "title='Grinsawl' target='#{window_id}' scroll='manual' location='main' justify='3' " \
-           "height='200' resident='true'><dialogData id='#{window_id}'></dialogData></openDialog>")
+           "height='340' resident='true'><dialogData id='#{window_id}'></dialogData></openDialog>")
     end
 
     def self.close_window
@@ -504,40 +952,101 @@ if defined?(Script)
       v.to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;').gsub("'", '&apos;').gsub('"', '&quot;')
     end
 
-    def self.window_lines
-      ls = []
-      ls << if goal
-              "Goal: #{goal[:min].to_s.upcase} #{goal[:creature]}   [#{state[:active] ? 'ACTIVE' : 'idle'}]"
-            else
-              'No goal.  ;grinsawl <tier> <creature>   [idle]'
-            end
-      ls << "Spares: #{stock}/#{state[:buffer]}    Byproducts: #{state[:byproducts]}"
-      cap = ready?(:aversaris) ? 'ready' : "#{cd_left(:aversaris)}s"
-      foil = ready?(:vangaris) ? 'ready' : "#{cd_left(:vangaris)}s"
-      ls << "Capture: #{cap}    Foil: #{foil}"
-      tier = state[:vangaris] && state[:vangaris][:tier]
-      ls << "Verbs: cap=#{cap_verb} foil=#{foil_verb}    Tier #{tier || '?'}"
-      ls << 'Tracking:'
-      summary = Summary.by_creature(ledger.values)
-      if summary.empty?
-        ls << '  (nothing captured yet)'
+    # Capitalize the first letter (creatures/tiers read nicer in the window).
+    def self.cap(s) = s.to_s.sub(/\A([a-z])/) { Regexp.last_match(1).upcase }
+
+    # Candidate target creatures for the panel: present in room UNION tracked.
+    def self.target_candidates
+      Summary.target_candidates(present_objs.map { |o| Match.normalize(o.name) },
+                                inventory_entries, state[:want], state[:avoid])
+    end
+
+    # Each element: { kind: :label|:link, text:, cmd: (links only), left:, top: }.
+    def self.status_elements
+      els = []
+      row = 0
+      lbl = ->(t, l = 0) { els << { kind: :label, text: t, left: l, top: row * 18 } }
+      lnk = ->(t, c, l)  { els << { kind: :link,  text: t, cmd: c, left: l, top: row * 18 } }
+
+      lbl.call("Grinsawl #{VERSION}"); lnk.call('[Setup]', 'grinsawl view setup', 250); row += 1
+      lbl.call(goal ? "Goal: #{goal[:min].to_s.upcase} #{cap(goal[:creature])}" : 'Goal: (pick a target below)')
+      lnk.call(state[:active] ? '[Clear]' : '[Go]', state[:active] ? 'grinsawl clear' : 'grinsawl go', 250); row += 1
+      lbl.call("Spares #{stock}/#{state[:buffer]}    Byproducts #{state[:byproducts]}    vissi Tier #{(state[:vangaris] || {})[:tier] || '?'}"); row += 1
+      lbl.call("Capture: #{ready?(:aversaris) ? 'ready' : "#{cd_left(:aversaris)}s"}     Foil: #{ready?(:vangaris) ? 'ready' : "#{cd_left(:vangaris)}s"}"); row += 1
+      lbl.call('Foil goal (click to set):'); row += 1
+      sel = (goal ? goal[:min] : state[:default_min])
+      %i[bronze silver gold].each_with_index do |t, i|
+        base = (t == sel ? "**#{cap(t.to_s)}**" : cap(t.to_s)) # ** marks the selected floor (this tier or better)
+        lnk.call(" #{base}", "grinsawl min #{t}", 12 + (i * 80)) # leading space indents each tier
+      end
+      row += 1
+      lbl.call('Target (click to set):'); row += 1
+      cands = target_candidates.first(8)
+      if cands.empty?
+        lbl.call(' (no creatures here or tracked)'); row += 1
       else
-        summary.sort_by { |c, _| c }.first(8).each do |c, h|
-          parts = []
-          parts << "#{h[:unfoiled]} unfoiled" if h[:unfoiled].positive?
-          %i[gold silver bronze].each { |t| parts << "#{h[t]} #{t}" if h[t].positive? }
-          ls << "  #{c}: #{parts.join(', ')}"
+        cands.each do |c|
+          lnk.call(" #{cap(c[:creature])} (#{c[:unfoiled]} unfoiled)", "grinsawl target #{c[:creature]}", 12); row += 1
         end
       end
-      ls
+      lbl.call("Pausing: #{state[:pause_list].join(', ')}"); row += 1
+      lnk.call('[Store foiled]', 'grinsawl store', 0)
+      lnk.call('[Store all]', 'grinsawl store all', 120); row += 1
+      lbl.call('Collection:'); row += 1
+      tr = Summary.by_creature(inventory_entries)
+      if tr.empty?
+        lbl.call(" (nothing tracked -- capture, or scan your #{tome_label} in Setup)"); row += 1
+      else
+        tr.sort_by { |c, _| c }.first(6).each do |c, h|
+          parts = []
+          parts << "#{h[:unfoiled]} unfoiled" if h[:unfoiled].positive?
+          %i[gold silver bronze].each { |t| parts << "#{h[t]} #{cap(t.to_s)}" if h[t].positive? }
+          lbl.call(" #{cap(c)}: #{parts.join(', ')}"); row += 1
+        end
+      end
+      els
+    end
+
+    def self.setup_elements
+      els = []
+      row = 0
+      lbl = ->(t, l = 0) { els << { kind: :label, text: t, left: l, top: row * 18 } }
+      lnk = ->(t, c, l)  { els << { kind: :link,  text: t, cmd: c, left: l, top: row * 18 } }
+
+      lbl.call('Grinsawl Setup'); lnk.call('[Done]', 'grinsawl view status', 250); row += 1
+      lbl.call("Card holder: #{state[:card_sack_name] || '(not set)'}"); row += 1
+      lbl.call("Card book: #{state[:tome_name] || '(not set)'}"); row += 1
+      row += 1
+      lbl.call('Hold an item in a hand, then click to assign it:'); row += 1
+      lnk.call('[set card holder to held item]', 'grinsawl setsack hand', 12); row += 1
+      lnk.call('[set card book to held item]',   'grinsawl settome hand', 12); row += 1
+      row += 1
+      if state[:tome_scanned_at]
+        lbl.call("#{tome_label} scanned: #{tome_cards.size} card(s).")
+        lnk.call('[rescan]', 'grinsawl scan tome', 12); row += 1
+      else
+        lbl.call("#{tome_label} not scanned -- counts miss filed cards until you scan.")
+        row += 1
+        lnk.call('[scan now]', 'grinsawl scan tome', 12); row += 1
+      end
+      row += 1
+      lbl.call('Pause during capture (click to toggle):'); row += 1
+      running_scripts.first(8).each do |n|
+        lbl.call(n, 12)
+        lnk.call(state[:pause_list].include?(n) ? '[on]' : '[off]', "grinsawl pausetoggle #{n}", 230); row += 1
+      end
+      els
     end
 
     def self.render_window
+      els = state[:view] == :setup ? setup_elements : status_elements
       out = +"<dialogData id='#{window_id}' clear='t' >"
-      top = 0
-      window_lines.each_with_index do |ln, i|
-        out << "<label id='gs_#{i}' value='#{sanitize(ln)}' justify='left' left='0' top='#{top}' />"
-        top += 18
+      els.each_with_index do |e, i|
+        out << if e[:kind] == :link
+                 "<link id='gl_#{i}' value='#{sanitize(e[:text])}' cmd='#{sanitize(e[:cmd])}' echo='#{sanitize(e[:cmd])}' justify='left' left='#{e[:left]}' top='#{e[:top]}' />"
+               else
+                 "<label id='gl_#{i}' value='#{sanitize(e[:text])}' justify='left' left='#{e[:left]}' top='#{e[:top]}' />"
+               end
       end
       out << '</dialogData>'
       puts(out)
@@ -547,7 +1056,7 @@ if defined?(Script)
 
     # ---- main tick ----
     def self.tick
-      return unless state[:active] && goal
+      return unless state[:active] && goal && configured?
 
       objs  = present_objs
       names = objs.map { |o| Match.normalize(o.name) }.reject(&:empty?).uniq
@@ -595,12 +1104,27 @@ if defined?(Script)
 
   before_dying do
     UpstreamHook.remove('grinsawl')
+    Grinsawl.persist_config if Grinsawl.state # flush config (before_dying runs on the script thread)
     Grinsawl.close_window
     respond '[grinsawl] stopped.'
   end
 
   loop do
     begin
+      if Grinsawl.state[:scan_tome_request]
+        Grinsawl.state[:scan_tome_request] = false
+        Grinsawl.scan_tome
+      end
+      if Grinsawl.state[:scan_sack_request]
+        Grinsawl.state[:scan_sack_request] = false
+        Grinsawl.scan_sack
+        respond "[grinsawl] #{Grinsawl.sack_label} scan: #{Grinsawl.ledger.size} card(s) tracked (#{Grinsawl.stock} unfoiled goal)."
+      end
+      if (req = Grinsawl.state[:store_request])
+        Grinsawl.state[:store_request] = nil
+        Grinsawl.store_cards(req)
+      end
+      Grinsawl.persist_config if Grinsawl.state[:config_dirty]
       Grinsawl.tick
       Grinsawl.render_window
     rescue StandardError => e
