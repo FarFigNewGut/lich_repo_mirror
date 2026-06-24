@@ -7,7 +7,11 @@
 
   An in-game window is the control panel. From it you pick the target creature
   and the foil goal, watch your capture and foil cooldowns and your collection, and
-  manage your tome: scan it and store finished cards into it.
+  manage your tome: scan it, store finished cards into it, and pull a filed card
+  back to your hand when you want it.
+
+  [Organize tome] opens a separate window where you arrange your filed cards into
+  the exact leaf/slot layout you want, then sends the moves to the game.
 
   USAGE
     ;grinsawl                                    open the control panel
@@ -20,11 +24,11 @@
     Collector vissi must be slotted in both your aversaris and vangaris arcarium.
 
   author: Zedarius
-  version: 0.3.0
+  version: 0.5.0
 =end
 
 module Grinsawl
-  VERSION = '0.3.0'
+  VERSION = '0.5.0'
 
   TIER_RANK  = { bronze: 1, silver: 2, gold: 3 }.freeze
   ACTIVATORS = %w[rub tap push pull poke].freeze
@@ -101,23 +105,27 @@ module Grinsawl
     end
 
     # Capture attempt terminal line -> { creature: } on success, :fail, else nil.
+    # :fail includes a BROKEN link (creature retreated / you acted): "maintaining the
+    # tether becomes impossible ... the radiance fades into nothingness".
     def capture_result(line)
       s = line.to_s
       if (m = s.match(/solidifies into a radiant white grinsawl bearing the image of\s+(.+?)\./i))
         return { creature: clean_creature(m[1]) }
       end
-      return :fail if s =~ /failed card capture|the (?:magical )?link (?:fades|expires|dissipates|is broken)|fail(?:s|ed) to (?:capture|imprint|link)/i
+      return :fail if s =~ /failed card capture|the (?:magical )?link (?:fades|expires|dissipates|is broken)|fail(?:s|ed) to (?:capture|imprint|link)|tether (?:becomes impossible|untwines)|radiance fades into nothingness|too much distance between you/i
 
       nil
     end
 
-    # Foil attempt terminal line -> { tier: } on success, :mismatch, else nil.
+    # Foil attempt terminal line -> { tier: } on success, :mismatch, :broke, else nil.
+    # :broke is the link breaking ("...leaving your grinsawl unharmed" / tether untwines).
     def foil_result(line)
       s = line.to_s
       if (m = s.match(/your card now bears a luxuriant\s+(bronze|silver|gold)\s+foil/i))
         return { tier: m[1].downcase.to_sym }
       end
       return :mismatch if s =~ /only attempt to foil this grinsawl by establishing a link with an identical creature/i
+      return :broke if s =~ /tether (?:becomes impossible|untwines)|too much distance between you|leaving your grinsawl unharmed/i
 
       nil
     end
@@ -202,11 +210,13 @@ module Grinsawl
 
     # Candidate targets for the control panel: creatures present in the room UNION
     # creatures already tracked, filtered by want/avoid, each with its counts.
+    # A creature you already own a GOLD of is dropped -- gold is the top tier, so it
+    # is done and not worth suggesting as a target.
     # => [{ creature:, unfoiled:, total: }] sorted by most-unfoiled then name.
     def target_candidates(present, entries, want = [], avoid = [])
       counts = by_creature(entries)
       names  = (Array(present) + counts.keys).map { |n| n.to_s.strip }.reject(&:empty?).uniq
-      names.select { |n| Match.wanted?(n, want, avoid) }
+      names.select { |n| Match.wanted?(n, want, avoid) && (counts[n] || {})[:gold].to_i.zero? }
            .map do |n|
              h = counts[n] || {}
              { creature: n, unfoiled: h[:unfoiled].to_i, total: h.values.sum }
@@ -232,6 +242,73 @@ module Grinsawl
         [c[:qty].to_i, 1].max.times { entries << { creature: c[:creature], foil: c[:foil] } }
       end
       entries
+    end
+
+    # Collapse tome cards into clickable retrieve groups: distinct (creature, foil)
+    # with a summed qty. => [{creature:, foil:, qty:}] sorted by name then tier desc.
+    def group_tome(tome_cards)
+      groups = {}
+      Array(tome_cards).each do |c|
+        cre = c[:creature].to_s.strip
+        next if cre.empty?
+
+        key = [cre, c[:foil]]
+        groups[key] = (groups[key] || 0) + [c[:qty].to_i, 1].max
+      end
+      groups.map { |(cre, foil), qty| { creature: cre, foil: foil, qty: qty } }
+            .sort_by { |g| [g[:creature], -Tier.rank(g[:foil])] }
+    end
+
+    # Choose the single tome card to retrieve. Matches creature by exact depicted
+    # name first, then partial (so "kobold" finds "a big ugly kobold"); filters by an
+    # explicit tier or the unfoiled flag; otherwise prefers the highest tier present.
+    # => one card hash or nil.
+    def pick_card(tome_cards, creature, tier: nil, unfoiled: false)
+      cre  = Match.normalize(creature)
+      cand = Array(tome_cards).select do |c|
+        name = c[:creature].to_s
+        Match.normalize(name) == cre || Match.goal_match?(cre, name)
+      end
+      cand = cand.select { |c| c[:foil].nil? } if unfoiled
+      cand = cand.select { |c| c[:foil] == tier } if tier
+      cand.min_by { |c| [(Match.normalize(c[:creature].to_s) == cre ? 0 : 1), -Tier.rank(c[:foil])] }
+    end
+
+    # Find a configured item in a pool of {id:, name:} hashes. Item exist-ids change
+    # across logins, so we match by saved id first, then by NAME -- and tolerantly,
+    # since the saved name can drift (saved "bear hide pack" must still find a live
+    # "black bear hide pack"): exact, then either name containing the other.
+    # => the matched hash or nil.
+    def resolve_item(pool, id, name)
+      pool = Array(pool)
+      nm = name.to_s.strip.downcase
+      found = nil
+      found = pool.find { |o| o[:id].to_s == id.to_s } if id && !id.to_s.empty?
+      unless found || nm.empty?
+        found = pool.find { |o| o[:name].to_s.strip.casecmp?(nm) } ||
+                pool.find { |o| o[:name].to_s.downcase.include?(nm) } ||
+                pool.find { |o| (n = o[:name].to_s.strip.downcase); !n.empty? && nm.include?(n) }
+      end
+      found
+    end
+
+    # Decide where to file a card of (creature, foil) given a live slot model: a list
+    # of { leaf:, slot:, card: nil|{creature,foil,qty} }. Cards stack onto a slot with
+    # the IDENTICAL depicted name and SAME foil that still has room (qty < cap); else
+    # the lowest empty slot is used. Both pick the LOWEST [leaf, slot] so the tome fills
+    # from leaf 1 forward regardless of which leaf the book happens to be open to.
+    # => { leaf:, slot:, mode: :stack|:empty } or nil (full).
+    def place_card(model, creature, foil, cap: 2)
+      cre = Match.normalize(creature)
+      order = ->(e) { [e[:leaf].to_i.zero? ? 99 : e[:leaf].to_i, e[:slot].to_i] }
+      stack = Array(model).select do |e|
+        c = e[:card]
+        c && Match.normalize(c[:creature]) == cre && c[:foil] == foil && c[:qty].to_i < cap
+      end.min_by(&order)
+      return { leaf: stack[:leaf], slot: stack[:slot], mode: :stack } if stack
+
+      empty = Array(model).select { |e| e[:card].nil? }.min_by(&order)
+      empty ? { leaf: empty[:leaf], slot: empty[:slot], mode: :empty } : nil
     end
   end
 
@@ -380,6 +457,48 @@ module Grinsawl
       m = line.to_s.match(/radiant\s+(?:(bronze|silver|gold)\s+)?(?:white\s+)?grinsawl bearing the image of\s+(.+?)\s+separates cleanly/i) or return nil
       { foil: (m[1] ? m[1].downcase.to_sym : nil), creature: Match.normalize(m[2]) }
     end
+
+    # Organizer planner (pure). Turn a current tome layout into a target layout using the
+    # sack as scratch: lift only the cards that are misplaced out to the sack, then file the
+    # vacancies from the sack. Cards already of the right type in the right slot are left
+    # untouched (fixed points). full:true ignores fixed points -- the bulletproof rebuild.
+    #
+    # Layouts are 0-indexed arrays: layout[leaf_i][slot_i] = list of 0-2 cards
+    # { creature:, foil: }. Output uses 1-based leaf/slot to match the game:
+    #   { pull: [[leaf, slot], ...],                          # one entry per card to lift out
+    #     fill: [{ leaf:, slot:, creature:, foil: }, ...] }   # one per card to file, in order
+    module Plan
+      module_function
+
+      def slot_at(layout, li, si)
+        row = Array(layout)[li]
+        row ? Array(row[si]) : []
+      end
+
+      def key(card) = [Match.normalize(card[:creature]), card[:foil]]
+
+      def tally(cards)
+        cards.each_with_object(Hash.new(0)) { |c, h| h[key(c)] += 1 }
+      end
+
+      def plan(current, target, full: false)
+        pull = []
+        fill = []
+        nleaves = [Array(current).length, Array(target).length].max
+        (0...nleaves).each do |li|
+          (0...12).each do |si|
+            cur = tally(slot_at(current, li, si))
+            tgt = tally(slot_at(target, li, si))
+            (cur.keys | tgt.keys).each do |k|
+              fixed = full ? 0 : [cur[k], tgt[k]].min
+              (cur[k] - fixed).times { pull << [li + 1, si + 1] }
+              (tgt[k] - fixed).times { fill << { leaf: li + 1, slot: si + 1, creature: k[0], foil: k[1] } }
+            end
+          end
+        end
+        { pull: pull, fill: fill.sort_by { |f| [f[:leaf], f[:slot]] } }
+      end
+    end
   end
 
   def self.version
@@ -392,6 +511,12 @@ end
 # game I/O (exact failure/cooldown messages, hand juggling, sack/tome browsing)
 # is a first cut meant to be tuned live -- see the `# LIVE:` notes.
 if defined?(Script)
+  begin
+    require 'gtk3' # only the organizer needs it; the rest of grinsawl runs without GTK
+  rescue LoadError, StandardError
+    nil
+  end
+
   module Grinsawl
     class << self
       attr_accessor :state, :goal, :ledger, :cooldowns
@@ -401,9 +526,14 @@ if defined?(Script)
       self.ledger    = {}                         # card-id => { creature:, foil: }
       self.cooldowns = { aversaris: 0.0, vangaris: 0.0 }
       self.goal      = nil
+      g = CharSettings['goal'] # restore last goal (idle until you click Go)
+      self.goal = { creature: g[:creature].to_s, min: (Grinsawl::Tier.normalize(g[:min]) || :gold) } \
+        if g.is_a?(Hash) && !g[:creature].to_s.strip.empty?
       self.state = {
         running: true, active: false, want: [], avoid: [], buffer: 3,
         byproducts: 0, view: :status, last_status: nil, config_dirty: false,
+        cd_marks: { aversaris: [], vangaris: [] }, # cooldown milestones already announced
+        organizer: nil, org_open_request: false,   # GTK organizer window + open flag
         default_min: (CharSettings['default_min'] ? CharSettings['default_min'].to_s.to_sym : :gold),
         aversaris: nil, vangaris: nil,
         card_sack_id: CharSettings['card_sack_id'], card_sack_name: CharSettings['card_sack_name'],
@@ -429,10 +559,11 @@ if defined?(Script)
       contained = (GameObj.containers.values.flatten rescue [])
       pool = (GameObj.inv.to_a + [GameObj.right_hand, GameObj.left_hand] + contained)
              .compact.select { |o| o.id }.uniq(&:id)
-      obj = (state[idk] && pool.find { |o| o.id.to_s == state[idk].to_s }) ||
-            (state[nmk] && pool.find { |o| o.name.to_s.casecmp?(state[nmk].to_s) })
+      simple = pool.map { |o| { id: o.id, name: o.name, obj: o } }
+      match = Summary.resolve_item(simple, state[idk], state[nmk])
+      obj = match && match[:obj]
       if obj && obj.id.to_s != state[idk].to_s
-        state[idk] = obj.id.to_s     # refresh id from the remembered name
+        state[idk] = obj.id.to_s     # refresh id from the remembered name (ids change across logins)
         state[:config_dirty] = true  # main loop persists; CharSettings needs the script thread
       end
       obj
@@ -511,6 +642,22 @@ if defined?(Script)
       held.any? { |o| o.id.to_s == id.to_s }
     end
 
+    # Filing a card needs BOTH the ledger and the grinsawl in hand ("You must be holding
+    # both the ledger and the grinsawl" otherwise). Navigation (open/inspect/flip) works
+    # with the tome in a pack, but `tap ... at` does not -- so pull the tome to a hand,
+    # stowing any loose grinsawls first (frees a hand AND makes them store candidates).
+    def self.ensure_tome_in_hand(t)
+      return true if held.any? { |o| o.id.to_s == t.id.to_s }
+
+      held.select { |o| o.name.to_s =~ /grinsawl/i }.each { |o| stow_to_sack(o.id) }
+      if GameObj.right_hand.id && GameObj.left_hand.id # both hands still occupied (non-grinsawl)
+        respond "[grinsawl] both hands are full -- free one so I can hold your #{t.name}."
+        return false
+      end
+      dothistimeout("get ##{t.id}", 5, /You (?:get|pick up|remove|sling)|already (?:in|have)|in your|What were you/i)
+      held.any? { |o| o.id.to_s == t.id.to_s }
+    end
+
     # ---- analyze / setup ----
     def self.analyze_arcarium(which)
       lines = Lich::Util.issue_command(
@@ -534,8 +681,13 @@ if defined?(Script)
           respond "[grinsawl] #{k}: verb=#{info[:verb]} tier=#{info[:tier]} cooldown=#{info[:cooldown] || '?'}s"
         end
       end
-      state[:scan_sack_request] = true if configured? # first sack scan runs on the main loop
-      unless configured?
+      # Open ready (status panel) if a card holder was set in a prior session -- even if
+      # it hasn't re-resolved live yet -- and only fall into Setup for a first-time user.
+      saved = !state[:card_sack_id].to_s.strip.empty? || !state[:card_sack_name].to_s.strip.empty?
+      if configured? || saved
+        state[:view] = :status
+        state[:scan_sack_request] = true if configured? # first sack scan runs on the main loop
+      else
         state[:view] = :setup
         respond '[grinsawl] no card-holder set -- opening Setup. Hold yours and click to assign it.'
       end
@@ -547,7 +699,13 @@ if defined?(Script)
     def self.foil_cd   = ((state[:vangaris]  && state[:vangaris][:cooldown])  || 120).to_f
 
     # ---- cooldowns ----
-    def self.start_cd(which) = cooldowns[which] = Time.now.to_f
+    MILESTONES = [90, 60, 30, 10, 3].freeze # announce remaining time only at these marks
+
+    def self.start_cd(which)
+      cooldowns[which] = Time.now.to_f
+      (state[:cd_marks] ||= {})[which] = [] # fresh cooldown, re-arm the milestone announcements
+    end
+
     def self.ready?(which)
       cd = which == :aversaris ? cap_cd : foil_cd
       (Time.now.to_f - cooldowns[which].to_f) >= cd
@@ -556,6 +714,25 @@ if defined?(Script)
     def self.cd_left(which)
       cd = which == :aversaris ? cap_cd : foil_cd
       [0, (cd - (Time.now.to_f - cooldowns[which].to_f)).round].max
+    end
+
+    # mm:ss like the user's marks: 90->"1:30", 60->"1:00", 30->":30", 10->":10", 3->":3".
+    def self.fmt_cd(s) = s >= 60 ? format('%d:%02d', s / 60, s % 60) : ":#{s}"
+
+    # Quiet cooldown feedback: instead of echoing a per-tick countdown, announce a
+    # capture/foil cooldown ONLY as it passes each milestone (1:30, 1:00, :30, :10, :3).
+    def self.announce_cooldowns
+      { aversaris: 'Capture', vangaris: 'Foil' }.each do |which, label|
+        next if ready?(which)
+
+        marks = (state[:cd_marks] ||= {})[which] ||= []
+        left = cd_left(which)
+        m = MILESTONES.find { |ms| left <= ms && !marks.include?(ms) }
+        next unless m
+
+        marks << m
+        respond "[grinsawl] #{label} ready in #{fmt_cd(m)}"
+      end
     end
 
     # Pause the configured scripts (e.g. energywings) around an activation so they
@@ -575,9 +752,11 @@ if defined?(Script)
     # you already own (creature + foil status). Slow; runs at setup and on demand.
     def self.scan_sack
       ensure_sack_loaded
-      grins = sack_contents.select { |o| o.name.to_s =~ /grinsawl/i }
+      # Loose cards live in the sack OR in a hand (a freshly captured or retrieved
+      # card sits in hand); track both so a hand card isn't pruned away.
+      grins = (sack_contents + held).select { |o| o.name.to_s =~ /grinsawl/i }.uniq(&:id)
       here_ids = grins.map { |o| o.id.to_s }
-      ledger.keys.each { |id| ledger.delete(id) unless here_ids.include?(id) } # drop cards no longer in the sack
+      ledger.keys.each { |id| ledger.delete(id) unless here_ids.include?(id) } # drop cards no longer loose
       grins.each do |o|
         next if ledger.key?(o.id.to_s)
 
@@ -597,7 +776,7 @@ if defined?(Script)
       Parse.card(strip(lines))
     end
 
-    # unfoiled cards matching the goal (partial name) still in sack or hand
+    # unfoiled cards matching the goal (partial name) still in sack or hand (LOOSE).
     def self.unfoiled_goal_ids
       return [] unless goal
 
@@ -607,11 +786,23 @@ if defined?(Script)
       end.keys
     end
 
-    def self.unfoiled_goal_creatures
-      unfoiled_goal_ids.map { |id| ledger[id][:creature] }.compact.uniq
+    # Unfoiled goal cards FILED IN THE TOME (the foiler can pull one out if no loose copy).
+    def self.tome_unfoiled_goal
+      return [] unless goal
+
+      tome_cards.select { |c| c[:foil].nil? && Match.goal_match?(goal[:creature], c[:creature]) }
     end
 
-    def self.stock = unfoiled_goal_ids.size
+    # Creatures we can foil toward the goal -- loose OR filed -- so the planner picks foil
+    # even when the only unfoiled copy lives in the tome.
+    def self.unfoiled_goal_creatures
+      (unfoiled_goal_ids.map { |id| ledger[id][:creature] } +
+       tome_unfoiled_goal.map { |c| c[:creature] }).compact.uniq
+    end
+
+    # Backlog = unfoiled goal cards anywhere (loose + filed, qty-expanded), so we do not
+    # over-capture when unfoiled copies are already filed.
+    def self.stock = unfoiled_goal_ids.size + tome_unfoiled_goal.sum { |c| [c[:qty].to_i, 1].max }
 
     # ---- tome snapshot (persisted, trusted, rescan-on-demand) ----
     def self.tome_cards = state[:tome_cards] || []
@@ -631,6 +822,7 @@ if defined?(Script)
       CharSettings['tome_name']      = state[:tome_name]
       CharSettings['pause_list']     = state[:pause_list]
       CharSettings['default_min']    = state[:default_min].to_s
+      CharSettings['goal']           = self.goal
       state[:config_dirty] = false
     rescue StandardError => e
       respond "[grinsawl] config save error: #{e.message}"
@@ -651,23 +843,15 @@ if defined?(Script)
       []
     end
 
-    # Scan every leaf -> persisted snapshot. INSPECT reads the current leaf (grid +
-    # "Nth open leaf"); flip advances; stop when a leaf repeats (wrap) or is unreadable.
-    # Flavor-agnostic: never parses the customizable open/close/name prose.
-    def self.scan_tome
-      t = tome
-      unless t
-        respond "[grinsawl] no #{tome_label} assigned -- assign it in Setup."
-        return false
-      end
-      respond "[grinsawl] scanning #{t.name}..."
-      # Open flavor varies per tome skin (a ledger says "a ripple of crimson light
-      # ... as you carefully open its ... cover"), so DON'T parse the open response:
-      # just fire it (idempotent -- "already open" is fine), then read each leaf with
-      # INSPECT, which reliably shows the grid + "Nth open leaf".
+    # Walk every leaf once -> a live model of the whole tome. INSPECT reads the current
+    # leaf (grid + "Nth open leaf"); flip advances; stop when a leaf repeats (wrap) or is
+    # unreadable. Flavor-agnostic: never parses the customizable open/close/name prose.
+    # => { model: [{leaf:, slot:, card: nil|slot-hash}], cards: [occupied + :leaf], leaves: [n] }
+    def self.walk_tome(t)
       tome_io("open ##{t.id}", /ripple|cover|latch|flatten|You open|already open|leaf|can't|don't|What were you|seem to|no way/i)
-
+      model = []
       cards = []
+      leaves = []
       seen = {}
       14.times do
         insp = tome_io("inspect ##{t.id}", /open leaf|thumb your fingers|\bleaf\b|empty slot|grinsawl|study/i)
@@ -675,41 +859,68 @@ if defined?(Script)
         break if leafno.nil? || seen[leafno] # nil (unreadable) or wrapped back to a read leaf
 
         seen[leafno] = true
-        Grinsawl::Tome.leaf(insp)[:slots].each { |sl| cards << sl.merge(leaf: leafno) if sl }
+        leaves << leafno
+        Grinsawl::Tome.leaf(insp)[:slots].each_with_index do |sl, i|
+          model << { leaf: leafno, slot: i + 1, card: sl }
+          cards << sl.merge(leaf: leafno) if sl
+        end
         tome_io("flip ##{t.id}", /arrive at the|flip through|\bleaf\b|reached the end|back to the first|can't|What were you/i)
       end
       # leave the tome open (closing is unnecessary)
+      { model: model, cards: cards, leaves: leaves }
+    end
 
-      state[:tome_cards] = cards
+    # Scan every leaf -> persisted snapshot (occupied slots only).
+    def self.scan_tome
+      t = tome
+      unless t
+        respond "[grinsawl] no #{tome_label} assigned -- assign it in Setup."
+        return false
+      end
+      respond "[grinsawl] scanning #{t.name}..."
+      walk = walk_tome(t)
+      state[:tome_cards] = walk[:cards]
       state[:tome_scanned_at] = Time.now.to_i
-      tids = cards.map { |c| c[:id].to_s }
+      tids = walk[:cards].map { |c| c[:id].to_s }
       ledger.keys.each { |id| ledger.delete(id) if tids.include?(id) } # a card in the tome isn't in the sack
       save_tome_cache
-      respond "[grinsawl] #{t.name} scan complete: #{cards.size} card(s) across #{seen.size} leaf/leaves."
+      respond "[grinsawl] #{t.name} scan complete: #{walk[:cards].size} card(s) across #{walk[:leaves].size} leaf/leaves."
       true
     end
 
-    # Navigate to a leaf with an empty slot; leaves us ON that leaf so a subsequent
-    # `tap #tome at N` targets the right slot. => [slot_n, leaf_n] or nil (tome full).
-    def self.find_empty_slot(t)
-      seen = {}
-      14.times do
+    # Turn the tome to a specific leaf so a subsequent `tap #tome at N` targets it.
+    # => true once we're on that leaf, false if it can't be reached.
+    def self.goto_leaf(t, target)
+      16.times do
         insp = tome_io("inspect ##{t.id}", /open leaf|thumb your fingers|\bleaf\b|empty slot|grinsawl|study/i)
-        leafno = strip(insp).map { |l| Grinsawl::Tome.flip_leaf(l) }.compact.first
-        return nil if leafno.nil? || seen[leafno]
-
-        seen[leafno] = true
-        empty = Grinsawl::Tome.first_empty_slot(Grinsawl::Tome.leaf(insp))
-        return [empty, leafno] if empty
+        cur = strip(insp).map { |l| Grinsawl::Tome.flip_leaf(l) }.compact.first
+        return true if cur == target
 
         tome_io("flip ##{t.id}", /arrive at the|flip through|\bleaf\b|reached the end|back to the first|can't|What were you/i)
       end
-      nil
+      false
+    end
+
+    # A store/stack took if the tome confirms it OR the card has left our hand (stacking
+    # onto a matching card may print different flavor, but the held card is consumed
+    # either way). Brief poll because the hand state updates asynchronously.
+    def self.store_took?(res, id)
+      return true if strip(res).any? { |l| Grinsawl::Tome.stored?(l) }
+
+      20.times do
+        return true unless held.any? { |o| o.id.to_s == id.to_s }
+
+        sleep 0.1
+      end
+      false
     end
 
     # File grinsawl cards from the card sack INTO the tome. which = :foiled (default,
-    # finished cards) or :all. Updates the cached snapshot + ledger in place. Runs on
-    # the main loop (queued), wrapped in with_pause.
+    # finished cards) or :all. Cards with an identical depicted name and the same foil
+    # STACK onto an existing slot that has room; otherwise an empty slot is used. One
+    # leaf walk builds the slot model (also refreshing the cache); then each card is
+    # placed and we turn to its leaf before tapping. Runs on the main loop (queued),
+    # wrapped in with_pause.
     def self.store_cards(which = :foiled)
       t = tome
       return respond("[grinsawl] no #{tome_label} assigned -- assign it in Setup.") unless t
@@ -729,26 +940,49 @@ if defined?(Script)
         return
       end
 
-      respond "[grinsawl] storing #{candidates.size} #{which} card(s) into #{t.name}..."
+      respond "[grinsawl] storing #{candidates.size} #{which} card(s) into #{t.name} (stacking matching cards)..."
       stored = 0
+      stacked = 0
+      aborted = false
+      # Store needs BOTH hands (ledger + card), so the runestaff (if out) is the one place
+      # we set it down -- stowed up front, restored in the ensure -- to keep it out the rest
+      # of the time.
+      staff = nil
       with_pause do
-        tome_io("open ##{t.id}", /ripple|cover|latch|flatten|You open|already open|leaf|can't|don't|What were you|seem to|no way/i)
+        staff = held_runestaff
+        if staff
+          respond '[grinsawl] setting your runestaff down to free both hands for storing...'
+          stow_to_sack(staff.id)
+        end
+        unless ensure_tome_in_hand(t) # filing needs the ledger held, not just referenced by id
+          aborted = true
+          next
+        end
+        walk = walk_tome(t)                       # one pass: authoritative slot model + fresh cache
+        model = walk[:model]
+        state[:tome_cards] = walk[:cards]
+        state[:tome_scanned_at] = Time.now.to_i
         candidates.each do |c|
-          slot, leafno = find_empty_slot(t)
-          unless slot
-            respond "[grinsawl] #{t.name} is full -- no empty slots left."
+          place = Summary.place_card(model, c[:creature], c[:foil])
+          unless place
+            respond "[grinsawl] #{t.name} is full -- no slot for #{c[:creature]}."
+            break
+          end
+          unless goto_leaf(t, place[:leaf])
+            respond "[grinsawl] couldn't turn to leaf #{place[:leaf]}; stopping."
             break
           end
           unless get_from_sack(c[:id])
             respond "[grinsawl] couldn't pull #{c[:creature]} from your #{sack_label}; skipping."
             next
           end
-          res = tome_io("tap ##{t.id} at #{slot}", /grafted likeness remains|already|can't|full|no room|What were you/i)
-          if strip(res).any? { |l| Grinsawl::Tome.stored?(l) }
-            state[:tome_cards].reject! { |tc| tc[:id].to_s == c[:id].to_s } # no duplicate-id entries
-            state[:tome_cards] << { slot: slot, leaf: leafno, id: c[:id], creature: c[:creature], foil: c[:foil], qty: 1 }
+          res = tome_io("tap ##{t.id} at #{place[:slot]}",
+                        /grafted likeness remains|join|combine|merg|alongside|existing|stack|already|can't|full|no room|doesn't match|What were you/i)
+          if store_took?(res, c[:id])
+            apply_store(model, place, c)
             ledger.delete(c[:id])
             stored += 1
+            stacked += 1 if place[:mode] == :stack
           else
             respond "[grinsawl] store of #{c[:creature]} didn't take (#{strip(res).reject(&:empty?).first}); stopping."
             break
@@ -756,27 +990,160 @@ if defined?(Script)
         end
         # leave the tome open (closing is unnecessary)
       end
+      if staff # put the runestaff back in hand (it is the user's default)
+        dothistimeout("get ##{staff.id}", 5, /You (?:get|pick up|remove|wield|sling)|already|What were you/i)
+        respond '[grinsawl] runestaff back in hand.'
+      end
+      return if aborted
+
       save_tome_cache
-      respond "[grinsawl] stored #{stored} card(s) into your #{t.name}."
+      tail = stacked.positive? ? " (#{stacked} stacked onto matching cards)" : ''
+      respond "[grinsawl] stored #{stored} card(s) into your #{t.name}#{tail}."
+    end
+
+    # Record a successful store in both the live model (so the next card in the batch
+    # sees the update) and the persisted cache: bump qty on a stack, else add the slot.
+    def self.apply_store(model, place, card)
+      ment = model.find { |e| e[:leaf] == place[:leaf] && e[:slot] == place[:slot] }
+      tent = (state[:tome_cards] ||= []).find { |tc| tc[:leaf] == place[:leaf] && tc[:slot] == place[:slot] }
+      if place[:mode] == :stack
+        ment[:card][:qty] = ment[:card][:qty].to_i + 1 if ment && ment[:card]
+        tent[:qty] = tent[:qty].to_i + 1 if tent
+      else
+        entry = { slot: place[:slot], leaf: place[:leaf], id: card[:id], creature: card[:creature], foil: card[:foil], qty: 1 }
+        ment[:card] = entry if ment
+        state[:tome_cards].reject! { |tc| tc[:id].to_s == card[:id].to_s } # no duplicate-id entries
+        state[:tome_cards] << entry
+      end
+    end
+
+    # ---- retrieve (pull a filed card back to hand) ----
+    # Drop one copy of a retrieved card from the cached snapshot (decrement a stacked
+    # slot, else remove the entry). Keyed on the STABLE leaf+slot, not the card's exist
+    # id (tome card ids are regenerated on every render -- see retrieve_one).
+    def self.remove_tome_card(card)
+      arr = state[:tome_cards] || []
+      idx = arr.index { |c| c[:leaf] == card[:leaf] && c[:slot] == card[:slot] } ||
+            arr.index { |c| c[:id].to_s == card[:id].to_s }
+      return unless idx
+
+      if arr[idx][:qty].to_i > 1
+        arr[idx] = arr[idx].merge(qty: arr[idx][:qty].to_i - 1)
+      else
+        arr.delete_at(idx)
+      end
+    end
+
+    # Parse "[bronze|silver|gold|card] <creature>" and pull the matching filed card to
+    # hand. Runs on the main loop (queued), wrapped in with_pause. The card is left in
+    # hand so you can use, trade, or sell it; a later store/scan re-files or re-counts it.
+    def self.run_retrieve(args)
+      t = tome
+      return respond("[grinsawl] no #{tome_label} assigned -- assign it in Setup.") unless t
+      return respond("[grinsawl] no #{tome_label} scan yet -- scan it (Setup) so I know what's filed.") if tome_cards.empty?
+
+      parts = args.to_s.split
+      first = parts[0].to_s.downcase
+      tier = Grinsawl::Tier.normalize(first)
+      unfoiled = %w[card white unfoiled none plain].include?(first)
+      creature = ((tier || unfoiled) ? parts[1..] : parts).to_a.join(' ').strip.downcase
+      if creature.empty?
+        return respond('[grinsawl] usage: grinsawl retrieve [bronze|silver|gold|card] <creature>')
+      end
+
+      card = Summary.pick_card(tome_cards, creature, tier: tier, unfoiled: unfoiled)
+      unless card
+        desc = tier ? tier.to_s : (unfoiled ? 'unfoiled' : 'matching')
+        return respond("[grinsawl] no #{desc} #{creature} card filed in your #{t.name}.")
+      end
+      retrieve_one(t, card)
+    end
+
+    # A tome card's exist id is EPHEMERAL -- the ledger regenerates it on every leaf
+    # render, so the id captured at scan time is stale (a stale `get #<id>#` gives
+    # "Get what?"). Only the leaf+slot is stable. So turn to the card's leaf, INSPECT to
+    # read the CURRENT id for that slot, and get it immediately (no render in between).
+    def self.retrieve_one(t, card)
+      unless free_hand!
+        respond '[grinsawl] retrieve skipped: both hands are full.'
+        return
+      end
+      unless card[:leaf] && goto_leaf(t, card[:leaf])
+        respond "[grinsawl] couldn't turn to leaf #{card[:leaf]} for #{card[:creature]} -- rescan your #{t.name}."
+        return
+      end
+      insp = tome_io("inspect ##{t.id}", /open leaf|thumb your fingers|\bleaf\b|empty slot|grinsawl|study/i)
+      fresh = (Grinsawl::Tome.leaf(insp)[:slots] || [])[card[:slot].to_i - 1]
+      unless fresh && fresh[:id]
+        respond "[grinsawl] slot #{card[:slot]} on leaf #{card[:leaf]} is empty now -- rescan your #{t.name}."
+        return
+      end
+      if card[:creature] && fresh[:creature] && !Match.identical?(card[:creature], fresh[:creature])
+        respond "[grinsawl] leaf #{card[:leaf]} slot #{card[:slot]} now holds #{fresh[:creature]}, not #{card[:creature]} -- rescan your #{t.name}."
+        return
+      end
+      # fresh[:id] carries the anchor's trailing '#', so `get #<id>` is `get #424352439#`.
+      res = with_pause do
+        tome_io("get ##{fresh[:id]}",
+                /separates cleanly|don't (?:see|have)|can't|isn't (?:here|in)|no .*grinsawl|not your|What were you|Get what/i)
+      end
+      got = strip(res).map { |l| Grinsawl::Tome.retrieved?(l) }.compact.first
+      if got
+        remove_tome_card(card)
+        g = nil
+        15.times { g = held_grinsawl; break if g; sleep 0.1 } # GameObj hand updates async
+        ledger[(g ? g.id.to_s : "ret_#{card[:leaf]}_#{card[:slot]}")] = { creature: got[:creature], foil: got[:foil] }
+        save_tome_cache
+        respond "[grinsawl] retrieved a #{got[:foil] || 'unfoiled'} #{got[:creature]} card to your hand."
+      else
+        respond "[grinsawl] retrieve didn't take (#{strip(res).reject(&:empty?).first}); rescan if your #{t.name} changed."
+      end
     end
 
     # ---- present creatures ----
+    # A dead creature still lingers as a target but capturing/foiling it just burns the
+    # cooldown, so it must never be chosen or acted on. Lich marks the kill in .status.
+    def self.corpse?(obj)
+      return false unless obj
+
+      (obj.status.to_s =~ /dead/i) || (obj.name.to_s =~ /\bcorpse\b/i) ? true : false
+    rescue StandardError
+      false
+    end
+
     def self.present_objs
       (GameObj.targets.to_a + GameObj.npcs.to_a).compact.uniq(&:id)
-        .select { |o| !o.name.to_s.empty? && Match.wanted?(o.name, state[:want], state[:avoid]) }
+        .select { |o| !o.name.to_s.empty? && !corpse?(o) && Match.wanted?(o.name, state[:want], state[:avoid]) }
     end
 
     # ---- executors ----
+    # Activation terminal patterns. They include the LINK-BREAK ("the tether becomes
+    # impossible...the radiance fades into nothingness" / "leaving your grinsawl unharmed")
+    # and NO-TARGET phrasings so an interrupted attempt ends in ~1s instead of waiting the
+    # full timeout. NO_FIRE means the activation never went off -- do NOT spend a cooldown.
+    NO_FIRE_RX = /need to specify a target|activate your Collector vissi/i
+    CAPTURE_END_RX = /solidifies into a radiant white grinsawl bearing the image of|failed card capture|the (?:magical )?link (?:fades|expires)|tether (?:becomes impossible|untwines)|too much distance between you|radiance fades into nothingness|need to specify a target|Collector vissi|you can't|cannot|no longer here|isn't here|What were you/i
+    FOIL_END_RX = /your card now bears a luxuriant (?:bronze|silver|gold) foil|identical creature|tether (?:becomes impossible|untwines)|too much distance between you|leaving your grinsawl unharmed|need to specify a target|Collector vissi|you can't|cannot|no longer here|isn't here|What were you/i
+
+    # The user keeps a runestaff out for casting, so it is never stowed for capture/foil
+    # (those free the OTHER hand). It is identified so store can set it down and restore it.
+    def self.held_runestaff
+      held.find { |o| o.noun.to_s =~ /runestaff/i || o.name.to_s =~ /runestaff/i }
+    end
+
     def self.do_capture(obj)
-      unless free_hand!
-        respond '[grinsawl] capture skipped: no free hand.'
+      return respond('[grinsawl] capture skipped: that target is a corpse.') if corpse?(obj)
+
+      unless free_hand! # stows a loose grinsawl, never the runestaff
+        respond '[grinsawl] capture skipped: no free hand (keeping your runestaff out).'
         return
       end
       result = with_pause do
-        dothistimeout(
-          "#{cap_verb} my aversaris arcarium at ##{obj.id}", 35,
-          /solidifies into a radiant white grinsawl bearing the image of|failed card capture|the (?:magical )?link (?:fades|expires)|you can't|cannot|no longer here|isn't here|What were you/i
-        )
+        dothistimeout("#{cap_verb} my aversaris arcarium at ##{obj.id}", 35, CAPTURE_END_RX)
+      end
+      if result.to_s =~ NO_FIRE_RX
+        respond '[grinsawl] capture did not fire (no valid target); will retry.'
+        return # activation never went off -- do not spend the cooldown
       end
       start_cd(:aversaris)
       res = Parse.capture_result(result)
@@ -788,22 +1155,45 @@ if defined?(Script)
         end
         respond "[grinsawl] captured #{res[:creature]} (stock now #{stock})"
       else
-        respond "[grinsawl] capture of #{Match.normalize(obj.name)} did not take (#{result.to_s.strip[0, 40]})"
+        respond "[grinsawl] capture of #{Match.normalize(obj.name)} did not take (link broke or resisted)."
       end
     end
 
+    # Put an unfoiled card of `cname` into hand to foil: prefer a LOOSE copy (sack/hand),
+    # else pull one out of the TOME. Returns the held card's id, or nil if none anywhere.
+    def self.bring_unfoiled_to_hand(cname)
+      loose = unfoiled_goal_ids.find { |cid| Match.identical?(ledger[cid][:creature], cname) }
+      if loose
+        return loose if held.any? { |o| o.id.to_s == loose } # already in hand
+
+        free_hand! # free the non-runestaff hand to hold the card
+        return loose if get_from_sack(loose)
+      end
+      # fall back to an unfoiled copy filed in the tome (retrieve_one frees a hand itself)
+      t = tome
+      tcard = t && tome_unfoiled_goal.find { |c| Match.identical?(c[:creature], cname) }
+      if tcard && retrieve_one(t, tcard)
+        g = held_grinsawl
+        return g.id.to_s if g
+      end
+      nil
+    end
+
     def self.do_foil(obj)
+      return respond('[grinsawl] foil skipped: that target is a corpse.') if corpse?(obj)
+
       cname = Match.normalize(obj.name)
-      id = unfoiled_goal_ids.find { |cid| Match.identical?(ledger[cid][:creature], cname) }
-      unless id && (held.any? { |o| o.id.to_s == id } || get_from_sack(id))
-        respond "[grinsawl] no unfoiled #{cname} card available to foil."
+      id = bring_unfoiled_to_hand(cname)
+      unless id
+        respond "[grinsawl] no unfoiled #{cname} card available to foil (loose or filed)."
         return
       end
       result = with_pause do
-        dothistimeout(
-          "#{foil_verb} my vangaris arcarium at ##{obj.id}", 35,
-          /your card now bears a luxuriant (?:bronze|silver|gold) foil|identical creature|you can't|cannot|no longer here|isn't here|What were you/i
-        )
+        dothistimeout("#{foil_verb} my vangaris arcarium at ##{obj.id}", 35, FOIL_END_RX)
+      end
+      if result.to_s =~ NO_FIRE_RX
+        respond '[grinsawl] foil did not fire (no valid target); will retry.'
+        return
       end
       start_cd(:vangaris)
       res = Parse.foil_result(result)
@@ -821,8 +1211,10 @@ if defined?(Script)
         stow_to_sack(g.id) if g
       elsif res == :mismatch
         respond '[grinsawl] foil rejected: that was not an identical creature.'
+      elsif res == :broke
+        respond '[grinsawl] foil link broke (target moved); cooldown spent.'
       else
-        respond "[grinsawl] foil inconclusive (#{result.to_s.strip[0, 40]})"
+        respond "[grinsawl] foil inconclusive."
       end
     end
 
@@ -860,6 +1252,7 @@ if defined?(Script)
           goal[:creature] = cre
           goal[:min] ||= state[:default_min]
           state[:active] = true if configured?
+          state[:config_dirty] = true # remember the goal across sessions
           respond "[grinsawl] target: #{goal[:min]} #{cre}#{configured? ? '' : ' (set a card sack in Setup to start)'}"
         end
       when 'min'
@@ -911,6 +1304,16 @@ if defined?(Script)
       when 'store'
         state[:store_request] = (rest.to_s =~ /all/i ? :all : :foiled)
         respond "[grinsawl] store (#{state[:store_request]}) queued..."
+      when 'organize', 'organizer', 'org'
+        state[:org_open_request] = true
+        respond '[grinsawl] opening the organizer...'
+      when 'retrieve', 'get', 'pull'
+        if rest.to_s.strip.empty?
+          respond '[grinsawl] usage: grinsawl retrieve [bronze|silver|gold|card] <creature>'
+        else
+          state[:retrieve_request] = rest.to_s.strip
+          respond "[grinsawl] retrieve queued: #{rest.strip}"
+        end
       when 'dump'
         respond "[grinsawl] tome: #{state[:tome_name].inspect} id=#{state[:tome_id].inspect} scanned_at=#{state[:tome_scanned_at].inspect}"
         respond "[grinsawl] card sack: #{state[:card_sack_name].inspect} id=#{state[:card_sack_id].inspect}; resolves now? #{!tome.nil?}/#{!card_sack.nil?}"
@@ -919,7 +1322,7 @@ if defined?(Script)
         sc = sack_contents
         respond "[grinsawl] sack LIVE contents: #{sc.size} item(s), #{sc.count { |o| o.name.to_s =~ /grinsawl/i }} grinsawl(s); GameObj.containers loaded? #{!card_sack.nil? && GameObj.containers[card_sack.id].is_a?(Array)}"
       when 'stop'  then state[:active] = false; respond '[grinsawl] stopped (idle).'
-      when 'clear' then self.goal = nil; state[:active] = false; state[:byproducts] = 0; respond '[grinsawl] goal cleared.'
+      when 'clear' then self.goal = nil; state[:active] = false; state[:byproducts] = 0; state[:config_dirty] = true; respond '[grinsawl] goal cleared.'
       else respond "[grinsawl] unknown sub-command '#{cmd}'. try: grinsawl status"
       end
     end
@@ -991,8 +1394,11 @@ if defined?(Script)
       end
       lbl.call("Pausing: #{state[:pause_list].join(', ')}"); row += 1
       lnk.call('[Store foiled]', 'grinsawl store', 0)
-      lnk.call('[Store all]', 'grinsawl store all', 120); row += 1
-      lbl.call('Collection:'); row += 1
+      lnk.call('[Store all]', 'grinsawl store all', 120)
+      lnk.call('[Rescan tome]', 'grinsawl scan tome', 230); row += 1
+      lnk.call('[Organize tome]', 'grinsawl organize', 0); row += 1
+      scanned = state[:tome_scanned_at] ? "#{tome_cards.size} card(s) filed" : 'not scanned yet'
+      lbl.call("Collection (#{scanned}):"); row += 1
       tr = Summary.by_creature(inventory_entries)
       if tr.empty?
         lbl.call(" (nothing tracked -- capture, or scan your #{tome_label} in Setup)"); row += 1
@@ -1002,6 +1408,15 @@ if defined?(Script)
           parts << "#{h[:unfoiled]} unfoiled" if h[:unfoiled].positive?
           %i[gold silver bronze].each { |t| parts << "#{h[t]} #{cap(t.to_s)}" if h[t].positive? }
           lbl.call(" #{cap(c)}: #{parts.join(', ')}"); row += 1
+        end
+      end
+      groups = Summary.group_tome(tome_cards)
+      unless groups.empty?
+        lbl.call("Retrieve from #{tome_label} (click to get):"); row += 1
+        groups.first(8).each do |g|
+          tierword = g[:foil] ? g[:foil].to_s : 'card'
+          label = " #{g[:foil] ? "#{cap(g[:foil].to_s)} " : ''}#{cap(g[:creature])} (#{g[:qty]})"
+          lnk.call(label, "grinsawl retrieve #{tierword} #{g[:creature]}", 12); row += 1
         end
       end
       els
@@ -1054,10 +1469,371 @@ if defined?(Script)
       respond "[grinsawl] window error: #{e.message}" if state[:debug]
     end
 
+    # ============================ ORGANIZER (Phase 4) =========================
+    # A GTK window to arrange the tome to a target layout. Editing happens in the GTK thread
+    # (Gtk.queue); Send/Rebuild/Rescan push intents onto state[:org_queue] which the MAIN
+    # LOOP drains (all game I/O on the script thread, like store/retrieve).
+    def self.gtk_ready? = defined?(Gtk) && Gtk.respond_to?(:queue)
+
+    # walk_tome result -> 0-indexed layout: layout[leaf_i][slot_i] = list of 0-2 cards
+    # { creature:, foil: }. Leaf count = tome capacity (every leaf is walked).
+    def self.build_layout(walk)
+      nleaves = [Array(walk[:leaves]).map(&:to_i).max.to_i, 1].max
+      layout = Array.new(nleaves) { Array.new(12) { [] } }
+      Array(walk[:cards]).each do |c|
+        li = c[:leaf].to_i - 1
+        si = c[:slot].to_i - 1
+        next unless li >= 0 && si.between?(0, 11)
+
+        [c[:qty].to_i, 1].max.times { layout[li][si] << { creature: c[:creature], foil: c[:foil] } }
+      end
+      layout
+    end
+
+    def self.open_organizer
+      return respond('[grinsawl] the organizer needs GTK3, which is not available in this Lich.') unless gtk_ready?
+
+      t = tome
+      return respond("[grinsawl] no #{tome_label} assigned -- set it in Setup first.") unless t
+      return respond('[grinsawl] the organizer is already open.') if state[:organizer]
+
+      respond "[grinsawl] opening the organizer (scanning #{t.name})..."
+      walk = walk_tome(t)
+      state[:tome_cards] = walk[:cards]
+      state[:tome_scanned_at] = Time.now.to_i
+      save_tome_cache
+      layout = build_layout(walk)
+      q = (state[:org_queue] ||= Queue.new)
+      Gtk.queue do
+        state[:organizer] = OrgWindow.new(q, layout, tome_label)
+        state[:organizer].show_all
+      end
+    end
+
+    # Drain organizer intents (main loop, script thread).
+    def self.organizer_drain
+      q = state[:org_queue]
+      return unless q
+
+      until q.empty?
+        intent = (q.pop(true) rescue nil)
+        break unless intent
+
+        case intent[:action]
+        when :organize then organize_execute(intent[:plan])
+        when :rescan   then respond '[grinsawl] organizer: rescanning...'; refresh_organizer
+        when :close    then state[:organizer] = nil; respond '[grinsawl] organizer closed.'
+        end
+      end
+    end
+
+    # Push a fresh scan back into the open window.
+    def self.refresh_organizer
+      win = state[:organizer]
+      return unless win && gtk_ready?
+
+      t = tome or return
+
+      walk = walk_tome(t)
+      state[:tome_cards] = walk[:cards]
+      state[:tome_scanned_at] = Time.now.to_i
+      save_tome_cache
+      layout = build_layout(walk)
+      Gtk.queue { win.load_current(layout) rescue nil }
+    end
+
+    # A sack grinsawl whose type matches (creature, foil), or nil.
+    def self.find_sack_card(creature, foil)
+      sack_contents.select { |o| o.name.to_s =~ /grinsawl/i }.each do |o|
+        info = ledger[o.id.to_s] || look_card(o.id) || {}
+        ledger[o.id.to_s] = info if info[:creature]
+        return { id: o.id.to_s, creature: info[:creature], foil: info[:foil] } \
+          if info[:creature] && Match.identical?(info[:creature], creature) && info[:foil] == foil
+      end
+      nil
+    end
+
+    # Run an organizer plan: lift the misplaced cards out to the sack (PULL), then file the
+    # vacancies from the sack (FILL). Reuses retrieve/store primitives, the ledger-held rule,
+    # and runestaff handling; then rescans the window.
+    def self.organize_execute(plan)
+      t = tome
+      return respond("[grinsawl] no #{tome_label} to organize.") unless t
+
+      pulls = Array(plan && plan[:pull])
+      fills = Array(plan && plan[:fill])
+      return respond('[grinsawl] organizer: nothing to change.') if pulls.empty? && fills.empty?
+
+      respond "[grinsawl] organizing #{t.name}: lifting #{pulls.size}, filing #{fills.size}..."
+      staff = nil
+      filed = 0
+      with_pause do
+        ensure_sack_loaded
+        # PULL: lift each misplaced card out to the sack (one free hand; keep the runestaff).
+        pulls.each do |(leaf, slot)|
+          next unless goto_leaf(t, leaf)
+
+          insp = tome_io("inspect ##{t.id}", /open leaf|thumb your fingers|\bleaf\b|empty slot|grinsawl|study/i)
+          cell = (Grinsawl::Tome.leaf(insp)[:slots] || [])[slot.to_i - 1]
+          next unless cell && cell[:id]
+
+          free_hand!
+          tome_io("get ##{cell[:id]}", /separates cleanly|don't|can't|isn't|no .*grinsawl|not your|Get what/i)
+          g = nil
+          15.times { g = held_grinsawl; break if g; sleep 0.1 } # GameObj hand updates async
+          if g
+            ledger[g.id.to_s] = { creature: cell[:creature], foil: cell[:foil] }
+            stow_to_sack(g.id)
+          end
+        end
+        # FILL: file vacancies from the sack (needs the ledger held; set runestaff down).
+        staff = held_runestaff
+        stow_to_sack(staff.id) if staff
+        if ensure_tome_in_hand(t)
+          ensure_sack_loaded
+          fills.each do |f|
+            card = find_sack_card(f[:creature], f[:foil])
+            unless card
+              respond "[grinsawl] organizer: out of #{f[:foil] || 'unfoiled'} #{f[:creature]} cards to file."
+              next
+            end
+            next unless get_from_sack(card[:id])
+            next unless goto_leaf(t, f[:leaf])
+
+            res = tome_io("tap ##{t.id} at #{f[:slot]}", /grafted likeness remains|join|combine|already|can't|full|no room|doesn't match|What were you/i)
+            filed += 1 if store_took?(res, card[:id])
+          end
+        else
+          respond "[grinsawl] organizer: couldn't hold your #{t.name} to file cards."
+        end
+      end
+      dothistimeout("get ##{staff.id}", 5, /You (?:get|pick up|remove|wield|sling)|already|What were you/i) if staff
+      respond "[grinsawl] organizer: filed #{filed} card(s); rescanning..."
+      refresh_organizer
+    end
+
+    if defined?(Gtk) && Gtk.respond_to?(:queue)
+      # One tome slot button.
+      class OrgSlot < Gtk::Button
+        def initialize(idx, on_click)
+          super()
+          @idx = idx
+          @label = Gtk::Label.new
+          @label.set_use_markup(true)
+          @label.set_line_wrap(true)
+          add(@label)
+          set_size_request(124, 62)
+          signal_connect('clicked') { on_click.call(@idx) }
+        end
+
+        def render(cards, differs, editable)
+          head = "<b>#{@idx + 1}.</b>"
+          cards = Array(cards)
+          body = if cards.empty?
+                   "#{head} <i>empty</i>"
+                 else
+                   c = cards.first
+                   tier = c[:foil] ? c[:foil].to_s.capitalize : 'Unfoiled'
+                   qty = cards.size > 1 ? " x#{cards.size}" : ''
+                   "#{head} #{tier} #{esc(c[:creature])}#{qty}"
+                 end
+          bg = (differs && editable) ? '#cfe9c4' : nil
+          @label.set_markup(bg ? "<span background='#{bg}' foreground='#000000'>#{body}</span>" : body)
+        end
+
+        def esc(s) = s.to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;')
+      end
+
+      # The organizer window: one leaf at a time, a Held tray for cross-leaf moves.
+      class OrgWindow < Gtk::Window
+        def initialize(queue, layout, tome_label)
+          super("Grinsawl Organizer -- #{tome_label}")
+          @queue = queue
+          @tome_label = tome_label
+          @current = deep(layout)
+          @target  = deep(layout)
+          @nleaves = [Array(layout).size, 1].max
+          @leaf = 0
+          @viewing_current = false
+          @held = nil
+          @undo = []
+          set_default_size(560, 440)
+          signal_connect('destroy') { @queue.push(action: :close) }
+          build_ui
+          refresh
+        end
+
+        def deep(layout) = Array(layout).map { |lf| Array(lf).map { |sl| Array(sl).map(&:dup) } }
+
+        def shown = @viewing_current ? @current : @target
+
+        def build_ui
+          vbox = Gtk::Box.new(:vertical, 6)
+          vbox.margin = 8
+          add(vbox)
+
+          top = Gtk::Box.new(:horizontal, 6)
+          @view_toggle = Gtk::ToggleButton.new(label: 'Show current (read-only)')
+          @view_toggle.signal_connect('toggled') do
+            @viewing_current = @view_toggle.active?
+            @view_toggle.label = @viewing_current ? 'Show target (editable)' : 'Show current (read-only)'
+            refresh
+          end
+          top.pack_start(@view_toggle, expand: false, fill: false, padding: 0)
+          top.pack_start(Gtk::Label.new(''), expand: true, fill: true, padding: 0)
+          @prev_btn = Gtk::Button.new(label: '<')
+          @prev_btn.signal_connect('clicked') { @leaf = (@leaf - 1) % @nleaves; refresh }
+          @leaf_label = Gtk::Label.new
+          @next_btn = Gtk::Button.new(label: '>')
+          @next_btn.signal_connect('clicked') { @leaf = (@leaf + 1) % @nleaves; refresh }
+          top.pack_start(@prev_btn, expand: false, fill: false, padding: 0)
+          top.pack_start(@leaf_label, expand: false, fill: false, padding: 0)
+          top.pack_start(@next_btn, expand: false, fill: false, padding: 0)
+          vbox.pack_start(top, expand: false, fill: false, padding: 0)
+
+          @held_label = Gtk::Label.new
+          @held_label.set_use_markup(true)
+          @held_label.set_xalign(0.0)
+          vbox.pack_start(@held_label, expand: false, fill: false, padding: 0)
+
+          @grid = Gtk::Grid.new
+          @grid.column_spacing = 6
+          @grid.row_spacing = 6
+          @slots = (0...12).map do |i|
+            w = OrgSlot.new(i, method(:on_click))
+            @grid.attach(w, i % 4, i / 4, 1, 1)
+            w
+          end
+          vbox.pack_start(@grid, expand: true, fill: true, padding: 0)
+
+          @status = Gtk::Label.new
+          @status.set_use_markup(true)
+          @status.set_xalign(0.0)
+          vbox.pack_start(@status, expand: false, fill: false, padding: 0)
+
+          btns = Gtk::Box.new(:horizontal, 6)
+          [['Send to game', :send], ['Undo', :undo], ['Reset', :reset],
+           ['Rebuild', :rebuild], ['Rescan', :rescan], ['Close', :close]].each do |label, act|
+            b = Gtk::Button.new(label: label)
+            b.signal_connect('clicked') { on_button(act) }
+            btns.pack_start(b, expand: false, fill: false, padding: 0)
+          end
+          vbox.pack_start(btns, expand: false, fill: false, padding: 0)
+        end
+
+        def on_click(i)
+          if @viewing_current
+            set_status('Current is read-only -- press "Show target (editable)" to edit.', '#ffaa44')
+            return
+          end
+          cell = @target[@leaf][i]
+          if @held.nil?
+            return if cell.empty?
+
+            snapshot
+            @held = cell.pop
+          elsif cell.empty?
+            snapshot
+            cell.push(@held)
+            @held = nil
+          elsif same?(cell.first, @held) && cell.size < 2
+            snapshot
+            cell.push(@held)
+            @held = nil
+          elsif cell.size == 1
+            snapshot
+            displaced = cell.pop
+            cell.push(@held)
+            @held = displaced
+          else
+            set_status('That slot is full (two of another card).', '#ffaa44')
+            return
+          end
+          refresh
+        end
+
+        def same?(a, b) = a && b && a[:creature].to_s == b[:creature].to_s && a[:foil] == b[:foil]
+
+        def snapshot
+          @undo << [deep(@target), @held && @held.dup]
+          @undo.shift if @undo.size > 50
+        end
+
+        def on_button(act)
+          case act
+          when :undo
+            if @undo.empty?
+              set_status('Nothing to undo.', '#88bbff')
+            else
+              @target, @held = @undo.pop
+              refresh
+            end
+          when :reset
+            snapshot
+            @target = deep(@current)
+            @held = nil
+            set_status('Target reset to current.', '#88bbff')
+            refresh
+          when :rescan
+            set_status('Rescanning the tome...', '#d4af37')
+            @queue.push(action: :rescan)
+          when :close
+            destroy
+          when :send, :rebuild
+            return set_status('Drop the held card into a slot before sending.', '#ffaa44') if @held
+
+            plan = Grinsawl::Tome::Plan.plan(@current, @target, full: (act == :rebuild))
+            return set_status('Already matches the tome; nothing to do.', '#88bbff') if plan[:pull].empty? && plan[:fill].empty?
+
+            set_status("Queued: lift #{plan[:pull].size}, file #{plan[:fill].size}...", '#d4af37')
+            @queue.push(action: :organize, plan: plan)
+          end
+        end
+
+        # Called from the worker (via Gtk.queue) after execute / rescan.
+        def load_current(layout)
+          @current = deep(layout)
+          @target  = deep(layout)
+          @held = nil
+          @undo = []
+          @nleaves = [Array(layout).size, 1].max
+          @leaf = [[@leaf, 0].max, @nleaves - 1].min
+          set_status('Updated from a fresh scan.', '#88bbff')
+          refresh
+        end
+
+        def refresh
+          @leaf_label.set_text(" Leaf #{@leaf + 1} / #{@nleaves} ")
+          h = @held ? "#{(@held[:foil] || 'unfoiled').to_s.capitalize} #{@held[:creature]}" : '(nothing)'
+          @held_label.set_markup("Held: <b>#{esc(h)}</b>   (click a card to pick up, a slot to drop)")
+          lay = shown
+          @slots.each_with_index do |w, i|
+            differs = !@viewing_current && !same_cell?(@current.dig(@leaf, i), @target.dig(@leaf, i))
+            w.render(lay.dig(@leaf, i), differs, !@viewing_current)
+          end
+          show_all
+        rescue StandardError
+          nil
+        end
+
+        def same_cell?(a, b)
+          Array(a).map { |c| [c[:creature].to_s, c[:foil]] }.sort_by(&:to_s) ==
+            Array(b).map { |c| [c[:creature].to_s, c[:foil]] }.sort_by(&:to_s)
+        end
+
+        def esc(s) = s.to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;')
+
+        def set_status(msg, color = '#cccccc')
+          @status.set_markup("<span foreground='#{color}'>#{esc(msg)}</span>")
+        end
+      end
+    end
+
     # ---- main tick ----
     def self.tick
       return unless state[:active] && goal && configured?
 
+      announce_cooldowns # milestone updates only -- no per-tick countdown spam
       objs  = present_objs
       names = objs.map { |o| Match.normalize(o.name) }.reject(&:empty?).uniq
       action = Planner.next_action(
@@ -1065,18 +1841,11 @@ if defined?(Script)
         stock: stock, aversaris_ready: ready?(:aversaris), vangaris_ready: ready?(:vangaris),
         buffer: state[:buffer]
       )
-      case action
-      when Array
-        kind, name = action
-        obj = objs.find { |o| Match.normalize(o.name) == name }
-        kind == :foil ? do_foil(obj) : do_capture(obj) if obj
-      else
-        msg = "idle (cap #{cd_left(:aversaris)}s / foil #{cd_left(:vangaris)}s, stock #{stock})"
-        if state[:last_status] != msg
-          respond "[grinsawl] #{msg}"
-          state[:last_status] = msg
-        end
-      end
+      return unless action.is_a?(Array) # idle: announce_cooldowns already handled feedback
+
+      kind, name = action
+      obj = objs.find { |o| Match.normalize(o.name) == name }
+      kind == :foil ? do_foil(obj) : do_capture(obj) if obj
     end
   end
 
@@ -1105,6 +1874,9 @@ if defined?(Script)
   before_dying do
     UpstreamHook.remove('grinsawl')
     Grinsawl.persist_config if Grinsawl.state # flush config (before_dying runs on the script thread)
+    if Grinsawl.state && Grinsawl.state[:organizer] && Grinsawl.gtk_ready?
+      Gtk.queue { Grinsawl.state[:organizer]&.destroy rescue nil } rescue nil
+    end
     Grinsawl.close_window
     respond '[grinsawl] stopped.'
   end
@@ -1124,6 +1896,15 @@ if defined?(Script)
         Grinsawl.state[:store_request] = nil
         Grinsawl.store_cards(req)
       end
+      if (req = Grinsawl.state[:retrieve_request])
+        Grinsawl.state[:retrieve_request] = nil
+        Grinsawl.run_retrieve(req)
+      end
+      if Grinsawl.state[:org_open_request]
+        Grinsawl.state[:org_open_request] = false
+        Grinsawl.open_organizer
+      end
+      Grinsawl.organizer_drain
       Grinsawl.persist_config if Grinsawl.state[:config_dirty]
       Grinsawl.tick
       Grinsawl.render_window
