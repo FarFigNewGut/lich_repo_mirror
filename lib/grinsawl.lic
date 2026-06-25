@@ -46,11 +46,11 @@
     - Opens straight to the control panel and remembers your goal between sessions.
 
   author: Zedarius
-  version: 0.5.13
+  version: 0.5.13.3
 =end
 
 module Grinsawl
-  VERSION = '0.5.13'
+  VERSION = '0.5.13.3'
 
   TIER_RANK  = { bronze: 1, silver: 2, gold: 3 }.freeze
   ACTIVATORS = %w[rub tap push pull poke].freeze
@@ -590,7 +590,9 @@ if defined?(Script)
         tome_scanned_at: CharSettings['tome_scanned_at'],
         disable_spell: (CharSettings['disable_spell'] || '').to_s, # which spell to cast on the target first
         disable_enabled: (CharSettings['disable_enabled'] ? true : false), # whether to cast it at all
-        pause_list: (pl = plain_array(CharSettings['pause_list']) { |x| x.to_s }).empty? ? ['energywings'] : pl
+        pause_list: (pl = plain_array(CharSettings['pause_list']) { |x| x.to_s }).empty? ? %w[energywings spellactive] : pl,
+        max_mobs: (CharSettings['max_mobs'] || 0).to_i, # pause if MORE than this many monsters are in the room (0 = off)
+        paused_reason: nil                              # last auto-pause reason announced (edge-triggered, no spam)
       }
     end
 
@@ -818,6 +820,47 @@ if defined?(Script)
       false
     end
 
+    # On your feet? Anything else (sitting/kneeling/prone) usually means combat
+    # has gone sideways, so we hold off capturing/foiling until you stand again.
+    def self.upright?
+      XMLData.indicator['IconSTANDING'].to_s == 'y'
+    rescue StandardError
+      true
+    end
+
+    # Live monsters in the room (ignores corpses/empties).
+    def self.mob_count
+      GameObj.targets.to_a.reject { |o| o.name.to_s.empty? || corpse?(o) }.size
+    rescue StandardError
+      0
+    end
+
+    # Why grinsawl should hold this tick (nil = clear to act). Edge-triggered
+    # announce/clear keeps it from spamming while paused.
+    def self.pause_reason
+      return 'not standing (combat?)' unless upright?
+
+      cap = state[:max_mobs].to_i
+      n = mob_count
+      return "too many monsters here (#{n} > #{cap})" if cap.positive? && n > cap
+
+      nil
+    end
+
+    def self.note_paused(reason)
+      return if state[:paused_reason] == reason
+
+      state[:paused_reason] = reason
+      respond "[grinsawl] holding off: #{reason}."
+    end
+
+    def self.note_resumed
+      return unless state[:paused_reason]
+
+      state[:paused_reason] = nil
+      respond '[grinsawl] clear -- back to it.'
+    end
+
     # Read both Collector vissi (verbs/cooldowns). A ghost can't ANALYZE, so this is skipped
     # while dead and re-run on revival (need_analyze). => true if it actually read them.
     def self.analyze_arcaria
@@ -989,6 +1032,7 @@ if defined?(Script)
       CharSettings['tome_cap']       = state[:tome_cap]
       CharSettings['disable_spell']   = state[:disable_spell].to_s
       CharSettings['disable_enabled'] = state[:disable_enabled] ? true : false
+      CharSettings['max_mobs']        = state[:max_mobs].to_i
       state[:config_dirty] = false
     rescue StandardError => e
       respond "[grinsawl] config save error: #{e.message}"
@@ -1351,23 +1395,25 @@ if defined?(Script)
     # impossible...the radiance fades into nothingness" / "leaving your grinsawl unharmed")
     # and NO-TARGET phrasings so an interrupted attempt ends in ~1s instead of waiting the
     # full timeout. NO_FIRE means the activation never went off -- do NOT spend a cooldown.
+    WARN_SECS = 2 # heads-up before grinsawl issues a capture/foil, so you can weave your own hunting
     NO_FIRE_RX = /need to specify a target|activate your Collector vissi/i
     CAPTURE_END_RX = /solidifies into a radiant white grinsawl bearing the image of|failed card capture|the (?:magical )?link (?:fades|expires)|tether (?:becomes impossible|untwines)|too much distance between you|radiance fades into nothingness|need to specify a target|Collector vissi|you can't|cannot|no longer here|isn't here|What were you/i
     FOIL_END_RX = /your card now bears a luxuriant (?:bronze|silver|gold) foil|identical creature|tether (?:becomes impossible|untwines)|too much distance between you|leaving your grinsawl unharmed|need to specify a target|Collector vissi|you can't|cannot|no longer here|isn't here|What were you/i
 
     # Capture/foil break if the creature flees, so cast the user's configured disabling spell
-    # (e.g. 709) at it FIRST to root it in the room. No-op if none is set. Done before the
-    # attempt (and before a hand is busy with a card) so the cast has a free hand and the
-    # mob is held when the link forms.
+    # (e.g. 709) FIRST to keep it in the room. No-op if disabled/unset. A BARE NUMBER is cast
+    # with INCANT (`incant 709`); anything else is sent verbatim, with `{target}` replaced by
+    # the creature's id so single-target commands can aim (e.g. `cast 901 at {target}`).
     def self.disable_target(obj)
       return unless state[:disable_enabled]
 
       spell = state[:disable_spell].to_s.strip
       return if spell.empty? || obj.nil? || corpse?(obj)
 
+      cmd = spell =~ /\A\d+\z/ ? "incant #{spell}" : spell.gsub('{target}', "##{obj.id}")
       with_pause do
-        dothistimeout("cast #{spell} at ##{obj.id}",
-                      8, /Cast Roundtime|you gesture|Warding (?:failed|is)|fully resists|takes? root|is (?:rooted|held|ensnared|entangled)|cannot move|lack (?:the|sufficient)|don't have (?:enough|the)|isn't here|no longer (?:here|alive)|not a valid|What were you/i)
+        dothistimeout(cmd,
+                      8, /Cast Roundtime|you gesture|you recite|Warding (?:failed|is)|fully resists|takes? root|is (?:rooted|held|ensnared|entangled)|cannot move|lack (?:the|sufficient)|don't have (?:enough|the)|insufficient|isn't here|no longer (?:here|alive)|not a valid|incant what|cast at what|What were you/i)
       end
     end
 
@@ -1532,6 +1578,18 @@ if defined?(Script)
         else
           respond '[grinsawl] usage: grinsawl tomecap <n>'
         end
+      when 'maxmobs', 'maxmob', 'mobs'
+        arg = rest.to_s.strip.downcase
+        if arg.empty?
+          m = state[:max_mobs].to_i
+          respond "[grinsawl] max monsters: #{m.positive? ? "pause when more than #{m} in the room" : 'off'}. Set with grinsawl maxmobs <n> (0 = off)."
+        elsif arg =~ /\A\d+\z/ || %w[off none].include?(arg)
+          state[:max_mobs] = arg =~ /\A\d+\z/ ? arg.to_i : 0
+          state[:config_dirty] = true
+          respond state[:max_mobs].positive? ? "[grinsawl] will pause when more than #{state[:max_mobs]} monster(s) are in the room." : '[grinsawl] max-monsters pause OFF.'
+        else
+          respond '[grinsawl] usage: grinsawl maxmobs <n>  (0 or off to disable)'
+        end
       when 'spell', 'disable'
         raw = rest.to_s.strip
         case raw.downcase
@@ -1574,12 +1632,16 @@ if defined?(Script)
         else
           respond '[grinsawl] hold the item in a hand first, then click again.'
         end
-      when 'pausetoggle'
+      when 'pause', 'unpause', 'pausetoggle'
         n = rest.to_s.strip
-        unless n.empty?
-          state[:pause_list].include?(n) ? state[:pause_list].delete(n) : (state[:pause_list] << n)
+        if n.empty?
+          respond "[grinsawl] pause-list: #{state[:pause_list].empty? ? '(none)' : state[:pause_list].join(', ')}"
+        else
+          present = state[:pause_list].include?(n)
+          add = cmd.downcase == 'unpause' ? false : (cmd.downcase == 'pause' ? true : !present)
+          add ? (state[:pause_list] << n unless present) : state[:pause_list].delete(n)
           state[:config_dirty] = true
-          respond "[grinsawl] pause-list: #{state[:pause_list].join(', ')}"
+          respond "[grinsawl] pause-list: #{state[:pause_list].empty? ? '(none)' : state[:pause_list].join(', ')}"
         end
       when 'want'  then state[:want]  = rest.to_s.split(/\s*,\s*/).reject(&:empty?); respond "[grinsawl] want: #{state[:want].join(', ')}"
       when 'avoid' then state[:avoid] = rest.to_s.split(/\s*,\s*/).reject(&:empty?); respond "[grinsawl] avoid: #{state[:avoid].join(', ')}"
@@ -1745,6 +1807,10 @@ if defined?(Script)
       lbl.call("Disabling spell: #{state[:disable_spell].to_s.empty? ? '(unset)' : state[:disable_spell]}  (#{state[:disable_enabled] ? 'ON' : 'OFF'})")
       lnk.call(state[:disable_enabled] ? '[turn off]' : '[turn on]', state[:disable_enabled] ? 'grinsawl spell off' : 'grinsawl spell on', 250); row += 1
       lbl.call('  set the spell with  ;grinsawl spell <number>'); row += 1
+      row += 1
+      lbl.call("Pause if more than X monsters in room: #{state[:max_mobs].to_i.positive? ? state[:max_mobs] : 'off'}"); row += 1
+      lbl.call('  set with  ;grinsawl maxmobs <n>  (0 = off)'); row += 1
+      lbl.call('Auto-pause when not standing (sitting/kneeling/prone): always on'); row += 1
       row += 1
       lbl.call('Pause during capture (click to toggle):'); row += 1
       running_scripts.first(8).each do |n|
@@ -2254,6 +2320,14 @@ if defined?(Script)
       return if dead?
       return unless state[:active] && goal && configured?
 
+      # Safety holds: don't fire while you're knocked out of a standing position,
+      # or when the room is more crowded than your max-monsters setting.
+      if (reason = pause_reason)
+        note_paused(reason)
+        return
+      end
+      note_resumed
+
       announce_cooldowns # milestone updates only -- no per-tick countdown spam
       objs  = present_objs
       names = objs.map { |o| Match.normalize(o.name) }.reject(&:empty?).uniq
@@ -2266,7 +2340,12 @@ if defined?(Script)
 
       kind, name = action
       obj = objs.find { |o| Match.normalize(o.name) == name }
-      kind == :foil ? do_foil(obj) : do_capture(obj) if obj
+      return unless obj
+
+      # Heads-up + grace period so you can weave your own hunting around it.
+      respond ">>> [grinsawl] #{kind == :foil ? 'FOILING' : 'CAPTURING'} #{cap(name)} in #{WARN_SECS} seconds <<<"
+      sleep WARN_SECS
+      kind == :foil ? do_foil(obj) : do_capture(obj)
     end
   end
 

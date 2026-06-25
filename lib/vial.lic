@@ -1,0 +1,302 @@
+=begin
+  Vial-based blood harvest with smart-flask selection.
+
+  Same overall flow as the user's previous `;vial` alias (stow, get vial,
+  harvest, sheathe, pour, stow, gird) but:
+
+    - Resilient to RT/stuns/web via dothistimeout's built-in retries.
+    - Before pouring, classifies flasks IN HAND: it picks up each crystal
+      flask in UserVars.animateSack one at a time and LOOKs in the held
+      flask, classifying:
+        :crimson -- "filled with a dark crimson fluid"   (creature blood)
+        :other   -- "filled with" something else         (water, etc.)
+        :empty   -- only the chain/cork descriptor line  (untouched flask)
+      Because we only ever inspect the flask we are HOLDING (and re-look
+      until the response is clean), a slow look response can't be
+      misattributed to the wrong flask -- the old scan-by-id approach
+      could pour blood into a water flask when a laggy look straggled into
+      the next flask's read. Any :other flask is put straight back so we
+      never ruin it.
+    - Picks the user's *one* crimson flask (if present); falls back to an
+      empty flask only if there's no crimson at all. If the chosen
+      crimson flask rejects with "different kinds of blood", that means
+      this corpse is a different species from what's in the flask --
+      give up cleanly (dump vial, search corpse). We deliberately do NOT
+      open a fresh empty flask or try another crimson, because the user
+      only wants one curated blood flask at a time.
+    - Emits "VIAL HARVEST READY" on success so a Grimoire highlight
+      rule can flash it.
+
+  USAGE: ;vial <creature>
+  Example: ;vial ranger
+=end
+
+version = '1.7.1'
+
+creature = script.vars[1..-1].to_a.join(' ').strip
+if creature.empty?
+  echo 'Usage: ;vial <creature>'
+  exit
+end
+
+sack = (UserVars.animateSack || 'pouch').to_s
+echo "vial v#{version}: harvesting from #{creature} via sack '#{sack}'"
+
+# ---------- helpers ----------
+
+def clear_rt
+  return if dead?
+  sleep 0.1 while checkrt > 0
+  sleep 0.2
+end
+
+def cmd(command, success_regex = /.*/, timeout: 8)
+  return nil if dead?
+  clear_rt
+  dothistimeout(command, timeout, success_regex)
+end
+
+STOW_OK    = /You put|You are not holding|aren't holding/
+GET_OK     = /You remove|You get|I can't find|don't have|free hand|both your hands/
+STANCE_OK  = /defensive stance/
+SHEATHE_OK = /You sheathe|stow it in|leaves your hands|already sheathed|aren't holding any weapons|both your hands/
+POUR_OK    = /You (?:carefully )?pour|different kinds of .* blood|would not want to mix|filled to capacity|nothing in/
+TURN_OK    = /You turn your.*over|empty/
+PUT_OK     = /You put|don't have|aren't holding/
+GIRD_OK    = /You gird|You draw|You retrieve|At your touch|don't have|empty-handed/
+SEARCH_OK  = /You search|already searched|no longer here|What were you/
+
+# Lich-side hand checks so we never send a command the game would just no-op.
+def holding_flask?
+  [GameObj.right_hand, GameObj.left_hand].any? { |o| o && o.noun == 'flask' }
+end
+
+def holding_vial?
+  [GameObj.right_hand, GameObj.left_hand].any? { |o| o && o.noun == 'vial' }
+end
+
+# A real weapon in hand (not the vial/flask we juggle). Used to decide whether a
+# sheathe/gird is even needed.
+def weapon_in_hand?
+  [GameObj.right_hand, GameObj.left_hand].any? { |o| o && o.id && !%w[vial flask].include?(o.noun.to_s) }
+end
+
+def cleanup(creature, sack, sheathed:, dump_vial: false, search_target: false)
+  cmd 'turn my vial', TURN_OK if dump_vial && holding_vial?
+  cmd "put my vial in my #{sack}", PUT_OK if holding_vial?
+  cmd "put my flask in my #{sack}", PUT_OK if holding_flask?
+  cmd "search #{creature}", SEARCH_OK if search_target
+  cmd 'gird', GIRD_OK if sheathed && !weapon_in_hand?
+end
+
+# Classify the flask CURRENTLY IN HAND by LOOKing inside it.
+#
+# The key difference from the old scan-by-id approach: we only ever inspect
+# the flask we are HOLDING, and if the look response is slow (busy combat
+# stream) we RE-LOOK rather than give up and move on. The held flask doesn't
+# change between tries, so re-looking is safe, and waiting for this look's
+# terminator ("chain is affixed") guarantees its full response is consumed
+# before we touch the next flask. That removes the straggler race that let a
+# laggy look get attributed to the wrong flask.
+def held_flask_state
+  3.times do
+    clear_rt
+    clear   # drop any stale lines so we read only this look's fresh response
+    fput 'look in my flask'
+    collected = []
+    begin
+      Timeout::timeout(6) do
+        loop do
+          line = get
+          collected << line
+          # A crystal-flask look ALWAYS ends with the chain/cork descriptor.
+          # Break ONLY on that. The generic "can't find / find what / don't have"
+          # lines are noise from concurrent caster scripts (ecaster etc.); breaking
+          # on them was misreading a held flask -- especially an EMPTY one, whose
+          # look has no "filled with" line -- as :missing.
+          break if line =~ /chain is affixed/
+        end
+      end
+    rescue Timeout::Error
+      next   # retry -- the flask is still in hand, so this is safe
+    end
+    joined = collected.join(' ')
+    return :crimson if joined =~ /filled with a dark crimson fluid/
+    return :other   if joined =~ /flask is filled with/
+    return :empty   if joined =~ /chain is affixed/
+  end
+  :unknown
+end
+
+# Pick up each crystal flask in the sack, classify it in hand, and KEEP the
+# first crimson one in hand (ready to pour). If none are crimson, fall back to
+# an empty flask. Anything else (water/other) is put straight back. Returns
+# true with a usable flask held, false otherwise.
+def select_flask(sack)
+  sack_item = GameObj.inv.find { |o| o.noun == sack }
+  unless sack_item
+    echo "vial: couldn't find sack '#{sack}' in top-level inventory"
+    return false
+  end
+  flasks = (GameObj.containers[sack_item.id] || []).select { |o| o.noun == 'flask' }
+  if flasks.empty?
+    echo "vial: no flasks found inside #{sack}"
+    return false
+  end
+  echo "vial: checking #{flasks.size} flask(s) in #{sack}, one at a time"
+  empty_id = nil
+  flasks.each do |f|
+    got = cmd "get ##{f.id}", GET_OK
+    unless holding_flask?
+      echo "vial:   flask ##{f.id}: couldn't pick up (#{got.to_s.strip}); skipping"
+      next
+    end
+    state = held_flask_state
+    echo "vial:   flask ##{f.id} -> #{state}"
+    return true if state == :crimson          # keep it in hand, ready to pour
+    empty_id ||= f.id if state == :empty
+    cmd "put my flask in my #{sack}", PUT_OK  # put it back; prefer a crimson if one exists
+  end
+  if empty_id                                  # no crimson found -- use an empty
+    cmd "get ##{empty_id}", GET_OK
+    if holding_flask?
+      echo "vial: no crimson found; using empty flask ##{empty_id}"
+      return true
+    end
+  end
+  echo 'vial: no crimson or empty flask available'
+  false
+end
+
+# ---------- main flow ----------
+
+sheathed = false
+
+# Get the vial in hand. Skip entirely if we're already holding it, and only free
+# a hand if one is actually occupied.
+unless holding_vial?
+  cmd 'stow left', STOW_OK unless GameObj.left_hand.id.nil?
+  cmd 'get my vial from my pouch', GET_OK
+end
+
+def attempt_harvest(creature)
+  clear_rt
+  return nil if dead?
+  union = Regexp.union(
+    /Roundtime: \d+/,                               # success
+    /already have some .* in your vial/,            # vial not empty
+    /not enough blood/,                             # corpse drained
+    /still alive/,                                  # creature not dead
+    /Try holding it first/                          # no vial held
+  )
+  dothistimeout("harvest blood from #{creature} with vial", 8, union)
+end
+
+result = attempt_harvest(creature)
+
+if result.to_s =~ /already have some .* in your vial/
+  echo 'vial: vial had old blood; dumping and retrying'
+  cmd 'turn my vial', TURN_OK
+  result = attempt_harvest(creature)
+end
+
+if result.to_s =~ /still alive|Try holding|not enough blood/
+  echo "vial: #{result.strip}"
+  cleanup(creature, sack, sheathed: sheathed)
+  exit
+end
+echo "vial: #{result.strip}" if result && result !~ /Roundtime: \d+/
+
+clear_rt
+
+# Defensive stance only if we're not already there.
+cmd 'stance def', STANCE_OK unless XMLData.stance_value == 100
+
+# Sheathe to free the weapon hand, but only if a weapon is actually in hand.
+# (Ruskos's runestaff flares hide the standard "You sheathe" line, so we verify
+# via GameObj rather than the message, and retry once if it's still held.)
+if weapon_in_hand?
+  cmd 'sheathe', SHEATHE_OK
+  sheathed = true
+  if weapon_in_hand?
+    echo 'vial: sheathe did not free the weapon hand; retrying'
+    cmd 'sheathe', SHEATHE_OK
+  end
+end
+
+# Acquire a usable flask IN HAND. Fast path: if we remember which flask is the
+# crimson blood flask AND Lich still sees that id in the sack, grab it directly
+# and let the (self-validating) pour confirm it -- no scan, no looks. Otherwise
+# scan flask-by-flask.
+sack_item = GameObj.inv.find { |o| o.noun == sack }
+flask_ids = sack_item ? (GameObj.containers[sack_item.id] || []).select { |o| o.noun == 'flask' }.map(&:id) : []
+known = CharSettings['crimson_flask_id']
+used_known = false
+if known && flask_ids.include?(known)
+  cmd "get ##{known}", GET_OK
+  used_known = holding_flask?
+end
+
+unless used_known || select_flask(sack)
+  echo 'vial: no crimson or empty flask available in animateSack'
+  cleanup(creature, sack, sheathed: sheathed, dump_vial: true, search_target: true)
+  exit
+end
+
+pour = cmd 'pour my vial into my flask', POUR_OK
+
+# If the remembered flask turned out wrong (water or different blood), drop the
+# cache, put it back, scan properly, and pour again.
+if used_known && pour.to_s =~ /different kinds|would not want to mix/
+  echo 'vial: remembered flask no longer matches; rescanning'
+  cmd "put my flask in my #{sack}", PUT_OK if holding_flask?
+  CharSettings['crimson_flask_id'] = nil
+  unless select_flask(sack)
+    cleanup(creature, sack, sheathed: sheathed, dump_vial: true, search_target: true)
+    exit
+  end
+  pour = cmd 'pour my vial into my flask', POUR_OK
+end
+
+# Flask-full is a "you're done collecting" signal, not a failure. The
+# vial's blood couldn't be transferred; dump it, stow everything, and
+# emit a distinct alert so a Grimoire highlight rule can flash it.
+if pour.to_s =~ /filled to capacity/
+  echo 'vial: chosen flask is full -- stop collecting blood'
+  cmd 'turn my vial', TURN_OK if holding_vial?
+  cmd "put my vial in my #{sack}", PUT_OK if holding_vial?
+  cmd "put my flask in my #{sack}", PUT_OK if holding_flask?
+  cmd 'gird', GIRD_OK if sheathed && !weapon_in_hand?
+  echo '>>>> VIAL FLASK FULL -- DONE <<<<'
+  echo "vial: #{creature} flask is at capacity; no more harvesting needed"
+  exit
+end
+
+unless pour.to_s =~ /carefully pour/
+  case pour.to_s
+  when /different kinds/
+    echo "vial: chosen flask holds a different creature's blood"
+  when /would not want to mix/
+    echo 'vial: chosen flask holds something incompatible (water?); scan misread it'
+  else
+    echo "vial: unexpected pour response: #{pour.to_s.strip}"
+  end
+  echo 'vial: giving up -- dumping vial and searching corpse'
+  cleanup(creature, sack, sheathed: sheathed, dump_vial: true, search_target: true)
+  exit
+end
+
+# Success. Remember which flask we poured into so future runs skip the scan
+# entirely (the next pour will validate it; if it's ever wrong we rescan).
+held = [GameObj.right_hand, GameObj.left_hand].find { |o| o && o.noun == 'flask' }
+CharSettings['crimson_flask_id'] = held.id if held
+
+# Stow everything and re-arm (only what's actually needed).
+cmd 'turn my vial', TURN_OK if holding_vial?
+cmd "put my vial in my #{sack}", PUT_OK if holding_vial?
+cmd "put my flask in my #{sack}", PUT_OK if holding_flask?
+cmd 'gird', GIRD_OK if sheathed && !weapon_in_hand?
+
+# Visible success marker -- add a Grimoire highlight on "VIAL HARVEST READY".
+echo '>>>> VIAL HARVEST READY <<<<'
+echo "vial: blood from #{creature} stored; ready for next target"
