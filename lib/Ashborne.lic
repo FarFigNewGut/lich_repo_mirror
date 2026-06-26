@@ -8273,6 +8273,11 @@ module Ashborne_toolkit
 
   def defend_while_waiting_for_group
     return false if GameObj.targets.empty?
+    if $ashborne_group_danger_active == "1" || Ashborne_toolkit.medical_retreat_reason?
+      Ashborne_toolkit.stance_defensive
+      respond "Emergency retreat active; Ashborne will not fight while waiting to leave."
+      return false
+    end
 
     respond "Group wait interrupted by combat; defending until the room is safe."
     defense_deadline = Time.now + 30
@@ -8528,8 +8533,8 @@ module Ashborne_toolkit
         nil
       end
 
-      if emergency_retreat && !GameObj.targets.empty?
-        Ashborne_toolkit.fight_or_recover_for_emergency_retreat(blockers)
+      if emergency_retreat
+        Ashborne_toolkit.recover_from_emergency_blocker(blockers)
       else
         Ashborne_toolkit.defend_while_waiting_for_group if !GameObj.targets.empty?
         Ashborne_toolkit.stand_check if blockers.include?("not standing")
@@ -9867,7 +9872,57 @@ module Ashborne_toolkit
     Ashborne_toolkit.apply_group_danger_abort
   end
 
+  def solo_emergency_return_to_town
+    $ashborne_group_danger_active = "1"
+    $ashborne_return_why ||= "Emergency retreat."
+    Ashborne_toolkit.stance_defensive
+    waitrt? if checkrt.to_f > 0
+    waitcastrt? if checkcastrt.to_f > 0
+
+    retreat_origin = Room.current && Room.current.id
+    retreat_attempt = 0
+    loop do
+      retreat_attempt += 1
+      Ashborne_toolkit.stance_defensive
+      unless Ashborne_toolkit.travel_departure_ready?("emergency retreat")
+        Ashborne_toolkit.stance_defensive
+        Ashborne_toolkit.script_kill
+        Ashborne_toolkit.top_menu
+        respond "Solo emergency retreat could not safely start travel. Staying defensive instead of returning to combat."
+        Ashborne_toolkit.bottom_menu
+        exit
+      end
+
+      do_client ";go2 town"
+      Ashborne_toolkit.unpause_go2
+      wait_while { running? "go2" }
+
+      moved_from_danger = Room.current && Room.current.id &&
+        retreat_origin && Room.current.id.to_s != retreat_origin.to_s
+      break if Ashborne_toolkit.safe_retreat_room_reached? || moved_from_danger
+
+      respond "Solo emergency retreat did not move to safety; retrying go2 town." if retreat_attempt == 1 || retreat_attempt % 3 == 0
+      sleep 1
+    end
+
+    Ashborne_toolkit.script_kill
+    Ashborne_toolkit.top_menu
+    respond "I returned to town because: #{$ashborne_return_why}"
+    Ashborne_toolkit.bottom_menu
+    Ashborne_toolkit.ashborne_stow_all
+    exit
+  end
+
+  def emergency_return_to_town_if_needed
+    return false unless $ashborne_group_danger_active == "1"
+    return Ashborne_toolkit.solo_emergency_return_to_town if $ashborne_group_ai == "0"
+
+    Ashborne_toolkit.group_return_to_town
+  end
+
   def group_return_to_town
+    return Ashborne_toolkit.solo_emergency_return_to_town if $ashborne_group_ai == "0"
+
     $ashborne_group_danger_active = "1"
     $ashborne_return_why ||= "Group danger detected."
     Ashborne_toolkit.stance_defensive
@@ -9883,10 +9938,28 @@ module Ashborne_toolkit
       )
     end
 
-    return nil unless Ashborne_toolkit.group_wait_for_followers_to_move
-    until Ashborne_toolkit.travel_departure_ready?("emergency retreat")
-      return nil if checkdead
-      sleep 1
+    urgent_retreat = $ashborne_group_danger_active == "1"
+    unless urgent_retreat
+      return nil unless Ashborne_toolkit.group_wait_for_followers_to_move
+      until Ashborne_toolkit.travel_departure_ready?("emergency retreat")
+        return nil if checkdead
+        sleep 1
+      end
+    else
+      respond "Emergency retreat is bypassing group movement wait because danger is already active."
+      3.times do
+        break if checkdead
+        break if Ashborne_toolkit.travel_departure_ready?("emergency retreat")
+
+        blockers = []
+        blockers << "stunned" if checkstunned
+        blockers << "webbed" if webbed?
+        blockers << "bound" if bound?
+        blockers << "roundtime" if checkrt.to_f > 0
+        blockers << "cast roundtime" if checkcastrt.to_f > 0
+        Ashborne_toolkit.recover_from_emergency_blocker(blockers)
+        sleep 0.5
+      end
     end
 
     retreat_origin = Room.current && Room.current.id
@@ -9905,13 +9978,17 @@ module Ashborne_toolkit
 
       moved_from_danger = Room.current && Room.current.id &&
         retreat_origin && Room.current.id.to_s != retreat_origin.to_s
-      break if GameObj.targets.empty? && (moved_from_danger || Ashborne_toolkit.safe_retreat_room_reached?)
+      safe_here = Ashborne_toolkit.safe_retreat_room_reached?
+      break if safe_here
+      break if urgent_retreat ? moved_from_danger : (moved_from_danger && GameObj.targets.empty?)
 
       respond "Emergency retreat did not reach safety; retrying go2 town." if retreat_attempt == 1 || retreat_attempt % 3 == 0
       sleep 1
-      until Ashborne_toolkit.travel_departure_ready?("emergency retreat retry")
-        return nil if checkdead
-        sleep 1
+      unless urgent_retreat
+        until Ashborne_toolkit.travel_departure_ready?("emergency retreat retry")
+          return nil if checkdead
+          sleep 1
+        end
       end
     end
 
@@ -10194,6 +10271,12 @@ module Ashborne_toolkit
       sleep 1
     end
     nil
+  end
+
+  def medical_retreat_reason?(reason = $ashborne_return_why)
+    reason.to_s =~ /medical retreat|injury|bleeding|low health|critical health/i ? true : false
+  rescue
+    false
   end
 
   def short_group_sync_route?(leader_room, max_steps = 12)
@@ -10651,19 +10734,22 @@ module Ashborne_toolkit
   end
 
   def safe_room_default
+    emergency_retreat = $ashborne_group_danger_active == "1" || Ashborne_toolkit.medical_retreat_reason?
     if $ashborne_group_ai == "1"
-      Ashborne_toolkit.group_wait_for_loot_to_settle(8)
-      until Ashborne_toolkit.group_wait_for_followers_to_move(5)
-        Ashborne_toolkit.defend_while_waiting_for_group
-        unless GameObj.targets.empty?
-          Ashborne_toolkit.stance_defensive
-          respond "Ashborne will not leave visible followers behind while combat is active."
+      unless emergency_retreat
+        Ashborne_toolkit.group_wait_for_loot_to_settle(8)
+        until Ashborne_toolkit.group_wait_for_followers_to_move(5)
+          Ashborne_toolkit.defend_while_waiting_for_group
+          unless GameObj.targets.empty?
+            Ashborne_toolkit.stance_defensive
+            respond "Ashborne will not leave visible followers behind while combat is active."
+          end
         end
       end
       return false unless Ashborne_toolkit.movement_guard
     end
     Ashborne_toolkit.unhide_before_group_travel("safe return")
-    return false unless Ashborne_toolkit.travel_departure_ready?("safe return")
+    return false unless Ashborne_toolkit.travel_departure_ready?(emergency_retreat ? "emergency retreat" : "safe return")
 
     if $ashborne_my_area =~ /moonmagru/
       fput "move clear"
@@ -24708,7 +24794,7 @@ loop {
   Ashborne_toolkit.boost_loot
   Ashborne_toolkit.upkeep_quartz
   ashborne_status_check.call
-  Ashborne_toolkit.group_return_to_town if $ashborne_group_danger_active == "1"
+  Ashborne_toolkit.emergency_return_to_town_if_needed if $ashborne_group_danger_active == "1"
   # Check for all group members
   # respond "Debug Output - Group Cluster."
   ashborne_group_cluster.call
@@ -24900,7 +24986,7 @@ loop {
 
     ashborne_kill_script.call
 
-    Ashborne_toolkit.group_return_to_town if $ashborne_group_danger_active == "1"
+    Ashborne_toolkit.emergency_return_to_town_if_needed if $ashborne_group_danger_active == "1"
 
     if $ashborne_my_area =~ /qlite|quick|drarena|drlite|grounded/
       Ashborne_toolkit.top_menu
