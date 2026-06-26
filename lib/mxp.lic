@@ -1,0 +1,256 @@
+=begin
+  mxp.lic
+
+  Equalizes experience across a group of characters by adjusting each character's
+  ascension absorption rate. Characters above the group average are set to their
+  max rate (their level%), diverting XP into ascension and slowing regular gain.
+  Characters at or below average are set to a configurable low rate (default 0).
+  Requires the Borg system (borg.lic + drone.lic) running on all characters.
+  Run ;mxp help for full syntax and setup instructions.
+
+  Quick command reference:
+    ;mxp                       queen mode - collect XP, compute rates, apply to all
+    ;mxp report                save own experience to shared file (drones run this)
+    ;mxp status                show stored data and computed rates, no changes made
+    ;mxp set chars <names>     set the comma-separated list of characters to manage
+    ;mxp set rate <N>          set the ascension % for at/below-average chars (default 0)
+    ;mxp help                  full setup instructions and command list
+
+       author: Mara
+         game: gs
+         tags: experience, ascension, utility, multi
+      contact: mara.lilly on Discord, @Lillymara on GitHub
+    co-author: Claude (Anthropic) - claude.ai/code
+      version: 1.0
+
+  Changelog:
+    1.0 (2026-06-26) - Initial release.
+=end
+
+require 'drb/drb'
+
+MXP_FILE = File.join(DATA_DIR, 'mxp_data.yaml')
+
+# ---- file helpers ----
+
+def mxp_load
+  return {} unless File.exist?(MXP_FILE)
+  YAML.safe_load(File.read(MXP_FILE), permitted_classes: [Time]) || {}
+rescue StandardError
+  {}
+end
+
+def mxp_save(level, experience)
+  data = mxp_load
+  data[Char.name] = { 'level' => level, 'experience' => experience, 'updated' => Time.now }
+  tmp = MXP_FILE + '.tmp'
+  File.write(tmp, YAML.dump(data))
+  File.rename(tmp, MXP_FILE)
+end
+
+# ---- borg command sender ----
+
+def mxp_borg(target, cmd)
+  DRb.start_service
+  DRbObject.new_with_uri('druby://localhost:4435').push "5 #{rand(999999)} #{target.downcase} #{cmd}"
+rescue => e
+  respond "[MXP] Borg error: #{e.message}. Is drone.lic + borg.lic running?"
+end
+
+# ---- parse experience command ----
+
+def mxp_read_exp
+  output = Lich::Util.quiet_command("experience", /Level:/, end_pattern = /PTPs\/MTPs:/, include_end = true, timeout = 5, silent = true)
+  text = output.to_s
+  level = text[/Level:\s+(\d+)/, 1].to_i
+  exp   = text[/\bExperience:\s+([\d,]+)/, 1]&.gsub(',', '').to_i || 0
+  [level, exp]
+end
+
+# ---- equalization math ----
+
+ASC_MIN_LEVEL = 20
+
+def mxp_low_rate
+  (Vars.mxp_low_rate || 0).to_i
+end
+
+def mxp_compute_rates(data)
+  eligible = data.select { |_, v| v.is_a?(Hash) && v['experience'].to_i > 0 && v['level'].to_i >= ASC_MIN_LEVEL }
+  return {} if eligible.empty?
+  avg = eligible.values.map { |v| v['experience'] }.sum / eligible.length
+  eligible.transform_values { |v| v['experience'] <= avg ? mxp_low_rate : v['level'] }
+end
+
+# ---- formatting helpers ----
+
+def fmt_exp(n)
+  n.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\1,').reverse
+end
+
+# ---- status display ----
+
+def mxp_show_status(data, rates = nil)
+  rates ||= mxp_compute_rates(data)
+  avg = data.values.map { |v| v['experience'].to_i }.sum / [data.length, 1].max
+  respond "[MXP] ---- Experience Status ---- (avg: #{fmt_exp(avg)})"
+  data.sort_by { |_, v| -(v['experience'].to_i) }.each do |char, info|
+    age_sec = info['updated'] ? (Time.now - info['updated']).round : nil
+    stale   = age_sec && age_sec > 30 ? " [#{age_sec}s old]" : ''
+    rate     = rates[char]
+    too_low  = info['level'].to_i > 0 && info['level'].to_i < ASC_MIN_LEVEL
+    rate_str = if too_low
+      "-> level too low (need #{ASC_MIN_LEVEL})"
+    elsif rate
+      "-> ascension #{rate}%"
+    else
+      '-> no data'
+    end
+    respond "[MXP]  #{char.ljust(16)} Lv#{info['level'].to_s.rjust(3)}  #{fmt_exp(info['experience']).rjust(12)}  #{rate_str}#{stale}"
+  end
+end
+
+# ---- arg dispatch ----
+
+cmd = Script.current.vars[1..-1]&.join(' ').to_s.strip
+
+if cmd =~ /^set\s+chars?\s+(.+)$/i
+  Vars.mxp_chars = $1.strip
+  respond "[MXP] Characters set: #{Vars.mxp_chars}"
+  raise SystemExit
+
+elsif cmd =~ /^set\s+rate\s+(\d+)$/i
+  Vars.mxp_low_rate = $1.to_i
+  respond "[MXP] Low rate set to #{Vars.mxp_low_rate}%. Characters at or below average will be set to this."
+  raise SystemExit
+
+elsif cmd =~ /^report$/i
+  level, experience = mxp_read_exp
+  if level == 0 || experience == 0
+    respond "[MXP] Could not parse experience output. Try again."
+    raise SystemExit
+  end
+  mxp_save(level, experience)
+  respond "[MXP] Reported: #{Char.name} Lv#{level} Exp #{fmt_exp(experience)}"
+  raise SystemExit
+
+elsif cmd =~ /^status$/i
+  data = mxp_load
+  if data.empty?
+    respond "[MXP] No data yet. Run ;mxp on the queen character first."
+  else
+    mxp_show_status(data)
+  end
+  raise SystemExit
+
+elsif cmd =~ /^help$/i || cmd == '?'
+  respond "[MXP] ---- Help ----"
+  respond "[MXP]"
+  respond "[MXP] SETUP (run once on the queen character):"
+  respond "[MXP]   ;mxp set chars Name1,Name2,...   Set the full list of characters to manage"
+  respond "[MXP]   Example: ;mxp set chars Kirk,Spock,McCoy,Scotty,Uhura,Sulu,Chekov"
+  respond "[MXP]"
+  respond "[MXP] REQUIREMENTS:"
+  respond "[MXP]   drone.lic and borg.lic must be running on all characters."
+  respond "[MXP]   mxp.lic must be installed on all characters (drones run ;mxp report)."
+  respond "[MXP]"
+  respond "[MXP] COMMANDS:"
+  respond "[MXP]   ;mxp                  Queen mode - collect XP, compute rates, apply to all"
+  respond "[MXP]   ;mxp report           Drone mode - read own experience and save to shared file"
+  respond "[MXP]   ;mxp status           Show stored data and computed rates (no changes made)"
+  respond "[MXP]   ;mxp set chars ...    Update the character list"
+  respond "[MXP]   ;mxp set rate <N>     Set the ascension % for at/below-average characters (default 0)"
+  respond "[MXP]   ;mxp help             Show this help"
+  respond "[MXP]"
+  respond "[MXP] HOW IT WORKS:"
+  respond "[MXP]   The queen sends ;mxp report to all drones via the Borg command system."
+  respond "[MXP]   Each drone reads their experience and saves it to a shared file."
+  respond "[MXP]   The queen computes the group average, then sets ascension rates:"
+  respond "[MXP]     At or below average  ->  ascension set <low rate>%  (default 0; fastest XP gain)"
+  respond "[MXP]     Above average        ->  ascension set <level>%  (slowest XP gain)"
+  respond "[MXP]   This naturally equalizes experience over time as characters hunt together."
+  respond "[MXP]"
+  respond "[MXP]   Note: ascension set % is capped at the character's current level."
+  respond "[MXP]   Run ;mxp periodically during a hunt session to keep rates current."
+  raise SystemExit
+
+elsif !cmd.empty?
+  respond "[MXP] Unknown command '#{cmd}'. Try: ;mxp help"
+  raise SystemExit
+end
+
+# ---- queen mode ----
+
+chars_cfg = (Vars.mxp_chars || '').split(',').map(&:strip).reject(&:empty?)
+if chars_cfg.empty?
+  respond "[MXP] No characters configured. Run: ;mxp set chars Name1,Name2,..."
+  raise SystemExit
+end
+
+drones = chars_cfg.reject { |c| c.casecmp(Char.name) == 0 }
+respond "[MXP] Starting experience equalization for #{chars_cfg.length} characters..."
+
+# Step 1: save own XP
+level, experience = mxp_read_exp
+if level == 0 || experience == 0
+  respond "[MXP] Could not read own experience. Aborting."
+  raise SystemExit
+end
+mxp_save(level, experience)
+respond "[MXP] Own data saved: Lv#{level} Exp #{fmt_exp(experience)}"
+
+# Step 2: tell drones to report their XP
+drones.each { |drone| mxp_borg(drone, ";mxp report") }
+respond "[MXP] Waiting 15 seconds for #{drones.length} drone(s) to report..."
+pause 15
+
+# Step 3: read and validate, dropping any characters who didn't respond this run
+data = mxp_load
+missing = chars_cfg.reject { |c| data.key?(c) }
+stale   = data.select { |c, v| v['updated'] && (Time.now - v['updated']) > 30 }.keys
+
+missing.each { |c| respond "[MXP] WARNING: No report from #{c} - skipping. Make sure drone.lic is running on #{c}." }
+stale.each   { |c| respond "[MXP] WARNING: #{c} did not respond this run (data #{((Time.now - data[c]['updated'])).round}s old) - skipping. Make sure drone.lic is running on #{c}." }
+
+# remove non-responders so they don't skew the average or receive a rate command
+data.reject! { |c, v| missing.include?(c) || stale.include?(c) }
+
+# Step 4: compute rates and display
+rates = mxp_compute_rates(data)
+if rates.empty?
+  no_responders = (missing + stale).length == drones.length
+  if no_responders
+    respond "[MXP] No characters responded. If borg.lic or borg.rb is not running, commands cannot be delivered to drones."
+    respond "[MXP] Make sure borg.lic (or borg.rb) is running first, then run ;drone on each character."
+  else
+    respond "[MXP] No valid data to compute rates. Aborting."
+  end
+  raise SystemExit
+end
+
+mxp_show_status(data, rates)
+
+# Step 5: apply rates
+respond "[MXP] Applying rates..."
+
+my_rate = rates[Char.name]
+if my_rate
+  fput "ascension set #{my_rate}"
+  waitrt?
+  respond "[MXP] Set own ascension rate to #{my_rate}%"
+elsif (own = data[Char.name]) && own['level'].to_i < ASC_MIN_LEVEL
+  respond "[MXP] Skipping own rate - level #{own['level']} is below #{ASC_MIN_LEVEL}."
+end
+
+data.each do |char, info|
+  next if char.casecmp(Char.name) == 0
+  rate = rates[char]
+  if rate
+    mxp_borg(char, "ascension set #{rate}")
+    pause 0.5
+  elsif info['level'].to_i > 0 && info['level'].to_i < ASC_MIN_LEVEL
+    respond "[MXP] Skipping #{char} - level #{info['level']} is below #{ASC_MIN_LEVEL}."
+  end
+end
+
+respond "[MXP] Done. Run ;mxp status to verify all characters updated."
