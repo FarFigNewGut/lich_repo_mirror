@@ -14,6 +14,7 @@
     ;transmog_inventory setname <name>     set display name for the Transmog Exchange
     ;transmog_inventory upload             push catalog to Transmog Exchange web database
     ;transmog_inventory clearweb confirm   remove your entries from web database (keeps local CSV)
+    ;transmog_inventory gui                browse and edit catalog in a point-and-click window
     ;transmog_inventory help               full command list with examples
 
        author: Mara
@@ -21,9 +22,12 @@
          tags: transmog, inventory, locker, items
       contact: mara.lilly on Discord, @Lillymara on GitHub
     co-author: Claude (Anthropic) - claude.ai/code
-      version: 2.0
+      version: 2.1
 
   Changelog:
+    2.1.0 (2026-06-27) - GUI browser (;transmog gui): searchable point-and-click
+                         window with inline price/note editing and multi-select delete.
+                         Bugfix: remove/rm now accepts a numeric item ID directly.
     2.0.0 (2026-06-21) - Shared CSV across alts with Character column; setname,
                          price, and char: search commands; upload uses display name.
     1.4.0 (2026-06-18) - Full boolean search syntax for search/remove/note.
@@ -41,6 +45,17 @@ require 'json'
 require 'securerandom'
 
 # Changelog:
+# 2.1.0 (2026-06-27)
+#   - New "gui" command (aliases: browse, ui): opens a GTK3 point-and-click browser.
+#     Search box filters in real-time (same boolean syntax as the command line).
+#     Price and Note columns are editable inline -- click a cell and type.
+#     Multi-select rows and click Delete Selected to remove them from the catalog.
+#     Widget creation runs via GLib::Idle.add on the GTK main thread to avoid the
+#     "Not Responding" freeze that occurs when GTK is driven from a script thread.
+#   - Bugfix: remove/rm now accepts a bare numeric item ID (e.g. ;transmog rm 154876914)
+#     without needing to match it through the boolean text search, which excluded
+#     the id field.
+#
 # 2.0.0 (2026-06-21)
 #   - Single CSV per Lich install (transmog_inventory.csv) instead of one per
 #     character. Scans from any alt are merged in; a "Character" column records
@@ -204,6 +219,9 @@ def usage
 
     Remove your entries from the web database (local CSV is untouched):
       ;transmog_inventory clearweb confirm
+
+    Browse and delete items with a point-and-click window:
+      ;transmog_inventory gui
 
     Stand at your open locker with the chest accessible (or have the container
     worn/held), with at least one free hand. Output CSV:
@@ -536,6 +554,22 @@ end
 def run_remove(query)
   unless File.exist?(csv_path)
     respond "transmog_inventory: no catalog found at #{csv_path}"
+    return
+  end
+
+  if query.to_s.strip =~ /\A\d{6,9}\z/
+    item_id = query.to_s.strip.to_i
+    rows    = read_catalog
+    entry   = rows.find { |r| r[:id].to_i == item_id }
+    if entry.nil?
+      respond "transmog_inventory: no item with ID #{item_id} in your catalog."
+      respond "  Use ;transmog_inventory search to find item IDs."
+      return
+    end
+    remaining = rows.reject { |r| r[:id].to_i == item_id }
+    write_catalog(remaining)
+    respond "transmog_inventory: removed 1 entry (catalog now #{remaining.size}):"
+    show_entry("- ", entry)
     return
   end
 
@@ -1105,6 +1139,163 @@ def run_clearweb(raw)
 end
 
 # ---------------------------------------------------------------------------
+# GUI browser
+
+def run_gui
+  unless File.exist?(csv_path)
+    respond "transmog_inventory: no catalog found -- run a scan first."
+    return
+  end
+
+  begin
+    require 'gtk3'
+  rescue LoadError
+    respond "transmog_inventory: GTK3 not available -- use ;transmog_inventory search instead."
+    return
+  end
+
+  # File I/O on the script thread before touching GTK.
+  catalog = read_catalog
+  if catalog.any? { |r| r[:id].to_i == 0 }
+    write_catalog(catalog)
+    catalog = read_catalog
+  end
+
+  closed = false
+
+  # ponytail: GLib::Idle.add runs this block on the GTK main thread, which owns
+  # the Windows message pump. Creating widgets from the script thread causes the
+  # "Not Responding" freeze because GTK starves the pump mid-construction.
+  GLib::Idle.add do
+    store = Gtk::ListStore.new(Integer, String, String, String, String, Integer, String, String)
+
+    fill_store = lambda do |cat, query|
+      store.clear
+      rows = if query.to_s.strip.empty?
+        cat
+      else
+        node = parse_query(query)
+        cat.select { |e| eval_bool(node, e) }
+      end
+      rows.each do |r|
+        it = store.append
+        it[0] = r[:id].to_i
+        it[1] = r[:character].to_s
+        it[2] = r[:noun].to_s
+        it[3] = r[:name].to_s
+        it[4] = r[:location].to_s
+        it[5] = r[:quantity].to_i
+        it[6] = r[:price] ? format_price(r[:price]) : ""
+        it[7] = r[:note].to_s
+      end
+      rows.size
+    end
+
+    fill_store.call(catalog, "")
+
+    tree = Gtk::TreeView.new(store)
+    tree.selection.mode = :multiple
+
+    # Read-only columns
+    [[0, "ID", 90], [1, "Character", 90], [2, "Noun", 80], [3, "Full Name", 340],
+     [4, "Worn Location", 160], [5, "Qty", 40]].each do |idx, title, w|
+      r = Gtk::CellRendererText.new
+      c = Gtk::TreeViewColumn.new(title, r, text: idx)
+      c.resizable = true
+      c.min_width = w
+      c.sort_column_id = idx
+      tree.append_column(c)
+    end
+
+    # Editable Price column
+    price_r = Gtk::CellRendererText.new
+    price_r.editable = true
+    price_r.signal_connect("edited") do |_, path_str, new_text|
+      it = store.get_iter(Gtk::TreePath.new(path_str))
+      next unless it
+      item_id = it[0]
+      parsed = parse_price(new_text.strip)
+      next if parsed == false
+      new_price = parsed == PRICE_CLEAR ? nil : parsed
+      catalog = catalog.map { |r| r[:id].to_i == item_id ? r.merge(price: new_price) : r }
+      write_catalog(catalog)
+      it[6] = new_price ? format_price(new_price) : ""
+    end
+    price_c = Gtk::TreeViewColumn.new("Price", price_r, text: 6)
+    price_c.resizable = true
+    price_c.min_width = 120
+    price_c.sort_column_id = 6
+    tree.append_column(price_c)
+
+    # Editable Note column
+    note_r = Gtk::CellRendererText.new
+    note_r.editable = true
+    note_r.signal_connect("edited") do |_, path_str, new_text|
+      it = store.get_iter(Gtk::TreePath.new(path_str))
+      next unless it
+      item_id = it[0]
+      new_note = new_text.strip.downcase == "clear" ? "" : new_text.strip[0, NOTE_MAX_CHARS]
+      catalog = catalog.map { |r| r[:id].to_i == item_id ? r.merge(note: new_note) : r }
+      write_catalog(catalog)
+      it[7] = new_note
+    end
+    note_c = Gtk::TreeViewColumn.new("Note", note_r, text: 7)
+    note_c.resizable = true
+    note_c.min_width = 200
+    note_c.sort_column_id = 7
+    tree.append_column(note_c)
+
+    search = Gtk::Entry.new
+    status = Gtk::Label.new("#{catalog.size} items  |  click Price or Note cells to edit")
+
+    search.signal_connect("changed") do
+      n = fill_store.call(catalog, search.text)
+      status.text = "#{n} shown / #{catalog.size} total"
+    end
+
+    del_btn = Gtk::Button.new(label: "Delete Selected")
+    del_btn.signal_connect("clicked") do
+      paths = tree.selection.selected_rows
+      next if paths.empty?
+      ids = paths.map { |p| store.get_iter(p)[0] }.to_set
+      catalog = catalog.reject { |r| ids.include?(r[:id].to_i) }
+      write_catalog(catalog)
+      respond "transmog_inventory: removed #{ids.size} item(s) via GUI (#{catalog.size} remaining)."
+      n = fill_store.call(catalog, search.text)
+      status.text = "#{n} shown / #{catalog.size} total"
+    end
+
+    top = Gtk::Box.new(:horizontal, 5)
+    top.pack_start(Gtk::Label.new("Search:"), expand: false)
+    top.pack_start(search, expand: true, fill: true)
+
+    scroll = Gtk::ScrolledWindow.new
+    scroll.set_policy(:automatic, :automatic)
+    scroll.add(tree)
+
+    bot = Gtk::Box.new(:horizontal, 5)
+    bot.pack_start(status, expand: true, fill: true, padding: 5)
+    bot.pack_start(del_btn, expand: false)
+
+    vbox = Gtk::Box.new(:vertical, 5)
+    vbox.border_width = 8
+    vbox.pack_start(top, expand: false)
+    vbox.pack_start(scroll, expand: true, fill: true)
+    vbox.pack_start(bot, expand: false)
+
+    win = Gtk::Window.new("Transmog Inventory")
+    win.set_default_size(1100, 600)
+    win.add(vbox)
+    win.signal_connect("destroy") { closed = true }
+    win.show_all
+
+    false  # don't repeat
+  end
+
+  sleep 0.1 until closed
+end
+
+# ---------------------------------------------------------------------------
 # Command dispatch
 
 if script.vars[1].to_s =~ /^(?:help|\?|-h|--help)$/i
@@ -1152,6 +1343,11 @@ end
 if script.vars[1].to_s =~ /^(?:setname|name|displayname)$/i
   raw = script.vars[0].to_s.sub(/\A\s*(?:setname|name|displayname)\s*/i, "")
   run_setname(raw)
+  exit
+end
+
+if script.vars[1].to_s =~ /^(?:gui|browse|ui)$/i
+  run_gui
   exit
 end
 
