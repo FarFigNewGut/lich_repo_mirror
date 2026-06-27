@@ -2497,6 +2497,10 @@ module Ashborne_toolkit
 
   def target_check
     # respond "Debug Output - I'm defining creatures"
+    if $ashborne_group_ai == "0" ? GameObj.pcs.any? : Ashborne_toolkit.visible_non_group_players.any?
+      Ashborne_toolkit.leave_occupied_room
+      return nil
+    end
 
     $ashborne_current_target = nil
     $ashborne_id_placeholder = nil
@@ -2691,11 +2695,11 @@ module Ashborne_toolkit
       # respond "Debug Output - I do not own the room yet."
 
       if $ashborne_group_ai == "0"
-        if GameObj.pcs.length >= 1
+        if GameObj.pcs.any?
           # respond "Debug Output - There's someone here."
           $ashborne_my_vine = "0"
           Ashborne_toolkit.cock_support
-          Ashborne_toolkit.safe_walk
+          Ashborne_toolkit.leave_occupied_room
         elsif GameObj.targets.length >= 1
           # respond "Debug Output - No other players here, I'm about to own the room."
           Ashborne_toolkit.target_check
@@ -2720,13 +2724,13 @@ module Ashborne_toolkit
       else
         # Group Mode Move Logic
         sleep 0.01
-        if GameObj.pcs.length > $ashborne_group_array.length
+        if Ashborne_toolkit.visible_non_group_players.any?
           # respond "Debug Output - Group Mode - There's someone here besides the permitted group."
           $ashborne_my_vine = "0"
           Ashborne_toolkit.cock_support
           Ashborne_toolkit.purge_group_combat
           # Ashborne_toolkit.group_grounded
-          Ashborne_toolkit.safe_walk
+          Ashborne_toolkit.leave_occupied_room
         elsif GameObj.targets.length >= 1
           # respond "Debug Output - Group Mode - No extra players here, I'm about to own the room."
           Ashborne_toolkit.target_check
@@ -2754,7 +2758,10 @@ module Ashborne_toolkit
 
     elsif $ashborne_own_this_room == 1
       # respond "Debug Output - I'm in movement and own this room is 1."
-      if GameObj.dead.length >= 1
+      if $ashborne_group_ai == "0" ? GameObj.pcs.any? : Ashborne_toolkit.visible_non_group_players.any?
+        # Someone else entered or was revealed after we thought we owned the room.
+        Ashborne_toolkit.leave_occupied_room
+      elsif GameObj.dead.length >= 1
         # respond "Debug Output - Dead creature detected."
         Ashborne_toolkit.loot_script("#{$ashborne_loot_script}")
       elsif GameObj.targets.length >= 1
@@ -4231,41 +4238,90 @@ module Ashborne_toolkit
     false
   end
 
-  def loot_safe_to_start?
-    return false unless GameObj.targets.empty?
+  def dead_body_wait_seconds
+    if GameObj.dead.empty?
+      $ashborne_first_dead_seen_at = nil
+      return 0
+    end
+
+    $ashborne_first_dead_seen_at ||= Time.now
+    Time.now - $ashborne_first_dead_seen_at
+  rescue
+    0
+  end
+
+  def urgent_loot_needed?
+    return false if GameObj.dead.empty?
+    return false if GameObj.targets.empty?
+    return false if GameObj.targets.length > 2
+
+    GameObj.dead.length > 2 || Ashborne_toolkit.dead_body_wait_seconds >= 12
+  rescue
+    false
+  end
+
+  def loot_safe_to_start?(urgent = false)
+    return false unless GameObj.targets.empty? || (urgent && GameObj.targets.length <= 2)
 
     if Ashborne_toolkit.unstable_dead_creature_present?
       respond "Ashborne is pausing loot briefly because this creature may reform."
       settle_deadline = Time.now + 8
       until Time.now >= settle_deadline
-        return false unless GameObj.targets.empty?
+        return false unless GameObj.targets.empty? || (urgent && GameObj.targets.length <= 2)
         sleep 0.5
       end
-      return false unless GameObj.targets.empty?
+      return false unless GameObj.targets.empty? || (urgent && GameObj.targets.length <= 2)
     end
 
     true
   rescue
-    GameObj.targets.empty?
+    GameObj.targets.empty? || (urgent && GameObj.targets.length <= 2)
   end
 
   def loot_script(scriptname)
     return nil unless Ashborne_toolkit.group_looter?
+    return nil unless GameObj.dead.length >= 1
+    urgent_loot = Ashborne_toolkit.urgent_loot_needed?
+    return nil unless Ashborne_toolkit.loot_safe_to_start?(urgent_loot)
 
     waitrt?
-    Ashborne_toolkit.stance_guarded
+    urgent_loot ? Ashborne_toolkit.stance_defensive : Ashborne_toolkit.stance_guarded
     if Script.running? "#{$ashborne_loot_script}"
     # respond "Debug Output - Loot Script is Running."
     else
       if GameObj.dead.length >= 1
-        return nil unless Ashborne_toolkit.loot_safe_to_start?
-
         Ashborne_toolkit.put_wand_manager
         $ashborne_looting_active = "1"
         Ashborne_toolkit.publish_group_state(true) if $ashborne_group_ai != "0"
+        respond "Ashborne is doing an urgent corpse sweep before bodies decay." if urgent_loot
         do_client ";#{scriptname}"
-        wait_while { running? "#{scriptname}" }
+        sleep 0.1
+        held_state = nil
+        held_since = nil
+        while Script.running?(scriptname.to_s)
+          storage_failed, held_state, held_since = Ashborne_toolkit.loot_storage_failure_detected?(scriptname, held_state, held_since)
+          if storage_failed
+            respond "Ashborne detected #{scriptname} is stuck with loot in hand; returning to town to sell."
+            Script.kill(scriptname.to_s)
+            Ashborne_toolkit.trigger_loot_storage_emergency
+            break
+          end
+
+          unsafe_loot = urgent_loot ? GameObj.targets.length > 2 : !GameObj.targets.empty?
+          if unsafe_loot
+            respond "Ashborne interrupted #{scriptname} because a hostile creature arrived."
+            Script.kill(scriptname.to_s)
+            sleep 0.1
+            waitrt?
+            $ashborne_uac_hands_verified = "0"
+            fput "gird"
+            Ashborne_toolkit.enforce_uac_empty_hands
+            break
+          end
+          sleep 0.1
+        end
         $ashborne_looting_active = "0"
+        $ashborne_first_dead_seen_at = nil if GameObj.dead.empty?
         Ashborne_toolkit.publish_group_state(true) if $ashborne_group_ai != "0"
 
         if $ashborne_aim_fail != 0
@@ -4290,6 +4346,48 @@ module Ashborne_toolkit
       $ashborne_looting_active = "0"
       Ashborne_toolkit.publish_group_state(true) if defined?($ashborne_group_ai) && $ashborne_group_ai != "0"
     end
+  end
+
+  def loot_storage_failure_detected?(scriptname, held_state = nil, held_since = nil)
+    script = scriptname.to_s
+    paused = begin
+      Script.respond_to?(:paused?) && Script.paused?(script)
+    rescue
+      false
+    end
+    return [true, held_state, held_since] if paused
+
+    right = checkright.to_s
+    left = checkleft.to_s
+    holding = !checkright.nil? || !checkleft.nil?
+    unless holding
+      return [false, nil, nil]
+    end
+
+    current_state = [right, left].join("|")
+    if current_state == held_state
+      held_since ||= Time.now
+    else
+      held_state = current_state
+      held_since = Time.now
+    end
+
+    stuck = Time.now - held_since >= 6
+    [stuck, held_state, held_since]
+  rescue
+    [false, held_state, held_since]
+  end
+
+  def trigger_loot_storage_emergency
+    Ashborne_toolkit.stance_defensive
+    $ashborne_return_why = "Loot storage failure: hands full or container full; returning to town to sell."
+    $ashborne_action = 99
+    $ashborne_group_danger_active = "1"
+    $ashborne_group_end_sell = "1"
+    Ashborne_toolkit.publish_group_danger($ashborne_return_why) if $ashborne_group_ai != "0"
+    true
+  rescue
+    false
   end
 
   def cman_control
@@ -5665,7 +5763,12 @@ module Ashborne_toolkit
   end
 
   def combat_unique_to_ashborne
+    return if Ashborne_toolkit.solo_swarm_retreat_if_needed
     return if Ashborne_toolkit.group_danger_status_check
+    if $ashborne_group_ai == "0" ? GameObj.pcs.any? : Ashborne_toolkit.visible_non_group_players.any?
+      Ashborne_toolkit.leave_occupied_room
+      return
+    end
 
     Ashborne_toolkit.publish_group_state
     return if Ashborne_toolkit.process_anti_caster_event
@@ -9276,7 +9379,7 @@ module Ashborne_toolkit
   end
 
   def encumbrance_return?
-    $ashborne_return_why.to_s =~ /encumbrance|eligible looters reached/i ? true : false
+    $ashborne_return_why.to_s =~ /encumbrance|eligible looters reached|loot storage failure|container full|hands full/i ? true : false
   rescue
     false
   end
@@ -9807,6 +9910,33 @@ module Ashborne_toolkit
     end
 
     nil
+  end
+
+  def solo_swarm_retreat_threshold
+    4
+  end
+
+  def solo_swarm_retreat_reason
+    return nil unless $ashborne_group_ai == "0"
+    target_count = GameObj.targets.length
+    return nil if target_count < Ashborne_toolkit.solo_swarm_retreat_threshold
+
+    "solo swarm pressure (#{target_count} hostile creatures)"
+  rescue
+    nil
+  end
+
+  def solo_swarm_retreat_if_needed
+    reason = Ashborne_toolkit.solo_swarm_retreat_reason
+    return false if reason.nil?
+
+    Ashborne_toolkit.stance_defensive
+    $ashborne_return_why = "Emergency retreat: #{reason}."
+    $ashborne_action = 99
+    $ashborne_group_danger_active = "1"
+    true
+  rescue
+    false
   end
 
   def publish_group_danger(reason)
@@ -10873,6 +11003,8 @@ module Ashborne_toolkit
     # respond "Debug Output - Starting UAC Round"
     if GameObj.targets.length >= 1
 
+      return unless Ashborne_toolkit.enforce_uac_empty_hands
+
       if $ashborne_uac_current_attack == 0
         $ashborne_uac_current_attack = "jab"
       elsif $ashborne_uac_current_attack == nil
@@ -10909,6 +11041,36 @@ module Ashborne_toolkit
     end
 
     # respond "Debug Output - Ending UAC Round"
+  end
+
+  def enforce_uac_empty_hands
+    return true unless $ashborne_my_style == "1" || $ashborne_my_style == "2"
+
+    waitrt?
+    hands_report_empty = checkright.nil? && checkleft.nil?
+    if $ashborne_uac_hands_verified.to_s != "1" || !hands_report_empty
+      # Hand XML can lag immediately after GIRD. STOW ALL is authoritative and
+      # prevents a newly drawn shield from slipping past a stale empty-hand read.
+      fput "stow all"
+      sleep 0.25
+    end
+    waitrt?
+
+    empty = checkright.nil? && checkleft.nil?
+    $ashborne_uac_hands_verified = empty ? "1" : "0"
+    unless empty
+      now = Time.now.to_i
+      if now >= $ashborne_uac_hands_warning_at.to_s.to_i
+        respond "Ashborne cannot begin UAC until both hands are empty."
+        $ashborne_uac_hands_warning_at = now + 10
+      end
+      Ashborne_toolkit.stance_defensive
+      Ashborne_toolkit.trigger_loot_storage_emergency
+    end
+    empty
+  rescue => error
+    respond "UAC hand check warning: #{error.message}" if $ashborne_qc_debug == "1"
+    false
   end
 
   def mstrike_setup
@@ -11435,6 +11597,41 @@ module Ashborne_toolkit
     $ashborne_my_vine = "0"
     Ashborne_toolkit.safe_walk
     sleep 0.10
+  end
+
+  def leave_occupied_room
+    players = if $ashborne_group_ai == "0"
+                GameObj.pcs
+              else
+                Ashborne_toolkit.visible_non_group_players
+              end
+    return false if players.empty?
+
+    names = players.map { |player| Ashborne_toolkit.canonical_character_name(player.name) }
+      .select { |name| Ashborne_toolkit.valid_character_name?(name) }
+    respond "Room already occupied by #{names.join(', ')}; leaving without engaging."
+
+    waitrt?
+    Ashborne_toolkit.stance_defensive
+    starting_room = Room.current && Room.current.id ? Room.current.id.to_s : nil
+    moved = false
+    3.times do
+      walk
+      sleep 0.15
+      moved = starting_room.nil? || !Room.current || Room.current.id.to_s != starting_room
+      break if moved
+      waitrt?
+    end
+
+    $ashborne_action = 0
+    $ashborne_own_this_room = 0
+    $ashborne_my_vine = "0"
+    respond "Occupied-room exit failed; remaining defensive." unless moved
+    moved
+  rescue => error
+    Ashborne_toolkit.stance_defensive
+    respond "Occupied-room exit warning: #{error.message}" if $ashborne_qc_debug == "1"
+    false
   end
 
   def wattune_help
@@ -13904,6 +14101,7 @@ $ashborne_preferred_looter = "0"
 $ashborne_eligible_looters = "all"
 $ashborne_loot_handoff = 30
 $ashborne_loot_emergency = 40
+$ashborne_first_dead_seen_at = nil
 $ashborne_own_this_room = 0
 $ashborne_style_9_primary_spell_override = "1700"
 $ashborne_uac_current_attack = 0
@@ -14201,6 +14399,8 @@ $ashborne_boost_loot = "0"
 
 $ashborne_qc_debug = "0"
 $ashborne_qc_testing = "0"
+$ashborne_uac_hands_verified = "0"
+$ashborne_uac_hands_warning_at = 0
 
 $ashborne_noquartz = "0"
 
@@ -20541,6 +20741,7 @@ ashborne_zone_reset_check = proc {
 
 ashborne_status_check = proc {
   Ashborne_toolkit.publish_group_state
+  next if Ashborne_toolkit.solo_swarm_retreat_if_needed
   Ashborne_toolkit.group_danger_status_check
 
   if !checkdead
@@ -25067,7 +25268,7 @@ loop {
   ashborne_group_status_check.call unless $ashborne_follow_mode == "1"
   Ashborne_toolkit.group_danger_retreat_if_needed
   ashborne_group_support.call unless $ashborne_follow_mode == "1"
-  Ashborne_toolkit.loot_script("#{$ashborne_loot_script}") if GameObj.dead.length >= 1
+  Ashborne_toolkit.loot_script("#{$ashborne_loot_script}") if GameObj.dead.length >= 1 && (GameObj.targets.empty? || Ashborne_toolkit.urgent_loot_needed?)
   Ashborne_toolkit.boost_long
   ashborne_upkeep_buffs.call
 
@@ -25148,7 +25349,7 @@ loop {
   Ashborne_toolkit.group_danger_retreat_if_needed
   Ashborne_toolkit.boost_long
   ashborne_upkeep_buffs.call
-  Ashborne_toolkit.loot_script("#{$ashborne_loot_script}") if GameObj.dead.length >= 1
+  Ashborne_toolkit.loot_script("#{$ashborne_loot_script}") if GameObj.dead.length >= 1 && (GameObj.targets.empty? || Ashborne_toolkit.urgent_loot_needed?)
 
   # respond "I'm in qfollow"
   result = matchtimeout(1, /#{$ashborne_captain} (swings|gestures|fires|attempts to|skillfully weaves|punches with|channels|rushes forward|thrusts with|thrusts with a|lunges at|waves a|launches a .* bash|lashes out with an? awesome shield bash|attempts a shield bash|looping .*? lashes out in a strike|brings .*? around to pummel|sweeping .*? out low to .*? launches a quick bash|whirls in a fury of unrelenting strikes|mstrikes?|starts to climb|begins to climb|begins climbing|begins to descend|confidently climbs|gracefully climbs|climbs up|climbs down|goes through|squeezes through|crawls through|pushes through|pulls open|opens .*door|enters)/).to_s
