@@ -1,8 +1,8 @@
 =begin
-  Creates one batch of crimson salt crystals for use with Animate Dead.
-  Run the script once per batch; re-run as many times as needed.
+  Creates crimson salt crystals for use with Animate Dead.
+  Makes one batch per run by default; pass a number to make several in a row.
 
-  INGREDIENTS (consumed each run):
+  INGREDIENTS (consumed each batch):
     - One measure of sea water    (one of your two crystal flasks)
     - One measure of troll blood  (the other crystal flask)
     - One moonflower              (night-only forage in Icemule Trace / Veythorne Manor, or check player shops)
@@ -13,6 +13,7 @@
     - A glass vial                              (~12,500 silver; used to dose one unit at a time)
     - Two small crystal flasks                  (~1,000 silver each, hold 20 measures of water or blood each)
     - A single container to hold all of the above, including your moonflowers
+    - Optional: a jar in that container to drop the finished crystals into
 
   SETUP -- run once per character:
     ;vars set csc_container {noun}
@@ -22,9 +23,16 @@
     ;vars set csc_mortar {noun}    (default: mortar)
     ;vars set csc_pestle {noun}    (default: pestle)
     ;vars set csc_vial {noun}      (default: vial)
+    ;vars set csc_jar {noun}       (optional: finished crystals go here; else into the container)
 
   USAGE:
-    ;crimson_salt
+    ;crimson_salt        -- make one batch
+    ;crimson_salt 5      -- make five batches in a row
+    ;crimson_salt help   -- show the help screen
+
+  Where the finished crystals go:
+    - If csc_jar is set and that jar is in your container, the crystals go into the jar.
+    - Otherwise they go loose into your csc_container.
 
   The crystals extend Animate Dead duration from 10 minutes to 20 minutes + 15 seconds per level of troll blood
   Apply with: SPREAD CRYSTALS ON {dead target}
@@ -33,8 +41,15 @@
           game: Gemstone
           tags: alchemy, animate dead, necromancer
       requires: Lich >= 5.0.0
-       version: 0.3
+       version: 0.5
 
+v0.5: Add batch mode (;crimson_salt N makes N batches in a row) and a csc_jar
+      variable -- finished crystals are stored in your jar, or loose in your
+      csc_container if no jar is set. A run that hits an ingredient shortage now
+      stops cleanly and reports how many batches it completed.
+v0.4: Fix the flask empty-check race -- read the look response to its
+      "chain is affixed" terminator and ignore concurrent caster-script noise,
+      so a filled flask is no longer falsely reported empty on the first run.
 v0.3: Disable SAFERSPELLS around the 719 cast and re-enable it after
 v0.2: Fix empty flask check
 v0.1: Initial release
@@ -42,6 +57,9 @@ v0.1: Initial release
 TLDR: Put all your ingredients in a *single container*, and run ;crimson_salt.
 Ingredients: 1 vial of sea water, 1 vial of troll's blood, a vial, one (or a bundle of) moonflower, a mortar, a pestle.
 =end
+
+CSC_VERSION     = '0.5' unless defined?(CSC_VERSION)
+CSC_MAX_BATCHES = 20    unless defined?(CSC_MAX_BATCHES)
 
 # ---- Helpers -----------------------------------------------------------------
 
@@ -56,13 +74,44 @@ def csc_find_in(container, noun)
     container.contents.find { |o| o.name =~ /\b#{Regexp.escape(noun)}\b/i }
 end
 
+# Read a flask's contents reliably. The look response can lag or be interleaved
+# with concurrent caster-script noise, so we drain lines until the crystal
+# flask's guaranteed last line ("chain is affixed") instead of trusting the first
+# line back -- trusting the first line caused false "empty" aborts on the 1st run.
+# Returns true (has fluid), false (empty), or nil (couldn't read it).
+def csc_flask_filled?(id)
+  clear
+  fput "look in ##{id}"
+  collected = []
+  begin
+    Timeout.timeout(6) do
+      loop do
+        line = get
+        collected << line
+        break if line =~ /chain is affixed/
+      end
+    end
+  rescue Timeout::Error
+    return nil
+  end
+  collected.join(" ") =~ /flask is filled with/ ? true : false
+end
+
+# Refresh the container's contents listing so Lich's parsed contents are current.
+def csc_refresh_contents(container)
+  dothistimeout "look in ##{container.id}", 10, /Total items:/i
+  deadline = Time.now + 5
+  sleep 0.1 until container.contents || Time.now > deadline
+  !container.contents.nil?
+end
+
 HELP = <<~HELP
   **  CRIMSON SALT  --  Animate Dead Crystal Maker  **
 
-  Creates one batch of crimson salt crystals per run.
+  Creates crimson salt crystals -- one batch per run, or several in a row.
   Extends Animate Dead from 10 min to 20+ min.
 
-  * INGREDIENTS *  (consumed each run)
+  * INGREDIENTS *  (consumed each batch)
       Sea water   -- one measure  (crystal flask)
       Troll blood -- one measure  (crystal flask)
       Moonflower  -- one, or a bundle
@@ -72,7 +121,8 @@ HELP = <<~HELP
       Pestle
       Glass vial
       Two small crystal flasks (one water, one blood)
-  
+      Jar (optional -- where finished crystals are stored)
+
   * SETUP *  (run once per character)
       ;vars set csc_container={noun}
       Example:  ;vars set csc_container=tube
@@ -81,29 +131,257 @@ HELP = <<~HELP
       ;vars set csc_mortar={noun}     (default: mortar)
       ;vars set csc_pestle={noun}     (default: pestle)
       ;vars set csc_vial={noun}       (default: vial)
+      ;vars set csc_jar={noun}        (optional: finished crystals go here)
 
   * USAGE *
-      ;crimson_salt           -- make a batch
+      ;crimson_salt           -- make one batch
+      ;crimson_salt 5         -- make five batches in a row
       ;crimson_salt help      -- show this screen
+
+  Finished crystals go into your jar if csc_jar is set, otherwise loose
+  into your csc_container.
 
   Apply crystals with:  SPREAD CRYSTALS ON {dead target}
   Questions?  Reach out to @Zedarius on Discord.
 
 HELP
 
+# ---- One batch ---------------------------------------------------------------
+# Returns :ok on success, or a descriptive String if it had to stop (missing
+# equipment, ingredient shortage, failed cast, etc). The caller decides whether
+# a stop is a hard abort (nothing made yet) or a graceful summary (some made).
+def csc_make_one(container, container_noun, mortar_noun, pestle_noun, vial_noun, jar_noun, batch_num, total)
+  # Refresh and re-find everything -- contents change between batches.
+  return "Could not read the contents of your #{container_noun}. Is it open?" unless csc_refresh_contents(container)
+
+  mortar     = csc_find_in(container, mortar_noun)
+  pestle     = csc_find_in(container, pestle_noun)
+  vial       = csc_find_in(container, vial_noun)
+  flasks     = container.contents.select { |o| o.noun =~ /flask/i }
+  moonflower = container.contents.find   { |o| o.noun =~ /moonflower/i || o.name =~ /moonflower/i }
+
+  return "Cannot find mortar ('#{mortar_noun}') in your #{container_noun}.\n" \
+         "          Override with: ;vars set csc_mortar={noun}" if mortar.nil?
+  return "Cannot find pestle ('#{pestle_noun}') in your #{container_noun}.\n" \
+         "          Override with: ;vars set csc_pestle={noun}" if pestle.nil?
+  return "Cannot find glass vial ('#{vial_noun}') in your #{container_noun}.\n" \
+         "          Override with: ;vars set csc_vial={noun}" if vial.nil?
+
+  if flasks.length < 2
+    return "Expected 2 crystal flasks in your #{container_noun} but found #{flasks.length}.\n" \
+           "          Make sure both your sea water flask and troll blood flask are in the container."
+  end
+
+  return "No moonflower left in your #{container_noun}.\n" \
+         "          Moonflowers are forageable only at night in Icemule Trace\n" \
+         "          or the Veythorne Manor garden. Also, check player shops!" if moonflower.nil?
+
+  flasks.first(2).each do |flask|
+    case csc_flask_filled?(flask.id)
+    when false
+      return "One of your flasks (#{flask.name}) is empty.\n" \
+             "          Fill your flasks:\n" \
+             "            Sea water:   HARVEST WATER WITH FLASK at a coastal area\n" \
+             "            Troll blood: HARVEST BLOOD FROM {troll} WITH FLASK"
+    when nil
+      return "Couldn't read flask #{flask.name} (the look timed out). Try again."
+    end
+  end
+
+  # ---- Stow hands ------------------------------------------------------------
+  waitrt?
+  fput "stow right" unless checkright.nil?
+  sleep 0.75
+  fput "stow left"  unless checkleft.nil?
+  sleep 0.75
+
+  # ---- First liquid: flask[0] -> vial -> mortar ------------------------------
+  _respond "* Crimson Salt: Adding first liquid..."
+  waitrt?
+  fput "get ##{flasks[0].id} from ##{container.id}"  # flask 1 -> right hand
+  sleep 0.75
+  fput "get ##{vial.id} from ##{container.id}"        # vial -> left hand
+  sleep 0.75
+  fput "turn ##{vial.id}"                              # empty vial in case it has residue from a prior run
+  sleep 0.75
+  fput "pour ##{flasks[0].id} in ##{vial.id}"         # dose one measure into vial
+  sleep 0.75
+  fput "put ##{flasks[0].id} in ##{container.id}"     # flask 1 -> container
+  sleep 0.75
+  fput "get ##{mortar.id} from ##{container.id}"       # mortar -> right hand
+  sleep 0.75
+  fput "pour ##{vial.id} in ##{mortar.id}"             # pour vial into mortar
+  sleep 0.75
+  fput "put ##{mortar.id} in ##{container.id}"         # mortar -> container
+  sleep 0.75
+  # State: left=vial (empty), right=empty
+
+  # ---- Second liquid: flask[1] -> vial -> mortar -----------------------------
+  _respond "* Crimson Salt: Adding second liquid..."
+  waitrt?
+  fput "get ##{flasks[1].id} from ##{container.id}"  # flask 2 -> right hand
+  sleep 0.75
+  fput "pour ##{flasks[1].id} in ##{vial.id}"         # dose one measure into vial
+  sleep 0.75
+  fput "put ##{flasks[1].id} in ##{container.id}"     # flask 2 -> container
+  sleep 0.75
+  fput "get ##{mortar.id} from ##{container.id}"       # mortar -> right hand
+  sleep 0.75
+  fput "pour ##{vial.id} in ##{mortar.id}"             # pour vial into mortar
+  sleep 0.75
+  fput "put ##{vial.id} in ##{container.id}"           # vial -> container
+  sleep 0.75
+  # State: right=mortar, left=empty
+
+  # ---- Moonflower ------------------------------------------------------------
+  _respond "* Crimson Salt: Adding moonflower..."
+  waitrt?
+  if moonflower.name =~ /bundle/i # if you have a bundle of moonflowers in your container
+    # Need both hands free to do BUNDLE REMOVE safely
+    fput "put ##{mortar.id} in ##{container.id}"           # mortar -> container (right hand free)
+    sleep 0.75
+    fput "get ##{moonflower.id} from ##{container.id}"     # bundle -> right hand
+    sleep 0.75
+    fput "bundle remove"                                     # one moonflower -> left hand
+    sleep 1; waitrt?  # sleep before waitrt? so RT XML arrives first; 1s here for hand state
+    # If bundle still has moonflowers, right hand won't be empty -- put it back.
+    # Use GameObj.right_hand.id rather than moonflower.id: if the bundle had only
+    # one flower it "unbundles completely" and the original object ID is gone.
+    rh = GameObj.right_hand
+    unless rh.nil?
+      fput "put ##{rh.id} in ##{container.id}"
+      sleep 0.75
+    end
+    fput "get ##{mortar.id} from ##{container.id}"          # mortar -> right hand
+    sleep 0.75
+  else
+    # If you only have a single moonflower
+    fput "get ##{moonflower.id} from ##{container.id}"     # moonflower -> left hand
+    sleep 0.75
+  end
+  fput "put moonflower in ##{mortar.id}"                    # moonflower -> mortar (left hand free)
+  sleep 0.75
+
+  # ---- Pestle ----------------------------------------------------------------
+  waitrt?
+  fput "get ##{pestle.id} from ##{container.id}"  # pestle -> left hand
+  sleep 0.75
+  # State: right=mortar (with all ingredients), left=pestle
+
+  # ---- Grind sequence (using a converted mortar, GRIND verb) -----------------
+  # Note: old-style mortars use PUSH {ingredient} WITH PESTLE instead of GRIND.
+  # sleep 1 after each fput lets the roundtime XML arrive before waitrt? checks.
+  _respond "* Crimson Salt: Grinding moonflower..."
+  fput "grind moonflower"
+  sleep 1; waitrt?
+
+  _respond "* Crimson Salt: Grinding mash (1 of 2)..."
+  fput "grind mash"
+  sleep 1; waitrt?
+
+  _respond "* Crimson Salt: Grinding mash (2 of 2)..."
+  fput "grind mash"
+  sleep 1; waitrt?
+
+  _respond "* Crimson Salt: Grinding solution..."
+  fput "grind solution"
+  sleep 1; waitrt?
+
+  # ---- Cast Animate Dead (719) at the solution -------------------------------
+  _respond "* Crimson Salt: Casting 719 at solution..."
+  fput "set saferspells off"
+  fput "prep 719"
+  sleep 1; waitcastrt?
+  fput "cast at my solution"
+  sleep 1; waitrt?  # sleep so RT XML arrives before waitrt? checks
+  fput "set saferspells on"
+
+  # Stow the pestle while the reaction builds -- no need to hold it any longer
+  _respond "* Crimson Salt: Stowing pestle while the reaction builds..."
+  fput "put ##{pestle.id} in ##{container.id}"
+  sleep 0.75
+
+  # Watch for the three intermediate flame stages, then the final die-down.
+  # We give the reaction up to 10 minutes.
+  deadline = Time.now + 600
+  loop do
+    line = get
+    if line =~ /shadowy flames arise/i
+      _respond "* Crimson Salt: The reaction has begun! This can take several minutes -- be patient..."
+    elsif line =~ /flames of pure essence/i
+      _respond "* Crimson Salt: Still cooking..."
+    elsif line =~ /black flames rise/i
+      _respond "* Crimson Salt: Almost there -- the solution is nearly cooked down..."
+    elsif line =~ /dark flames.*die down/i
+      break
+    elsif line =~ /fumble|spell.*fail|not enough/i
+      return "Spell cast failed: #{line.strip}\n" \
+             "          Check your mana, spell knowledge, and mortar contents."
+    end
+    if Time.now > deadline
+      return "Timed out (10 min) waiting for the crystal reaction to complete.\n" \
+             "          The cast may have failed. Check your mortar."
+    end
+  end
+
+  # ---- Collect crystals and store them ---------------------------------------
+  _respond "* Crimson Salt: Collecting crystals..."
+  waitrt?
+  fput "get crystals from my mortar"             # crystals -> left hand
+  sleep 0.75
+  crystals     = GameObj.left_hand
+  crystals_ref = crystals.nil? ? "crystals" : "##{crystals.id}"
+  fput "put ##{mortar.id} in ##{container.id}"   # mortar back -> right hand free
+  sleep 0.75
+
+  # Prefer a configured jar; otherwise drop the crystals loose into the container.
+  jar = jar_noun.to_s.strip.empty? ? nil : csc_find_in(container, jar_noun)
+  if jar
+    fput "get ##{jar.id} from ##{container.id}"  # jar -> right hand
+    sleep 0.75
+    fput "put #{crystals_ref} in ##{jar.id}"     # crystals -> jar
+    sleep 0.75
+    fput "put ##{jar.id} in ##{container.id}"    # jar back -> container
+    sleep 0.75
+    dest = "jar"
+  else
+    fput "put #{crystals_ref} in ##{container.id}"  # crystals -> container
+    sleep 0.75
+    dest = "#{container_noun}"
+  end
+
+  if total > 1
+    _respond "* Crimson Salt: Batch #{batch_num} of #{total} complete -- crystals stored in your #{dest}."
+  else
+    _respond "* Crimson Salt: Done! Your crimson salt crystals are in your #{dest}."
+  end
+  :ok
+end
+
 # ---- Argument parsing --------------------------------------------------------
 
-arg = script.vars[1].to_s.strip.downcase
+arg   = script.vars[1].to_s.strip.downcase
+count = 1
 case arg
 when "help", "setup"
   _respond HELP
   exit
 when ""
-  # no argument -- proceed normally
+  count = 1
+when /\A\d+\z/
+  count = arg.to_i
+  if count < 1
+    _respond "*** Crimson Salt: Batch count must be at least 1."
+    exit
+  end
+  if count > CSC_MAX_BATCHES
+    _respond "*** Crimson Salt: That's a lot -- capping at #{CSC_MAX_BATCHES} batches."
+    count = CSC_MAX_BATCHES
+  end
 else
   _respond "*** Crimson Salt: Unknown argument '#{arg}'."
-  _respond "***   Valid arguments: help, setup"
-  _respond "***   To make crystals, run: ;crimson_salt"
+  _respond "***   Usage: ;crimson_salt [N]   (N = number of batches, default 1)"
+  _respond "***   Help:  ;crimson_salt help"
   exit
 end
 
@@ -113,6 +391,7 @@ container_noun = UserVars.csc_container
 mortar_noun    = UserVars.csc_mortar.to_s.strip.empty? ? "mortar" : UserVars.csc_mortar
 pestle_noun    = UserVars.csc_pestle.to_s.strip.empty? ? "pestle" : UserVars.csc_pestle
 vial_noun      = UserVars.csc_vial.to_s.strip.empty?   ? "vial"   : UserVars.csc_vial
+jar_noun       = UserVars.csc_jar.to_s.strip            # optional; blank means "use the container"
 
 if container_noun.to_s.strip.empty?
   _respond HELP
@@ -120,208 +399,40 @@ if container_noun.to_s.strip.empty?
   exit
 end
 
-# ---- Locate container and load its contents ----------------------------------
+# ---- Locate container --------------------------------------------------------
 
 container = GameObj.inv.find { |o| o.noun =~ /#{Regexp.escape(container_noun)}/i } ||
             GameObj.inv.find { |o| o.name =~ /\b#{Regexp.escape(container_noun)}\b/i }
 csc_abort "Cannot find your container ('#{container_noun}') in inventory." if container.nil?
 
-# Wait for the full container listing so Lich can parse contents into container.contents
-dothistimeout "look in ##{container.id}", 10, /Total items:/i
-deadline = Time.now + 5
-sleep 0.1 until container.contents || Time.now > deadline
-csc_abort "Could not read the contents of your #{container_noun}. Is it open?" if container.contents.nil?
+_respond "* Crimson Salt v#{CSC_VERSION}: starting#{count > 1 ? " (#{count} batches)" : ''}..."
 
-# ---- Check equipment and ingredients -----------------------------------------
+# ---- Make the batches --------------------------------------------------------
 
-_respond "* Crimson Salt: Checking equipment and ingredients..."
-
-mortar     = csc_find_in(container, mortar_noun)
-pestle     = csc_find_in(container, pestle_noun)
-vial       = csc_find_in(container, vial_noun)
-flasks     = container.contents.select { |o| o.noun =~ /flask/i }
-moonflower = container.contents.find   { |o| o.noun =~ /moonflower/i || o.name =~ /moonflower/i }
-
-csc_abort "Cannot find mortar ('#{mortar_noun}') in your #{container_noun}.\n" \
-          "          Override with: ;vars set csc_mortar={noun}" if mortar.nil?
-
-csc_abort "Cannot find pestle ('#{pestle_noun}') in your #{container_noun}.\n" \
-          "          Override with: ;vars set csc_pestle={noun}" if pestle.nil?
-
-csc_abort "Cannot find glass vial ('#{vial_noun}') in your #{container_noun}.\n" \
-          "          Override with: ;vars set csc_vial={noun}" if vial.nil?
-
-if flasks.length < 2
-  csc_abort "Expected 2 crystal flasks in your #{container_noun} but found #{flasks.length}.\n" \
-            "          Make sure both your sea water flask and troll blood flask are in the container."
-end
-
-csc_abort "No moonflower found in your #{container_noun}.\n" \
-          "          Moonflowers are forageable only at night in Icemule Trace\n" \
-          "          or the Veythorne Manor garden. Also, check player shops!" if moonflower.nil?
-
-flasks.first(2).each do |flask|
-  look = dothistimeout "look in ##{flask.id}", 5, /.+/
-  if look =~ /\bempty\b|\bnothing\b/i || look !~ /\bfilled\b/i
-    csc_abort "One of your flasks (#{flask.name}) appears to be empty.\n" \
-              "          Fill your flasks:\n" \
-              "            Sea water:   HARVEST WATER WITH FLASK at a coastal area\n" \
-              "            Troll blood: HARVEST BLOOD FROM {troll} WITH FLASK"
-  end
-end
-
-_respond "* Crimson Salt: All equipment and ingredients confirmed. Beginning crystal creation."
-
-# ---- Stow hands --------------------------------------------------------------
-
-waitrt?
-fput "stow right" unless checkright.nil?
-sleep 0.75
-fput "stow left"  unless checkleft.nil?
-sleep 0.75
-
-# ---- First liquid: flask[0] -> vial -> mortar --------------------------------
-
-_respond "* Crimson Salt: Adding first liquid..."
-waitrt?
-fput "get ##{flasks[0].id} from ##{container.id}"  # flask 1 -> right hand
-sleep 0.75
-fput "get ##{vial.id} from ##{container.id}"        # vial -> left hand
-sleep 0.75
-fput "turn ##{vial.id}"                              # empty vial in case it has residue from a prior run
-sleep 0.75
-fput "pour ##{flasks[0].id} in ##{vial.id}"         # dose one measure into vial
-sleep 0.75
-fput "put ##{flasks[0].id} in ##{container.id}"     # flask 1 -> container
-sleep 0.75
-fput "get ##{mortar.id} from ##{container.id}"       # mortar -> right hand
-sleep 0.75
-fput "pour ##{vial.id} in ##{mortar.id}"             # pour vial into mortar
-sleep 0.75
-fput "put ##{mortar.id} in ##{container.id}"         # mortar -> container
-sleep 0.75
-# State: left=vial (empty), right=empty
-
-# ---- Second liquid: flask[1] -> vial -> mortar -------------------------------
-
-_respond "* Crimson Salt: Adding second liquid..."
-waitrt?
-fput "get ##{flasks[1].id} from ##{container.id}"  # flask 2 -> right hand
-sleep 0.75
-fput "pour ##{flasks[1].id} in ##{vial.id}"         # dose one measure into vial
-sleep 0.75
-fput "put ##{flasks[1].id} in ##{container.id}"     # flask 2 -> container
-sleep 0.75
-fput "get ##{mortar.id} from ##{container.id}"       # mortar -> right hand
-sleep 0.75
-fput "pour ##{vial.id} in ##{mortar.id}"             # pour vial into mortar
-sleep 0.75
-fput "put ##{vial.id} in ##{container.id}"           # vial -> container
-sleep 0.75
-# State: right=mortar, left=empty
-
-# ---- Moonflower --------------------------------------------------------------
-
-_respond "* Crimson Salt: Adding moonflower..."
-waitrt?
-if moonflower.name =~ /bundle/i #if you have a bundle of moonflowers in your container
-  # Need both hands free to do BUNDLE REMOVE safely
-  fput "put ##{mortar.id} in ##{container.id}"           # mortar -> container (right hand free)
-  sleep 0.75
-  fput "get ##{moonflower.id} from ##{container.id}"     # bundle -> right hand
-  sleep 0.75
-  fput "bundle remove"                                     # one moonflower -> left hand
-  sleep 1; waitrt?  # sleep before waitrt? so RT XML arrives first; 1s here for hand state
-  # If bundle still has moonflowers, right hand won't be empty -- put it back.
-  # Use GameObj.right_hand.id rather than moonflower.id: if the bundle had only
-  # one flower it "unbundles completely" and the original object ID is gone.
-  rh = GameObj.right_hand
-  unless rh.nil?
-    fput "put ##{rh.id} in ##{container.id}"
-    sleep 0.75
-  end
-  fput "get ##{mortar.id} from ##{container.id}"          # mortar -> right hand
-  sleep 0.75
-else
-  # If you only have a single moonflower
-  fput "get ##{moonflower.id} from ##{container.id}"     # moonflower -> left hand
-  sleep 0.75
-end
-fput "put moonflower in ##{mortar.id}"                    # moonflower -> mortar (left hand free)
-sleep 0.75
-
-# ---- Pestle ------------------------------------------------------------------
-
-waitrt?
-fput "get ##{pestle.id} from ##{container.id}"  # pestle -> left hand
-sleep 0.75
-# State: right=mortar (with all ingredients), left=pestle
-
-# ---- Grind sequence (using a converted mortar, GRIND verb) --------------------------
-# Note: old-style mortars use PUSH {ingredient} WITH PESTLE instead of GRIND.
-# sleep 1 after each fput lets the roundtime XML arrive before waitrt? checks.
-
-_respond "* Crimson Salt: Grinding moonflower..."
-fput "grind moonflower"
-sleep 1; waitrt?
-
-_respond "* Crimson Salt: Grinding mash (1 of 2)..."
-fput "grind mash"
-sleep 1; waitrt?
-
-_respond "* Crimson Salt: Grinding mash (2 of 2)..."
-fput "grind mash"
-sleep 1; waitrt?
-
-_respond "* Crimson Salt: Grinding solution..."
-fput "grind solution"
-sleep 1; waitrt?
-
-# ---- Cast Animate Dead (719) at the solution ---------------------------------
-
-_respond "* Crimson Salt: Casting 719 at solution..."
-fput "set saferspells off"
-fput "prep 719"
-sleep 1; waitcastrt?
-fput "cast at my solution"
-sleep 1; waitrt?  # sleep so RT XML arrives before waitrt? checks
-fput "set saferspells on"
-
-# Stow the pestle while the reaction builds -- no need to hold it any longer
-_respond "* Crimson Salt: Stowing pestle while the reaction builds..."
-fput "put ##{pestle.id} in ##{container.id}"
-sleep 0.75
-
-# Watch for the three intermediate flame stages, then the final die-down.
-# We give the reaction up to 10 minutes.
-deadline = Time.now + 600
-loop do
-  line = get
-  if line =~ /shadowy flames arise/i
-    _respond "* Crimson Salt: The reaction has begun! This can take several minutes -- be patient..."
-  elsif line =~ /flames of pure essence/i
-    _respond "* Crimson Salt: Still cooking..."
-  elsif line =~ /black flames rise/i
-    _respond "* Crimson Salt: Almost there -- the solution is nearly cooked down..."
-  elsif line =~ /dark flames.*die down/i
+made        = 0
+stop_reason = nil
+count.times do |i|
+  batch_num = i + 1
+  _respond "* Crimson Salt: ===== Batch #{batch_num} of #{count} =====" if count > 1
+  result = csc_make_one(container, container_noun, mortar_noun, pestle_noun, vial_noun, jar_noun, batch_num, count)
+  if result == :ok
+    made += 1
+  else
+    stop_reason = result
     break
-  elsif line =~ /fumble|spell.*fail|not enough/i
-    csc_abort "Spell cast failed: #{line.strip}\n" \
-              "          Check your mana, spell knowledge, and mortar contents."
-  end
-  if Time.now > deadline
-    csc_abort "Timed out (10 min) waiting for the crystal reaction to complete.\n" \
-              "          The cast may have failed. Check your mortar."
   end
 end
 
-# ---- Collect crystals and return equipment to container ----------------------
+# ---- Report ------------------------------------------------------------------
 
-_respond "* Crimson Salt: Collecting crystals and returning equipment..."
-waitrt?
-fput "get crystals from my mortar"             # crystals -> left hand
-sleep 0.75
-fput "put ##{mortar.id} in ##{container.id}"  # mortar back -> right free
-
-_respond "* Crimson Salt: Done! You now have a bunch of crimson salt crystals in your left hand."
-_respond "* Apply them with: SPREAD CRYSTALS ON {target}"
+if stop_reason
+  if made == 0
+    csc_abort stop_reason
+  else
+    _respond "* Crimson Salt: Stopped after #{made} of #{count} batch#{made == 1 ? '' : 'es'}."
+    _respond "*   Reason: #{stop_reason}"
+  end
+else
+  _respond "* Crimson Salt: All #{count} batches complete." if count > 1
+  _respond "* Apply crystals with: SPREAD CRYSTALS ON {target}"
+end
