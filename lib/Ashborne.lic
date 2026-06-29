@@ -989,6 +989,18 @@ module Ashborne_toolkit
     $ashborne_huntplan_catalog_rooms.include?(room_id.to_i)
   end
 
+  def disable_huntplan_catalog_zone(reason = nil)
+    respond "Ashborne catalog boundary disabled for this run: #{reason}" unless reason.to_s.empty?
+    $ashborne_huntplan_catalog_key = nil
+    $ashborne_huntplan_catalog_rooms = nil
+    $ashborne_huntplan_catalog_anchor = nil
+    $ashborne_huntplan_catalog_names = nil
+    $ashborne_huntplan_catalog_recent_rooms = []
+    nil
+  rescue
+    nil
+  end
+
   def huntplan_catalog_neighbors(room)
     return [] unless room
 
@@ -1046,6 +1058,11 @@ module Ashborne_toolkit
 
     candidates = Ashborne_toolkit.huntplan_catalog_neighbors(current_room)
     if candidates.empty?
+      if current_id.to_i == anchor.to_i
+        Ashborne_toolkit.disable_huntplan_catalog_zone("anchor room #{anchor} has no mapped in-area exits.")
+        return nil
+      end
+
       respond "Ashborne catalog movement has no mapped in-area exits from #{current_id}; returning to anchor."
       Ashborne_toolkit.catalog_go2(anchor, "catalog anchor return")
       return true
@@ -2496,6 +2513,8 @@ module Ashborne_toolkit
   end
 
   def target_check
+    return if Ashborne_toolkit.medical_retreat_if_needed
+
     # respond "Debug Output - I'm defining creatures"
     if $ashborne_group_ai == "0" ? GameObj.pcs.any? : Ashborne_toolkit.visible_non_group_players.any?
       Ashborne_toolkit.leave_occupied_room
@@ -2684,6 +2703,8 @@ module Ashborne_toolkit
   end
 
   def movemgr
+    return if Ashborne_toolkit.medical_retreat_if_needed
+
     # Ashborne_toolkit.group_rt_check
     sleep $ashborne_spawn_delay
     # respond "Debug Output - You are starting movemgr"
@@ -5764,6 +5785,7 @@ module Ashborne_toolkit
 
   def combat_unique_to_ashborne
     return if Ashborne_toolkit.solo_swarm_retreat_if_needed
+    return if Ashborne_toolkit.medical_retreat_if_needed
     return if Ashborne_toolkit.group_danger_status_check
     if $ashborne_group_ai == "0" ? GameObj.pcs.any? : Ashborne_toolkit.visible_non_group_players.any?
       Ashborne_toolkit.leave_occupied_room
@@ -9894,17 +9916,55 @@ module Ashborne_toolkit
     nil
   end
 
-  def personal_group_danger_reason
+  def critical_health_retreat_reason?(reason)
+    reason.to_s =~ /critical health/i ? true : false
+  rescue
+    false
+  end
+
+  def personal_medical_retreat_reason
     critical_health = Ashborne_toolkit.critical_health_retreat_reason
     return critical_health unless critical_health.nil?
 
     wound_rank = Ashborne_toolkit.max_injury_rank(Wounds)
     scar_rank = Ashborne_toolkit.max_injury_rank(Scars)
     injury_rank = [wound_rank, scar_rank].max
+    bleeding = Ashborne_toolkit.bleeding_danger?
 
+    return "rank #{injury_rank} injury with active bleeding" if injury_rank >= 1 && bleeding
     return "rank #{injury_rank} injury" if injury_rank >= 2
-    return "active bleeding" if Ashborne_toolkit.bleeding_danger?
+    return "active bleeding" if bleeding
     return "low health (#{percenthealth.to_i}%)" if percenthealth.to_i < Ashborne_toolkit.health_floor
+
+    nil
+  rescue
+    nil
+  end
+
+  def medical_retreat_if_needed
+    reason = Ashborne_toolkit.personal_medical_retreat_reason
+    return false if reason.nil?
+
+    Ashborne_toolkit.stance_defensive
+    $ashborne_return_why = "Medical retreat: #{reason}."
+    $ashborne_action = 99
+    $ashborne_group_danger_active = "1"
+    Ashborne_toolkit.publish_group_danger(reason) if $ashborne_group_ai != "0"
+    if Ashborne_toolkit.critical_health_retreat_reason?(reason)
+      waitrt? if checkrt.to_f > 0
+      waitcastrt? if checkcastrt.to_f > 0
+      Ashborne_toolkit.emergency_return_to_town_if_needed
+      exit
+    end
+    true
+  rescue
+    false
+  end
+
+  def personal_group_danger_reason
+    medical_reason = Ashborne_toolkit.personal_medical_retreat_reason
+    return medical_reason unless medical_reason.nil?
+
     if Ashborne_toolkit.loot_rotation_enabled? && Ashborne_toolkit.personal_encumbrance_emergency?
       return "encumbrance advanced beyond moderate (#{checkencumbrance}, #{percentencumbrance.to_i})"
     end
@@ -9931,11 +9991,21 @@ module Ashborne_toolkit
     return false if reason.nil?
 
     Ashborne_toolkit.stance_defensive
-    $ashborne_return_why = "Emergency retreat: #{reason}."
-    $ashborne_action = 99
-    $ashborne_group_danger_active = "1"
+    waitrt? if checkrt.to_f > 0
+    waitcastrt? if checkcastrt.to_f > 0
+    starting_room = Room.current && Room.current.id ? Room.current.id.to_s : nil
+    respond "Ashborne is stepping out to break up #{reason}."
+    walk
+    sleep 0.25
+    moved = starting_room.nil? || !Room.current || Room.current.id.to_s != starting_room
+    respond "Ashborne could not move out of the swarm room; staying defensive." unless moved
+    $ashborne_action = 0
+    $ashborne_own_this_room = 0
+    $ashborne_my_vine = "0"
+    $ashborne_recent_eviction = "1"
     true
   rescue
+    Ashborne_toolkit.stance_defensive
     false
   end
 
@@ -9992,7 +10062,16 @@ module Ashborne_toolkit
   end
 
   def group_danger_status_check
-    return false if $ashborne_group_ai == "0"
+    if $ashborne_group_ai == "0"
+      danger_reason = Ashborne_toolkit.personal_group_danger_reason
+      return false if danger_reason.nil?
+
+      $ashborne_group_danger_active = "1"
+      $ashborne_return_why = "Medical retreat: #{danger_reason}."
+      $ashborne_action = 99
+      return true
+    end
+
     return true if Ashborne_toolkit.apply_group_danger_abort
 
     danger_reason = Ashborne_toolkit.personal_group_danger_reason
@@ -10404,7 +10483,9 @@ module Ashborne_toolkit
   end
 
   def medical_retreat_reason?(reason = $ashborne_return_why)
-    reason.to_s =~ /medical retreat|injury|bleeding|low health|critical health/i ? true : false
+    return true if reason.to_s =~ /medical retreat|injury|bleeding|low health|critical health/i
+
+    !Ashborne_toolkit.personal_medical_retreat_reason.nil?
   rescue
     false
   end
@@ -10864,6 +10945,12 @@ module Ashborne_toolkit
   end
 
   def safe_room_default
+    medical_reason = Ashborne_toolkit.personal_medical_retreat_reason
+    if medical_reason
+      $ashborne_group_danger_active = "1"
+      $ashborne_return_why = "Medical retreat: #{medical_reason}." unless $ashborne_return_why.to_s =~ /medical retreat|injury|bleeding|low health|critical health/i
+    end
+
     emergency_retreat = $ashborne_group_danger_active == "1" || Ashborne_toolkit.medical_retreat_reason?
     if $ashborne_group_ai == "1"
       unless emergency_retreat
@@ -10981,13 +11068,26 @@ module Ashborne_toolkit
   end
 
   def unpause_go2
-    sleep 3
-    do_client ";ua"
-    if Script.running? "go2"
-      wait_while { running? "go2" }
-    else
-      nil
+    last_unpause = 0
+    while Script.running?("go2")
+      paused = begin
+        Script.respond_to?(:paused?) && Script.paused?("go2")
+      rescue
+        false
+      end
+
+      if paused || Time.now.to_f - last_unpause.to_f >= 3.0
+        do_client ";unpause"
+        do_client ";ua"
+        last_unpause = Time.now.to_f
+      end
+
+      sleep 0.25
     end
+    true
+  rescue => error
+    respond "go2 unpause warning: #{error.message}" if $ashborne_qc_debug == "1"
+    false
   end
 
   def waitroundtime
@@ -20742,6 +20842,7 @@ ashborne_zone_reset_check = proc {
 ashborne_status_check = proc {
   Ashborne_toolkit.publish_group_state
   next if Ashborne_toolkit.solo_swarm_retreat_if_needed
+  next if Ashborne_toolkit.medical_retreat_if_needed
   Ashborne_toolkit.group_danger_status_check
 
   if !checkdead
