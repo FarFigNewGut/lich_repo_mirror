@@ -5,6 +5,8 @@
 
   Author: Falvicar
   Bugs, issues, or suggestions? Reach out to Falvicar in-game or on Discord: Shadowleaves
+  Note: This script is actively maintained -- bugs are fixed and features are added on
+  an ongoing basis as they are discovered during play. Check back for updates regularly.
 
   Usage:
     ;gshunting4all setup    -- open the setup GUI to create or update your profile
@@ -1394,7 +1396,8 @@ module SetupWizard
     header_idx = lines.index { |l| l =~ /\bSkill\b/i && l =~ /\bMnemonic\b/i }
     return [] unless header_idx
     header = lines[header_idx]
-    type_col = header =~ /\bType\b/i ? header.index(/\bType\b/i) : nil
+    mnemonic_col = header =~ /\bMnemonic\b/i ? header.index(/\bMnemonic\b/i) : nil
+    type_col     = header =~ /\bType\b/i     ? header.index(/\bType\b/i)     : nil
     results = []
     lines[(header_idx + 1)..].each do |line|
       break if line =~ /\Athe output listed/i
@@ -1412,9 +1415,10 @@ module SetupWizard
       next if name =~ /\A(you|the|a |an |also|there|it |he |she )/i
       next if name.split.length > 5
       next unless name =~ /\A[A-Za-z][A-Za-z\s'\-]*\z/
-      type_str = (type_col && line.length > type_col) ? line[type_col..].split.first.to_s.downcase : ""
+      mnemonic = (mnemonic_col && line.length > mnemonic_col) ? line[mnemonic_col..].split.first.to_s.downcase : ""
+      type_str = (type_col     && line.length > type_col)     ? line[type_col..].split.first.to_s.downcase     : ""
       passive  = type_str == "passive"
-      results << { name: name, passive: passive }
+      results << { name: name, passive: passive, mnemonic: mnemonic }
     end
     results.uniq { |r| r[:name] }
   rescue Exception
@@ -3578,7 +3582,8 @@ module SetupWizard
     else
     cf, cb = frame_vbox("CMANs & Feats")
     hint1 = Gtk::Label.new(
-      "Active feats default to type 'attack' -- change to 'aoe', 'maintenance', or 'emergency' as needed.\n" \
+      "Types: attack (per-attack round) | engagement (once per new fight, good for Buff CMs like Surge) |\n" \
+      "aoe (multi-target phase) | maintenance (between fights) | emergency (low health).\n" \
       "Set Daily Limit to 1-3 for abilities with limited daily uses (0 = unlimited).\n" \
       "#TARGET in verb is replaced with the enemy ID at runtime."
     )
@@ -3592,10 +3597,11 @@ module SetupWizard
 
     passive_names = []
     Array(d[:feats]).each do |feat|
-      name    = feat.is_a?(Hash) ? feat[:name].to_s    : feat.to_s
-      stamina = feat.is_a?(Hash) ? feat[:stamina].to_i : 0
-      cd      = feat.is_a?(Hash) ? feat[:cd].to_i      : 0
-      is_pass = feat.is_a?(Hash) ? feat[:passive]       : false
+      name     = feat.is_a?(Hash) ? feat[:name].to_s     : feat.to_s
+      mnemonic = feat.is_a?(Hash) ? feat[:mnemonic].to_s : ""
+      stamina  = feat.is_a?(Hash) ? feat[:stamina].to_i  : 0
+      cd       = feat.is_a?(Hash) ? feat[:cd].to_i       : 0
+      is_pass  = feat.is_a?(Hash) ? feat[:passive]        : false
       saved   = (@profile["cmans"] || []).find { |c| c["name"].to_s.casecmp(name) == 0 }
       # Passive check: hardcoded list takes priority, then auto-detect, then saved type
       name_lc = name.downcase
@@ -3608,7 +3614,8 @@ module SetupWizard
       iter = @cman_store.append
       @cman_store.set_value(iter, 0, saved ? saved["enabled"] != false : true)
       @cman_store.set_value(iter, 1, name)
-      @cman_store.set_value(iter, 2, saved ? saved["verb"].to_s    : "feat #{name.downcase}")
+      default_verb = mnemonic.empty? ? "CM #{name.gsub(/\s+/, "").downcase}" : "CM #{mnemonic}"
+      @cman_store.set_value(iter, 2, saved ? saved["verb"].to_s    : default_verb)
       @cman_store.set_value(iter, 3, saved ? saved["type"].to_s    : "attack")
       @cman_store.set_value(iter, 4, saved ? saved["stamina"].to_s    : stamina.to_s)
       @cman_store.set_value(iter, 5, saved ? saved["cd"].to_s         : cd.to_s)
@@ -3803,8 +3810,8 @@ module SetupWizard
     fields = {}
     [
       ["Name (e.g. Chastise):",              :name,    ""],
-      ["Verb (e.g. feat chastise):",          :verb,    "feat "],
-      ["Type (attack/aoe/maintenance):",      :type,    "attack"],
+      ["Verb (e.g. CM chastise):",            :verb,    "CM "],
+      ["Type (attack/engagement/aoe/maintenance/emergency):", :type, "attack"],
       ["Stamina cost:",                       :stamina, "0"],
       ["CD in seconds (0 = no CD):",          :cd,      "0"],
     ].each do |lbl, key, dv|
@@ -5267,9 +5274,16 @@ module GSH4A
     return unless checkstanding
     noun = mount_cfg["noun"] || "mount"
     log "Mounting #{noun}"
+    mount_result = nil
+    hook = "gsh4a_remount_tmp"
+    DownstreamHook.add(hook, proc { |line|
+      clean = line.gsub(/<[^>]+>/, "")
+      mount_result ||= clean if clean =~ /climb|settle|already|cannot|can't|unable/i
+      line
+    })
     fput "mount #{noun}"
-    result = matchtimeout(5, "climb", "settle", "already", "cannot", "can't", "unable")
-    GSH4AState.mounted = !!(result && result =~ /climb|settle|already/)
+    DownstreamHook.remove(hook) rescue nil
+    GSH4AState.mounted = !!(mount_result =~ /climb|settle|already/i)
     pause 0.5
   end
 
@@ -5298,10 +5312,19 @@ module GSH4A
     end
 
     log "Summoning #{noun}"
+    # Capture the game's response during fput -- the arrival message comes before the
+    # prompt that fput waits on, so matchtimeout would always miss it.
+    summon_result = nil
+    hook = "gsh4a_summon_tmp"
+    DownstreamHook.add(hook, proc { |line|
+      clean = line.gsub(/<[^>]+>/, "")
+      summon_result ||= clean if clean =~ /arrives|already here|What were you|cannot|inside/i
+      line
+    })
     fput "#{verb} my #{item}"
-    result = matchtimeout(10, "arrives", "already here", "What were you", "cannot", "inside")
-    result = nil if result == false
-    # "What were you referring to?" means item (reins) not in hand -- mount likely already present
+    DownstreamHook.remove(hook) rescue nil
+    result = summon_result
+    # "What were you referring to?" means item not in hand -- mount likely already present
     already = result =~ /arrives|already here|What were you/i
     GSH4AState.mount_summoned = !!already
     unless GSH4AState.mount_summoned
@@ -5409,9 +5432,22 @@ module GSH4A
 
       log "Arcarium vissi: #{v['name']} (#{verb})"
       waitrt?
+      arc_response = nil
+      arc_hook = "gsh4a_arc_tmp"
+      DownstreamHook.add(arc_hook, proc { |line|
+        clean = line.gsub(/<[^>]+>/, "")
+        arc_response ||= clean if clean =~ /not enough silver|cannot|no longer|already active|whispers in your mind/i
+        line
+      })
       fput verb
+      DownstreamHook.remove(arc_hook) rescue nil
       waitrt?
       pause 0.3
+      if arc_response =~ /not enough silver/i
+        log "#{v['name']} skipped -- not enough silver (cooling down 5 min)"
+        GSH4AState.set_cd(dl_key, 300)
+        next
+      end
       GSH4AState.use_daily(dl_key) if dl > 0
       GSH4AState.set_cd(dl_key, cd) if cd > 0
     end
@@ -6174,34 +6210,53 @@ module GSH4A
   end
 
   def self.start_reaction_watcher
-    @reaction_pending = {}
     techs = techniques_by_type[:reaction]
     return if techs.empty?
 
-    hook_name = "gsh4a_reaction_watcher"
-    DownstreamHook.remove(hook_name) rescue nil
-    DownstreamHook.add(hook_name, proc { |line|
-      techs.each do |tech|
-        name    = tech["name"].to_s
-        trigger = tech["trigger"].to_s.strip
-        # Default: match GS4's specific "opportunity" message so the technique's own
-        # output text doesn't re-trigger the watcher on the next game line.
-        pat = if trigger.empty?
-          /you could use this opportunity to #{Regexp.escape(name)}/i
-        else
-          /#{Regexp.escape(trigger)}/i
+    @reaction_thread&.kill rescue nil
+    @reaction_thread = Thread.new do
+      begin
+        loop do
+          break unless GSH4AState.hunting
+          # matchfind blocks until the game sends the reaction opportunity line.
+          # The ? wildcard captures the skill name (e.g. "Reverse Strike").
+          skill_name = matchfind("You could use this opportunity to ?!")
+          break if skill_name.nil?
+          next unless GSH4AState.hunting
+          next if npc_count == 0
+
+          stripped = skill_name.to_s.strip
+          tech = techs.find { |t|
+            t["enabled"] && t["name"].to_s.casecmp?(stripped)
+          }
+          next unless tech
+          next unless technique_ready?(tech)
+          next unless stamina_ok?(tech["stamina"].to_i)
+
+          # Wait for any in-progress assault to complete before firing reaction
+          sleep 0.1 while @assault_in_progress
+          next if npc_count == 0  # creature may have died during the wait
+
+          log "Reaction: #{tech["name"]}"
+          stance_offensive
+          switched_grip = switch_grip_for_ability(tech)
+          fput "weapon #{tech["mnemonic"]}"
+          waitrt?
+          @technique_on_cd[tech["name"].downcase] = true
+          restore_default_grip unless switched_grip.empty?
         end
-        @reaction_pending[name] = true if line =~ pat
+      rescue => e
+        log "Reaction watcher error: #{e.message}" unless e.is_a?(ThreadError)
       end
-      line
-    })
+    end
   end
 
   def self.stop_reaction_watcher
+    @reaction_thread&.kill rescue nil
+    @reaction_thread = nil
     DownstreamHook.remove("gsh4a_reaction_watcher") rescue nil
     DownstreamHook.remove("gsh4a_tech_cd_watcher")  rescue nil
-    @reaction_pending  = {}
-    @technique_on_cd   = {}
+    @technique_on_cd = {}
   end
 
   # Watches for stun messages and sets GSH4AState.stun_pending so the attack loop
@@ -6415,10 +6470,11 @@ module GSH4A
     @technique_on_cd = {}
     DownstreamHook.remove("gsh4a_tech_cd_watcher") rescue nil
     DownstreamHook.add("gsh4a_tech_cd_watcher", proc { |line|
-      if line =~ /\b(.+?)\s+is still in cooldown/i
+      clean = line.gsub(/<[^>]+>/, "")
+      if clean =~ /\b(.+?)\s+is still in cooldown/i
         @technique_on_cd[$1.strip.downcase] = true
       end
-      if line =~ /feel ready to perform the\s+(.+?)\s+technique/i
+      if clean =~ /feel ready to perform the\s+(.+?)\s+technique/i
         @technique_on_cd.delete($1.strip.downcase)
       end
       line
@@ -6429,27 +6485,6 @@ module GSH4A
     !@technique_on_cd&.dig(tech["name"].to_s.downcase)
   end
 
-  # Called each attack loop iteration -- fires the highest-priority pending reaction.
-  def self.check_reaction_opportunity
-    return false unless @reaction_pending&.any? { |_, v| v }
-    return false if npc_count == 0  # no live targets -- discard pending reactions
-    techniques_by_type[:reaction].each do |tech|
-      name = tech["name"].to_s
-      next unless @reaction_pending[name]
-      next unless stamina_ok?(tech["stamina"].to_i)
-      log "Reaction technique available: #{name}"
-      @reaction_pending.clear  # clear all -- prevent re-trigger from own output
-      stance_offensive
-      switched_grip = switch_grip_for_ability(tech)
-      waitrt?
-      fput tech["verb"]
-      waitrt?
-      @technique_on_cd[name.downcase] = true
-      restore_default_grip unless switched_grip.empty?
-      return true
-    end
-    false
-  end
 
   # Switches the primary weapon grip if the ability requires it.
   # Pass a hash with a "grip" key ("one" or "two"; legacy "one-handed"/"two-handed" also accepted).
@@ -6485,6 +6520,7 @@ module GSH4A
       next unless technique_ready?(tech)
       next unless stamina_ok?(tech["stamina"].to_i)
       log "Assault: #{tech['name']}"
+      @assault_in_progress = true
       stance_offensive
       switched_grip = switch_grip_for_ability(tech)
       waitrt?
@@ -6495,6 +6531,8 @@ module GSH4A
       return true
     end
     false
+  ensure
+    @assault_in_progress = false
   end
 
   # AoE techniques: fire when creature count meets min_creatures.
@@ -6827,7 +6865,7 @@ module GSH4A
 
   def self.holy_weapon_enabled?
     holy_weapon_cfg.fetch("enabled", false) &&
-      XMLData.profession.to_s =~ /Paladin/i
+      @profile.dig("character", "profession").to_s =~ /Paladin/i
   end
 
   def self.holy_weapon_noun
@@ -6906,7 +6944,7 @@ module GSH4A
     depletion_pattern = /no longer infused|glows faintly and then darkens|charges have been expended/i
 
     DownstreamHook.add("gsh4a_holy_weapon_watcher", proc { |line|
-      if line =~ depletion_pattern
+      if line.gsub(/<[^>]+>/, "") =~ depletion_pattern
         respond "[gsh4a] Holy weapon depleted"
         GSH4AState.instance_variable_set(:@hw_activated, false)
         if holy_weapon_cfg.fetch("autorefill", true)
@@ -7097,7 +7135,7 @@ module GSH4A
             end
           end
         rescue; end
-        pause 30
+        pause 300
       end
     end
   end
@@ -7112,10 +7150,13 @@ module GSH4A
     stand_if_prone
     ensure_mounted
     mount_charge(id)
+    return unless hostile_npcs.any? { |n| n.id == id }
     beseech_holy_weapon
 
     while target_alive?(target)
       break unless GSH4AState.hunting
+      # Break immediately if target left the room (moved or died out of sight)
+      break unless hostile_npcs.any? { |n| n.id == id }
       # If a priority creature appeared and we're not already on one, finish this
       # swing then switch -- break so the main loop re-runs select_target.
       unless priority_npc?(target)
@@ -7155,14 +7196,11 @@ module GSH4A
 
       count = npc_count
 
-      # Reaction techniques have priority -- fire immediately if trigger was seen
       # Stun Maneuver fires first -- rogue acts through the stun before anything else
       next if check_stun_maneuver
 
       # Warrior berserk: suspend normal attacks while raging; enter berserk if enabled
       next if prof =~ /Warrior/i && check_berserk(id)
-
-      next if check_reaction_opportunity
 
       # AoE techniques when enough foes are present
       next if fire_aoe_techniques(count)
@@ -7170,6 +7208,7 @@ module GSH4A
       run_arcarium_moment("aoe") if aoe_needed?
       run_arcarium_moment("target_vulnerable", id)
       run_abilities_when("per_attack", id)
+      cmans_of_type("attack").each { |c| fire_cman(c, id) }
       beseech_holy_weapon if holy_weapon_cfg.fetch("mode", "per_target") == "per_attack"
       companion_attack(id)
 
@@ -7217,7 +7256,7 @@ module GSH4A
       end
     end
 
-    @reaction_pending&.clear       # target dead -- discard any pending reactions
+    # reaction thread discards naturally when npc_count == 0 check fires
     @companion_last_target_id = nil  # companion will need new attack directive for next target
     sync_mount_state
     run_abilities_when("engagement", nil)
@@ -7265,18 +7304,22 @@ module GSH4A
     load_profile
     GSH4AState.load_state
 
-    UpstreamHook.add("gsh4a_pause", proc { |cmd|
-      case cmd.to_s.strip.downcase
-      when "pause"
-        GSH4AState.paused = true
-        respond "[gsh4a] PAUSED -- type RESUME to continue"
-        nil
-      when "resume"
-        GSH4AState.paused = false
-        respond "[gsh4a] RESUMED"
-        nil
-      else
-        cmd
+    UpstreamHook.add("gsh4a_pause", proc { |input|
+      begin
+        bare = input.to_s.chomp.strip.sub(/\A<c>/i, "").downcase
+        if bare == "pause"
+          GSH4AState.paused = true
+          echo "[gsh4a] PAUSED -- type RESUME to continue"
+          nil
+        elsif bare == "resume"
+          GSH4AState.paused = false
+          echo "[gsh4a] RESUMED"
+          nil
+        else
+          input
+        end
+      rescue => _e
+        input
       end
     })
 
@@ -7315,6 +7358,19 @@ module GSH4A
     start_death_watcher
     start_encumbrance_watcher
     start_group_watcher
+
+    # Pause gsh4a whenever eloot pauses for a storage failure so the player
+    # can handle it manually before typing RESUME to continue.
+    DownstreamHook.remove("gsh4a_eloot_pause_watcher") rescue nil
+    DownstreamHook.add("gsh4a_eloot_pause_watcher", proc { |line|
+      if line.gsub(/<[^>]+>/, "") =~ /Lich: eloot paused|Pausing the script to handle it yourself/i
+        unless GSH4AState.paused
+          GSH4AState.paused = true
+          echo "[gsh4a] PAUSED -- eloot needs attention. Type RESUME when done."
+        end
+      end
+      line
+    })
 
     refresh_group_members
     ready_weapons
@@ -7377,6 +7433,7 @@ module GSH4A
       if npcs.empty?
         @combat_engaged = false
         ensure_mounted
+        cmans_of_type("maintenance").each { |c| fire_cman(c) }
         pause 1
         next
       end
@@ -7389,6 +7446,7 @@ module GSH4A
       if count >= pref("multi_threshold").to_i
         run_abilities_when("engagement", target_id)
       end
+      cmans_of_type("engagement").each { |c| fire_cman(c) }
 
       run_aoe_phase(target_id) if target_id
       single_target_rotation(target) if target
@@ -7428,7 +7486,8 @@ before_dying do
   GSH4A.stop_stun_watcher                       rescue nil
   GSH4A.stop_berserk_watcher                    rescue nil
   GSH4A.stop_holy_weapon_watcher                rescue nil
-  DownstreamHook.remove("gsh4a_group_watcher")  rescue nil
+  DownstreamHook.remove("gsh4a_group_watcher")        rescue nil
+  DownstreamHook.remove("gsh4a_eloot_pause_watcher")  rescue nil
   UpstreamHook.remove("gsh4a_setup")            rescue nil
 end
 
