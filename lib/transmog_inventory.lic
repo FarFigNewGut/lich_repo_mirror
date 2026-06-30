@@ -22,9 +22,10 @@
          tags: transmog, inventory, locker, items
       contact: mara.lilly on Discord, @Lillymara on GitHub
     co-author: Claude (Anthropic) - claude.ai/code
-      version: 2.1
+      version: 2.1.1
 
   Changelog:
+    2.1.1 (2026-06-29) - Bugfix: GUI delete no longer disconnects from game.
     2.1.0 (2026-06-27) - GUI browser (;transmog gui): searchable point-and-click
                          window with inline price/note editing and multi-select delete.
                          Bugfix: remove/rm now accepts a numeric item ID directly.
@@ -45,6 +46,21 @@ require 'json'
 require 'securerandom'
 
 # Changelog:
+# 2.1.1 (2026-06-29/30)
+#   - Bugfix: GUI "Delete Selected" was disconnecting from game. Root causes:
+#     (1) respond() on GTK thread interfered with Lich game socket -> removed.
+#     (2) write_catalog() on GTK thread -> moved to script thread via pending_write.
+#     (3) Gtk::TreeSelection#selected_foreach does not exist in GI-based ruby-gtk3
+#         4.3.6 -> switched to selected_rows with format detection ([paths,model] in
+#         GI vs plain array in older bindings), fresh iters via store.get_iter(path).
+#     (4) Any remaining Ruby exceptions in the handler now caught by rescue and shown
+#         in the status bar instead of escaping into the GLib event loop and killing
+#         the Lich socket connection.
+#   - Bugfix: segfault on GUI close -- Ruby GC finalizing GTK wrappers on non-GTK
+#     thread (rb_objspace_call_finalizer -> g_object_unref -> gtk_tree_view crash).
+#     Fixed by pinning all GTK wrapper objects in gtk_refs (scoped to run_gui) and
+#     extracting Gtk::TreeSelection into sel so it is also pinned.
+#
 # 2.1.0 (2026-06-27)
 #   - New "gui" command (aliases: browse, ui): opens a GTK3 point-and-click browser.
 #     Search box filters in real-time (same boolean syntax as the command line).
@@ -1161,7 +1177,13 @@ def run_gui
     catalog = read_catalog
   end
 
-  closed = false
+  closed   = false
+  # ponytail: hold every Ruby-GTK wrapper here so Ruby's GC doesn't call
+  # g_object_unref on a non-GTK thread while the main loop still uses them
+  # (segfault in rb_objspace_call_finalizer / g_object_unref / gtk_tree_view).
+  # Cleared implicitly when run_gui returns, after GTK destroy has done C cleanup.
+  gtk_refs     = []
+  pending_write = nil   # set by GTK thread; consumed by script thread to avoid cross-thread I/O
 
   # ponytail: GLib::Idle.add runs this block on the GTK main thread, which owns
   # the Windows message pump. Creating widgets from the script thread causes the
@@ -1194,7 +1216,8 @@ def run_gui
     fill_store.call(catalog, "")
 
     tree = Gtk::TreeView.new(store)
-    tree.selection.mode = :multiple
+    sel  = tree.selection
+    sel.mode = :multiple
 
     # Read-only columns
     [[0, "ID", 90], [1, "Character", 90], [2, "Noun", 80], [3, "Full Name", 340],
@@ -1205,6 +1228,7 @@ def run_gui
       c.min_width = w
       c.sort_column_id = idx
       tree.append_column(c)
+      gtk_refs << r << c
     end
 
     # Editable Price column
@@ -1255,14 +1279,29 @@ def run_gui
 
     del_btn = Gtk::Button.new(label: "Delete Selected")
     del_btn.signal_connect("clicked") do
-      paths = tree.selection.selected_rows
-      next if paths.empty?
-      ids = paths.map { |p| store.get_iter(p)[0] }.to_set
-      catalog = catalog.reject { |r| ids.include?(r[:id].to_i) }
-      write_catalog(catalog)
-      respond "transmog_inventory: removed #{ids.size} item(s) via GUI (#{catalog.size} remaining)."
-      n = fill_store.call(catalog, search.text)
-      status.text = "#{n} shown / #{catalog.size} total"
+      begin
+        raw = sel.selected_rows
+        # GI-based ruby-gtk3 returns [paths_array, model]; older binding returns paths_array.
+        paths = (raw.is_a?(Array) && raw[0].is_a?(Array)) ? raw[0] : Array(raw)
+        next if paths.empty?
+        # Get fresh iters from the store via each path (same pattern as note handler).
+        iters = paths.map { |p| store.get_iter(p) }.compact
+        next if iters.empty?
+        ids = iters.map { |it| it[0] }.to_set
+        catalog = catalog.reject { |r| ids.include?(r[:id].to_i) }
+        pending_write = catalog
+        iters.reverse_each { |it| store.remove(it) }
+        q = search.text.to_s.strip
+        n_shown = if q.empty?
+          catalog.size
+        else
+          node = parse_query(q)
+          catalog.count { |e| eval_bool(node, e) }
+        end
+        status.text = "#{n_shown} shown / #{catalog.size} total"
+      rescue => e
+        status.text = "Delete error: #{e.class}: #{e.message[0, 80]}"
+      end
     end
 
     top = Gtk::Box.new(:horizontal, 5)
@@ -1287,12 +1326,20 @@ def run_gui
     win.set_default_size(1100, 600)
     win.add(vbox)
     win.signal_connect("destroy") { closed = true }
+    gtk_refs.concat([store, tree, sel, price_r, price_c, note_r, note_c,
+                     search, status, del_btn, top, scroll, bot, vbox, win])
     win.show_all
 
     false  # don't repeat
   end
 
-  sleep 0.1 until closed
+  until closed
+    if (cat = pending_write)
+      pending_write = nil
+      write_catalog(cat)
+    end
+    sleep 0.1
+  end
 end
 
 # ---------------------------------------------------------------------------
