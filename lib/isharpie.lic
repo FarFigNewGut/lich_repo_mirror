@@ -1,0 +1,666 @@
+# frozen_string_literal: true
+
+require 'json'
+require 'fileutils'
+
+=begin
+
+isharpie.lic (Item Sharpie) tags held items with a personal note and color, then injects
+that note inline next to the item name everywhere it appears in game text.
+Item identity survives locker storage by matching on name and container.
+
+The following inputs are available:
+  ;isharpie tag <noun> "<note>" [color orange|teal|green|yellow|none]  - tag item in hand
+  ;isharpie color <name>                 - set color on last tagged item
+  ;isharpie remove <noun>                - remove note from item in hand
+  ;isharpie list                         - list all stored notes
+  ;isharpie colors                       - list valid color names
+  ;isharpie help                         - command list
+
+      author: Kyrandos
+      Other scripts: Combatical, Merchantical, Loresang, VolnRestore2
+      game: gs
+      tags: items, inventory, notes, highlight, Sharpie
+      version: 1.0.5
+      required: Lich > 5.0
+
+      \\Version\\
+      1.0.0 07/01/2026 - initial release
+      1.0.1 07/01/2026 - changed notes and fixed color name
+      1.0.3 07/01/2026 - notes now saved to EduBarbarian\isharpie_name for persistence
+      1.0.5 07/01/2026 - improved item detection: auto-bind on first sighting, word-set name matching
+
+=end
+
+module ISharpie
+  VERSION = '1.0.5'.freeze
+
+  VALID_COLORS = %w[orange teal green yellow none].freeze
+
+  # Maps player-facing color names to Lich msg_format preset names.
+  COLOR_MAP = {
+    'orange' => 'thought',
+    'teal'   => 'whisper',
+    'green'  => 'speech',
+    'yellow' => 'bold',
+    'none'   => 'none'
+  }.freeze
+
+
+  # <a exist="ID" noun="NOUN">TAG_TEXT</a> plus an optional trailing
+  # plain-text clause, up to the next tag or a punctuation boundary that
+  # marks the end of this item's own description (sentence punctuation, a
+  # list comma, or a "(2)"-style stack-count suffix). Matches anywhere in the
+  # downstream stream - flat per-item dumps, the categorized inventory
+  # block, room text, and "You put/remove" sentences all share this shape
+  # (confirmed against real .xml logs).
+  ITEM_TAG_RX = /<a exist="(-?\d+)" noun="([^"]*)">([^<]*)<\/a>([^<.,:;!?(]*)/.freeze
+
+  # "You put X in (a|an|the|your) Y." - deposit into a named container.
+  PUT_RX = /You put (.+?) in (?:a|an|the|your) (.+?)\./.freeze
+
+  # "You remove X from in (a|an|the|your) Y." - "from in" is the
+  # distinguishing substring; plain "from your belt"-style removals (no
+  # container involved) never match this, by design.
+  REMOVE_RX = /You remove (.+?) from in (?:a|an|the|your) (.+?)\./.freeze
+
+  ANNOTATOR_HOOK_ID          = 'isharpie_annotator'.freeze
+  CONTAINER_TRACKER_HOOK_ID  = 'isharpie_container_tracker'.freeze
+  UPSTREAM_HOOK_ID           = 'isharpie_upstream'.freeze
+  HOOK_CMD_RX = /^(?:<c>)?;#{Regexp.escape(Script.current.name)}(?:\s+(.*))?$/i
+  EDUBARBARIAN_DIR = File.join(LICH_DIR, 'EduBarbarian').freeze
+
+  CMD_QUEUE     = Queue.new
+  CONFIRM_QUEUE = Queue.new
+
+  @exist_bindings       = {}
+  @pending_confirmation = nil
+  @last_touched_note_id = nil
+  @last_ambiguous_list  = nil
+  @note_counter         = nil
+
+  ## ---- persisted notes ---------------------------------------------------
+
+  def self.notes_path
+    char = XMLData.name.to_s.downcase.gsub(/[^a-z0-9]+/, '_').gsub(/\A_+|_+\z/, '')
+    File.join(EDUBARBARIAN_DIR, "isharpie_#{char}.json")
+  end
+
+  def self.notes
+    @notes ||= begin
+      path = notes_path
+      if File.exist?(path)
+        JSON.parse(File.read(path), symbolize_names: true)
+      else
+        []
+      end
+    rescue StandardError => e
+      say "could not load notes from #{notes_path}: #{e.class}"
+      []
+    end
+  end
+
+  def self.save_notes!
+    FileUtils.mkdir_p(EDUBARBARIAN_DIR)
+    File.write(notes_path, JSON.pretty_generate(@notes))
+  rescue StandardError => e
+    say "could not save notes to #{notes_path}: #{e.class}"
+  end
+
+  def self.next_note_id
+    @note_counter ||= notes.map { |n| n[:id].to_s.sub(/^n/, '').to_i }.max.to_i
+    @note_counter += 1
+    "n#{@note_counter}"
+  end
+
+  def self.add_note(long_name:, container:, note:, color:)
+    record = {
+      id: next_note_id,
+      long_name: long_name,
+      container: container,
+      note: note,
+      color: color,
+      created_at: Time.now.to_i
+    }
+    notes.push(record)
+    save_notes!
+    record
+  end
+
+  def self.update_note(id, **changes)
+    record = notes.find { |n| n[:id] == id }
+    return nil unless record
+
+    changes.each { |k, v| record[k] = v }
+    save_notes!
+    record
+  end
+
+  def self.remove_note(id)
+    removed = notes.reject! { |n| n[:id] == id }
+    save_notes! if removed
+    !!removed
+  end
+
+  def self.candidates_for(long_name, container_context = nil)
+    matches = notes.select { |n| n[:long_name] == long_name }
+
+    # Suffix-match fallback: GS4 prepends quality/condition descriptors (e.g.
+    # "masterful") in display output but omits them from hand-tag updates, so
+    # GameObj.right_hand.name at tag-time may be shorter than what the stream
+    # shows. If no exact match, accept any stored name that is a trailing
+    # suffix of the stream name.
+    if matches.empty?
+      matches = notes.select { |n|
+        n[:long_name].length < long_name.length && long_name.end_with?(n[:long_name])
+      }
+    end
+
+    # Word-set fallback: GS4 sometimes omits descriptors from worn/display names
+    # that were present when held (e.g. "haon antlers" worn vs "haon-carved antlers"
+    # held). If still no match, accept any stored name where every word from the
+    # shorter name appears in the longer name. Requires at least 2 words to avoid
+    # single-noun false positives.
+    if matches.empty?
+      stream_words = long_name.downcase.gsub(/[^a-z0-9\s]/, ' ').split
+      matches = notes.select { |n|
+        stored_words = n[:long_name].downcase.gsub(/[^a-z0-9\s]/, ' ').split
+        short, long_w = [stream_words, stored_words].minmax_by(&:length)
+        short.length >= 2 && short.all? { |w| long_w.include?(w) }
+      }
+    end
+
+    return matches if container_context.nil?
+
+    narrowed = matches.select { |n| n[:container] == container_context }
+    narrowed.any? ? narrowed : matches
+  end
+
+  def self.normalize_container_name(raw)
+    raw.to_s.sub(/^(?:a|an|the|your)\s+/i, '').strip
+  end
+
+  ## ---- session-only exist-id cache ----------------------------------------
+  # Never read from or written to CharSettings - always starts empty every
+  # script run, on purpose, since exist ids don't survive a login.
+
+  def self.exist_bound?(exist_id)
+    @exist_bindings.key?(exist_id)
+  end
+
+  def self.bound_note_for(exist_id)
+    note_id = @exist_bindings[exist_id]
+    return nil unless note_id
+
+    notes.find { |n| n[:id] == note_id }
+  end
+
+  def self.bind!(exist_id, note_id)
+    @exist_bindings[exist_id] = note_id
+  end
+
+  ## ---- name helpers --------------------------------------------------------
+
+  # Tag text plus trailing clause only - deliberately never before_name/
+  # full_name, so this matches exactly what the regex-based hooks below can
+  # reliably extract from raw text (a leading clause like "a sinew-woven" is
+  # not safely regex-able without the structured tree GameObj itself uses).
+  # Both this and the hooks' own extraction must compute long_name the same
+  # way, or matching silently breaks.
+  def self.long_name_for(gameobj)
+    [gameobj.name, gameobj.after_name].compact.reject(&:empty?).join(' ').strip
+  end
+
+  # A bare trailing clause that actually starts a new sentence clause (most
+  # commonly "from in your <container>" off the back of a removal sentence)
+  # is sentence structure, not part of the item's own description - real
+  # descriptive clauses ("accented with a diamond", "filed with gravel")
+  # never start this way.
+  def self.sanitize_trailing(trailing)
+    t = trailing.to_s
+    return '' if t.strip =~ /^(?:from|to|in|at)\b/i
+
+    t
+  end
+
+  def self.extract_tagged(span)
+    m = ITEM_TAG_RX.match(span.to_s)
+    return nil unless m
+
+    exist_id, _noun, tag_text, trailing = m[1], m[2], m[3], m[4]
+    long_name = "#{tag_text}#{sanitize_trailing(trailing)}".strip
+    return nil if long_name.empty?
+
+    { exist_id: exist_id, long_name: long_name }
+  end
+
+  def self.extract_container_name(span)
+    tagged = extract_tagged(span)
+    return normalize_container_name(tagged[:long_name]) if tagged
+
+    normalize_container_name(span)
+  end
+
+  ## ---- display formatting --------------------------------------------------
+
+  def self.format_annotation(note_record, confirmed:)
+    text = "(#{note_record[:note]}#{confirmed ? '' : '?'})"
+    color = note_record[:color] || 'none'
+    return text if color == 'none'
+
+    Lich::Messaging.msg_format(COLOR_MAP[color] || color, text, encode: true)
+  end
+
+  ## ---- annotator downstream hook --------------------------------------------
+  # Runs on the socket-reading thread - must never block on game I/O.
+
+  def self.install_annotator
+    DownstreamHook.add(ANNOTATOR_HOOK_ID, proc { |line| annotate_line(line) })
+  end
+
+  def self.remove_annotator
+    DownstreamHook.remove(ANNOTATOR_HOOK_ID)
+  end
+
+  def self.annotate_line(line)
+    return line unless line.include?('<a ')
+    return line if notes.empty? && @exist_bindings.empty?
+    line.gsub(ITEM_TAG_RX) do |whole_match|
+      exist_id, _noun, tag_text, trailing = $1, $2, $3, $4
+      long_name = "#{tag_text}#{sanitize_trailing(trailing)}".strip
+      next whole_match if long_name.empty?
+
+      tag_only = whole_match[0, whole_match.length - trailing.length]
+
+      if exist_bound?(exist_id)
+        note = bound_note_for(exist_id)
+        note ? (tag_only + format_annotation(note, confirmed: true) + trailing) : whole_match
+      else
+        candidates = candidates_for(long_name)
+        if candidates.size == 1
+          bind!(exist_id, candidates.first[:id])
+          tag_only + format_annotation(candidates.first, confirmed: true) + trailing
+        else
+          whole_match
+        end
+      end
+    end
+  rescue StandardError => e
+    say "annotator error: #{e.class}: #{e.message}"
+    line
+  end
+
+  ## ---- container tracker downstream hook ------------------------------------
+  # Pure observation - always returns the input string unchanged. Also runs
+  # on the socket-reading thread.
+
+  def self.install_container_tracker
+    DownstreamHook.add(CONTAINER_TRACKER_HOOK_ID, proc { |line|
+      handle_container_line(line)
+      line
+    })
+  end
+
+  def self.remove_container_tracker
+    DownstreamHook.remove(CONTAINER_TRACKER_HOOK_ID)
+  end
+
+  def self.handle_container_line(line)
+    return unless line.include?('You put') || line.include?('You remove')
+
+    if (m = PUT_RX.match(line))
+      item = extract_tagged(m[1])
+      return unless item
+
+      handle_deposit(item[:exist_id], item[:long_name], extract_container_name(m[2]))
+    elsif (m = REMOVE_RX.match(line))
+      item = extract_tagged(m[1])
+      return unless item
+
+      handle_withdrawal(item[:exist_id], item[:long_name], extract_container_name(m[2]))
+    end
+  rescue StandardError => e
+    say "container tracker error: #{e.class}: #{e.message}"
+  end
+
+  def self.handle_deposit(exist_id, long_name, container)
+    candidates = exist_bound?(exist_id) ? [bound_note_for(exist_id)].compact : candidates_for(long_name)
+    return unless candidates.size == 1
+
+    update_note(candidates.first[:id], container: container)
+  end
+
+  def self.handle_withdrawal(exist_id, long_name, container)
+    if exist_bound?(exist_id)
+      note = bound_note_for(exist_id)
+      update_note(note[:id], container: 'carried') if note
+      return
+    end
+
+    candidates = candidates_for(long_name, container)
+    return if candidates.empty?
+
+    if candidates.size == 1
+      bind!(exist_id, candidates.first[:id])
+      update_note(candidates.first[:id], container: 'carried')
+    else
+      CONFIRM_QUEUE.push({ exist_id: exist_id, candidates: candidates })
+    end
+  end
+
+  ## ---- confirmation flow ----------------------------------------------------
+  # Driven from main_loop (our own thread), never from the hooks directly.
+
+  def self.pending_confirmation
+    @pending_confirmation
+  end
+
+  def self.drain_confirm_queue
+    until CONFIRM_QUEUE.empty?
+      req = CONFIRM_QUEUE.pop
+      start_confirmation(req[:exist_id], req[:candidates])
+    end
+  end
+
+  def self.start_confirmation(exist_id, candidates)
+    say "dropping an earlier unanswered confirmation to ask about a new one" if @pending_confirmation
+
+    @pending_confirmation = { exist_id: exist_id, candidates: candidates, index: 0 }
+    ask_current_candidate
+  end
+
+  def self.ask_current_candidate
+    return unless @pending_confirmation
+
+    candidate = @pending_confirmation[:candidates][@pending_confirmation[:index]]
+    unless candidate
+      @pending_confirmation = nil
+      return
+    end
+
+    say "is this the one noted \"#{candidate[:note]}\"? (;isharpie yes / ;isharpie no)"
+  end
+
+  def self.answer_confirmation(yes)
+    unless @pending_confirmation
+      say "no confirmation is pending"
+      return
+    end
+
+    if yes
+      candidate = @pending_confirmation[:candidates][@pending_confirmation[:index]]
+      bind!(@pending_confirmation[:exist_id], candidate[:id])
+      update_note(candidate[:id], container: 'carried')
+      @last_touched_note_id = candidate[:id]
+      say "got it - won't ask again this session"
+      @pending_confirmation = nil
+    else
+      @pending_confirmation[:index] += 1
+      ask_current_candidate
+    end
+  end
+
+  ## ---- upstream command hook -------------------------------------------------
+
+  def self.parse_upstream(command)
+    if (m = HOOK_CMD_RX.match(command))
+      CMD_QUEUE.push(m[1])
+      nil
+    else
+      command
+    end
+  end
+
+  def self.install_upstream_hook
+    UpstreamHook.add(UPSTREAM_HOOK_ID, proc { |command| parse_upstream(command) })
+  end
+
+  def self.remove_upstream_hook
+    UpstreamHook.remove(UPSTREAM_HOOK_ID)
+  end
+
+  def self.drain_cmd_queue
+    handle_command(CMD_QUEUE.pop) until CMD_QUEUE.empty?
+  end
+
+  def self.handle_command(msg)
+    text = msg.to_s.strip
+
+    case text
+    when ''
+      report_status
+    when /^help$/i
+      show_help
+    when /^colors?$/i
+      show_colors
+    when /^list$/i
+      list_notes
+    when /^(?:yes|y)$/i
+      answer_confirmation(true)
+    when /^(?:no|n)$/i
+      answer_confirmation(false)
+    when /^tag\s+(.+)$/i
+      handle_tag_command($1)
+    when /^color\s+(\w+)$/i
+      set_color($1)
+    when /^remove\s+(\S+)$/i
+      remove_by_token($1)
+    when /^remove$/i
+      say "usage: remove <noun>  e.g.  remove hatchet"
+    else
+      say "unrecognized command: #{text.inspect} - try ';isharpie help'"
+    end
+  rescue StandardError => e
+    say "command error: #{e.class}: #{e.message}"
+  end
+
+  def self.handle_tag_command(body)
+    m = /^([^\s"]+)\s+"([^"]+)"(?:\s+color\s+(\w+))?$/i.match(body)
+    unless m
+      say 'usage: tag <noun> "<note>" [color <name>]  e.g.  tag hatchet "Bonded Weapon" color thought'
+      return
+    end
+    tag_held_item(m[1], m[2], m[3])
+  end
+
+  ## ---- command handlers -------------------------------------------------------
+
+  def self.held_item(noun = nil)
+    both = [GameObj.right_hand, GameObj.left_hand].select { |g| g && g.name && g.name != 'Empty' }
+    return both.first unless noun
+
+    both.find { |g| g.noun.to_s.casecmp?(noun) } ||
+      both.find { |g| g.name.to_s.downcase.include?(noun.downcase) }
+  end
+
+  def self.normalize_color(name)
+    name.to_s.strip.downcase
+  end
+
+  def self.tag_held_item(noun, note_text, color_name)
+    item = held_item(noun)
+    unless item
+      say "you're not holding a #{noun}"
+      return
+    end
+
+    long_name = long_name_for(item)
+    existing = bound_note_for(item.id)
+    color = color_name ? normalize_color(color_name) : (existing && existing[:color]) || 'none'
+
+    unless VALID_COLORS.include?(color)
+      say "unknown color #{color.inspect} - valid: #{VALID_COLORS.join(', ')}"
+      return
+    end
+
+    if existing
+      update_note(existing[:id], note: note_text.strip, color: color)
+      @last_touched_note_id = existing[:id]
+      say "updated note on #{long_name}: #{note_text.strip}"
+    else
+      record = add_note(long_name: long_name, container: 'carried', note: note_text.strip, color: color)
+      bind!(item.id, record[:id])
+      @last_touched_note_id = record[:id]
+      say "tagged #{long_name}: #{note_text.strip}"
+    end
+  end
+
+  def self.set_color(color_name)
+    color = normalize_color(color_name)
+    unless VALID_COLORS.include?(color)
+      say "unknown color #{color.inspect} - valid: #{VALID_COLORS.join(', ')}"
+      return
+    end
+
+    unless @last_touched_note_id
+      say "nothing tagged/confirmed yet this session to color - tag an item first"
+      return
+    end
+
+    update_note(@last_touched_note_id, color: color)
+    say "color set to #{color}"
+  end
+
+  def self.remove_held_item(noun)
+    item = held_item(noun)
+    unless item
+      say "you're not holding a #{noun}"
+      return
+    end
+
+    long_name = long_name_for(item)
+    existing = bound_note_for(item.id)
+    candidates = existing ? [existing] : candidates_for(long_name)
+
+    if candidates.empty?
+      say "no note found for #{long_name}"
+    elsif candidates.size == 1
+      remove_note(candidates.first[:id])
+      say "removed note for #{long_name}"
+    else
+      @last_ambiguous_list = candidates
+      listing = candidates.each_with_index.map { |c, i| "#{i + 1}) #{c[:note]}" }.join(', ')
+      say "multiple notes match #{long_name} - #{listing} - then ';isharpie remove <n>'"
+    end
+  end
+
+  def self.remove_by_token(token)
+    # Numeric index from a previous ambiguous-list prompt
+    idx = token.to_i
+    if idx.nonzero? && @last_ambiguous_list && @last_ambiguous_list[idx - 1]
+      record = @last_ambiguous_list[idx - 1]
+      remove_note(record[:id])
+      say "removed note: #{record[:note]}"
+      @last_ambiguous_list = nil
+      return
+    end
+
+    # Literal note id (e.g. n5)
+    if token =~ /^n\d+$/i
+      record = notes.find { |n| n[:id] == token }
+      if record
+        remove_note(record[:id])
+        say "removed note: #{record[:note]}"
+      else
+        say "no note found with id #{token}"
+      end
+      return
+    end
+
+    # Otherwise treat as noun - find item in hand
+    remove_held_item(token)
+  end
+
+  def self.list_notes
+    if notes.empty?
+      say "no notes stored"
+      return
+    end
+
+    rows = notes.map { |n| "#{n[:id]}: #{n[:long_name]} [#{n[:container]}] -> #{n[:note]} (#{n[:color]})" }
+    Lich::Messaging.mono(rows.join("\n"))
+  end
+
+  def self.show_colors
+    VALID_COLORS.each do |c|
+      _respond(c == 'none' ? '  none' : "  #{Lich::Messaging.msg_format(COLOR_MAP[c], c, encode: false)}")
+    end
+  end
+
+  def self.show_help
+    t = proc { |s| Lich::Messaging.msg_format('thought', s, encode: false) }
+    g = proc { |s| Lich::Messaging.msg_format('speech',  s, encode: false) }
+    w = proc { |s| Lich::Messaging.msg_format('whisper', s, encode: true)  }
+
+    _respond t.call("  ISharpie (Item Sharpie) v#{VERSION}  -  Help Notes")
+    _respond ''
+    _respond '  Tags held items with a note, then injects that note inline'
+    _respond '  next to the item name everywhere it appears in game text.'
+    _respond ''
+    _respond g.call('  Tagging') + '  (hold item first)'
+    _respond "  #{w.call(';isharpie tag <noun> "<note>"')}  tag item in hand"
+    _respond "  #{w.call(';isharpie tag <noun> "<note>" color <name>')}  tag with color"
+    _respond "  #{w.call(';isharpie color <name>')}  update color on last tagged"
+    _respond "  #{w.call(';isharpie remove <noun>')}  remove note from item in hand"
+    _respond ''
+    _respond g.call('  Colors')
+    VALID_COLORS.each do |c|
+      _respond(c == 'none' ? '  none' : "  #{Lich::Messaging.msg_format(COLOR_MAP[c], c, encode: false)}")
+    end
+    _respond ''
+    _respond g.call('  Review')
+    _respond "  #{w.call(';isharpie list')}  list all stored notes"
+    _respond ''
+    _respond g.call('  Notes')
+    _respond '  item id resets each login, after locker storage, or scripted item mutations - matched automatically by name'
+    _respond "  Otherwise, confirmation prompt only fires when two tagged items share the same name"
+    _respond '  If struggling with syntax, ensure note text is in quotes and include "color" when changing it'
+    _respond ''
+  end
+
+  def self.report_status
+    pending = if @pending_confirmation
+                candidate = @pending_confirmation[:candidates][@pending_confirmation[:index]]
+                "a confirmation is pending (\"#{candidate && candidate[:note]}\")"
+              else
+                "no confirmation pending"
+              end
+    say "v#{VERSION} - #{notes.size} note(s) stored - #{pending}"
+  end
+
+  ## ---- misc -------------------------------------------------------------------
+
+  def self.say(message)
+    _respond Lich::Messaging.msg_format('whisper', "[ISharpie: #{message}]", encode: false)
+  end
+
+  def self.main_loop
+    loop do
+      begin
+        drain_cmd_queue
+        drain_confirm_queue
+      rescue StandardError => e
+        say "error in main loop: #{e.class}: #{e.message}"
+      end
+      pause 0.25
+    end
+  end
+end
+
+if Script.current.vars[1] =~ /^help$/i
+  ISharpie.show_help
+  exit
+end
+
+ISharpie.install_annotator
+ISharpie.install_container_tracker
+ISharpie.install_upstream_hook
+
+before_dying do
+  ISharpie.remove_annotator
+  ISharpie.remove_container_tracker
+  ISharpie.remove_upstream_hook
+end
+
+respond("ISharpie is running!")
+ISharpie.main_loop
