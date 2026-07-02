@@ -7,16 +7,45 @@
   game: Gemstone
   tags: hunting, combat, automate, society, arcarium, trinkets, gemstones, paladin, warrior, rogue, ranger, bard, cleric, empath, wizard, sorcerer
   required: Lich >= 5.9.0
-  version: 1.3.0
+  version: 1.4.3
 
   changelog:
+    1.4.3 (2026-07-01):
+      feat: add "low_health" when option -- fires when HP is below retreat threshold but NOT physically CC'd (safe for arcarium/trinkets that require movement)
+      fix: "CC'd" still fires on low health for backward compat with old profiles; "low_health" is the precise new option
+      fix: auto-migrate arcarium vissi from when CC'd to low_health on profile load (arcarium cannot fire while immobilized)
+      fix: group leader falsely flagged as non-grouped player -- "who is leading" suffix was causing pc_first_name to return "leading" instead of the leader's name
+      fix: daily-limited vissi now fire on "low_health" moment
+      fix: collect_arcarium now preserves extra profile fields (e.g. desc) that the setup wizard does not display
+      docs: update UI notes and =begin docs to clarify what each when option requires
+    1.4.2 (2026-07-01):
+      feat: flying weapon recovery -- casts spell 119 (Telekinesis) when weapon is disarmed and floating (Spell[119].known? gated)
+      fix: Symbol of Return (and society escapes) now fire during roundtime via background health watcher; no longer blocked by waitrt?
+    1.4.1 (2026-07-01):
+      refactor: replace manual status checks with Lich 5 API boolean forms
+      refactor: replace any manual society/skill/stat parsing with Lich 5 API
+      docs: add YARD documentation to all non-trivial public methods
+    1.4.0 (2026-07-01):
+      refactor: encapsulate all constants, modules, and state inside module GSH4A (no global namespace pollution)
+      refactor: inner combat engine renamed from module GSH4A to module GSH4A::Engine
+      refactor: entry point updated to use GSH4A::Engine, GSH4A::SetupWizard, GSH4A::GSH4AState
+      style: ASCII-only characters enforced throughout
     1.3.0 (2026-07-01):
-      Added "swarm" when option (user-configurable creature threshold, default 5)
+      Added "swarm" when option (user-configurable threshold, default 5; set in Hunting Prefs)
+      Swarm suppressed during gigas peace mode (consistent with AoE)
+      INCARNATE ONSLAUGHT can now be set to fire on swarm instead of AoE (mutually exclusive)
       Renamed "emergency" when option to "CC'd" (stunned/webbed/bound); backward compat preserved
-      Dead player pause (opt-in, Hunting Preferences)
-      Safe room escape now opt-in checkbox; society Symbol of Return unified under health threshold
-      CMAN Type column made non-editable
-      AoE vs Swarm explanatory notes added to Trinkets and Arcarium tabs
+      Scripts tab "When" dropdown now consistent with trinkets/arcarium (swarm, CC'd, target_vulnerable)
+      Fixed: Scripts tab "When" changes were never saving (entry key mismatch in scripts_for_slot)
+      Fixed: CMAN grip was always saving as "true" (column index skipped internal sensitive boolean)
+      Combat now targets GameObj.targets (game-flagged hostile only) instead of filtering GameObj.npcs
+      Dead player pause opt-in (Hunting Preferences); defaults off for invasion scenarios
+      INCARNATE ONSLAUGHT for Swarm checkbox added (grays out AoE version and vice versa)
+      AoE vs Swarm explanatory notes added to Trinkets, Arcarium, and Hunting Prefs tabs
+      Added repo metadata (author, version, tags, required, changelog) for ;repo info support
+      Fixed: CMAN/mount ability stall -- fput_guarded now exits immediately on Roundtime instead of waiting full 3s timeout
+      Fixed: crash "undefined method capture_detect" when firing INCARNATE ONSLAUGHT (replaced with dothistimeout)
+      Fixed: ability and CMAN commands could fire from waitrt? queue after character death (dead guard added)
     1.2.0 (2026-06-01):
       Society escape unified with health retreat threshold (single % field)
       Paladin INCARNATE ARMOR emergency support
@@ -83,7 +112,10 @@
     swarm            -- fires when creatures >= your configured swarm threshold (default 5,
                         set in Hunting Prefs); useful for abilities you want to save for
                         truly overwhelming numbers, independent of the AoE threshold
-    CC'd             -- fires when stunned, webbed, or bound
+    CC'd             -- fires when stunned, webbed, or bound (requires no physical movement;
+                        arcarium and most trinkets CANNOT fire in this state)
+    low_health       -- fires when HP is below your health retreat threshold but you are NOT
+                        physically CC'd; safe for arcarium, trinkets, items that need movement
     maintenance      -- fires out of combat (buffs, upkeep)
     target_vulnerable -- fires only when the current target has a vulnerable status
     - Gemstones: up to 5 slots with activated ability/when/cooldown tracking
@@ -112,6 +144,9 @@
 
 require 'yaml'
 require 'fileutils'
+
+# All script internals live inside this module -- no global namespace pollution.
+module GSH4A
 
 PROFILE_DIR = File.join(File.dirname(__FILE__), "gsh4a_profiles")
 FileUtils.mkdir_p(PROFILE_DIR)
@@ -714,8 +749,8 @@ RANGED_SUBTYPES  = ["bow", "crossbow", "sling", "thrown"].freeze
 AIM_LOCATIONS    = ["head", "neck", "chest", "back", "abdomen",
                     "right arm", "left arm", "right hand", "left hand",
                     "right leg", "left leg", "right eye", "left eye"].freeze
-BS_WHEN_OPTS     = ["engagement", "aoe", "swarm", "CC'd", "maintenance", "target_vulnerable"].freeze
-VISSI_WHEN_OPTS  = ["engagement", "aoe", "swarm", "CC'd", "maintenance", "target_vulnerable"].freeze
+BS_WHEN_OPTS     = ["engagement", "aoe", "swarm", "CC'd", "low_health", "maintenance", "target_vulnerable"].freeze
+VISSI_WHEN_OPTS  = ["engagement", "aoe", "swarm", "CC'd", "low_health", "maintenance", "target_vulnerable"].freeze
 SWARM_THRESHOLD_DEFAULT = 5
 
 ENCUMBRANCE_LEVELS = [
@@ -927,19 +962,38 @@ module GSH4AState
     attr_accessor :incarnation_expires
     attr_accessor :berserking, :berserk_rounds
 
+    # Returns true if the cooldown for key has expired (or was never set).
+    #
+    # @param key [String, Symbol] cooldown identifier
+    # @return [Boolean] true when the ability is off cooldown
     def cd_ready?(key)
       Time.now.to_f >= (@cooldowns[key] || 0)
     end
 
+    # Records a cooldown expiry time for key.
+    #
+    # @param key [String, Symbol] cooldown identifier
+    # @param seconds [Numeric] duration of the cooldown in seconds
+    # @return [Float] absolute expiry time (epoch seconds)
     def set_cd(key, seconds)
       @cooldowns[key] = Time.now.to_f + seconds.to_f
     end
 
+    # Returns true when the daily use count for key is below limit.
+    # Resets the counter automatically at midnight.
+    #
+    # @param key [String, Symbol] daily-use identifier
+    # @param limit [Integer] maximum uses allowed per day
+    # @return [Boolean] true when another use is permitted today
     def daily_ok?(key, limit)
       reset_daily(key)
       (@daily_uses[key] || 0) < limit
     end
 
+    # Increments the daily use counter for key and persists it to disk.
+    #
+    # @param key [String, Symbol] daily-use identifier
+    # @return [void]
     def use_daily(key)
       reset_daily(key)
       @daily_uses[key] = (@daily_uses[key] || 0) + 1
@@ -1252,27 +1306,15 @@ module SetupWizard
     d[:armor_specs]   = parse_technique_list(capture_detect("armor info",   2.5))
     d[:gem_slots]     = parse_gem_slots(capture_detect("gemstone slot", 3.0))
 
-    # Society -- capture command output for reliable detection
-    soc_out = capture_detect("society", 2.5)
-    d[:society] = case soc_out
+    # Society -- use Lich 5 Society API directly (no command send needed)
+    soc_raw = (Society.membership rescue nil) || (XMLData.society rescue nil)
+    d[:society] = case soc_raw.to_s
     when /order of voln/i               then "Voln"
     when /guardians of sunfist/i        then "Sunfist"
     when /council of light/i            then "CoL"
-    else
-      # fallback to XMLData/Society module
-      soc_raw = (XMLData.society rescue nil) || (Society.name rescue nil)
-      case soc_raw.to_s
-      when /voln/i    then "Voln"
-      when /sunfist/i then "Sunfist"
-      when /council/i, /col/i then "CoL"
-      else nil
-      end
+    else nil
     end
-    d[:society_rank] = if soc_out =~ /rank[:\s]+(\d+)/i then $1.to_i
-                       elsif soc_out =~ /(\d+)\s*(st|nd|rd|th)?\s*rank/i then $1.to_i
-                       elsif soc_out =~ /master/i && d[:society] == "Voln" then 26
-                       else (XMLData.society_rank rescue nil) || (Society.rank rescue nil) || 1
-                       end
+    d[:society_rank] = (Society.rank rescue nil) || (XMLData.society_rank rescue nil) || 1
 
     d
   end
@@ -4066,7 +4108,8 @@ module SetupWizard
       "<i><span foreground='#888888'>" \
       "aoe = creature count >= your AoE threshold  |  " \
       "swarm = creature count >= your swarm threshold (Hunting Prefs)  |  " \
-      "CC'd = stunned/webbed/bound" \
+      "CC'd = stunned/webbed/bound (arcarium CANNOT fire while physically immobilized)  |  " \
+      "low_health = HP below retreat threshold but NOT stunned/webbed/bound (safe for arcarium)" \
       "</span></i>"
     )
     ab.pack_start(vissi_when_note, false, false, 2)
@@ -4330,7 +4373,8 @@ module SetupWizard
       "engagement = every combat round  |  " \
       "aoe = when creature count >= your AoE threshold (Hunting Prefs)  |  " \
       "swarm = when creatures >= your swarm threshold (set in Hunting Prefs; default 5)  |  " \
-      "CC'd = when stunned, webbed, or bound  |  " \
+      "CC'd = when stunned, webbed, or bound (requires no physical action -- NOT safe for arcarium/trinkets)  |  " \
+      "low_health = when HP is below retreat threshold but you can still move (safe for arcarium/trinkets)  |  " \
       "maintenance = out of combat  |  " \
       "target_vulnerable = when current target has a vulnerable status" \
       "</span></i>"
@@ -5167,18 +5211,25 @@ module SetupWizard
   end
 
   def self.collect_arcarium(key)
-    store  = @w[:"#{key}_vissi_store"]
-    vissi  = []
+    store         = @w[:"#{key}_vissi_store"]
+    saved_by_name = ((@saved_config || {}).dig("arcarium", key.to_s, "vissi") || [])
+                      .map { |v| [v["name"].to_s, v] }.to_h
+    vissi = []
     if store
       store.each do |_, path, iter|
-        vissi << {
+        name  = store.get_value(iter, 1).to_s
+        saved = saved_by_name[name] || {}
+        entry = {
           "enabled"       => store.get_value(iter, 0),
-          "name"          => store.get_value(iter, 1).to_s,
+          "name"          => name,
           "verb"          => store.get_value(iter, 2).to_s,
           "when"          => store.get_value(iter, 3).to_s,
           "daily_limit"   => store.get_value(iter, 4).to_i,
           "cooldown_secs" => store.get_value(iter, 5).to_i,
         }
+        # Preserve extra metadata fields (e.g. desc) from saved profile that the UI does not track
+        saved.each { |k, v| entry[k] ||= v }
+        vissi << entry
       end
     end
     {
@@ -5202,7 +5253,7 @@ end
 # ===========================================================================
 # HUNTING ENGINE
 # ===========================================================================
-module GSH4A
+module Engine
   @profile = {}
 
   def self.load_profile
@@ -5219,7 +5270,31 @@ module GSH4A
     end
     @profile = YAML.load_file(path)
     @_priority_patterns = nil  # clear cache so new profile patterns take effect
+    migrate_profile(path)
     echo "[gsh4a] Profile loaded for #{name} (#{prof} #{race}, level #{level})."
+  end
+
+  # Applies one-time forward migrations to profiles saved by older script versions.
+  # Rewrites the profile file in place so the fix persists across restarts.
+  def self.migrate_profile(path)
+    changed = false
+
+    # v1.4.3: arcarium vissi with when: CC'd -> low_health
+    # Arcarium requires physical movement and cannot fire while stunned/webbed/bound.
+    # CC'd on any arcarium vissi was always wrong; low_health is the correct trigger.
+    %w[aversaris vangaris].each do |key|
+      Array(@profile.dig("arcarium", key, "vissi")).each do |v|
+        next unless v.is_a?(Hash) && v["when"].to_s == "CC'd"
+        v["when"] = "low_health"
+        changed = true
+        log "Migrated #{key} vissi '#{v['name']}': when CC'd -> low_health (arcarium cannot fire while immobilized)"
+      end
+    end
+
+    if changed
+      File.write(path, @profile.to_yaml)
+      log "Profile auto-migrated and saved."
+    end
   end
 
   def self.prof  = @profile.dig("character", "profession") || "Unknown"
@@ -5250,12 +5325,20 @@ module GSH4A
     checkrt < 6
   end
 
-  # Sends a command and detects game rejection ("too recently", "cannot", etc.).
-  # If rejected, sets a backoff CD on cd_key and returns false.
+  # Sends a command and backs off if the game signals rejection.
+  # Matches a short list of rejection phrases plus any caller-supplied hints.
+  # On rejection, sets a cooldown of backoff_secs on cd_key and returns false.
+  #
+  # @param cmd [String] the command string to send to the game
+  # @param cd_key [String, Symbol] cooldown key set on rejection
+  # @param backoff_secs [Numeric] cooldown duration in seconds when rejected
+  # @param success_hints [Array<String>] additional match strings (checked against REJECT_PATTERN too)
+  # @return [Boolean] false if the command was rejected, true otherwise
   def self.fput_guarded(cmd, cd_key, backoff_secs, success_hints = [])
     fput cmd
     all_hints = Array(success_hints) + ["recently", "cannot", "not yet", "too soon",
-                                        "does not respond", "no effect"]
+                                        "does not respond", "no effect",
+                                        "Roundtime", "roundtime"]
     result = matchtimeout(3, *all_hints)
     if result && result =~ REJECT_PATTERN
       warn "#{cmd} rejected (#{result.strip}) -- backing off #{backoff_secs}s"
@@ -5268,6 +5351,10 @@ module GSH4A
   # ---------------------------------------------------------------------------
   # NPC helpers
   # ---------------------------------------------------------------------------
+  # Returns the combined list of NPC name/noun patterns to skip attacking.
+  # Merges the built-in SAFE_NPC_PATTERN with any user-defined entries from the profile.
+  #
+  # @return [Array<Regexp>] patterns matching NPCs that must not be attacked
   def self.safe_npc_patterns
     user_safe = (pref("safe_npcs") || []).filter_map do |entry|
       Regexp.new(Regexp.escape(entry.strip), Regexp::IGNORECASE) rescue nil
@@ -5275,6 +5362,10 @@ module GSH4A
     [SAFE_NPC_PATTERN] + user_safe
   end
 
+  # Returns true when at least one gigas is alive in the room and avoid_gigas is enabled.
+  # Used to suppress AoE attacks that would break gigas peace.
+  #
+  # @return [Boolean] true when a living gigas is present and avoidance is on
   def self.gigas_present?
     return false unless pref("avoid_gigas")
     (GameObj.npcs || []).any? do |n|
@@ -5283,6 +5374,10 @@ module GSH4A
     end
   end
 
+  # Returns the list of living hostile NPCs in the room that are valid attack targets.
+  # Filters by safe-NPC patterns, gigas avoidance, and the game's own hostile flag.
+  #
+  # @return [Array<GameObj>] attackable hostile NPCs
   def self.hostile_npcs
     safe    = safe_npc_patterns
     avoid_g = pref("avoid_gigas")
@@ -5365,6 +5460,8 @@ module GSH4A
       line = line.strip
       if line =~ /grouped with (.+)/i
         raw = $1.gsub(/\.\s*$/, "")
+              .gsub(/\s+who is leading\.?/i, "")
+              .gsub(/\s+and is leading\.?/i, "")
         raw.split(/,\s*|\s+and\s+/).each do |part|
           name = pc_first_name(part.strip)
           members << name unless name.empty?
@@ -5434,8 +5531,8 @@ module GSH4A
   # Normal stand -- waits for RT first (safe for the main attack loop).
   # Returns false if a movement debuff is blocking the stand attempt.
   def self.stand_if_prone
-    return true if checkstanding
-    return false if (checkdead rescue false)
+    return true if standing?
+    return false if dead?
     return false if !GSH4AState.cd_ready?(:cant_stand)
     log "Prone -- standing up"
     waitrt?
@@ -5448,8 +5545,8 @@ module GSH4A
   # Used when stunned/webbed/bound so we try to get up the instant we can,
   # even if the game rejects it (it will re-fire next monitor cycle).
   def self.emergency_stand
-    return if checkstanding
-    return if (checkdead rescue false)
+    return if standing?
+    return if dead?
     log "Emergency: attempting to stand (prone/kneeling)"
     fput "stand"
     pause 0.3
@@ -5481,7 +5578,7 @@ module GSH4A
   def self.remount
     return if GSH4AState.mounted
     stand_if_prone
-    return unless checkstanding
+    return unless standing?
     noun = mount_cfg["noun"] || "mount"
     log "Mounting #{noun}"
     mount_result = nil
@@ -5561,6 +5658,11 @@ module GSH4A
     GSH4AState.mount_summoned ? remount : summon_mount
   end
 
+  # Attempts a mounted charge attack against target_id.
+  # No-ops when unmounted, on cooldown, low stamina, or in roundtime.
+  #
+  # @param target_id [String, Integer] the game object ID of the attack target
+  # @return [Boolean] true if the charge was executed, false otherwise
   def self.mount_charge(target_id)
     return false unless has_mount? && mount_cfg["has_charge"]
     sync_mount_state
@@ -5577,6 +5679,11 @@ module GSH4A
     true
   end
 
+  # Attempts a mounted trample AoE attack against all room targets.
+  # No-ops when unmounted, gigas are present, below aoe_threshold, on cooldown,
+  # low stamina, or in roundtime.
+  #
+  # @return [Boolean] true if the trample was executed, false otherwise
   def self.mount_trample
     return false unless has_mount? && mount_cfg["has_trample"]
     sync_mount_state
@@ -5632,8 +5739,8 @@ module GSH4A
           next unless GSH4AState.cd_ready?(dl_key)
         end
       else
-        # Daily-limited vissi only fire on CC'd (backward compat: "emergency")
-        next if dl > 0 && !["CC'd", "emergency"].include?(moment.to_s)
+        # Daily-limited vissi only fire on CC'd or low_health (backward compat: "emergency")
+        next if dl > 0 && !["CC'd", "emergency", "low_health"].include?(moment.to_s)
         if dl > 0 && !GSH4AState.daily_ok?(dl_key, dl)
           log "#{v['name']} daily limit reached (#{dl}/day) -- skipping"
           next
@@ -5860,7 +5967,7 @@ module GSH4A
         next unless gs.is_a?(Hash) && gs["enabled"] && gs["activated_property"]
         slot_num = gs["slot_num"].to_i
         next unless slot_num > 0
-        prop = GEMSTONE_ACTIVATED_PROPS.find { |p| p[:name] == gs["activated_property"] }
+        prop = SetupWizard::GEMSTONE_ACTIVATED_PROPS.find { |p| p[:name] == gs["activated_property"] }
         next unless prop
         list << {
           "key"          => "gem_activate_#{slot_num}",
@@ -5882,6 +5989,14 @@ module GSH4A
     "#{ab['_slot']}_#{ab['key']}"
   end
 
+  # Returns true when all guards for an ability entry pass.
+  # Guards checked: cooldown, daily limit, min_creatures, health window (max/min),
+  # stamina reserve, mana reserve, and optional spell_req known check.
+  #
+  # @param ab [Hash] ability entry (from all_abilities)
+  # @param target_count [Integer] number of hostile NPCs currently in the room
+  # @param health_pct [Integer] current player health percentage (0-100)
+  # @return [Boolean] true when the ability may fire
   def self.ability_ready?(ab, target_count, health_pct)
     key = ability_key(ab)
     cd  = ab["cd"].to_i
@@ -5909,6 +6024,13 @@ module GSH4A
     true
   end
 
+  # Executes a single ability entry (trinket, arcarium, gemstone, or script ability).
+  # Handles Paladin INCARNATE pre-cast, dead guard, cast wait, cooldown and daily
+  # tracking, and optional fput_guarded rejection backoff for cooldown-tracked abilities.
+  #
+  # @param ab [Hash] ability entry hash (keys: verb, cd, daily_limit, _script, key, when, ...)
+  # @param primary_id [String, Integer, nil] target game object ID for #TARGET substitution
+  # @return [Boolean] false if any guard failed or the command was rejected; true on success
   def self.fire_ability(ab, primary_id = nil)
     cmd = ab["verb"].dup
     cmd.gsub!("#TARGET", "##{primary_id}") if primary_id
@@ -5922,7 +6044,7 @@ module GSH4A
         if spell_1650&.known?
           log "Casting 1650 to activate Divine Incarnation before #{cmd}"
           waitrt?; waitcastrt?
-          result = capture_detect("#{spell_verb(1650)} 1650", 5.0)
+          result = dothistimeout("#{spell_verb(1650)} 1650", 5, /cast roundtime|already incarnated|hindrance|armor prevents|insufficient mana/i)
           if result =~ /already incarnated/i
             # Buff is active but Lich didn't track it -- mark it manually
             GSH4AState.incarnation_expires = Time.now + 300
@@ -5946,6 +6068,7 @@ module GSH4A
 
     log "#{ab['_script']} #{ab['key']} (#{ab['when']})"
     waitrt?
+    return false if dead?
     waitcastrt? if cmd =~ /incant|sing|cast|prep/i
 
     key = ability_key(ab)
@@ -5978,6 +6101,13 @@ module GSH4A
     false
   end
 
+  # Fires all ability entries whose "when" field matches trigger.
+  # Skips daily-limited abilities when trigger is not "CC'd"/"emergency",
+  # and skips multi-target abilities when gigas peace is active.
+  #
+  # @param trigger [String] the "when" value to match (e.g. "maintenance", "aoe", "CC'd")
+  # @param primary_id [String, Integer, nil] passed through to fire_ability for targeting
+  # @return [void]
   def self.run_abilities_when(trigger, primary_id = nil)
     count   = npc_count
     health  = percenthealth rescue 100
@@ -5986,8 +6116,8 @@ module GSH4A
       saved = ab["when"] == "emergency" ? "CC'd" : ab["when"]
       saved == trigger
     }.each do |ab|
-      # Daily-limited abilities only fire on CC'd (backward compat: "emergency")
-      next if ab["daily_limit"].to_i > 0 && !["CC'd", "emergency"].include?(trigger)
+      # Daily-limited abilities only fire on CC'd or low_health (backward compat: "emergency")
+      next if ab["daily_limit"].to_i > 0 && !["CC'd", "emergency", "low_health"].include?(trigger)
       # If gigas are present and avoid_gigas is on, skip any multi-target abilities
       next if gigas_g && ab["min_creatures"].to_i > 1
       next unless ability_ready?(ab, count, health)
@@ -6044,7 +6174,7 @@ module GSH4A
   end
 
   def self.check_society_maintain
-    return if (checkdead rescue false)
+    return if dead?
     name = society_cfg["name"]
     return unless name
     (society_cfg["maintain"] || []).each do |entry|
@@ -6061,7 +6191,7 @@ module GSH4A
   end
 
   def self.check_society_mana
-    return if (checkdead rescue false)
+    return if dead?
     name = society_cfg["name"]
     return unless name
     mana_entry = (society_cfg["on_demand"] || []).find { |e| e["cmd"] =~ /mana/i }
@@ -6076,7 +6206,7 @@ module GSH4A
   end
 
   def self.check_society_restoration
-    return if (checkdead rescue false)
+    return if dead?
     name = society_cfg["name"]
     return unless name
     heal_entry = (society_cfg["on_demand"] || []).find { |e| e["cmd"] =~ /restoration|healing|wracking/i }
@@ -6094,7 +6224,7 @@ module GSH4A
   def self.check_society_escape
     cfg = society_cfg.dig("escape") || society_cfg.dig("symbol_return")
     return unless cfg && cfg["enabled"]
-    return if (checkdead rescue false)
+    return if dead?
     hp = percenthealth rescue 100
     return if hp >= pref("health_retreat_pct").to_i
     return unless GSH4AState.cd_ready?(:soc_escape)
@@ -7073,6 +7203,13 @@ module GSH4A
     (@profile["cmans"] || []).select { |c| c["type"] == type_str && c["enabled"] != false }
   end
 
+  # Executes a single CMAN or technique entry from the profile.
+  # Checks stamina, cooldown, and roundtime before firing.
+  # Handles optional grip switch and records cooldown on success.
+  #
+  # @param cman [Hash] CMAN entry from the profile (keys: name, verb, cd, stamina, ...)
+  # @param target_id [String, Integer, nil] game object ID to embed in the command, or nil
+  # @return [Boolean] true if the command was sent, false if any guard failed
   def self.fire_cman(cman, target_id = nil)
     return false unless stamina_ok?(cman["stamina"].to_i)
     key = "cman_#{cman['name'].gsub(/\s+/, '_').downcase}"
@@ -7084,6 +7221,7 @@ module GSH4A
     log cman["name"]
     switched_grip = switch_grip_for_ability(cman)
     waitrt?; waitcastrt?
+    return false if dead?
     fput cmd
     waitrt?
     restore_default_grip unless switched_grip.empty?
@@ -7099,6 +7237,11 @@ module GSH4A
     npc_count >= pref("aoe_threshold").to_i
   end
 
+  # Fires all configured AoE abilities and/or AoE spell/cman rotation entries.
+  # No-ops when the room has fewer NPCs than aoe_threshold or gigas are present.
+  #
+  # @param primary_id [String, Integer] ID of the current primary target (for targeted AoE commands)
+  # @return [void]
   def self.run_aoe_phase(primary_id)
     return unless aoe_needed?
     run_abilities_when("aoe", primary_id)
@@ -7263,13 +7406,18 @@ module GSH4A
   # ---------------------------------------------------------------------------
   # Emergency handler
   # ---------------------------------------------------------------------------
+  # Handles all mid-combat emergencies: standing, status removal, low health retreat,
+  # and low mana retreat. Called every iteration of the main and inner combat loops.
+  # May set GSH4AState.hunting = false and stop the script if retreat is triggered.
+  #
+  # @return [void]
   def self.monitor_emergencies
     # Stand up immediately -- no RT wait; re-fires next cycle if still rejected
-    emergency_stand unless checkstanding
+    emergency_stand unless standing?
 
-    stunned  = checkstunned
-    webbed   = (checkwebbed rescue false)
-    bound    = (checkbound  rescue false)
+    stunned  = stunned?
+    webbed   = webbed?
+    bound    = bound?
     in_rt    = (checkrt rescue 0).to_i
 
     hp_pct = percenthealth rescue 100
@@ -7287,8 +7435,12 @@ module GSH4A
       # Paladin INCARNATE ARMOR: fire when stunned AND in RT >= user-defined threshold
       check_incarnate_armor_emergency(stunned, in_rt)
     elsif low_health
-      # Health-restore arcarium vissi (e.g. Fated Fruit) fire on low health even without CC
+      # low_health: HP below threshold but not physically CC'd -- arcarium/trinkets can still act
+      # Also fire CC'd for backward compat (old profiles used CC'd for health-restore vissi)
+      run_abilities_when("CC'd")
       run_arcarium_moment("CC'd")
+      run_abilities_when("low_health")
+      run_arcarium_moment("low_health")
       check_society_restoration
     end
 
@@ -7299,6 +7451,8 @@ module GSH4A
     if pct < pref("health_retreat_pct").to_i
       run_abilities_when("CC'd")
       run_arcarium_moment("CC'd")
+      run_abilities_when("low_health")
+      run_arcarium_moment("low_health")
       check_society_restoration
       demon_fetch_weapon
       servant_fetch_weapon
@@ -7368,7 +7522,7 @@ module GSH4A
       loop do
         break unless GSH4AState.hunting
         begin
-          unless checkstanding
+          unless standing?
             if GSH4AState.cd_ready?(:cant_stand)
               waitrt?
               fput "stand" rescue nil
@@ -7456,8 +7610,84 @@ module GSH4A
   end
 
   # ---------------------------------------------------------------------------
+  # Disarm watcher -- recovers a flying weapon with spell 119 (Telekinesis)
+  # ---------------------------------------------------------------------------
+
+  # Watches for weapon-disarm messages and casts spell 119 to recover the weapon.
+  # Only fires if Spell[119] is known and mana is available.
+  def self.start_disarm_watcher
+    DownstreamHook.remove("gsh4a_disarm_watcher") rescue nil
+    DownstreamHook.add("gsh4a_disarm_watcher", proc { |line|
+      clean = line.gsub(/<[^>]+>/, "").strip
+      if clean =~ /Your (.+?) tears free from your hands and floats/i
+        noun = $1.to_s.split.last
+        Thread.new do
+          begin
+            next unless (Spell[119].known? rescue false)
+            next if dead?
+            next unless mana_ok?(10)
+            log "Weapon disarmed -- casting 119 to recover flying #{noun}"
+            waitrt?   rescue nil
+            waitcastrt? rescue nil
+            next if dead?
+            fput "prep 119"
+            waitcastrt? rescue nil
+            next if dead?
+            fput "cast flying #{noun}"
+            waitcastrt? rescue nil
+          rescue => e
+            warn "Disarm recovery error: #{e.message}"
+          end
+        end
+      end
+      line
+    })
+  end
+
+  # @return [void]
+  def self.stop_disarm_watcher
+    DownstreamHook.remove("gsh4a_disarm_watcher") rescue nil
+  end
+
+  # ---------------------------------------------------------------------------
+  # Health escape watcher -- fires society escape even during roundtime
+  # ---------------------------------------------------------------------------
+
+  # Polls health every 0.3s and fires the society escape ability the moment
+  # health drops below the configured threshold, regardless of main loop state.
+  # This catches rapid burst damage that kills faster than the loop can cycle.
+  def self.start_health_escape_watcher
+    @health_escape_thread&.kill rescue nil
+    @health_escape_thread = Thread.new do
+      loop do
+        break unless GSH4AState.hunting
+        begin
+          next if dead?
+          hp = percenthealth rescue 100
+          if hp < pref("health_retreat_pct").to_i
+            check_society_escape
+          end
+        rescue; end
+        pause 0.3
+      end
+    end
+  end
+
+  # @return [void]
+  def self.stop_health_escape_watcher
+    @health_escape_thread&.kill rescue nil
+    @health_escape_thread = nil
+  end
+
+  # ---------------------------------------------------------------------------
   # Single-target rotation
   # ---------------------------------------------------------------------------
+  # Runs the full combat loop against a single target until it dies or a break condition fires.
+  # Handles stance, mount, AoE check, berserk, stun maneuver, assault techniques,
+  # ranged/melee/runestaff rotation, and all emergency/pause guards per swing.
+  #
+  # @param target [GameObj] the hostile NPC to attack
+  # @return [void]
   def self.single_target_rotation(target)
     return unless target
     id = target.id
@@ -7470,7 +7700,7 @@ module GSH4A
 
     while target_alive?(target)
       break unless GSH4AState.hunting
-      break if (checkdead rescue false)
+      break if dead?
       # Break immediately if target left the room (moved or died out of sight)
       break unless hostile_npcs.any? { |n| n.id == id }
       # If a priority creature appeared and we're not already on one, finish this
@@ -7494,11 +7724,11 @@ module GSH4A
       # just when paused. Without this, bind/stun/web mid-fight is never seen by
       # monitor_emergencies because the outer loop (which calls it) doesn't run again
       # until single_target_rotation returns.
-      if checkstunned || (checkbound rescue false) || (checkwebbed rescue false)
+      if stunned? || bound? || webbed?
         monitor_emergencies
       end
 
-      unless checkstanding
+      unless standing?
         if GSH4AState.cd_ready?(:cant_stand)
           stand_if_prone
           next  # wait for standing to take effect
@@ -7514,7 +7744,7 @@ module GSH4A
         break unless GSH4AState.hunting  # society escape sets hunting=false
         hp_pct = percenthealth rescue 100
         handle_health_retreat(hp_pct) if hp_pct < pref("health_retreat_pct").to_i
-        break if (checkdead rescue false)
+        break if dead?
         break unless GSH4AState.hunting
         if dead_player_present? && !GSH4AState.paused
           GSH4AState.paused = true
@@ -7537,7 +7767,7 @@ module GSH4A
       next if fire_aoe_techniques(count)
 
       run_arcarium_moment("aoe") if aoe_needed?
-      if npc_count >= (pref("swarm_threshold") || SWARM_THRESHOLD_DEFAULT).to_i
+      if !gigas_present? && npc_count >= (pref("swarm_threshold") || SWARM_THRESHOLD_DEFAULT).to_i
         run_arcarium_moment("swarm")
         run_abilities_when("swarm", id)
       end
@@ -7695,6 +7925,8 @@ module GSH4A
     start_death_watcher
     start_encumbrance_watcher
     start_group_watcher
+    start_disarm_watcher
+    start_health_escape_watcher
 
     # Pause gsh4a whenever eloot pauses for a storage failure so the player
     # can handle it manually before typing RESUME to continue.
@@ -7717,11 +7949,11 @@ module GSH4A
     loop do
       break unless GSH4AState.hunting
       break if Script.current.nil? rescue false
-      break if (checkdead rescue false)
+      break if dead?
 
       monitor_emergencies
       break unless GSH4AState.hunting  # handle_health_retreat may have set this false
-      break if (checkdead rescue false)
+      break if dead?
 
       check_society_maintain
       check_society_mana
@@ -7806,6 +8038,8 @@ module GSH4A
     stop_uac_watcher
     stop_stun_watcher
     stop_berserk_watcher
+    stop_disarm_watcher
+    stop_health_escape_watcher
     # Stand up if we stopped hunting while kneeling (crossbow kneel mode)
     if GSH4AState.ranged_kneeling
       waitrt? rescue nil
@@ -7815,31 +8049,35 @@ module GSH4A
   end
 end
 
+end # module GSH4A
+
 # ===========================================================================
 # ENTRY POINT
 # ===========================================================================
 before_dying do
-  GSH4AState.save_state                         rescue nil
-  UpstreamHook.remove("gsh4a_pause")            rescue nil
-  GSH4A.stop_reaction_watcher                   rescue nil
-  GSH4A.stop_uac_watcher                        rescue nil
-  GSH4A.stop_stun_watcher                       rescue nil
-  GSH4A.stop_berserk_watcher                    rescue nil
-  GSH4A.stop_holy_weapon_watcher                rescue nil
-  DownstreamHook.remove("gsh4a_group_watcher")        rescue nil
-  DownstreamHook.remove("gsh4a_eloot_pause_watcher")  rescue nil
-  UpstreamHook.remove("gsh4a_setup")            rescue nil
+  GSH4A::GSH4AState.save_state                         rescue nil
+  UpstreamHook.remove("gsh4a_pause")                   rescue nil
+  GSH4A::Engine.stop_reaction_watcher                  rescue nil
+  GSH4A::Engine.stop_uac_watcher                       rescue nil
+  GSH4A::Engine.stop_stun_watcher                      rescue nil
+  GSH4A::Engine.stop_berserk_watcher                   rescue nil
+  GSH4A::Engine.stop_holy_weapon_watcher               rescue nil
+  GSH4A::Engine.stop_disarm_watcher                    rescue nil
+  GSH4A::Engine.stop_health_escape_watcher             rescue nil
+  DownstreamHook.remove("gsh4a_group_watcher")         rescue nil
+  DownstreamHook.remove("gsh4a_eloot_pause_watcher")   rescue nil
+  UpstreamHook.remove("gsh4a_setup")                   rescue nil
 end
 
 case Script.current.vars[1].to_s.strip.downcase
 when /^(setup|reset)$/
-  SetupWizard.run
+  GSH4A::SetupWizard.run
 when /^stop$/
   kill_script "gshunting4all"
 when /^status$/
-  GSH4A.load_profile rescue nil
-  GSH4A.show_status
+  GSH4A::Engine.load_profile rescue nil
+  GSH4A::Engine.show_status
 else
-  GSH4A.run
+  GSH4A::Engine.run
 end
 

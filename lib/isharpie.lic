@@ -10,7 +10,7 @@ that note inline next to the item name everywhere it appears in game text.
 Item identity survives locker storage by matching on name and container.
 
 The following inputs are available:
-  ;isharpie tag <noun> "<note>" [color orange|teal|green|yellow|none]  - tag item in hand
+  ;isharpie tag <noun> ["<note>"] [SN "<silent>"] [color ...]  - tag item in hand
   ;isharpie color <name>                 - set color on last tagged item
   ;isharpie remove <noun>                - remove note from item in hand
   ;isharpie list                         - list all stored notes
@@ -21,7 +21,7 @@ The following inputs are available:
       Other scripts: Combatical, Merchantical, Loresang, VolnRestore2
       game: gs
       tags: items, inventory, notes, highlight, Sharpie
-      version: 1.0.5
+      version: 1.0.8
       required: Lich > 5.0
 
       \\Version\\
@@ -29,13 +29,28 @@ The following inputs are available:
       1.0.1 07/01/2026 - changed notes and fixed color name
       1.0.3 07/01/2026 - notes now saved to EduBarbarian\isharpie_name for persistence
       1.0.5 07/01/2026 - improved item detection: auto-bind on first sighting, word-set name matching
+      1.0.6 07/01/2026 - sanity-check cached bindings against item name to prevent cross-item annotation
+      1.0.7 07/01/2026 - silent notes (SN): per-item, list-only, no inline annotation
+      1.0.8 07/01/2026 - trimmed help to one SN example with brief mention of variations
 
 =end
 
 module ISharpie
-  VERSION = '1.0.5'.freeze
+  VERSION = '1.0.8'.freeze
 
   VALID_COLORS = %w[orange teal green yellow none].freeze
+
+  # GS4 crafting/quality descriptors that are legitimately dropped from worn or
+  # display names. The word-set fallback only fires when the stored name is
+  # longer than the stream name if every extra stored word is in this list --
+  # prevents material adjectives like "starstone" from causing cross-item matches.
+  WORD_SET_QUALIFIERS = %w[
+    carved hammered turned twisted braided engraved etched inlaid stamped
+    worked polished finished riveted studded forged fashioned wrought
+    masterful flawless perfect exceptional excellent superb fine quality
+    crude rough poor journeyman ordinary remarkable
+    worn damaged battered dented cracked crumbling scratched
+  ].to_set.freeze
 
   # Maps player-facing color names to Lich msg_format preset names.
   COLOR_MAP = {
@@ -113,12 +128,13 @@ module ISharpie
     "n#{@note_counter}"
   end
 
-  def self.add_note(long_name:, container:, note:, color:)
+  def self.add_note(long_name:, container:, note:, color:, silent_note: nil)
     record = {
       id: next_note_id,
       long_name: long_name,
       container: container,
       note: note,
+      silent_note: silent_note,
       color: color,
       created_at: Time.now.to_i
     }
@@ -167,7 +183,19 @@ module ISharpie
       matches = notes.select { |n|
         stored_words = n[:long_name].downcase.gsub(/[^a-z0-9\s]/, ' ').split
         next false unless stored_words.last == stream_noun
-        short, long_w = [stream_words, stored_words].minmax_by(&:length)
+        # Explicit length comparison avoids minmax_by's equal-length tie-break
+        # bug where both results point to the same (first) array, causing the
+        # check to compare the stream against itself and always pass.
+        short, long_w = stream_words.length <= stored_words.length \
+                          ? [stream_words, stored_words] \
+                          : [stored_words, stream_words]
+        # When the stored name is longer, extra stored words must be known
+        # crafting/quality qualifiers -- blocks "white band" from matching
+        # "white starstone band" because "starstone" is not a qualifier.
+        if stored_words.length > stream_words.length
+          extra = stored_words - stream_words
+          next false unless extra.all? { |w| WORD_SET_QUALIFIERS.include?(w) }
+        end
         short.length >= 2 && short.all? { |w| long_w.include?(w) }
       }
     end
@@ -246,7 +274,9 @@ module ISharpie
   ## ---- display formatting --------------------------------------------------
 
   def self.format_annotation(note_record, confirmed:)
-    text = "(#{note_record[:note]}#{confirmed ? '' : '?'})"
+    visible = note_record[:note].to_s.strip
+    return nil if visible.empty?
+    text = "(#{visible}#{confirmed ? '' : '?'})"
     color = note_record[:color] || 'none'
     return text if color == 'none'
 
@@ -277,7 +307,23 @@ module ISharpie
 
       if exist_bound?(exist_id)
         note = bound_note_for(exist_id)
-        note ? (tag_only + format_annotation(note, confirmed: true) + trailing) : whole_match
+        if note
+          # Sanity check: verify the displayed name is still plausible for this
+          # note before trusting the cached binding. Exist IDs can collide on
+          # test servers (recycled IDs) or change after locker storage, causing
+          # a stale binding to incorrectly annotate a completely different item.
+          check_names = [long_name, tag_text.strip].uniq
+          plausible = check_names.any? { |n| candidates_for(n).any? { |c| c[:id] == note[:id] } }
+          if plausible
+            ann = format_annotation(note, confirmed: true)
+            ann ? (tag_only + ann + trailing) : whole_match
+          else
+            @exist_bindings.delete(exist_id)
+            whole_match
+          end
+        else
+          whole_match
+        end
       else
         candidates = candidates_for(long_name)
         # If the trailing clause ("with a rippling green sheen...") prevented a
@@ -288,7 +334,8 @@ module ISharpie
         end
         if candidates.size == 1
           bind!(exist_id, candidates.first[:id])
-          tag_only + format_annotation(candidates.first, confirmed: true) + trailing
+          ann = format_annotation(candidates.first, confirmed: true)
+          ann ? (tag_only + ann + trailing) : whole_match
         else
           whole_match
         end
@@ -464,12 +511,23 @@ module ISharpie
   end
 
   def self.handle_tag_command(body)
-    m = /^([^\s"]+)\s+"([^"]+)"(?:\s+color\s+(\w+))?$/i.match(body)
-    unless m
-      say 'usage: tag <noun> "<note>" [color <name>]  e.g.  tag hatchet "Bonded Weapon" color thought'
+    noun = body[/\A([^\s"]+)/, 1]
+    unless noun
+      say 'usage: tag <noun> ["<note>"] [SN "<silent note>"] [color <name>]'
       return
     end
-    tag_held_item(m[1], m[2], m[3])
+    rest      = body.sub(/\A[^\s"]+\s*/, '')
+    color     = rest[/\bcolor\s+(\w+)\b/i, 1]
+    silent    = rest[/\bSN\s+"([^"]+)"/i, 1]
+    cleaned   = rest.gsub(/\bcolor\s+\w+\b/i, '').gsub(/\bSN\s+"[^"]+"/i, '').strip
+    note_text = cleaned[/"([^"]+)"/, 1]
+
+    if note_text.nil? && silent.nil?
+      say 'usage: tag <noun> ["<note>"] [SN "<silent note>"] [color <name>]'
+      return
+    end
+
+    tag_held_item(noun, note_text, color, silent)
   end
 
   ## ---- command handlers -------------------------------------------------------
@@ -486,7 +544,7 @@ module ISharpie
     name.to_s.strip.downcase
   end
 
-  def self.tag_held_item(noun, note_text, color_name)
+  def self.tag_held_item(noun, note_text, color_name, silent_note = nil)
     item = held_item(noun)
     unless item
       say "you're not holding a #{noun}"
@@ -494,23 +552,31 @@ module ISharpie
     end
 
     long_name = long_name_for(item)
-    existing = bound_note_for(item.id)
-    color = color_name ? normalize_color(color_name) : (existing && existing[:color]) || 'none'
+    existing  = bound_note_for(item.id)
+    color     = color_name ? normalize_color(color_name) : (existing && existing[:color]) || 'none'
 
     unless VALID_COLORS.include?(color)
       say "unknown color #{color.inspect} - valid: #{VALID_COLORS.join(', ')}"
       return
     end
 
+    label = [note_text && "\"#{note_text.strip}\"",
+             silent_note && "SN: \"#{silent_note.strip}\""].compact.join(' ')
+
     if existing
-      update_note(existing[:id], note: note_text.strip, color: color)
+      changes = { color: color }
+      changes[:note]        = note_text.strip   if note_text
+      changes[:silent_note] = silent_note.strip if silent_note
+      update_note(existing[:id], **changes)
       @last_touched_note_id = existing[:id]
-      say "updated note on #{long_name}: #{note_text.strip}"
+      say "updated #{long_name}: #{label}"
     else
-      record = add_note(long_name: long_name, container: 'carried', note: note_text.strip, color: color)
+      record = add_note(long_name: long_name, container: 'carried',
+                        note: note_text&.strip, color: color,
+                        silent_note: silent_note&.strip)
       bind!(item.id, record[:id])
       @last_touched_note_id = record[:id]
-      say "tagged #{long_name}: #{note_text.strip}"
+      say "tagged #{long_name}: #{label}"
     end
   end
 
@@ -586,7 +652,13 @@ module ISharpie
       return
     end
 
-    rows = notes.map { |n| "#{n[:id]}: #{n[:long_name]} [#{n[:container]}] -> #{n[:note]} (#{n[:color]})" }
+    rows = notes.map { |n|
+      visible = n[:note].to_s.strip
+      silent  = n[:silent_note].to_s.strip
+      label   = [visible.empty? ? nil : visible,
+                 silent.empty?  ? nil : "SN: #{silent}"].compact.join(' | ')
+      "#{n[:id]}: #{n[:long_name]} [#{n[:container]}] -> #{label} (#{n[:color]})"
+    }
     Lich::Messaging.mono(rows.join("\n"))
   end
 
@@ -606,9 +678,9 @@ module ISharpie
     _respond '  Tags held items with a note, then injects that note inline'
     _respond '  next to the item name everywhere it appears in game text.'
     _respond ''
-    _respond g.call('  Tagging') + '  (hold item first)'
+    _respond g.call('  Tagging') + '  (hold item first. You can add tag, SN, and color all in one command)' 
     _respond "  #{w.call(';isharpie tag <noun> "<note>"')}  tag item in hand"
-    _respond "  #{w.call(';isharpie tag <noun> "<note>" color <name>')}  tag with color"
+    _respond "  #{w.call(';isharpie tag <noun> SN "<note>"')}  silent note - shows in list only, no inline tag"
     _respond "  #{w.call(';isharpie color <name>')}  update color on last tagged"
     _respond "  #{w.call(';isharpie remove <noun>')}  remove note from item in hand"
     _respond ''
