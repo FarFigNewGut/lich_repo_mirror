@@ -1,0 +1,246 @@
+=begin
+  parasitex.lic
+  Author: Hexbane
+  Version: 1.1
+  Tags: combat, vissi, parasite
+
+  Watches your current target's status and activates the Cirrose Parasite vissi
+  when the target is stunned, frozen, webbed, or otherwise vulnerable.
+  Pauses configured combat scripts before activating and resumes them after.
+
+  Usage:
+    ;parasitex        -- start with saved settings
+    ;parasitex setup  -- open GTK setup GUI
+    ;parasitex reset  -- clear saved settings
+=end
+
+require 'yaml'
+
+module ParasiteX
+  # Cooldown key includes "(A)" suffix in Effects::Cooldowns
+  COOLDOWN_KEY  = "Cirrose Parasite (A)".freeze
+  POLL_SECONDS  = 0.5
+  PRONE_STATUS  = /sleeping|webbed|stunned|kneeling|sitting|lying|prone|frozen|held in place|entangled|rooted/i
+
+  # ----------------------------
+  # YAML settings
+  # ----------------------------
+  def self.settings_path
+    File.join(DATA_DIR, XMLData.game, Char.name, 'parasitex.yaml')
+  end
+
+  def self.save_settings(full_command, pause_scripts)
+    dir = File.dirname(settings_path)
+    Dir.mkdir(dir) unless Dir.exist?(dir)
+    File.write(settings_path, {
+      'full_command'  => full_command,
+      'pause_scripts' => pause_scripts
+    }.to_yaml)
+  end
+
+  def self.load_settings
+    return {} unless File.exist?(settings_path)
+    YAML.load_file(settings_path) rescue {}
+  end
+
+  # ----------------------------
+  # GTK Setup GUI
+  # ----------------------------
+  module SetupGUI
+    def self.run
+      unless defined?(Gtk) && Gtk::Version::MAJOR == 3
+        echo "GTK3 is not available. Cannot open setup GUI."
+        exit
+      end
+
+      saved         = ParasiteX.load_settings
+      saved_command = saved['full_command'].to_s
+      saved_scripts = saved['pause_scripts'].to_s
+      saved_command = 'rub my ave arc' if saved_command.empty?
+
+      @running = true
+      @result  = nil
+
+      Gtk.queue do
+        @win = Gtk::Window.new(:toplevel)
+        @win.set_title("Parasite Vissi Setup")
+        @win.set_default_size(400, 180)
+        @win.set_border_width(12)
+        @win.keep_above = true
+
+        vbox = Gtk::Box.new(:vertical, 10)
+        @win.add(vbox)
+
+        grid = Gtk::Grid.new
+        grid.set_column_spacing(12)
+        grid.set_row_spacing(8)
+        grid.set_border_width(6)
+        vbox.pack_start(grid, expand: true, fill: true, padding: 0)
+
+        # Activation command
+        lbl_cmd = Gtk::Label.new("Activation Command:")
+        lbl_cmd.set_halign(:end)
+        grid.attach(lbl_cmd, 0, 0, 1, 1)
+
+        @cmd_entry = Gtk::Entry.new
+        @cmd_entry.set_placeholder_text("e.g. rub my ave arc")
+        @cmd_entry.set_text(saved_command)
+        @cmd_entry.set_hexpand(true)
+        grid.attach(@cmd_entry, 1, 0, 1, 1)
+
+        # Scripts to pause
+        lbl_scripts = Gtk::Label.new("Scripts to Pause:")
+        lbl_scripts.set_halign(:end)
+        grid.attach(lbl_scripts, 0, 1, 1, 1)
+
+        @scripts_entry = Gtk::Entry.new
+        @scripts_entry.set_placeholder_text("e.g. bigshot, hunt3 (comma separated)")
+        @scripts_entry.set_text(saved_scripts) unless saved_scripts.empty?
+        @scripts_entry.set_hexpand(true)
+        grid.attach(@scripts_entry, 1, 1, 1, 1)
+
+        hint = Gtk::Label.new("Scripts will be paused during activation and resumed after.")
+        hint.set_halign(:start)
+        hint.set_margin_start(4)
+        grid.attach(hint, 1, 2, 1, 1)
+
+        btnrow = Gtk::Box.new(:horizontal, 8)
+        vbox.pack_start(btnrow, expand: false, fill: false, padding: 4)
+
+        save_btn = Gtk::Button.new(label: "Save")
+        save_btn.signal_connect("clicked") do
+          cmd     = @cmd_entry.text.strip
+          scripts = @scripts_entry.text.strip
+          cmd     = 'rub my ave arc' if cmd.empty?
+          ParasiteX.save_settings(cmd, scripts)
+          @result = { cmd: cmd, scripts: scripts }
+          @win.destroy
+        end
+        btnrow.pack_end(save_btn, expand: false, fill: false, padding: 0)
+
+        cancel_btn = Gtk::Button.new(label: "Cancel")
+        cancel_btn.signal_connect("clicked") { @win.destroy }
+        btnrow.pack_end(cancel_btn, expand: false, fill: false, padding: 0)
+
+        @win.signal_connect("destroy") do
+          Gtk.queue { @running = false }
+        end
+
+        @win.show_all
+      end
+
+      wait_while { @running }
+
+      if @result
+        echo "Setup saved: command='#{@result[:cmd]}' pause_scripts='#{@result[:scripts]}'"
+      else
+        echo "Setup cancelled."
+      end
+    end
+  end
+
+  # ----------------------------
+  # Runner
+  # ----------------------------
+  class Runner
+    def initialize
+      settings        = ParasiteX.load_settings
+      @full_command   = settings['full_command'].to_s
+      @full_command   = 'rub my ave arc' if @full_command.empty?
+      @pause_scripts  = (settings['pause_scripts'] || '').to_s
+                        .split(',').map(&:strip).reject(&:empty?)
+    end
+
+    def on_cooldown?
+      # Check for exact key or any key containing 'Cirrose Parasite'
+      Effects::Cooldowns.to_h.keys.any? { |k| k.to_s =~ /Cirrose Parasite/i }
+    rescue StandardError
+      false
+    end
+
+    def current_target
+      targets = GameObj.targets
+      return nil if targets.nil? || targets.empty?
+      targets.first
+    rescue StandardError
+      nil
+    end
+
+    def target_vulnerable?(target)
+      return false unless target
+      status = target.status.to_s
+      status =~ PRONE_STATUS
+    rescue StandardError
+      false
+    end
+
+    def pause_combat_scripts
+      @pause_scripts.each do |name|
+        script = Script.running.find { |s| s.name =~ /^#{Regexp.escape(name)}$/i }
+        if script
+          script.pause
+          echo "Paused #{name}."
+        end
+      end
+    end
+
+    def resume_combat_scripts
+      @pause_scripts.each do |name|
+        script = Script.running.find { |s| s.name =~ /^#{Regexp.escape(name)}$/i }
+        if script && script.paused?
+          script.unpause
+          echo "Resumed #{name}."
+        end
+      end
+    end
+
+    def activate
+      echo "Target is vulnerable! Activating Cirrose Parasite..."
+      pause_combat_scripts
+      waitrt?
+      fput @full_command
+      waitrt?
+      resume_combat_scripts
+    end
+
+    def run
+      echo "ParasiteX v1.1 active."
+      echo "Activation: '#{@full_command}'"
+      echo "Cooldown key: #{COOLDOWN_KEY}"
+      echo "Pause scripts: #{@pause_scripts.empty? ? 'none' : @pause_scripts.join(', ')}"
+      echo "Watching for vulnerable targets..."
+
+      loop do
+        begin
+          next if on_cooldown?
+
+          target = current_target
+          next unless target
+          next unless target_vulnerable?(target)
+
+          activate
+
+        rescue StandardError => e
+          echo "error: #{e.class} #{e.message}"
+        ensure
+          sleep POLL_SECONDS
+        end
+      end
+    end
+  end
+end
+
+# ----------------------------
+# Entry point
+# ----------------------------
+cmd = Script.current.vars[1].to_s.strip.downcase
+
+case cmd
+when 'setup'
+  ParasiteX::SetupGUI.run
+when 'reset'
+  File.delete(ParasiteX.settings_path) if File.exist?(ParasiteX.settings_path)
+  echo "Settings cleared."
+else
+  ParasiteX::Runner.new.run
+end
