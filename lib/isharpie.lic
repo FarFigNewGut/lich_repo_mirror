@@ -5,9 +5,12 @@ require 'fileutils'
 
 =begin
 
-isharpie.lic (Item Sharpie) tags held items with a personal note and color, then injects
-that note inline next to the item name everywhere it appears in game text.
-Item identity survives locker storage by matching on name and container.
+isharpie.lic (Item Sharpie) tags held items with a displayed note and/or a hidden note, then injects
+that note inline wherever it appears in game text, or just in inventory (flag option).
+Name your weapons and see the name in game!
+Track your weapon and armor CER services in a hidden note, viewed through the list function!
+List the enhancive benefits of your items right next to their name!
+
 
 The following inputs are available:
   ;isharpie tag <noun> ["<note>"] [SN "<silent>"] [color ...]  - tag item in hand
@@ -21,7 +24,7 @@ The following inputs are available:
       Other scripts: Combatical, Merchantical, Loresang, VolnRestore2
       game: gs
       tags: items, inventory, notes, highlight, Sharpie
-      version: 1.0.8
+      version: 1.1.0
       required: Lich > 5.0
 
       \\Version\\
@@ -32,11 +35,12 @@ The following inputs are available:
       1.0.6 07/01/2026 - sanity-check cached bindings against item name to prevent cross-item annotation
       1.0.7 07/01/2026 - silent notes (SN): per-item, list-only, no inline annotation
       1.0.8 07/01/2026 - trimmed help to one SN example with brief mention of variations
+      1.1.0 07/02/2026 - startup Container search, silent mode added
 
 =end
 
 module ISharpie
-  VERSION = '1.0.8'.freeze
+  VERSION = '1.1.0'.freeze
 
   VALID_COLORS = %w[orange teal green yellow none].freeze
 
@@ -93,6 +97,8 @@ module ISharpie
   @last_touched_note_id = nil
   @last_ambiguous_list  = nil
   @note_counter         = nil
+  @startup_suppress     = false
+  @inventory_only       = false
 
   ## ---- persisted notes ---------------------------------------------------
 
@@ -105,7 +111,13 @@ module ISharpie
     @notes ||= begin
       path = notes_path
       if File.exist?(path)
-        JSON.parse(File.read(path), symbolize_names: true)
+        data = JSON.parse(File.read(path), symbolize_names: true)
+        if data.is_a?(Array)
+          data  # old format: plain array, @inventory_only stays false
+        else
+          @inventory_only = data[:inventory_only] || false
+          Array(data[:notes])
+        end
       else
         []
       end
@@ -117,9 +129,18 @@ module ISharpie
 
   def self.save_notes!
     FileUtils.mkdir_p(EDUBARBARIAN_DIR)
-    File.write(notes_path, JSON.pretty_generate(@notes))
+    File.write(notes_path, JSON.pretty_generate({ notes: @notes, inventory_only: @inventory_only }))
   rescue StandardError => e
     say "could not save notes to #{notes_path}: #{e.class}"
+  end
+
+  def self.toggle_inventory_only
+    notes  # ensure loaded before toggling
+    @inventory_only = !@inventory_only
+    save_notes!
+    state = @inventory_only ? 'ON  - notes only appear on items in your own inventory' \
+                            : 'OFF - notes appear everywhere a matching item name is seen'
+    say "inventory-only: #{state}"
   end
 
   def self.next_note_id
@@ -229,6 +250,50 @@ module ISharpie
     @exist_bindings[exist_id] = note_id
   end
 
+  # Returns true if the given exist_id is found anywhere in the player's own
+  # inventory (hands, worn, carried, or inside containers they own). Used to
+  # guard auto-binding: we only label items we can confirm belong to us, so
+  # other players' items with the same name are silently skipped.
+  def self.player_item?(exist_id)
+    id = exist_id.to_s
+    return true if GameObj.right_hand&.id == id
+    return true if GameObj.left_hand&.id == id
+    inv_contains_id?(GameObj.inv.to_a, id)
+  end
+
+  def self.inv_contains_id?(items, id)
+    items.any? { |item|
+      item.id == id || inv_contains_id?(item.contents.to_a, id)
+    }
+  end
+
+  # At script startup, look in every top-level inventory item to populate
+  # GameObj with nested container contents. Output is suppressed via
+  # @startup_suppress so nothing shows to the player; Lich's XML parser still
+  # runs underneath and fills in item.contents for each container.
+  # Non-containers get a "can't look in that" response which is also suppressed.
+  def self.preload_containers
+    @startup_suppress = true
+    silence_me  # toggles script.silent = true, suppresses [script]>command echo
+    begin
+      say 'examining inventory...'
+      noun_counts = Hash.new(0)
+      GameObj.inv.to_a.each do |item|
+        next if item.contents  # already populated this session, skip
+        noun_counts[item.noun] += 1
+        n       = noun_counts[item.noun]
+        ordinal = n == 1 ? '' : "#{n}#{n == 2 ? 'nd' : n == 3 ? 'rd' : 'th'} "
+        fput "look in #{ordinal}my #{item.noun}"
+      end
+      say 'done!'
+    rescue => e
+      say "preload warning: #{e.message}"
+    ensure
+      silence_me  # toggles back to false
+      @startup_suppress = false
+    end
+  end
+
   ## ---- name helpers --------------------------------------------------------
 
   # Tag text plus trailing clause only - deliberately never before_name/
@@ -295,6 +360,7 @@ module ISharpie
   end
 
   def self.annotate_line(line)
+    return nil if @startup_suppress
     return line unless line.include?('<a ')
     return line if notes.empty? && @exist_bindings.empty?
     line.gsub(ITEM_TAG_RX) do |whole_match|
@@ -306,6 +372,13 @@ module ISharpie
       tag_only = whole_match[0, whole_match.length - trailing.length]
 
       if exist_bound?(exist_id)
+        if @inventory_only
+          id = exist_id.to_s
+          # Items in hand appear in combat/action text - suppress those.
+          # Items in inventory/containers (not held) are safe to annotate.
+          in_hand = GameObj.right_hand&.id == id || GameObj.left_hand&.id == id
+          next whole_match if in_hand || !inv_contains_id?(GameObj.inv.to_a, id)
+        end
         note = bound_note_for(exist_id)
         if note
           # Sanity check: verify the displayed name is still plausible for this
@@ -325,6 +398,10 @@ module ISharpie
           whole_match
         end
       else
+        # Only attempt to match/bind items that are in the player's own
+        # inventory. Skips other players' items that share a name with a
+        # tagged item (e.g. Folwer's backpack, someone's orb brooch).
+        next whole_match unless player_item?(exist_id)
         candidates = candidates_for(long_name)
         # If the trailing clause ("with a rippling green sheen...") prevented a
         # match, retry using only the tag text itself - the trailing clause is
@@ -503,6 +580,8 @@ module ISharpie
       remove_by_token($1)
     when /^remove$/i
       say "usage: remove <noun>  e.g.  remove hatchet"
+    when /^silent$/i
+      toggle_inventory_only
     else
       say "unrecognized command: #{text.inspect} - try ';isharpie help'"
     end
@@ -670,31 +749,33 @@ module ISharpie
 
   def self.show_help
     t = proc { |s| Lich::Messaging.msg_format('thought', s, encode: false) }
-    g = proc { |s| Lich::Messaging.msg_format('speech',  s, encode: false) }
+    b = proc { |s| Lich::Messaging.msg_format('bold',    s, encode: false) }
     w = proc { |s| Lich::Messaging.msg_format('whisper', s, encode: true)  }
 
     _respond t.call("  ISharpie (Item Sharpie) v#{VERSION}  -  Help Notes")
     _respond ''
-    _respond '  Tags held items with a note, then injects that note inline'
-    _respond '  next to the item name everywhere it appears in game text.'
+    _respond '  ISharpie tags held items with a displayed note and/or a hidden note, then injects'
+    _respond '  that note inline wherever it appears in game text, or just in inventory (flag option).'
+    _respond '  Name your weapons and see the name in game!'
+    _respond '  Track your weapon and armor CER services in a hidden note, viewed through the list function!'
+    _respond '  List the enhancive benefits of your items right next to their name!'
     _respond ''
-    _respond g.call('  Tagging') + '  (hold item first. You can add tag, SN, and color all in one command)' 
+    _respond b.call('  -- Usage --') + '  (hold item first. You can add tag, SN, and color all in one command)'
     _respond "  #{w.call(';isharpie tag <noun> "<note>"')}  tag item in hand"
     _respond "  #{w.call(';isharpie tag <noun> SN "<note>"')}  silent note - shows in list only, no inline tag"
     _respond "  #{w.call(';isharpie color <name>')}  update color on last tagged"
     _respond "  #{w.call(';isharpie remove <noun>')}  remove note from item in hand"
+    _respond "  #{w.call(';isharpie list')}  list all stored notes"
+    _respond "  #{w.call(';isharpie silent')}  toggle silent mode (notes show only on your own items)"
     _respond ''
-    _respond g.call('  Colors')
+    _respond b.call('  -- Colors --')
     VALID_COLORS.each do |c|
       _respond(c == 'none' ? '  none' : "  #{Lich::Messaging.msg_format(COLOR_MAP[c], c, encode: false)}")
     end
     _respond ''
-    _respond g.call('  Review')
-    _respond "  #{w.call(';isharpie list')}  list all stored notes"
-    _respond ''
-    _respond g.call('  Notes')
+    _respond b.call('  -- Notes --')
     _respond '  item id resets each login, after locker storage, or scripted item mutations - matched automatically by name'
-    _respond "  Otherwise, confirmation prompt only fires when two tagged items share the same name"
+    _respond '  Otherwise, confirmation prompt only fires when two tagged items share the same name'
     _respond '  If struggling with syntax, ensure note text is in quotes and include "color" when changing it'
     _respond ''
   end
@@ -743,5 +824,6 @@ before_dying do
   ISharpie.remove_upstream_hook
 end
 
+ISharpie.preload_containers
 respond("ISharpie is running!")
 ISharpie.main_loop
