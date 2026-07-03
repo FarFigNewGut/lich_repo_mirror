@@ -1,0 +1,294 @@
+=begin
+  animate_refresher.lic: keep a Necromancer's Animate Dead (730) refreshed.
+
+  This ONLY does 'sacrifice channel' to refresh your animate when it is about to
+  decay -- no mob sacrificing and no essence stocking (handle those yourself). It
+  still tracks your shadow essence so it knows when you are out and warns you.
+
+  Refresh triggers when the spell's remaining time drops to the safety buffer, or
+  when a decay message is seen; it skips if you have no shadow essence.
+
+  Usage:  ;animate_refresher
+  Stop:   ;kill animate_refresher
+
+  Tune the values under "config" at the top of the module to taste.
+
+            author: Zedarius
+   original author: Gilderan (animatekeeper.lic)
+              game: Gemstone
+              tags: necromancer, animate
+          required: Lich >= 5.0.0
+           version: 1.0.0
+
+  changelog:
+  v1.0.0 (2026-07-03)
+    - initial release. Forked from animatekeeper.lic v10 and stripped to just the
+      'sacrifice channel' refresh, then namespaced into the AnimateRefresher
+      module so it no longer leaks globals (e.g. $debug) into Lich.
+=end
+
+module AnimateRefresher
+  # === config (edit to taste) ===================================================
+  SAFETY_BUFFER_SECONDS        = 60   # refresh when <= this many seconds remain
+  ESSENCE_MAX                  = 5
+  CHECK_INTERVAL               = 10   # main loop tick
+  ESSENCE_CHECK_INTERVAL       = 300  # refresh resource read every 5 minutes (unless forced)
+  REFRESH_COOLDOWN_SECONDS     = 10   # prevent double-refresh if timeleft doesn't update immediately (ONLY on success)
+  REFRESH_FAIL_BACKOFF_SECONDS = 3    # backoff after a failed refresh attempt so we don't spam
+
+  # Debug controls
+  DEBUG                    = false
+  DEBUG_TICK_SECONDS       = 10
+  DEBUG_SHOW_SPELL_DUMP    = false
+  DEBUG_SHOW_PENDING_LINES = false
+
+  # Fallback timer (only used if we can't read spell timeleft for any reason)
+  DEFAULT_REFRESH_MINUTES = 25
+  REFRESH_INTERVAL = [(DEFAULT_REFRESH_MINUTES * 60) - SAFETY_BUFFER_SECONDS, 180].max
+
+  ANIMATE_DEAD_SPELL_ID = 730
+
+  # === matchers =================================================================
+  DECAY_MESSAGE_REGEX = /
+    Your\ animate\
+    (?:begins\ to\ crumble|
+       appears\ to\ weaken|
+       form\ blurs|
+       wavers\ slightly|
+       starts\ fading|
+       looks\ tired|
+       is\ starting\ to\ decay
+    )
+  /xi
+
+  # Channel refresh: failure/success messaging
+  REFRESH_FAIL_REGEX = /
+    broken\ life\ forces.*overwhelm
+  /xi
+
+  REFRESH_SUCCESS_REGEX = /
+    focusing\ on\ the\ bond\ to\ your\ animate|
+    force\ shadow\ essence\ into|
+    unnatural\ revitalization
+  /xi
+
+  # === state ====================================================================
+  @cached_essence     = 0
+  @last_essence_check = Time.now - 10_000
+  @last_refresh       = Time.now - 10_000   # only updated on success
+  @last_refresh_fail  = Time.now - 10_000
+  @warned_no_essence  = false
+  @pending_lines      = []
+  @last_debug_tick    = Time.now - 10_000
+
+  # === helpers ==================================================================
+  def self.log_debug(msg)
+    return unless DEBUG
+
+    echo "[DBG] #{msg}"
+  end
+
+  def self.animate_dead_timeleft_seconds
+    spells = Spells.active
+    return nil unless spells.respond_to?(:find)
+
+    s = spells.find { |sp| sp.respond_to?(:num) && sp.num.to_i == ANIMATE_DEAD_SPELL_ID }
+    return nil unless s
+
+    minutes =
+      if s.respond_to?(:timeleft)
+        s.timeleft
+      elsif s.instance_variable_defined?(:@timeleft)
+        s.instance_variable_get(:@timeleft)
+      end
+
+    return nil unless minutes.is_a?(Numeric)
+
+    minutes * 60.0
+  end
+
+  def self.spell_dump_compact
+    spells = Spells.active
+    return "Spells.active=#{spells.class}" unless spells.respond_to?(:map)
+
+    spells
+      .select { |s| s.respond_to?(:num) && (s.respond_to?(:timeleft) || s.instance_variable_defined?(:@timeleft)) }
+      .map { |s|
+        tl = s.respond_to?(:timeleft) ? s.timeleft : s.instance_variable_get(:@timeleft)
+        "#{s.num}:#{tl.is_a?(Numeric) ? tl.round(2) : tl}"
+      }
+      .join(", ")
+  end
+
+  def self.parse_essence_from_lines
+    re = /(?:shadow|accumulated)?\s*essence.*?(\d+)/i
+    30.times do
+      line = get
+      @pending_lines << line
+      if (m = line.match(re))
+        n = m[1].to_i
+        return n if n <= (ESSENCE_MAX + 1)
+      end
+    end
+    nil
+  end
+
+  def self.get_essence_count(force = false)
+    return @cached_essence if !force && (Time.now - @last_essence_check) < ESSENCE_CHECK_INTERVAL
+
+    log_debug("Essence recount: sending 'resource' (force=#{force})")
+    fput 'resource'
+    sleep 1.0
+
+    count = parse_essence_from_lines
+    if count
+      @cached_essence = count
+      @last_essence_check = Time.now
+      log_debug("Essence updated: #{@cached_essence}/#{ESSENCE_MAX}")
+
+      if count == 0 && !@warned_no_essence
+        @warned_no_essence = true
+      elsif count > 0
+        @warned_no_essence = false
+      end
+    else
+      echo "Essence parse failed - using cached: #{@cached_essence}"
+      log_debug("Essence parse failed after resource read")
+    end
+
+    @cached_essence
+  end
+
+  def self.attempt_refresh!
+    before = animate_dead_timeleft_seconds
+    before_m = before ? (before / 60.0) : nil
+
+    log_debug("ACTION: refresh -> 'sacrifice channel' (timeleft_before=#{before_m ? "#{before_m.round(2)}m" : "nil"})")
+    fput 'sacrifice channel'
+
+    # Read immediate feedback lines
+    12.times do
+      line = get
+      log_debug("refresh_rsp: #{line}") if DEBUG_SHOW_PENDING_LINES
+
+      if line =~ REFRESH_FAIL_REGEX
+        @last_refresh_fail = Time.now
+        log_debug("REFRESH FAILED (matched fail regex)")
+        return :fail
+      end
+
+      if line =~ REFRESH_SUCCESS_REGEX
+        sleep 0.2
+        after = animate_dead_timeleft_seconds
+        if after && before && after > before + 5
+          log_debug("REFRESH SUCCESS (success line + timeleft increased)")
+          return :ok
+        end
+        log_debug("REFRESH SUCCESS (success line)")
+        return :ok
+      end
+
+      break if line.strip == ">" || line =~ /^>\s*$/
+    end
+
+    # No explicit success/fail line: infer by timeleft increase
+    sleep 0.4
+    after = animate_dead_timeleft_seconds
+    after_m = after ? (after / 60.0) : nil
+
+    if before && after && after > before + 5
+      log_debug("REFRESH SUCCESS (timeleft increased #{before_m&.round(2)}m -> #{after_m&.round(2)}m)")
+      return :ok
+    end
+
+    @last_refresh_fail = Time.now
+    log_debug("REFRESH UNKNOWN/FAIL (timeleft did not increase #{before_m&.round(2)}m -> #{after_m&.round(2)}m)")
+    :fail
+  end
+
+  # === main =====================================================================
+  def self.run
+    echo "AnimateRefresher started! (debug=#{DEBUG})"
+    echo "Refresh logic: Animate Dead (#{ANIMATE_DEAD_SPELL_ID}) via Spells.active timeleft"
+    echo "Safety buffer: #{SAFETY_BUFFER_SECONDS}s"
+    echo "Refresh cooldown (success only): #{REFRESH_COOLDOWN_SECONDS}s"
+    echo "Refresh fail backoff: #{REFRESH_FAIL_BACKOFF_SECONDS}s"
+    echo "This script ONLY does 'sacrifice channel' -- no mob sacrificing."
+    echo "Stop with ;kill animate_refresher"
+
+    # Initial forced essence check
+    get_essence_count(true)
+    echo "Current shadow essence: #{@cached_essence}/#{ESSENCE_MAX}"
+    echo "AnimateRefresher ready."
+
+    loop do
+      current_essence = get_essence_count
+
+      # Heartbeat debug tick
+      if DEBUG && (Time.now - @last_debug_tick) >= DEBUG_TICK_SECONDS
+        @last_debug_tick = Time.now
+        animate_present = GameObj.npcs.any? { |npc| npc.name =~ /animate/i }
+        tl_s = animate_dead_timeleft_seconds
+        tl_m = tl_s ? (tl_s / 60.0) : nil
+
+        log_debug("Heartbeat: animate_present=#{animate_present} essence=#{current_essence}/#{ESSENCE_MAX} timeleft=#{tl_m ? "#{tl_m.round(2)}m" : "nil"} last_refresh_age=#{(Time.now - @last_refresh).round(1)}s last_fail_age=#{(Time.now - @last_refresh_fail).round(1)}s")
+        log_debug("Spells: #{spell_dump_compact}") if DEBUG_SHOW_SPELL_DUMP
+      end
+
+      # Decay detection (watch incoming text)
+      decay_detected = false
+      while (line = get?)
+        @pending_lines << line
+        decay_detected = true if line =~ DECAY_MESSAGE_REGEX
+      end
+
+      until @pending_lines.empty?
+        decay_detected = true if @pending_lines.shift =~ DECAY_MESSAGE_REGEX
+      end
+
+      # Animate + refresh decision
+      animate_present = GameObj.npcs.any? { |npc| npc.name =~ /animate/i }
+      timeleft_seconds = animate_dead_timeleft_seconds
+      timeleft_minutes = timeleft_seconds ? (timeleft_seconds / 60.0) : nil
+
+      refresh_due =
+        if animate_present && timeleft_seconds.is_a?(Numeric)
+          timeleft_seconds <= SAFETY_BUFFER_SECONDS
+        else
+          animate_present && (Time.now - @last_refresh) > REFRESH_INTERVAL
+        end
+
+      refresh_allowed = (Time.now - @last_refresh) > REFRESH_COOLDOWN_SECONDS
+      fail_backoff_ok = (Time.now - @last_refresh_fail) > REFRESH_FAIL_BACKOFF_SECONDS
+
+      log_debug("Decision: animate_present=#{animate_present} timeleft=#{timeleft_minutes ? "#{timeleft_minutes.round(2)}m" : "nil"} refresh_due=#{refresh_due} decay_detected=#{decay_detected} refresh_allowed=#{refresh_allowed} fail_backoff_ok=#{fail_backoff_ok} essence=#{current_essence}")
+
+      # Refresh animate if needed and essence available
+      if fail_backoff_ok && (decay_detected || refresh_due) && animate_present && current_essence > 0 && refresh_allowed
+        result = attempt_refresh!
+
+        if result == :ok
+          @last_refresh = Time.now
+          get_essence_count(true)
+          echo "Refreshed animate (timeleft was #{timeleft_minutes ? timeleft_minutes.round(2) : 'unknown'}m, essence: #{@cached_essence}/#{ESSENCE_MAX})"
+          @warned_no_essence = false
+          sleep 0.1
+          next
+        else
+          echo "Refresh attempt FAILED (timeleft was #{timeleft_minutes ? timeleft_minutes.round(2) : 'unknown'}m). Will retry."
+        end
+      end
+
+      # Warn if no essence when refresh would be needed
+      if (decay_detected || refresh_due) && animate_present && @cached_essence.zero? && !@warned_no_essence
+        echo "Animate needs refresh but no essence available! Monitoring continues."
+        log_debug("WARN: refresh needed but essence=0")
+        @warned_no_essence = true
+      end
+
+      sleep CHECK_INTERVAL
+    end
+  end
+end
+
+AnimateRefresher.run
