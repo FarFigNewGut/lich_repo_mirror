@@ -6,9 +6,33 @@
   game: Gemstone
   tags: hunting, combat, automate, society, arcarium, trinkets, gemstones, paladin, warrior, rogue, ranger, bard, cleric, empath, wizard, sorcerer
   required: Lich >= 5.9.0
-  version: 1.5.4
+  version: 1.6.0
 
   changelog:
+    1.6.0:
+      Weapon attack rotation (6 single-target + 6 AoE slots) added to Combat Abilities
+      tab -- supports CMans, techniques, Paladin FEATs (Chastise / Excoriate), mount
+      abilities, Warrior Guild abilities (warcries, feint, spit), Rogue Guild Silent
+      Strike, arcarium vissi, trinket abilities (Energy Wings, Battle Standard, Elemental
+      Gloves, Twisted Gloves, Twisted Kicks), or Normal Attack. Rotation cycles in order
+      each round, falling back to Normal Attack when an ability is on cooldown. CMans in
+      the rotation are grayed out in the CMan list; all other abilities suppress their
+      standalone trigger firing automatically to prevent double-fire.
+      Spell rotation expanded from 4 to 6 slots (both single-target and AoE).
+      Bloodstone Jewelry (Empath Bloodsmith 1135) added to Trinkets tab -- Vivacity
+      (BESEECH, T3+) and Sanguine Swap (SPIN, T4+) with tier-aware cooldowns; both
+      available as Low Health Priority list entries.
+      Spell 1607 Rejuvenation (Paladin) and society healing symbols (Symbol of Restoration,
+      Sign of Healing) now appear as Low Health Priority list entries so their order
+      relative to arcarium and trinket responses is user-controlled.
+      Fixed CMan Surge of Strength (and other maintenance-type CMans) not firing during
+      active combat -- now re-applied at each engagement start when off cooldown.
+      Fixed Symbol of Restoration firing unconditionally in the CC and main hunt loops,
+      bypassing the Low Health Priority list ordering.
+      Hunting Preferences split into two tabs: Hunting Preferences (health thresholds,
+      escape methods, mana retreat, Emergency Priorities) and Hunting Preferences 2
+      (eloot, encumbrance, stamina/mana floors, AoE/swarm thresholds, target priority,
+      priority creatures, never-attack list, gigas peace).
     1.5.4:
       Mount Charge and Mount Trample now have a configurable When option (engagement,
       aoe, swarm, target_vulnerable for Charge; engagement, aoe, swarm for Trample).
@@ -61,6 +85,7 @@
 
 require 'yaml'
 require 'fileutils'
+require 'set'
 
 # All script internals live inside this module -- no global namespace pollution.
 module GSH4A
@@ -670,8 +695,9 @@ BS_WHEN_OPTS            = ["engagement", "aoe", "swarm", "maintenance", "target_
 VISSI_WHEN_OPTS         = ["engagement", "aoe", "swarm", "maintenance", "target_vulnerable"].freeze
 MOUNT_CHARGE_WHEN_OPTS  = ["engagement", "aoe", "swarm", "target_vulnerable"].freeze
 MOUNT_TRAMPLE_WHEN_OPTS = ["engagement", "aoe", "swarm"].freeze
-TRINKET_KEYS     = %w[energy_wings battle_standard elemental_gloves twisted_gloves twisted_kicks
-                       mages_gauntlet magic_gloves mana_battery].freeze
+TRINKET_KEYS              = %w[energy_wings battle_standard elemental_gloves twisted_gloves twisted_kicks
+                                mages_gauntlet magic_gloves mana_battery].freeze
+BLOODSTONE_VIVACITY_TARGETS = %w[HEALTH STAMINA MANA].freeze
 SWARM_THRESHOLD_DEFAULT = 5
 
 ENCUMBRANCE_LEVELS = [
@@ -979,7 +1005,7 @@ end
 # ===========================================================================
 module SetupWizard
   PAGES = [
-    "Character", "Hunting Preferences", "Society", "Spells", "Weapons",
+    "Character", "Hunting Preferences", "Hunting Preferences 2", "Society", "Spells", "Weapons",
     "Defense", "Songs", "Combat Abilities",
     "Rogue Guild", "Warrior Guild",
     "Mount", "Scripts",
@@ -1676,9 +1702,9 @@ module SetupWizard
 
     update_profession_tabs = proc do
       prof = (GS_PROFESSIONS[@w[:char_prof]&.active.to_i] rescue "") || ""
-      songs_pg    = @w[:nb].get_nth_page(6)
-      rogue_pg    = @w[:nb].get_nth_page(8)
-      warrior_pg  = @w[:nb].get_nth_page(9)
+      songs_pg    = @w[:nb].get_nth_page(7)
+      rogue_pg    = @w[:nb].get_nth_page(9)
+      warrior_pg  = @w[:nb].get_nth_page(10)
       songs_pg.visible   = !!(prof =~ /Bard/i)     if songs_pg
       rogue_pg.visible   = !!(prof =~ /Rogue/i)    if rogue_pg
       warrior_pg.visible = !!(prof =~ /Warrior/i)  if warrior_pg
@@ -1698,20 +1724,21 @@ module SetupWizard
   def self.build_page(idx)
     inner = case idx
     when 0  then pg_character
-    when 1  then pg_hunting
-    when 2  then pg_society
-    when 3  then pg_spells
-    when 4  then pg_weapon
-    when 5  then pg_defense
-    when 6  then pg_songs
-    when 7  then pg_combat_abilities
-    when 8  then pg_rogue_guild
-    when 9  then pg_warrior_guild
-    when 10 then pg_mount
-    when 11 then pg_scripts
-    when 12 then pg_trinkets
-    when 13 then pg_arcarium
-    when 14 then pg_gemstones
+    when 1  then pg_hunting1
+    when 2  then pg_hunting2
+    when 3  then pg_society
+    when 4  then pg_spells
+    when 5  then pg_weapon
+    when 6  then pg_defense
+    when 7  then pg_songs
+    when 8  then pg_combat_abilities
+    when 9  then pg_rogue_guild
+    when 10 then pg_warrior_guild
+    when 11 then pg_mount
+    when 12 then pg_scripts
+    when 13 then pg_trinkets
+    when 14 then pg_arcarium
+    when 15 then pg_gemstones
     else Gtk::Label.new("Unknown page #{idx}")
     end
     sw = Gtk::ScrolledWindow.new
@@ -1941,6 +1968,19 @@ module SetupWizard
       odb.pack_start(cb, false, false, 1)
     end
     container.pack_start(odf, false, false, 4)
+
+    # Voln rank 10+: note about Symbol of Restoration auto-healing via priority list
+    if soc == "Voln" && rank >= 10
+      rf, rb = frame_vbox("Automatic Healing -- Symbol of Restoration")
+      rdesc = Gtk::Label.new(
+        "Symbol of Restoration restores up to half your lost HP. Add it to the Low Health Priority\n" \
+        "list in Hunting Preferences to control when it fires and in what order. Requires Symbol of\n" \
+        "Restoration to be checked in On-Demand Abilities above."
+      )
+      rdesc.xalign = 0.0; rdesc.set_line_wrap(true)
+      rb.pack_start(rdesc, false, false, 3)
+      container.pack_start(rf, false, false, 4)
+    end
   end
 
   # Build the fields for one weapon slot (noun + type + sub-panels).
@@ -2828,6 +2868,20 @@ module SetupWizard
       end
       vb.pack_start(pf1, false, false, 5)
 
+      # 1607 -- Rejuvenation: add to Hunting Preferences low_health priority list to control when it fires
+      has_1607 = known.any? { |s| s[:num] == 1607 }
+      if has_1607
+        pf7, pb7 = frame_vbox("Spell 1607 -- Rejuvenation")
+        desc7 = Gtk::Label.new(
+          "Rejuvenation restores HP and stamina. Add it to the Low Health Priority list\n" \
+          "in Hunting Preferences to control when it fires and in what order relative to\n" \
+          "your other low-health responses. Has a 5-minute cooldown after each use."
+        )
+        desc7.xalign = 0.0; desc7.set_line_wrap(true)
+        pb7.pack_start(desc7, false, false, 3)
+        vb.pack_start(pf7, false, false, 5)
+      end
+
       # 140 -- Wall of Force: cast when Feeble debuff is active (halves evasion/block/parry)
       has_140 = known.any? { |s| s[:num] == 140 }
       pf140, pb140 = frame_vbox("Spell 140 -- Wall of Force (Feeble response)")
@@ -3009,7 +3063,7 @@ module SetupWizard
       hl = Gtk::Label.new(hint_text)
       hl.xalign = 0.0; hl.set_line_wrap(true)
       rb.pack_start(hl, false, false, 3)
-      ["1st cast:", "2nd cast:", "3rd cast:", "4th cast:"].each_with_index do |lbl, i|
+      ["1st cast:", "2nd cast:", "3rd cast:", "4th cast:", "5th cast:", "6th cast:"].each_with_index do |lbl, i|
         c = mk_combo_text(spell_opts, 0)
         @w[keys[i]] = c
         rb.pack_start(lrow(lbl, c), false, false, 2)
@@ -3020,10 +3074,10 @@ module SetupWizard
     vb.pack_start(build_rot_frame.call(
       "Single Target Rotation (always fires)",
       "Fires every attack round regardless of how many creatures are present.",
-      [:rot_st_1, :rot_st_2, :rot_st_3, :rot_st_4]
+      [:rot_st_1, :rot_st_2, :rot_st_3, :rot_st_4, :rot_st_5, :rot_st_6]
     ), false, false, 5)
     ((@saved_config || {}).dig("spells", "rotation") || []).each_with_index do |slot, i|
-      key = [:rot_st_1, :rot_st_2, :rot_st_3, :rot_st_4][i]; next unless @w[key]
+      key = [:rot_st_1, :rot_st_2, :rot_st_3, :rot_st_4, :rot_st_5, :rot_st_6][i]; next unless @w[key]
       num = slot["cmd"].to_s.split.last.to_i; next unless num > 0
       idx = spell_opts.index { |o| o.start_with?("#{num} --") }
       @w[key].active = idx if idx
@@ -3044,10 +3098,10 @@ module SetupWizard
     vb.pack_start(build_rot_frame.call(
       "Multi-Target / AoE Rotation (fires in addition to single-target when threshold is met)",
       "AoE spells go here. Fires every round alongside single-target when creature count >= threshold above.",
-      [:rot_mt_1, :rot_mt_2, :rot_mt_3, :rot_mt_4]
+      [:rot_mt_1, :rot_mt_2, :rot_mt_3, :rot_mt_4, :rot_mt_5, :rot_mt_6]
     ), false, false, 5)
     ((@saved_config || {}).dig("spells", "aoe_rotation") || []).each_with_index do |slot, i|
-      key = [:rot_mt_1, :rot_mt_2, :rot_mt_3, :rot_mt_4][i]; next unless @w[key]
+      key = [:rot_mt_1, :rot_mt_2, :rot_mt_3, :rot_mt_4, :rot_mt_5, :rot_mt_6][i]; next unless @w[key]
       num = slot["cmd"].to_s.split.last.to_i; next unless num > 0
       idx = spell_opts.index { |o| o.start_with?("#{num} --") }
       @w[key].active = idx if idx
@@ -3884,6 +3938,181 @@ module SetupWizard
     vb.pack_start(tf, true, true, 0)
     end # has_any_tech
 
+    # ---- Weapon Attack Rotation -----------------------------------------------
+    # Builds the items list for weapon rotation dropdowns.
+    # Each item: {key: String, label: String}
+    # key format: "normal_attack", "feat:chastise", "feat:excoriate",
+    #             "mount_charge", "mount_trample",
+    #             "cman:<Name>", "technique:<Name>"
+    build_weapon_rot_items = lambda do |include_trample|
+      items = [{key: "normal_attack", label: "-- Normal Attack --"}]
+      if prof =~ /Paladin/i
+        items << {key: "feat:chastise",  label: "FEAT: Chastise (15s CD, 10 stamina)"}
+        items << {key: "feat:excoriate", label: "FEAT: Excoriate (15s CD, 10 mana)"}
+      end
+      mnt = (@saved_config || {})["mount"] || {}
+      if mnt["enabled"]
+        items << {key: "mount_charge",  label: "Mount: Charge"}  if mnt["has_charge"]
+        items << {key: "mount_trample", label: "Mount: Trample"} if include_trample && mnt["has_trample"]
+      end
+      wg_saved = (@saved_config || {})["warrior_guild"] || {}
+      wg_cries = wg_saved["warcries"] || {}
+      WG_WARCRIES.each do |cry|
+        next unless (wg_cries[cry[:key]] || {})["enabled"]
+        items << {key: "warcry:#{cry[:key]}", label: "Warcry: #{cry[:desc].split(' -- ').first}"}
+      end
+      if wg_saved["feint_enabled"]
+        items << {key: "warrior_feint", label: "Warrior Feint (WTRICK FEINT)"}
+      end
+      if wg_saved["spit_enabled"]
+        items << {key: "warrior_spit", label: "Warrior Spit (WTRICK SPIT)"}
+      end
+      rg_saved = (@saved_config || {})["rogue_guild"] || {}
+      if rg_saved["ss_enabled"]
+        items << {key: "rogue_ss", label: "Rogue: Silent Strike"}
+      end
+      (@saved_config || {})["arcarium"]&.each do |arc_key, arc_cfg|
+        next unless arc_cfg.is_a?(Hash) && arc_cfg["enabled"]
+        noun = arc_cfg["noun"].to_s
+        (arc_cfg["vissi"] || []).each do |v|
+          next unless v.is_a?(Hash) && v["enabled"]
+          items << {
+            key:   "vissi:#{arc_key}:#{v['name']}",
+            label: "Arcarium (#{noun}): #{v['name']}"
+          }
+        end
+      end
+      trinket_defs = [
+        ["energy_wings",    SCRIPT_TEMPLATES.dig("Energy Wings",    :weapon) || [], "Energy Wings"],
+        ["battle_standard", SCRIPT_TEMPLATES.dig("Battle Standard", :armor)  || [], "Battle Standard"],
+        ["elemental_gloves", EG_ABILITIES, "Elemental Gloves"],
+        ["twisted_gloves",   TG_ABILITIES, "Twisted Gloves"],
+        ["twisted_kicks",    TK_ABILITIES, "Twisted Kicks"],
+      ]
+      trinket_defs.each do |slot, tmpl, display|
+        cfg = (@saved_config || {}).dig("trinkets", slot)
+        next unless cfg.is_a?(Hash) && cfg["enabled"]
+        noun    = cfg["noun"].to_s.strip
+        ab_cfg  = cfg["abilities"] || {}
+        tier    = cfg["tier"].to_i
+        tmpl.each do |ab|
+          next if ab[:min_tier] && ab[:min_tier] > tier
+          key = ab[:key].to_s
+          user_ab = ab_cfg[key]
+          enabled = user_ab.is_a?(Hash) ? user_ab.fetch("enabled", true) : true
+          next unless enabled
+          next if ab[:when].to_s == "skip"
+          label_noun = noun.empty? ? display : "#{display} (#{noun})"
+          items << {
+            key:   "trinket:#{slot}:#{key}",
+            label: "#{label_noun}: #{key}"
+          }
+        end
+      end
+      @cman_store&.each do |_m, _p, iter|
+        name = @cman_store.get_value(iter, 1).to_s
+        next if name.empty?
+        items << {key: "cman:#{name}", label: "CMan: #{name}"}
+      end
+      @tech_store&.each do |_m, _p, iter|
+        name = @tech_store.get_value(iter, 1).to_s
+        next if name.empty?
+        items << {key: "technique:#{name}", label: "Technique: #{name}"}
+      end
+      items
+    end
+
+    st_items  = build_weapon_rot_items.call(true)
+    aoe_items = build_weapon_rot_items.call(true)
+
+    # Returns the combo index for a saved entry hash, defaulting to 0 (Normal Attack).
+    rot_entry_to_idx = lambda do |entry, items|
+      return 0 unless entry.is_a?(Hash)
+      key = case entry["type"].to_s
+            when "normal_attack" then "normal_attack"
+            when "feat"          then "feat:#{entry['name']}"
+            when "mount_charge"  then "mount_charge"
+            when "mount_trample" then "mount_trample"
+            when "cman"          then "cman:#{entry['name']}"
+            when "technique"     then "technique:#{entry['name']}"
+            when "warcry"        then "warcry:#{entry['key']}"
+            when "warrior_feint" then "warrior_feint"
+            when "warrior_spit"  then "warrior_spit"
+            when "rogue_ss"      then "rogue_ss"
+            when "vissi" then "vissi:#{entry['arcarium']}:#{entry['name']}"
+            when "trinket" then "trinket:#{entry['slot']}:#{entry['ability_key']}"
+            else "normal_attack"
+            end
+      items.index { |it| it[:key] == key } || 0
+    end
+
+    # Gray-out any CMan row whose name is selected in any rotation combo.
+    @weapon_rot_combos_st  = []
+    @weapon_rot_combos_aoe = []
+
+    sync_cman_grayouts = lambda do
+      selected_cmans = Set.new
+      (@weapon_rot_combos_st + @weapon_rot_combos_aoe).each do |combo_pair|
+        items_arr, combo = combo_pair
+        key = items_arr[combo.active]&.fetch(:key, nil).to_s
+        selected_cmans.add(key.sub("cman:", "")) if key.start_with?("cman:")
+      end
+      @cman_store&.each do |_m, _p, iter|
+        name   = @cman_store.get_value(iter, 1).to_s
+        in_rot = selected_cmans.include?(name)
+        @cman_store.set_value(iter, 7, !in_rot)
+        @cman_store.set_value(iter, 0, false) if in_rot
+      end
+    end
+
+    build_weapon_rot_frame = lambda do |frame_title, hint_text, saved_rot, items, combos_arr, keys|
+      rf, rb = frame_vbox(frame_title)
+      rl = Gtk::Label.new(hint_text)
+      rl.xalign = 0.0; rl.set_line_wrap(true)
+      rl.override_color(:normal, Gdk::RGBA.new(0.5, 0.5, 0.5, 1.0))
+      rb.pack_start(rl, false, false, 3)
+
+      ["1st:", "2nd:", "3rd:", "4th:", "5th:", "6th:"].each_with_index do |lbl, i|
+        combo = mk_combo_text(items.map { |it| it[:label] }, 0)
+        saved_val = Array(saved_rot)[i]
+        combo.active = rot_entry_to_idx.call(saved_val, items)
+        combo.signal_connect("changed") { sync_cman_grayouts.call }
+        combos_arr << [items, combo]
+        @w[keys[i]] = combo
+        rb.pack_start(lrow(lbl, combo), false, false, 2)
+      end
+      rf
+    end
+
+    saved_st_rot  = (@saved_config || {}).dig("weapons", "weapon_rotation")  || []
+    saved_aoe_rot = (@saved_config || {}).dig("weapons", "weapon_aoe_rotation") || []
+
+    caster_note = Gtk::Label.new(
+      "Note: Weapon rotation applies to melee and mixed characters. " \
+      "Casters using a runestaff use the spell rotation in the Spells tab instead. " \
+      "If a CMan appears in your rotation, it will be grayed out in the list above to prevent double-firing."
+    )
+    caster_note.xalign = 0.0; caster_note.set_line_wrap(true)
+    caster_note.override_color(:normal, Gdk::RGBA.new(0.5, 0.5, 0.5, 1.0))
+    vb.pack_start(mk_hsep, false, false, 4)
+    vb.pack_start(caster_note, false, false, 3)
+
+    vb.pack_start(build_weapon_rot_frame.call(
+      "Single Target Attack Rotation",
+      "Cycles through each slot in order. Falls back to Normal Attack if the chosen ability is on cooldown. Resets at the start of each new target engagement.",
+      saved_st_rot, st_items, @weapon_rot_combos_st,
+      [:wrot_st_1, :wrot_st_2, :wrot_st_3, :wrot_st_4, :wrot_st_5, :wrot_st_6]
+    ), false, false, 5)
+
+    vb.pack_start(build_weapon_rot_frame.call(
+      "AoE / Multi-Target Attack Rotation",
+      "Fires when creature count meets the AoE threshold (Hunting Preferences). Cycles the same way as single target.",
+      saved_aoe_rot, aoe_items, @weapon_rot_combos_aoe,
+      [:wrot_aoe_1, :wrot_aoe_2, :wrot_aoe_3, :wrot_aoe_4, :wrot_aoe_5, :wrot_aoe_6]
+    ), false, false, 5)
+
+    sync_cman_grayouts.call
+
     scrolled(vb)
   end
 
@@ -4094,7 +4323,7 @@ module SetupWizard
     container.pack_start(af, false, false, 5)
   end
 
-  def self.pg_hunting
+  def self.pg_hunting1
     vb = mk_vbox(6)
     vb.border_width = 10
     saved_maint_only = (@saved_config || {}).dig("hunting", "maintenance_only") || false
@@ -4107,47 +4336,6 @@ module SetupWizard
       "All targeting and attack rotation is disabled -- the script will not swing, cast offensively, or pick targets."
     ).tap { |l| l.xalign = 0.0; l.set_line_wrap(true) }, false, false, 2)
     vb.pack_start(mk_hsep, false, false, 4)
-    vb.pack_start(w_check(:use_eloot, "Use ;eloot for automatic looting (recommended)", (@saved_config || {}).dig("hunting", "use_eloot") != false), false, false, 3)
-
-    saved_eloot_grouped = (@saved_config || {}).dig("hunting", "eloot_grouped") || "skip"
-    eg_run_val  = saved_eloot_grouped == "run"
-    eg_skip_val = saved_eloot_grouped != "run"
-
-    eloot_gf, eloot_gb = frame_vbox("Eloot when Grouped")
-    eg_note = Gtk::Label.new("When the script detects you are in a group or are the group leader, eloot behavior is controlled here instead of the solo setting above.")
-    eg_note.xalign = 0.0; eg_note.set_line_wrap(true)
-    eg_note.override_color(:normal, Gdk::RGBA.new(0.5, 0.5, 0.5, 1.0))
-    eloot_gb.pack_start(eg_note, false, false, 2)
-
-    @w[:eloot_grouped_run]  = Gtk::CheckButton.new("Run eloot when grouped (I am the lotter / group lead)")
-    @w[:eloot_grouped_skip] = Gtk::CheckButton.new("Skip eloot when grouped (default -- another player lots)")
-    @w[:eloot_grouped_run].active  = eg_run_val
-    @w[:eloot_grouped_skip].active = eg_skip_val
-    @w[:eloot_grouped_skip].sensitive = !eg_run_val
-    @w[:eloot_grouped_run].sensitive  = !eg_skip_val
-
-    @w[:eloot_grouped_run].signal_connect("toggled") do |btn|
-      if btn.active?
-        @w[:eloot_grouped_skip].active    = false
-        @w[:eloot_grouped_skip].sensitive = false
-        @w[:eloot_grouped_run].sensitive  = true
-      else
-        @w[:eloot_grouped_skip].sensitive = true
-      end
-    end
-    @w[:eloot_grouped_skip].signal_connect("toggled") do |btn|
-      if btn.active?
-        @w[:eloot_grouped_run].active    = false
-        @w[:eloot_grouped_run].sensitive = false
-        @w[:eloot_grouped_skip].sensitive = true
-      else
-        @w[:eloot_grouped_run].sensitive = true
-      end
-    end
-
-    eloot_gb.pack_start(@w[:eloot_grouped_run],  false, false, 2)
-    eloot_gb.pack_start(@w[:eloot_grouped_skip], false, false, 2)
-    vb.pack_start(eloot_gf, false, false, 4)
 
     # --- Health + Escape Methods ---
     saved_retreat_pct   = (@saved_config || {}).dig("hunting", "health_retreat_pct") || 35
@@ -4306,6 +4494,239 @@ module SetupWizard
     mb2.pack_start(mana_hb, false, false, 2)
     vb.pack_start(mf2, false, false, 4)
 
+    # --- Emergency Priorities ---
+    vb.pack_start(mk_hsep, false, false, 4)
+    ep_saved = (@saved_config || {})["emergency_priorities"] || {}
+
+    ep_intro = Gtk::Label.new(
+      "Emergency Priorities: when a debuff or low-health condition fires, the script tries each entry " \
+      "in order and stops after the first one that succeeds. Built-in responses (1635 Beseech, " \
+      "Incarnate Armor) fire automatically before this list.\n" \
+      "Add arcarium vissi, trinket abilities, or built-in heals (1607 Rejuvenation, society healing " \
+      "symbols) here to control their order. Items that were previously set to CC'd or low_health " \
+      "in the Arcarium / Trinkets tabs are migrated here automatically."
+    )
+    ep_intro.xalign = 0.0
+    ep_intro.set_line_wrap(true)
+    ep_intro.override_color(:normal, Gdk::RGBA.new(0.5, 0.5, 0.5, 1.0))
+    vb.pack_start(ep_intro, false, false, 3)
+
+    build_ep_frame = lambda do |frame_label, store_sym, saved_list|
+      pf, pb = frame_vbox(frame_label)
+
+      ls = Gtk::ListStore.new(String, String, String, String)
+      Array(saved_list).each do |entry|
+        next unless entry.is_a?(Hash)
+        type = entry["type"].to_s
+        it   = ls.append
+        if type == "vissi"
+          it.set_value(0, "vissi")
+          it.set_value(1, "Arcarium #{entry['arcarium']} -- #{entry['name']}")
+          it.set_value(2, entry["arcarium"].to_s)
+          it.set_value(3, entry["name"].to_s)
+        elsif type == "ability"
+          it.set_value(0, "ability")
+          it.set_value(1, "#{entry['slot']} / #{entry['key']}")
+          it.set_value(2, entry["slot"].to_s)
+          it.set_value(3, entry["key"].to_s)
+        elsif type == "builtin"
+          builtin_label = case entry["id"].to_s
+            when "rejuvenation"         then "Spell 1607 -- Rejuvenation (Paladin)"
+            when "society_heal"         then "Society heal (Symbol of Restoration / Sign of Healing)"
+            when "bloodstone_vivacity"  then "Bloodstone Jewelry -- Vivacity (BESEECH for HP/stamina/mana)"
+            when "bloodstone_sanguine_swap" then "Bloodstone Jewelry -- Sanguine Swap (SPIN, stores wounds)"
+            else entry["id"].to_s
+          end
+          it.set_value(0, "builtin")
+          it.set_value(1, builtin_label)
+          it.set_value(2, "builtin")
+          it.set_value(3, entry["id"].to_s)
+        end
+      end
+      @w[store_sym] = ls
+
+      tv = Gtk::TreeView.new(ls)
+      tv.set_size_request(-1, 90)
+      tv.headers_visible = false
+      tv.append_column(Gtk::TreeViewColumn.new("", Gtk::CellRendererText.new, text: 1))
+      tv.selection.mode = :single
+
+      sw = Gtk::ScrolledWindow.new
+      sw.set_policy(:automatic, :automatic)
+      sw.add(tv)
+      pb.pack_start(sw, true, true, 2)
+
+      btn_row = mk_hbox(4)
+
+      up_btn = Gtk::Button.new(label: "Up")
+      up_btn.signal_connect("clicked") do
+        sel = tv.selection.selected
+        next unless sel
+        path = sel.path
+        next unless path.prev!
+        prev_iter = ls.get_iter(path)
+        ls.swap(sel, prev_iter) if prev_iter
+      end
+
+      dn_btn = Gtk::Button.new(label: "Down")
+      dn_btn.signal_connect("clicked") do
+        sel = tv.selection.selected
+        next unless sel
+        nxt = sel.dup
+        next unless ls.iter_next!(nxt)
+        ls.swap(sel, nxt)
+      end
+
+      rm_btn = Gtk::Button.new(label: "Remove")
+      rm_btn.signal_connect("clicked") do
+        sel = tv.selection.selected
+        ls.remove(sel) if sel
+      end
+
+      add_btn = Gtk::Button.new(label: "Add...")
+      add_btn.signal_connect("clicked") do
+        items = []
+        d_ep = @detected || {}
+        ep_prof    = GS_PROFESSIONS[@w[:char_prof]&.active.to_i] rescue d_ep[:profession]
+        ep_soc     = d_ep[:society].to_s
+        ep_soc_rank = d_ep[:society_rank].to_i
+        ep_known   = Array(d_ep[:known_spells])
+        if ep_prof == "Paladin" && ep_known.any? { |s| s[:num] == 1607 }
+          items << {type: "builtin", label: "Spell 1607 -- Rejuvenation (Paladin)", col2: "builtin", col3: "rejuvenation"}
+        end
+        soc_heal_unlocked = case ep_soc
+          when "Voln"    then ep_soc_rank >= 10
+          when "CoL"     then ep_soc_rank >= 9
+          when "Sunfist" then false
+          else false
+        end
+        if soc_heal_unlocked
+          soc_heal_label = case ep_soc
+            when "Voln" then "Voln -- Symbol of Restoration (auto-heal when HP low)"
+            when "CoL"  then "CoL -- Sign of Healing (auto-heal when HP low)"
+            else "#{ep_soc} -- society heal"
+          end
+          items << {type: "builtin", label: soc_heal_label, col2: "builtin", col3: "society_heal"}
+        end
+        bsj_ep = (@saved_config || {}).dig("trinkets", "bloodstone_jewelry") || {}
+        if bsj_ep["enabled"]
+          bsj_tier_ep = bsj_ep["tier"].to_i
+          if bsj_tier_ep >= 3 && bsj_ep.dig("abilities", "vivacity", "enabled") != false
+            viv_tgt = bsj_ep.dig("abilities", "vivacity", "target") || "HEALTH"
+            items << {type: "builtin", label: "Bloodstone Jewelry -- Vivacity (BESEECH #{viv_tgt})", col2: "builtin", col3: "bloodstone_vivacity"}
+          end
+          if bsj_tier_ep >= 4 && bsj_ep.dig("abilities", "sanguine_swap", "enabled") != false
+            items << {type: "builtin", label: "Bloodstone Jewelry -- Sanguine Swap (SPIN, [!] wounds reappear)", col2: "builtin", col3: "bloodstone_sanguine_swap"}
+          end
+        end
+        %w[aversaris vangaris].each do |arc_key|
+          arc_cfg = (@saved_config || {}).dig("arcarium", arc_key) || {}
+          next unless arc_cfg["enabled"]
+          Array(arc_cfg["vissi"]).each do |v|
+            next unless v.is_a?(Hash) && v["name"]
+            items << {type: "vissi", label: "Arcarium #{arc_key} -- #{v['name']}", col2: arc_key, col3: v["name"]}
+          end
+        end
+        TRINKET_KEYS.each do |tk|
+          tc = (@saved_config || {}).dig("trinkets", tk) || {}
+          next unless tc["enabled"]
+          (tc["abilities"] || {}).each_key do |ab_key|
+            items << {type: "ability", label: "#{tk} / #{ab_key}", col2: tk, col3: ab_key.to_s}
+          end
+        end
+
+        if items.empty?
+          dlg = Gtk::MessageDialog.new(@win, :modal, :info, :ok, "No arcarium or trinket items found. Save your profile first, then reopen setup.")
+          dlg.run; dlg.destroy
+          next
+        end
+
+        dlg = Gtk::Dialog.new(title: "Add Priority Entry", parent: @win, flags: :modal)
+        dlg.add_button("Add",    :ok)
+        dlg.add_button("Cancel", :cancel)
+        combo = mk_combo_text(items.map { |i| i[:label] }, 0)
+        dlg.content_area.pack_start(combo, false, false, 8)
+        dlg.content_area.show_all
+
+        if dlg.run == :ok && !items.empty?
+          chosen = items[combo.active] || items[0]
+          it = ls.append
+          it.set_value(0, chosen[:type])
+          it.set_value(1, chosen[:label])
+          it.set_value(2, chosen[:col2])
+          it.set_value(3, chosen[:col3])
+        end
+        dlg.destroy
+      end
+
+      [up_btn, dn_btn, rm_btn, add_btn].each { |b| btn_row.pack_start(b, false, false, 2) }
+      pb.pack_start(btn_row, false, false, 4)
+      vb.pack_start(pf, false, false, 6)
+    end
+
+    build_ep_frame.call(
+      "Low Health Priority (fires in order when HP < low_health %; stops after first success)",
+      :ep_low_health_store,
+      ep_saved["low_health"]
+    )
+    build_ep_frame.call(
+      "CC'd Priority (fires in order when stunned/webbed/bound/silenced/crippled; stops after first success)",
+      :ep_cc_store,
+      ep_saved["cc"]
+    )
+
+    scrolled(vb)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Hunting Preferences 2 tab -- eloot, encumbrance, floors, thresholds, targets
+  # ---------------------------------------------------------------------------
+  def self.pg_hunting2
+    vb = mk_vbox(6)
+    vb.border_width = 10
+
+    vb.pack_start(w_check(:use_eloot, "Use ;eloot for automatic looting (recommended)", (@saved_config || {}).dig("hunting", "use_eloot") != false), false, false, 3)
+
+    saved_eloot_grouped = (@saved_config || {}).dig("hunting", "eloot_grouped") || "skip"
+    eg_run_val  = saved_eloot_grouped == "run"
+    eg_skip_val = saved_eloot_grouped != "run"
+
+    eloot_gf, eloot_gb = frame_vbox("Eloot when Grouped")
+    eg_note = Gtk::Label.new("When the script detects you are in a group or are the group leader, eloot behavior is controlled here instead of the solo setting above.")
+    eg_note.xalign = 0.0; eg_note.set_line_wrap(true)
+    eg_note.override_color(:normal, Gdk::RGBA.new(0.5, 0.5, 0.5, 1.0))
+    eloot_gb.pack_start(eg_note, false, false, 2)
+
+    @w[:eloot_grouped_run]  = Gtk::CheckButton.new("Run eloot when grouped (I am the lotter / group lead)")
+    @w[:eloot_grouped_skip] = Gtk::CheckButton.new("Skip eloot when grouped (default -- another player lots)")
+    @w[:eloot_grouped_run].active  = eg_run_val
+    @w[:eloot_grouped_skip].active = eg_skip_val
+    @w[:eloot_grouped_skip].sensitive = !eg_run_val
+    @w[:eloot_grouped_run].sensitive  = !eg_skip_val
+
+    @w[:eloot_grouped_run].signal_connect("toggled") do |btn|
+      if btn.active?
+        @w[:eloot_grouped_skip].active    = false
+        @w[:eloot_grouped_skip].sensitive = false
+        @w[:eloot_grouped_run].sensitive  = true
+      else
+        @w[:eloot_grouped_skip].sensitive = true
+      end
+    end
+    @w[:eloot_grouped_skip].signal_connect("toggled") do |btn|
+      if btn.active?
+        @w[:eloot_grouped_run].active    = false
+        @w[:eloot_grouped_run].sensitive = false
+        @w[:eloot_grouped_skip].sensitive = true
+      else
+        @w[:eloot_grouped_run].sensitive = true
+      end
+    end
+
+    eloot_gb.pack_start(@w[:eloot_grouped_run],  false, false, 2)
+    eloot_gb.pack_start(@w[:eloot_grouped_skip], false, false, 2)
+    vb.pack_start(eloot_gf, false, false, 4)
+
     # Encumbrance retreat threshold
     saved_enc_thresh = (@saved_config || {}).dig("hunting", "encumbrance_retreat_pct") || 0
     enc_idx = ENCUMBRANCE_LEVELS.index { |_, v| v == saved_enc_thresh } || 0
@@ -4411,141 +4832,6 @@ module SetupWizard
     warn_lbl.override_color(:normal, Gdk::RGBA.new(0.75, 0.45, 0.0, 1.0))
     gb.pack_start(warn_lbl, false, false, 3)
     vb.pack_start(gf, false, false, 6)
-
-    # --- Emergency Priorities ---
-    vb.pack_start(mk_hsep, false, false, 4)
-    ep_saved = (@saved_config || {})["emergency_priorities"] || {}
-
-    ep_intro = Gtk::Label.new(
-      "Emergency Priorities: when a debuff or low-health condition fires, the script tries each entry " \
-      "in order and stops after the first one that succeeds. Built-in responses (1607 Rejuvenation, " \
-      "1635 Beseech, Incarnate Armor, Symbol of Restoration) fire automatically before this list.\n" \
-      "Add arcarium vissi or trinket abilities here. Items that were previously set to CC'd or low_health " \
-      "in the Arcarium / Trinkets tabs are migrated here automatically."
-    )
-    ep_intro.xalign = 0.0
-    ep_intro.set_line_wrap(true)
-    ep_intro.override_color(:normal, Gdk::RGBA.new(0.5, 0.5, 0.5, 1.0))
-    vb.pack_start(ep_intro, false, false, 3)
-
-    build_ep_frame = lambda do |frame_label, store_sym, saved_list|
-      pf, pb = frame_vbox(frame_label)
-
-      ls = Gtk::ListStore.new(String, String, String, String)
-      Array(saved_list).each do |entry|
-        next unless entry.is_a?(Hash)
-        type = entry["type"].to_s
-        it   = ls.append
-        if type == "vissi"
-          it.set_value(0, "vissi")
-          it.set_value(1, "Arcarium #{entry['arcarium']} -- #{entry['name']}")
-          it.set_value(2, entry["arcarium"].to_s)
-          it.set_value(3, entry["name"].to_s)
-        elsif type == "ability"
-          it.set_value(0, "ability")
-          it.set_value(1, "#{entry['slot']} / #{entry['key']}")
-          it.set_value(2, entry["slot"].to_s)
-          it.set_value(3, entry["key"].to_s)
-        end
-      end
-      @w[store_sym] = ls
-
-      tv = Gtk::TreeView.new(ls)
-      tv.set_size_request(-1, 90)
-      tv.headers_visible = false
-      tv.append_column(Gtk::TreeViewColumn.new("", Gtk::CellRendererText.new, text: 1))
-      tv.selection.mode = :single
-
-      sw = Gtk::ScrolledWindow.new
-      sw.set_policy(:automatic, :automatic)
-      sw.add(tv)
-      pb.pack_start(sw, true, true, 2)
-
-      btn_row = mk_hbox(4)
-
-      up_btn = Gtk::Button.new(label: "Up")
-      up_btn.signal_connect("clicked") do
-        sel = tv.selection.selected
-        next unless sel
-        path = sel.path
-        next unless path.prev!
-        prev_iter = ls.get_iter(path)
-        ls.swap(sel, prev_iter) if prev_iter
-      end
-
-      dn_btn = Gtk::Button.new(label: "Down")
-      dn_btn.signal_connect("clicked") do
-        sel = tv.selection.selected
-        next unless sel
-        nxt = sel.dup
-        next unless ls.iter_next!(nxt)
-        ls.swap(sel, nxt)
-      end
-
-      rm_btn = Gtk::Button.new(label: "Remove")
-      rm_btn.signal_connect("clicked") do
-        sel = tv.selection.selected
-        ls.remove(sel) if sel
-      end
-
-      add_btn = Gtk::Button.new(label: "Add...")
-      add_btn.signal_connect("clicked") do
-        items = []
-        %w[aversaris vangaris].each do |arc_key|
-          arc_cfg = (@saved_config || {}).dig("arcarium", arc_key) || {}
-          next unless arc_cfg["enabled"]
-          Array(arc_cfg["vissi"]).each do |v|
-            next unless v.is_a?(Hash) && v["name"]
-            items << {type: "vissi", label: "Arcarium #{arc_key} -- #{v['name']}", col2: arc_key, col3: v["name"]}
-          end
-        end
-        TRINKET_KEYS.each do |tk|
-          tc = (@saved_config || {}).dig("trinkets", tk) || {}
-          next unless tc["enabled"]
-          (tc["abilities"] || {}).each_key do |ab_key|
-            items << {type: "ability", label: "#{tk} / #{ab_key}", col2: tk, col3: ab_key.to_s}
-          end
-        end
-
-        if items.empty?
-          dlg = Gtk::MessageDialog.new(@win, :modal, :info, :ok, "No arcarium or trinket items found. Save your profile first, then reopen setup.")
-          dlg.run; dlg.destroy
-          next
-        end
-
-        dlg = Gtk::Dialog.new(title: "Add Priority Entry", parent: @win, flags: :modal)
-        dlg.add_button("Add",    :ok)
-        dlg.add_button("Cancel", :cancel)
-        combo = mk_combo_text(items.map { |i| i[:label] }, 0)
-        dlg.content_area.pack_start(combo, false, false, 8)
-        dlg.content_area.show_all
-
-        if dlg.run == :ok && !items.empty?
-          chosen = items[combo.active] || items[0]
-          it = ls.append
-          it.set_value(0, chosen[:type])
-          it.set_value(1, chosen[:label])
-          it.set_value(2, chosen[:col2])
-          it.set_value(3, chosen[:col3])
-        end
-        dlg.destroy
-      end
-
-      [up_btn, dn_btn, rm_btn, add_btn].each { |b| btn_row.pack_start(b, false, false, 2) }
-      pb.pack_start(btn_row, false, false, 4)
-      vb.pack_start(pf, false, false, 6)
-    end
-
-    build_ep_frame.call(
-      "Low Health Priority (fires in order when HP < low_health %; stops after first success)",
-      :ep_low_health_store,
-      ep_saved["low_health"]
-    )
-    build_ep_frame.call(
-      "CC'd Priority (fires in order when stunned/webbed/bound/silenced/crippled; stops after first success)",
-      :ep_cc_store,
-      ep_saved["cc"]
-    )
 
     scrolled(vb)
   end
@@ -4698,6 +4984,85 @@ module SetupWizard
     @w[:bs_noun]    = bs_noun_e
     @w[:bs_tier]    = bs_tier_sp
     outer.pack_start(bsf, false, false, 4)
+
+    # ---- Bloodstone Jewelry ----
+    bsj       = saved["bloodstone_jewelry"] || {}
+    bsjf, bsjb = frame_vbox("Bloodstone Jewelry (Empath healing item -- Bloodsmith 1135)")
+
+    bsj_chk = Gtk::CheckButton.new("I have Bloodstone Jewelry")
+    bsj_chk.active = bsj["enabled"] == true
+    bsjb.pack_start(bsj_chk, false, false, 2)
+
+    bsj_noun_e  = Gtk::Entry.new; bsj_noun_e.text = bsj["noun"].to_s.empty? ? "bloodstone" : bsj["noun"].to_s
+    bsj_tier_sp = Gtk::SpinButton.new(Gtk::Adjustment.new((bsj["tier"] || 3).to_f, 1.0, 5.0, 1.0, 1.0, 0.0), 1, 0)
+
+    # Tier 3 -- Vivacity: BESEECH <noun> HEALTH/STAMINA/MANA
+    bsj_ab_cfg         = bsj["abilities"] || {}
+    saved_viv          = bsj_ab_cfg["vivacity"] || {}
+    bsj_viv_enabled    = Gtk::CheckButton.new("Enable Vivacity (T3+) -- BESEECH for HP/stamina/mana recovery  (CD: 60/45/30 min at T3/T4/T5)")
+    bsj_viv_enabled.active = saved_viv.fetch("enabled", true)
+    saved_viv_target   = saved_viv["target"] || "HEALTH"
+    bsj_viv_target     = mk_combo_text(BLOODSTONE_VIVACITY_TARGETS, BLOODSTONE_VIVACITY_TARGETS.index(saved_viv_target) || 0)
+    viv_hb = mk_hbox(6)
+    viv_hb.pack_start(bsj_viv_enabled, true, true, 0)
+    viv_hb.pack_start(Gtk::Label.new("Target:"), false, false, 2)
+    viv_hb.pack_start(bsj_viv_target, false, false, 0)
+
+    # Tier 4 -- Sanguine Swap: SPIN <noun>
+    saved_swap         = bsj_ab_cfg["sanguine_swap"] || {}
+    bsj_swap_enabled   = Gtk::CheckButton.new("Enable Sanguine Swap (T4+) -- SPIN stores all wounds for 10 minutes  (CD: 30 min)")
+    bsj_swap_enabled.active = saved_swap.fetch("enabled", false)
+    swap_warn = Gtk::Label.new(
+      "WARNING: Stored wounds reappear after 10 minutes and WILL STACK with any new wounds acquired.\n" \
+      "This CAN KILL YOU. Only add to your priority list if you can manage wounds before they return."
+    )
+    swap_warn.xalign = 0.0
+    swap_warn.set_line_wrap(true)
+    swap_warn.override_color(:normal, Gdk::RGBA.new(0.75, 0.2, 0.2, 1.0))
+
+    # Note pointing to Hunting Preferences
+    bsj_note = Gtk::Label.new(
+      "Add Vivacity and/or Sanguine Swap to the Low Health Priority list in Hunting Preferences\n" \
+      "to control when they fire and in what order."
+    )
+    bsj_note.xalign = 0.0
+    bsj_note.set_line_wrap(true)
+    bsj_note.override_color(:normal, Gdk::RGBA.new(0.5, 0.5, 0.5, 1.0))
+
+    bsj_detail_rows = [
+      lrow("Item noun:", bsj_noun_e),
+      lrow("Tier:",      bsj_tier_sp),
+      viv_hb,
+      bsj_swap_enabled,
+      swap_warn,
+      bsj_note,
+    ]
+
+    # Gray abilities below their tier requirement
+    refresh_bsj_tiers = lambda do
+      t = bsj_tier_sp.value.to_i
+      viv_hb.sensitive         = t >= 3
+      bsj_swap_enabled.sensitive = t >= 4
+      swap_warn.sensitive        = t >= 4
+    end
+    bsj_tier_sp.signal_connect("value-changed") { refresh_bsj_tiers.call }
+
+    bsj_detail_rows.each { |r| r.sensitive = bsj_chk.active?; bsjb.pack_start(r, false, false, 2) }
+    bsj_chk.signal_connect("toggled") do
+      on = bsj_chk.active?
+      bsj_detail_rows.each { |r| r.sensitive = on }
+      refresh_bsj_tiers.call if on
+    end
+
+    refresh_bsj_tiers.call
+
+    @w[:bsj_enabled]          = bsj_chk
+    @w[:bsj_noun]             = bsj_noun_e
+    @w[:bsj_tier]             = bsj_tier_sp
+    @w[:bsj_viv_enabled]      = bsj_viv_enabled
+    @w[:bsj_viv_target]       = bsj_viv_target
+    @w[:bsj_swap_enabled]     = bsj_swap_enabled
+    outer.pack_start(bsjf, false, false, 4)
 
     # ---- Generic scripted trinket builder ----
     # Builds a frame with enable checkbox, noun entry, optional tier spinbutton,
@@ -5123,9 +5488,23 @@ module SetupWizard
       "elemental_gloves" => collect_generic_trinket.call(:elemental_gloves),
       "twisted_gloves"   => collect_generic_trinket.call(:twisted_gloves),
       "twisted_kicks"    => collect_generic_trinket.call(:twisted_kicks),
-      "mages_gauntlet"   => collect_generic_trinket.call(:mages_gauntlet),
-      "magic_gloves"     => collect_generic_trinket.call(:magic_gloves),
-      "mana_battery"     => collect_generic_trinket.call(:mana_battery),
+      "mages_gauntlet"      => collect_generic_trinket.call(:mages_gauntlet),
+      "magic_gloves"        => collect_generic_trinket.call(:magic_gloves),
+      "mana_battery"        => collect_generic_trinket.call(:mana_battery),
+      "bloodstone_jewelry"  => {
+        "enabled" => @w[:bsj_enabled]&.active? || false,
+        "noun"    => @w[:bsj_noun]&.text&.strip || "bloodstone",
+        "tier"    => @w[:bsj_tier]&.value&.to_i || 3,
+        "abilities" => {
+          "vivacity"      => {
+            "enabled" => @w[:bsj_viv_enabled]&.active? || false,
+            "target"  => BLOODSTONE_VIVACITY_TARGETS[@w[:bsj_viv_target]&.active || 0] || "HEALTH",
+          },
+          "sanguine_swap" => {
+            "enabled" => @w[:bsj_swap_enabled]&.active? || false,
+          },
+        },
+      },
     }
     slots = (1..MAX_GEMSTONE_SLOTS).map do |i|
       act_idx = @w[:"gem#{i}_act"]&.active.to_i - 1
@@ -5147,7 +5526,7 @@ module SetupWizard
     }
     p["hunting"]    = {
       "maintenance_only"    => @w[:maintenance_only].active?,
-      "use_eloot"           => @w[:use_eloot].active?,
+      "use_eloot"           => @w[:use_eloot]&.active? != false,
       "eloot_grouped"       => (@w[:eloot_grouped_run]&.active? ? "run" : "skip"),
       "low_health_pct"      => @w[:low_health_pct].value.to_i,
       "health_retreat_pct"  => @w[:health_retreat_pct].value.to_i,
@@ -5156,12 +5535,12 @@ module SetupWizard
       "mana_floor_enabled"    => @w[:mana_floor_enabled]&.active?    || false,
       "stamina_min_reserve"   => @w[:stamina_floor_enabled]&.active? ? @w[:stamina_reserve].value.to_i : 0,
       "mana_min_reserve"      => @w[:mana_floor_enabled]&.active?    ? @w[:mana_reserve].value.to_i    : 0,
-      "aoe_threshold"       => @w[:aoe_threshold].value.to_i,
-      "swarm_threshold"     => @w[:swarm_threshold].value.to_i,
-      "multi_threshold"     => @w[:multi_threshold].value.to_i,
+      "aoe_threshold"       => @w[:aoe_threshold]&.value&.to_i || (@saved_config || {}).dig("hunting", "aoe_threshold") || 3,
+      "swarm_threshold"     => @w[:swarm_threshold]&.value&.to_i || (@saved_config || {}).dig("hunting", "swarm_threshold") || 4,
+      "multi_threshold"     => @w[:multi_threshold]&.value&.to_i || (@saved_config || {}).dig("hunting", "multi_threshold") || 2,
       "retreat_room"        => (@w[:use_safe_room]&.active? && !(@w[:retreat_room]&.text&.strip || "").empty? ? @w[:retreat_room].text.strip.to_i : nil),
       "encumbrance_retreat_pct" => (ENCUMBRANCE_LEVELS[@w[:encumbrance_retreat]&.active || 0]&.last || 0),
-      "npc_priority"        => ["caster_first", "lowest_hp", "first_available"][@w[:npc_priority].active] || "caster_first",
+      "npc_priority"        => ["caster_first", "lowest_hp", "first_available"][@w[:npc_priority]&.active || 0] || "caster_first",
       "priority_creatures"  => (@w[:priority_creatures]&.buffer&.text || "")
                                  .split(/[\n,]+/).map(&:strip).reject(&:empty?),
       "safe_npcs"           => (@w[:safe_npcs]&.buffer&.text || "")
@@ -5184,6 +5563,8 @@ module SetupWizard
         list << {"type" => "vissi", "arcarium" => slot_or_arc, "name" => key_or_name}
       elsif type == "ability"
         list << {"type" => "ability", "slot" => slot_or_arc, "key" => key_or_name}
+      elsif type == "builtin"
+        list << {"type" => "builtin", "id" => key_or_name}
       end
     end
     list
@@ -5215,14 +5596,38 @@ module SetupWizard
 
   def self.collect_weapons
     dual = dual_wield?
-    { "dual_wield"   => dual,
-      "primary"      => collect_weapon("primary"),
-      "secondary"    => dual ? collect_weapon("secondary") : nil,
-      "ambush"       => {
+    collect_weapon_rot = lambda do |combos_arr|
+      combos_arr.filter_map do |items_arr, combo|
+        key = items_arr[combo.active]&.fetch(:key, nil).to_s
+        next nil if key.empty? || key == "normal_attack"
+        case key
+        when "mount_charge"   then {"type" => "mount_charge"}
+        when "mount_trample"  then {"type" => "mount_trample"}
+        when /\Afeat:(.+)/    then {"type" => "feat", "name" => $1}
+        when /\Acman:(.+)/    then {"type" => "cman", "name" => $1}
+        when /\Atechnique:(.+)/ then {"type" => "technique", "name" => $1}
+        when /\Awarcry:(.+)/     then {"type" => "warcry",        "key" => $1}
+        when "warrior_feint"     then {"type" => "warrior_feint"}
+        when "warrior_spit"      then {"type" => "warrior_spit"}
+        when "rogue_ss"          then {"type" => "rogue_ss"}
+        when /\Avissi:(\w+):(.+)/
+          {"type" => "vissi", "key" => "#{$1}:#{$2}", "arcarium" => $1, "name" => $2}
+        when /\Atrinket:(\w+):(.+)/
+          {"type" => "trinket", "key" => "#{$1}:#{$2}", "slot" => $1, "ability_key" => $2}
+        else nil
+        end
+      end
+    end
+    { "dual_wield"        => dual,
+      "primary"           => collect_weapon("primary"),
+      "secondary"         => dual ? collect_weapon("secondary") : nil,
+      "ambush"            => {
         "enabled"    => @w[:ambush_enabled]&.active? || false,
         "hide_first" => @w[:ambush_hide]&.active?    || false,
       },
-      "holy_weapon"  => collect_holy_weapon }
+      "holy_weapon"       => collect_holy_weapon,
+      "weapon_rotation"     => collect_weapon_rot.call(@weapon_rot_combos_st  || []),
+      "weapon_aoe_rotation" => collect_weapon_rot.call(@weapon_rot_combos_aoe || []) }
   end
 
   def self.collect_holy_weapon
@@ -5391,8 +5796,8 @@ module SetupWizard
     spell_names   = (@known_spell_checks || {}).transform_values { |h| h[:spell][:name] }
     song_names    = (BARD_DEFENSIVE_SONGS + BARD_UTILITY_SONGS + BARD_CYCLIC_SONGS).map { |s| [s[:num], s[:name]] }.to_h
     all_names     = song_names.merge(spell_names)
-    { "rotation"     => read_rot.call([:rot_st_1, :rot_st_2, :rot_st_3, :rot_st_4]),
-      "aoe_rotation" => read_rot.call([:rot_mt_1, :rot_mt_2, :rot_mt_3, :rot_mt_4]),
+    { "rotation"     => read_rot.call([:rot_st_1, :rot_st_2, :rot_st_3, :rot_st_4, :rot_st_5, :rot_st_6]),
+      "aoe_rotation" => read_rot.call([:rot_mt_1, :rot_mt_2, :rot_mt_3, :rot_mt_4, :rot_mt_5, :rot_mt_6]),
       "maintain"     => all_maintain.map { |n| { "num" => n, "label" => all_names[n] || "Spell #{n}" } } }
   end
 
@@ -6120,6 +6525,7 @@ module Engine
     return false unless cfg["enabled"]
     Array(cfg["vissi"]).each do |v|
       next unless v["enabled"]
+      next if weapon_rot_has_type?("vissi", "#{key}:#{v['name']}")
       saved_v_when = v["when"].to_s == "emergency" ? "CC'd" : v["when"].to_s
       next unless saved_v_when == moment.to_s
       # Per-vissi vulnerability gate: if require_vulnerable is set, the target must
@@ -6172,6 +6578,14 @@ module Engine
       ab = all_abilities.find { |a| a[:_slot].to_s == slot && a[:key].to_s == key }
       return false unless ab
       fire_ability(ab)
+    when "builtin"
+      case entry["id"].to_s
+      when "rejuvenation"             then check_rejuvenation
+      when "society_heal"             then check_society_restoration
+      when "bloodstone_vivacity"      then check_bloodstone_vivacity
+      when "bloodstone_sanguine_swap" then check_bloodstone_sanguine_swap
+      else false
+      end
     else
       false
     end
@@ -6534,6 +6948,7 @@ module Engine
     }.each do |ab|
       # Daily-limited abilities only fire on CC'd or low_health (backward compat: "emergency")
       next if ab["daily_limit"].to_i > 0 && !["CC'd", "emergency", "low_health"].include?(trigger)
+      next if weapon_rot_has_type?("trinket", "#{ab['_slot']}:#{ab['key']}")
       # If gigas are present and avoid_gigas is on, skip any multi-target abilities
       next if gigas_g && ab["min_creatures"].to_i > 1
       next unless ability_ready?(ab, count, health)
@@ -6626,19 +7041,74 @@ module Engine
   end
 
   def self.check_society_restoration
-    return if dead?
+    return false if dead?
     name = society_cfg["name"]
-    return unless name
+    return false unless name
     heal_entry = (society_cfg["on_demand"] || []).find { |e| e["cmd"] =~ /restoration|healing|wracking/i }
-    return unless heal_entry
+    return false unless heal_entry
     restore_threshold = (pref("society_restore_pct") || 75).to_i
-    return unless (percenthealth < restore_threshold rescue false)
-    return unless GSH4AState.cd_ready?("soc_restoration")
+    return false unless (percenthealth < restore_threshold rescue false)
+    return false unless GSH4AState.cd_ready?("soc_restoration")
     log "#{heal_entry['name']} -- healing"
     waitrt?
     fput heal_entry["cmd"]
     pause 0.3
     GSH4AState.set_cd("soc_restoration", 300)
+    true
+  end
+
+  # Fires the Bloodstone Jewelry Vivacity ability (BESEECH for HP/stamina/mana).
+  # Requires tier >= 3, a configured noun, and the vivacity ability enabled.
+  # Cooldown is tier-dependent: T3=60 min, T4=45 min, T5=30 min.
+  # @return [Boolean] true if the ability fired successfully
+  def self.check_bloodstone_vivacity
+    bsj = @profile.dig("trinkets", "bloodstone_jewelry")
+    return false unless bsj.is_a?(Hash) && bsj["enabled"]
+    return false unless bsj["tier"].to_i >= 3
+    return false unless bsj.dig("abilities", "vivacity", "enabled") != false
+    noun = bsj["noun"].to_s.strip
+    return false if noun.empty?
+    return false unless GSH4AState.cd_ready?("bloodstone_vivacity")
+    target = bsj.dig("abilities", "vivacity", "target") || "HEALTH"
+    log "Bloodstone Jewelry -- Vivacity BESEECH #{target}"
+    waitrt?
+    return false if dead?
+    fput "beseech my #{noun} #{target}"
+    pause 0.3
+    cd = case bsj["tier"].to_i
+         when 5 then 1800
+         when 4 then 2700
+         else        3600
+         end
+    GSH4AState.set_cd("bloodstone_vivacity", cd)
+    true
+  rescue => e
+    warn "check_bloodstone_vivacity error: #{e.message}"
+    false
+  end
+
+  # Fires the Bloodstone Jewelry Sanguine Swap ability (SPIN to store wounds for 10 min).
+  # Requires tier >= 4 and the sanguine_swap ability enabled. CD: 30 min.
+  # WARNING: wounds reappear after 10 minutes and can stack with new wounds.
+  # @return [Boolean] true if the ability fired successfully
+  def self.check_bloodstone_sanguine_swap
+    bsj = @profile.dig("trinkets", "bloodstone_jewelry")
+    return false unless bsj.is_a?(Hash) && bsj["enabled"]
+    return false unless bsj["tier"].to_i >= 4
+    return false unless bsj.dig("abilities", "sanguine_swap", "enabled") != false
+    noun = bsj["noun"].to_s.strip
+    return false if noun.empty?
+    return false unless GSH4AState.cd_ready?("bloodstone_sanguine_swap")
+    log "Bloodstone Jewelry -- Sanguine Swap SPIN (wounds stored 10 min)"
+    waitrt?
+    return false if dead?
+    fput "spin my #{noun}"
+    pause 0.3
+    GSH4AState.set_cd("bloodstone_sanguine_swap", 1800)
+    true
+  rescue => e
+    warn "check_bloodstone_sanguine_swap error: #{e.message}"
+    false
   end
 
   def self.check_society_escape
@@ -7224,6 +7694,7 @@ module Engine
     WG_WARCRIES.each do |cry|
       saved = cries[cry[:key]] || {}
       next unless saved["enabled"]
+      next if weapon_rot_has_type?("warcry", cry[:key])
       use_aoe   = cry[:stamina_aoe] && saved["aoe"]
       stam_cost = use_aoe ? cry[:stamina_aoe] : cry[:stamina_single]
       next unless stam_cost.nil? || stam_cost == 0 || stamina_ok?(stam_cost)
@@ -7245,13 +7716,13 @@ module Engine
   # Fire warrior trick combos before the attack.
   def self.check_warrior_tricks(target_id)
     wg = @profile["warrior_guild"] || {}
-    if wg["feint_enabled"]
+    if wg["feint_enabled"] && !weapon_rot_has_type?("warrior_feint")
       waitrt?
       fput "wtrick feint ##{target_id}"
       waitrt?
       pause 0.2
     end
-    if wg["spit_enabled"]
+    if wg["spit_enabled"] && !weapon_rot_has_type?("warrior_spit")
       loc = wg["spit_location"].to_s.gsub("_", " ")
       waitrt?
       fput "wtrick spit ##{target_id} #{loc}"
@@ -7290,12 +7761,200 @@ module Engine
     false
   end
 
+  # @return [Boolean] true when the single-target weapon rotation has at least one non-Normal-Attack slot configured
+  def self.weapon_rotation_active?
+    Array(@profile.dig("weapons", "weapon_rotation")).any? { |e| e.is_a?(Hash) && e["type"].to_s != "normal_attack" }
+  end
+
+  # Returns true when any slot in either weapon rotation contains an entry of the given type (and optional key).
+  # Used to suppress standalone guild/arcarium/trinket firing when the rotation owns that ability.
+  # @param type [String] entry type to match ("warcry", "vissi", "trinket", "warrior_feint", etc.)
+  # @param key [String, nil] optional secondary key to match (e.g. "bellow" for warcry, "aversaris:Parasite" for vissi)
+  # @return [Boolean]
+  def self.weapon_rot_has_type?(type, key = nil)
+    [
+      Array(@profile.dig("weapons", "weapon_rotation")),
+      Array(@profile.dig("weapons", "weapon_aoe_rotation"))
+    ].flatten.any? do |e|
+      next unless e.is_a?(Hash)
+      e["type"].to_s == type && (key.nil? || e["key"].to_s == key)
+    end
+  end
+
+  # Fires the current single-target weapon rotation slot, then advances the index.
+  # Falls back to a normal attack if the chosen ability is on cooldown or unavailable.
+  # Resets @weapon_rot_idx to 0 at the start of each new engagement (caller's responsibility).
+  # @param target_id [String, Integer] game object ID of the current target
+  # @return [Boolean] always true (either the rotation slot fired or the fallback attack fired)
+  def self.execute_weapon_rotation_step(target_id)
+    rot = Array(@profile.dig("weapons", "weapon_rotation")).select { |e| e.is_a?(Hash) }
+    return false if rot.empty?
+    entry    = rot[@weapon_rot_idx % rot.length]
+    @weapon_rot_idx = (@weapon_rot_idx + 1) % rot.length
+    fired    = fire_weapon_rot_entry(entry, target_id)
+    unless fired
+      wpn_cfg = @profile.dig("weapons", "primary") || {}
+      loc     = wpn_cfg["target_location"].to_s.strip
+      stance_offensive
+      waitrt?
+      fput loc.empty? ? "attack ##{target_id}" : "attack ##{target_id} #{loc}"
+      waitrt?
+    end
+    true
+  end
+
+  # Fires the current AoE weapon rotation slot and advances the AoE index.
+  # Called when aoe_needed? is true and weapon_rotation_active? is true.
+  # @param target_id [String, Integer] game object ID of the primary target
+  # @return [Boolean] true if the slot fired, false if rotation is empty or ability unavailable
+  def self.execute_weapon_aoe_step(target_id)
+    rot = Array(@profile.dig("weapons", "weapon_aoe_rotation")).select { |e| e.is_a?(Hash) }
+    return false if rot.empty?
+    entry = rot[@weapon_aoe_rot_idx % rot.length]
+    @weapon_aoe_rot_idx = (@weapon_aoe_rot_idx + 1) % rot.length
+    fire_weapon_rot_entry(entry, target_id)
+  end
+
+  # Dispatches a single weapon rotation entry to the appropriate firing path.
+  # Handles: normal_attack, feat, mount_charge, mount_trample, cman, technique,
+  #          warcry, warrior_feint, warrior_spit, rogue_ss, vissi, trinket.
+  # @param entry [Hash] rotation entry hash with at minimum "type" key
+  # @param target_id [String, Integer] game object ID of the current target
+  # @return [Boolean] true if the ability fired, false if unavailable or on cooldown
+  def self.fire_weapon_rot_entry(entry, target_id)
+    return false unless entry.is_a?(Hash)
+    type = entry["type"].to_s
+    case type
+    when "normal_attack"
+      false  # caller handles fallback
+
+    when "feat"
+      name = entry["name"].to_s.downcase
+      cd_key = "feat_#{name}"
+      return false unless GSH4AState.cd_ready?(cd_key)
+      case name
+      when "chastise"
+        return false unless stamina_ok?(10)
+        cd_secs = 15
+      when "excoriate"
+        return false unless mana_ok?(10)
+        cd_secs = 15
+      else
+        cd_secs = 15
+      end
+      stance_offensive
+      waitrt?
+      return false if dead?
+      fput "feat #{name}"
+      waitrt?
+      GSH4AState.set_cd(cd_key, cd_secs)
+      true
+
+    when "mount_charge"
+      return false unless GSH4AState.mounted
+      mount_charge(target_id)
+
+    when "mount_trample"
+      return false unless GSH4AState.mounted
+      mount_trample
+
+    when "cman"
+      cman_name = entry["name"].to_s
+      c = (@profile["cmans"] || []).find { |x| x["name"].to_s == cman_name }
+      return false unless c
+      fire_cman(c, target_id)
+
+    when "technique"
+      tech_name = entry["name"].to_s
+      tech = (@profile["techniques"] || []).find { |t| t["name"].to_s == tech_name }
+      return false unless tech
+      return false unless technique_ready?(tech)
+      return false unless stamina_ok?(tech["stamina"].to_i)
+      log "Rotation technique: #{tech['name']}"
+      switched_grip = switch_grip_for_ability(tech)
+      stance_offensive
+      waitrt?
+      return false if dead?
+      fput tech["verb"].to_s
+      waitrt?
+      @technique_on_cd[tech_name.downcase] = true
+      restore_default_grip unless switched_grip.empty?
+      true
+
+    when "warcry"
+      wg = @profile["warrior_guild"] || {}
+      cry_key  = entry["key"].to_s
+      cry_def  = WG_WARCRIES.find { |c| c[:key] == cry_key }
+      return false unless cry_def
+      saved = (wg["warcries"] || {})[cry_key] || {}
+      return false unless saved["enabled"]
+      use_aoe   = cry_def[:stamina_aoe] && saved["aoe"]
+      stam_cost = use_aoe ? cry_def[:stamina_aoe] : cry_def[:stamina_single]
+      return false if stam_cost && stam_cost > 0 && !stamina_ok?(stam_cost)
+      log "War Cry: #{cry_def[:cmd]} (rotation)"
+      waitrt?
+      if cry_def[:type] == :supporting || use_aoe
+        fput "warcry #{cry_def[:cmd]}"
+      else
+        fput "warcry #{cry_def[:cmd]} ##{target_id}"
+      end
+      waitrt?
+      pause 0.3
+      true
+
+    when "warrior_feint"
+      wg = @profile["warrior_guild"] || {}
+      return false unless wg["feint_enabled"]
+      waitrt?
+      fput "wtrick feint ##{target_id}"
+      waitrt?
+      pause 0.2
+      true
+
+    when "warrior_spit"
+      wg = @profile["warrior_guild"] || {}
+      return false unless wg["spit_enabled"]
+      loc = wg["spit_location"].to_s.gsub("_", " ")
+      waitrt?
+      fput "wtrick spit ##{target_id} #{loc}"
+      waitrt?
+      pause 0.2
+      true
+
+    when "rogue_ss"
+      check_silent_strike(target_id)
+
+    when "vissi"
+      arc_key  = entry["arcarium"].to_s
+      vis_name = entry["name"].to_s
+      arc_cfg  = (@profile["arcarium"] || {})[arc_key] || {}
+      return false unless arc_cfg["enabled"]
+      v = (arc_cfg["vissi"] || []).find { |x| x.is_a?(Hash) && x["name"].to_s == vis_name }
+      return false unless v
+      fire_single_vissi(arc_key, v)
+
+    when "trinket"
+      slot    = entry["slot"].to_s
+      ab_key  = entry["ability_key"].to_s
+      ab_obj  = all_abilities.find { |a| a["_slot"].to_s == slot && a["key"].to_s == ab_key }
+      return false unless ab_obj
+      fire_ability(ab_obj, target_id)
+
+    else
+      false
+    end
+  rescue => e
+    warn "fire_weapon_rot_entry error: #{e.message}"
+    false
+  end
+
   # Fires Silent Strike from stealth in place of a normal melee swing.
   # Hides first if needed (HIDE or Vanish), then fires FEAT SILENTSTRIKE [mod] #id.
   # Returns true if the attack was handled so the loop skips the normal swing.
   def self.check_silent_strike(target_id)
     rg = @profile["rogue_guild"] || {}
     return false unless rg["ss_enabled"]
+    return false if weapon_rot_has_type?("rogue_ss")
     unless stamina_ok?(20)
       log "Silent Strike: skipping -- stamina below reserve (cost 20)"
       return false
@@ -7880,7 +8539,6 @@ module Engine
       unless @cc_responded
         builtin_handled = cc_removable && run_abilities_when("emergency_status")
         run_cc_priorities unless builtin_handled
-        check_society_restoration
         demon_fetch_weapon
         servant_fetch_weapon
         check_incarnate_armor_emergency(stunned, in_rt)
@@ -7893,9 +8551,7 @@ module Engine
     # low_health: fires once per dip below threshold; resets when HP recovers above it
     if hp_pct < low_health_pct
       unless @low_health_responded
-        check_rejuvenation
         run_low_health_priorities
-        check_society_restoration
         @low_health_responded = true
       end
     else
@@ -7915,7 +8571,6 @@ module Engine
 
     pct = percenthealth rescue 100
     if pct < retreat_pct
-      check_society_restoration
       demon_fetch_weapon
       servant_fetch_weapon
       handle_health_retreat(pct)
@@ -8274,10 +8929,12 @@ module Engine
   def self.single_target_rotation(target)
     return unless target
     id = target.id
+    @weapon_rot_idx = 0
+    @weapon_aoe_rot_idx = 0
 
     stand_if_prone
     ensure_mounted
-    mount_charge(id)
+    mount_charge(id) unless weapon_rotation_active?
     return unless hostile_npcs.any? { |n| n.id == id }
     beseech_holy_weapon
 
@@ -8347,7 +9004,11 @@ module Engine
       next if prof =~ /Warrior/i && check_berserk(id)
 
       # AoE techniques when enough foes are present
-      next if fire_aoe_techniques(count)
+      if weapon_rotation_active?
+        execute_weapon_aoe_step(id) if aoe_needed?
+      else
+        next if fire_aoe_techniques(count)
+      end
 
       run_arcarium_moment("aoe", id) if aoe_needed?
       if !gigas_present? && npc_count >= (pref("swarm_threshold") || SWARM_THRESHOLD_DEFAULT).to_i
@@ -8396,25 +9057,29 @@ module Engine
           check_warrior_tricks(id)
         end
         next if p =~ /Rogue/i && check_silent_strike(id)
-        stance_offensive
-        unless fire_assault_techniques
-          unless walk_rotation(id)
-            sync_mount_state
-            waitrt?; waitcastrt?
-            wpn_cfg = @profile.dig("weapons", "primary") || {}
-            loc     = wpn_cfg["target_location"].to_s.strip
-            amb     = @profile.dig("weapons", "ambush") || {}
-            if amb["enabled"]
-              if amb["hide_first"]
-                fput "hide"
-                pause 1
+        if weapon_rotation_active?
+          execute_weapon_rotation_step(id)
+        else
+          stance_offensive
+          unless fire_assault_techniques
+            unless walk_rotation(id)
+              sync_mount_state
+              waitrt?; waitcastrt?
+              wpn_cfg = @profile.dig("weapons", "primary") || {}
+              loc     = wpn_cfg["target_location"].to_s.strip
+              amb     = @profile.dig("weapons", "ambush") || {}
+              if amb["enabled"]
+                if amb["hide_first"]
+                  fput "hide"
+                  pause 1
+                end
+                target_noun = (GameObj[id]&.noun rescue nil) || id.to_s
+                fput loc.empty? ? "ambush #{target_noun}" : "ambush #{target_noun} #{loc}"
+              else
+                fput loc.empty? ? "attack ##{id}" : "attack ##{id} #{loc}"
               end
-              target_noun = (GameObj[id]&.noun rescue nil) || id.to_s
-              fput loc.empty? ? "ambush #{target_noun}" : "ambush #{target_noun} #{loc}"
-            else
-              fput loc.empty? ? "attack ##{id}" : "attack ##{id} #{loc}"
+              waitrt?
             end
-            waitrt?
           end
         end
       end
@@ -8427,7 +9092,7 @@ module Engine
     run_arcarium_moment("engagement")
     fire_shield_specs
     fire_armor_specs
-    mount_trample if GSH4AState.mounted
+    mount_trample if GSH4AState.mounted && !weapon_rotation_active?
     stance_guarded
   end
 
@@ -8550,6 +9215,8 @@ module Engine
     @cc_responded         = false
     @low_health_responded = false
     @feeble_responded     = false
+    @weapon_rot_idx       = 0
+    @weapon_aoe_rot_idx   = 0
 
     log "Ready -- #{GSH4AState.mounted ? 'mounted' : 'unmounted'} | Group: #{@group_members_cache&.any? ? @group_members_cache.join(', ') : 'solo'}"
     log "Entering combat loop"
@@ -8565,7 +9232,6 @@ module Engine
 
       check_society_maintain
       check_society_mana
-      check_society_restoration
       maintain_sonic_songs
       cast_maintain_spells
       run_abilities_when("maintenance")
@@ -8631,7 +9297,8 @@ module Engine
       if count >= pref("multi_threshold").to_i
         run_abilities_when("engagement", target_id)
       end
-      cmans_of_type("engagement").each { |c| fire_cman(c) }
+      cmans_of_type("engagement").each   { |c| fire_cman(c) }
+      cmans_of_type("maintenance").each  { |c| fire_cman(c) }
 
       run_aoe_phase(target_id) if target_id
       single_target_rotation(target) if target
