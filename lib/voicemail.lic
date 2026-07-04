@@ -1,32 +1,98 @@
-VERSION = '2.0.0 (June 19, 2026)'
+VERSION = '3.0.0 (July 4, 2026)'
 =begin
-	Voicemail Version: 2.0.0 (June 19, 2026)
+	Voicemail Version: 3.0.0 (July 4, 2026)
 
 	Usage:
 
-	;voicemail                            Starts the background listener
-	voicemail help                        Brings up this message
-	voicemail check                       Checks your saved messages
-	voicemail delete <message #>          Deletes a saved message
-	voicemail delete all                  Deletes all saved messages
+	;voicemail                             Starts the background listener
+	;voicemail setup                       Opens the configuration window
+	;voicemail help                        Brings up this message
+	;voicemail afk on                      Enables AFK auto-reply and call forwarding
+	;voicemail afk off                     Disables AFK auto-reply and call forwarding
+	;voicemail check (whispers|chats|thoughts|all) (#|all)
+	;voicemail delete (whispers|chats|thoughts|all) (#|all)
 
 	Messages are saved to:
 	  <lich data dir>/<game>/<char>/voicemail.yaml
 
-	Captures ThoughtNet (Focused) and LNet (Private) messages.
+	Settings are saved to:
+	  <lich data dir>/<game>/<char>/voicemail_settings.yaml
+
+	Captures ThoughtNet (Focused), LNet (Private/Chat), and whispers.
 	OSA crew automation messages are silently ignored.
-	Enjoy
+
+	Call Forwarding:
+	  When AFK is on and a webhook URL is configured, incoming messages
+	  are forwarded to Discord via webhook. Set up in ;voicemail setup.
+
+	AFK Auto-Reply:
+	  When AFK is on, replies to senders using their original channel
+	  (think back for thoughts, ;chat for LNet, whisper for whispers).
+	  A configurable cooldown (minimum 60s) prevents reply spam.
 
 	Originally by Peggyanne. Modernized for Lich 5.18 / Ruby 4.0.
+
+	Changelog:
+	July 4, 2026 - Full rewrite. Added GTK3 setup window with webhook URL, AFK reply message, AFK cooldown timer
+	               (min 60s), and per-type capture toggles for whispers, chats, and thoughts. Added AFK mode with
+	               per-channel auto-reply and Discord webhook call forwarding when AFK is on and webhook is set.
+	               Added category-aware check/delete: voicemail (check|delete) (whispers|chats|thoughts|all) (#|all).
+	               Messages tagged by type for filtered display. Settings stored in voicemail_settings.yaml. Both
+	               ;voicemail launch-time and in-game voicemail upstream hook commands supported for all operations.
+	               Whisper detection split into three distinct types: whisper (private), visible_whisper (leans over),
+	               and ooc_whisper (OOC); all matched under the whispers filter for check/delete commands.
 =end
 
 require 'yaml'
+require 'net/http'
+require 'json'
+require 'uri'
 
 # ---------------------------------------------------------------------------
-# YAML persistence
+# Settings YAML
 # ---------------------------------------------------------------------------
 
-VOICEMAIL_YAML = File.join(DATA_DIR, XMLData.game, Char.name, 'voicemail.yaml')
+VOICEMAIL_YAML    = File.join(DATA_DIR, XMLData.game, Char.name, 'voicemail.yaml')
+SETTINGS_YAML     = File.join(DATA_DIR, XMLData.game, Char.name, 'voicemail_settings.yaml')
+MIN_AFK_COOLDOWN  = 60
+
+def default_settings
+	{
+		'webhook_url'    => '',
+		'afk_message'    => 'I am currently AFK. I will get back to you shortly.',
+		'afk_cooldown'   => 120,
+		'capture_whispers' => true,
+		'capture_chats'    => true,
+		'capture_thoughts' => true,
+	}
+end
+
+def load_settings
+	unless File.exist?(SETTINGS_YAML)
+		Dir.mkdir(File.dirname(SETTINGS_YAML)) unless Dir.exist?(File.dirname(SETTINGS_YAML))
+		save_settings(default_settings)
+	end
+	raw = YAML.safe_load(File.read(SETTINGS_YAML), permitted_classes: [Symbol])
+	default_settings.merge(raw.is_a?(Hash) ? raw : {})
+rescue => e
+	respond "Voicemail: error loading settings -- #{e.message}"
+	default_settings
+end
+
+def save_settings(s)
+	File.write(SETTINGS_YAML, YAML.dump(s))
+rescue => e
+	respond "Voicemail: error saving settings -- #{e.message}"
+end
+
+$vm_settings = load_settings
+$vm_afk      = false
+# Per-sender cooldown tracker: { sender => Time }
+$vm_afk_sent = {}
+
+# ---------------------------------------------------------------------------
+# Message YAML
+# ---------------------------------------------------------------------------
 
 def load_messages
 	unless File.exist?(VOICEMAIL_YAML)
@@ -36,86 +102,67 @@ def load_messages
 	raw = YAML.safe_load(File.read(VOICEMAIL_YAML), permitted_classes: [Symbol])
 	raw.is_a?(Array) ? raw : []
 rescue => e
-	respond "Voicemail: error loading YAML -- #{e.message}"
+	respond "Voicemail: error loading messages -- #{e.message}"
 	[]
 end
 
 def save_messages(msgs)
 	File.write(VOICEMAIL_YAML, YAML.dump(msgs))
 rescue => e
-	respond "Voicemail: error saving YAML -- #{e.message}"
+	respond "Voicemail: error saving messages -- #{e.message}"
 end
 
-def append_message(entry)
+def append_message(type, sender, text)
 	msgs = load_messages
-	return if msgs.include?(entry)
+	ts   = Time.now.strftime('%Y-%m-%d %H:%M:%S')
+	entry = { 'type' => type, 'sender' => sender, 'text' => text, 'time' => ts }
+	return if msgs.any? { |m| m == entry }
 	msgs << entry
 	save_messages(msgs)
 end
 
 # ---------------------------------------------------------------------------
-# UI helpers
+# Call forwarding via Discord webhook
 # ---------------------------------------------------------------------------
 
-def help_display
-	respond ''
-	respond "Voicemail #{VERSION}"
-	respond ''
-	respond '   ;voicemail                            Starts the background listener'
-	respond '   voicemail help                        Brings up this message'
-	respond '   voicemail check                       Checks your saved messages'
-	respond '   voicemail delete <message #>          Deletes a saved message'
-	respond '   voicemail delete all                  Deletes all saved messages'
-	respond ''
-	respond "   Messages saved to: #{VOICEMAIL_YAML}"
-	respond ''
-end
-
-def check_messages
-	msgs = load_messages
-	respond ''
-	if msgs.empty?
-		respond 'You have no saved messages.'
-	else
-		respond "You have #{msgs.length} saved message(s):"
-		respond ''
-		msgs.each_with_index do |msg, idx|
-			respond "  #{idx + 1}. #{msg}"
-		end
+def send_webhook(sender, type, text)
+	url = $vm_settings['webhook_url'].to_s.strip
+	return if url.empty?
+	begin
+		uri  = URI(url)
+		body = { content: "[GemStone IV Voicemail] #{type.upcase} from #{sender}: \"#{text}\"" }.to_json
+		Net::HTTP.post(uri, body, 'Content-Type' => 'application/json')
+	rescue => e
+		respond "Voicemail: webhook error -- #{e.message}"
 	end
-	respond ''
 end
 
-def delete_message(num_str)
-	idx = num_str.to_i - 1
-	msgs = load_messages
-	if idx < 0 || idx >= msgs.length
-		respond ''
-		respond "Voicemail: no message ##{num_str} to delete."
-		respond ''
-		return
+# ---------------------------------------------------------------------------
+# AFK auto-reply
+# ---------------------------------------------------------------------------
+
+def send_afk_reply(sender, channel)
+	return unless $vm_afk
+	msg     = $vm_settings['afk_message'].to_s.strip
+	return if msg.empty?
+	cooldown = [$vm_settings['afk_cooldown'].to_i, MIN_AFK_COOLDOWN].max
+	last_sent = $vm_afk_sent[sender]
+	return if last_sent && (Time.now - last_sent) < cooldown
+	$vm_afk_sent[sender] = Time.now
+	case channel
+	when :thought
+		fput "think to #{sender} #{msg}"
+	when :chat
+		fput ";chat to #{sender} #{msg}"
+	when :whisper
+		fput "whisper ooc #{sender} #{msg}"
 	end
-	respond ''
-	respond "Deleting message ##{num_str}..."
-	msgs.delete_at(idx)
-	save_messages(msgs)
-	respond "Message ##{num_str} deleted!"
-	respond ''
-	check_messages
-end
-
-def delete_all_messages
-	respond ''
-	respond 'Deleting all saved messages...'
-	save_messages([])
-	respond 'All messages deleted!'
-	respond ''
-	check_messages
 end
 
 # ---------------------------------------------------------------------------
-# OSA noise filter -- messages we never want to record
+# OSA noise filter
 # ---------------------------------------------------------------------------
+
 OSA_NOISE = [
 	/Health: .* \| Mana: .* \| Stamina: .* \| Spirit:/,
 	/Weekly .*:/,
@@ -129,27 +176,338 @@ def osa_noise?(text)
 end
 
 # ---------------------------------------------------------------------------
+# UI helpers
+# ---------------------------------------------------------------------------
+
+def filtered_messages(type_filter)
+	msgs = load_messages
+	case type_filter.to_s.downcase
+	when 'whispers', 'whisper'
+		msgs.select { |m| m['type'] == 'whisper' }
+	when 'chats', 'chat'
+		msgs.select { |m| m['type'] == 'chat' }
+	when 'thoughts', 'thought'
+		msgs.select { |m| m['type'] == 'thought' }
+	else
+		msgs
+	end
+end
+
+def help_display
+	respond ''
+	respond "Voicemail #{VERSION}"
+	respond ''
+	respond '   Launch commands (script not running):'
+	respond '   ;voicemail                                          Starts the background listener'
+	respond '   ;voicemail setup                                    Opens the configuration window'
+	respond '   ;voicemail afk on/off                              Enables or disables AFK mode'
+	respond '   ;voicemail check (whispers|chats|thoughts|all) (#|all)'
+	respond '   ;voicemail delete (whispers|chats|thoughts|all) (#|all)'
+	respond ''
+	respond '   In-game commands (while listener is running):'
+	respond '   voicemail help                                      Brings up this message'
+	respond '   voicemail setup                                     Opens the configuration window'
+	respond '   voicemail afk on/off                               Enables or disables AFK mode'
+	respond '   voicemail check (whispers|chats|thoughts|all) (#|all)'
+	respond '   voicemail delete (whispers|chats|thoughts|all) (#|all)'
+	respond ''
+	respond "   Messages saved to: #{VOICEMAIL_YAML}"
+	respond "   Settings saved to: #{SETTINGS_YAML}"
+	respond ''
+end
+
+def check_messages(type_filter = 'all', num = 'all')
+	respond ''
+	if type_filter == 'all'
+		# Display each category separated by a break
+		{ 'thoughts' => 'thought', 'chats' => 'chat', 'whispers' => 'whisper' }.each do |label, type|
+			msgs = load_messages.select { |m| m['type'] == type }
+			next if msgs.empty?
+			respond "--- #{label.upcase} ---"
+			respond ''
+			if num.to_s.downcase == 'all'
+				msgs.each_with_index do |m, idx|
+					respond "  #{idx + 1}. [#{m['type']}] #{m['time']} -- #{m['sender']}: \"#{m['text']}\""
+				end
+			else
+				idx = num.to_i - 1
+				if idx >= 0 && idx < msgs.length
+					m = msgs[idx]
+					respond "  #{idx + 1}. [#{m['type']}] #{m['time']} -- #{m['sender']}: \"#{m['text']}\""
+				end
+			end
+			respond ''
+		end
+		total = load_messages.length
+		respond total > 0 ? "#{total} total message(s)." : 'You have no saved messages.'
+	else
+		msgs = filtered_messages(type_filter)
+		label = type_filter == 'all' ? 'messages' : "#{type_filter} messages"
+		if msgs.empty?
+			respond "You have no saved #{label}."
+		else
+			respond "--- #{type_filter.upcase} ---"
+			respond ''
+			if num.to_s.downcase == 'all'
+				respond "You have #{msgs.length} saved #{label}:"
+				respond ''
+				msgs.each_with_index do |m, idx|
+					respond "  #{idx + 1}. [#{m['type']}] #{m['time']} -- #{m['sender']}: \"#{m['text']}\""
+				end
+			else
+				idx = num.to_i - 1
+				if idx < 0 || idx >= msgs.length
+					respond "Voicemail: no #{type_filter} message ##{num}."
+				else
+					m = msgs[idx]
+					respond "  #{idx + 1}. [#{m['type']}] #{m['time']} -- #{m['sender']}: \"#{m['text']}\""
+				end
+			end
+		end
+	end
+	respond ''
+end
+
+def delete_message(type_filter, num)
+	all_msgs     = load_messages
+	filtered     = filtered_messages(type_filter)
+	label        = type_filter == 'all' ? 'messages' : "#{type_filter} messages"
+
+	if num.to_s.downcase == 'all'
+		respond ''
+		respond "Deleting all #{label}..."
+		if type_filter == 'all'
+			save_messages([])
+		else
+			type_key = type_filter.sub(/s$/, '')
+			save_messages(all_msgs.reject { |m| m['type'] == type_key })
+		end
+		respond "All #{label} deleted!"
+		respond ''
+	else
+		idx = num.to_i - 1
+		if idx < 0 || idx >= filtered.length
+			respond ''
+			respond "Voicemail: no #{type_filter} message ##{num} to delete."
+			respond ''
+			return
+		end
+		target = filtered[idx]
+		all_msgs.delete(target)
+		save_messages(all_msgs)
+		respond ''
+		respond "#{type_filter.capitalize} message ##{num} deleted!"
+		respond ''
+	end
+	check_messages(type_filter)
+end
+
+# ---------------------------------------------------------------------------
+# GTK3 setup window
+# ---------------------------------------------------------------------------
+
+def open_setup_window
+	$vm_settings = load_settings
+	Thread.new do
+		begin
+			window = Gtk::Window.new
+			window.title = "Voicemail Setup -- #{Char.name}"
+			window.set_default_size(520, 420)
+			window.set_border_width(12)
+			window.keep_above = true
+			window.signal_connect('destroy') { window = nil }
+
+			outer = Gtk::Box.new(:vertical, 10)
+			outer.set_border_width(8)
+			window.add(outer)
+
+			# -- Header --
+			hdr = Gtk::Label.new
+			hdr.use_markup = true
+			hdr.label = "<b>Voicemail Settings</b>"
+			hdr.set_xalign(0.0)
+			outer.pack_start(hdr, false, false, 0)
+			outer.pack_start(Gtk::Separator.new(:horizontal), false, false, 4)
+
+			entries = {}
+
+			make_row = lambda do |label_text, key, default, tip, width = 340|
+				row = Gtk::Box.new(:horizontal, 8)
+				lab = Gtk::Label.new(label_text)
+				lab.set_xalign(0.0)
+				lab.set_size_request(180, -1)
+				lab.set_tooltip_text(tip)
+				ent = Gtk::Entry.new
+				ent.set_size_request(width, -1)
+				val = $vm_settings[key]
+				ent.text = (val.nil? || val.to_s.empty?) ? default.to_s : val.to_s
+				ent.set_tooltip_text(tip)
+				row.pack_start(lab, false, false, 0)
+				row.pack_start(ent, false, false, 0)
+				outer.pack_start(row, false, false, 0)
+				entries[key] = ent
+			end
+
+			make_check = lambda do |label_text, key, default, tip|
+				cb = Gtk::CheckButton.new(label_text)
+				cb.active = $vm_settings.key?(key) ? !!$vm_settings[key] : !!default
+				cb.set_tooltip_text(tip)
+				cb.set_halign(:start)
+				outer.pack_start(cb, false, false, 0)
+				entries[key] = cb
+			end
+
+			# -- Webhook --
+			outer.pack_start(Gtk::Separator.new(:horizontal), false, false, 4)
+			hdr2 = Gtk::Label.new
+			hdr2.use_markup = true
+			hdr2.label = "<b>Call Forwarding:</b>"
+			hdr2.set_xalign(0.0)
+			outer.pack_start(hdr2, false, false, 0)
+
+			make_row.call(
+				'Discord Webhook URL:',
+				'webhook_url', '',
+				'Discord webhook URL for call forwarding. Leave blank to disable. Messages are only forwarded when AFK mode is on. To get a webhook URL: (1) Create a private Discord server. (2) Go to a channel Settings > Integrations > Webhooks > New Webhook. (3) Copy the webhook URL and paste it here. Enable Discord mobile notifications on that server to receive pings on your phone.',
+				340
+			)
+
+			# -- AFK --
+			outer.pack_start(Gtk::Separator.new(:horizontal), false, false, 4)
+			hdr3 = Gtk::Label.new
+			hdr3.use_markup = true
+			hdr3.label = "<b>AFK Auto-Reply:</b>"
+			hdr3.set_xalign(0.0)
+			outer.pack_start(hdr3, false, false, 0)
+
+			make_row.call(
+				'AFK Reply Message:',
+				'afk_message',
+				'I am currently AFK. I will get back to you shortly.',
+				'Message sent back to the sender when AFK mode is on. Replies via the same channel they used (think, chat, whisper).',
+				340
+			)
+
+			make_row.call(
+				'Reply Cooldown (seconds):',
+				'afk_cooldown', 120,
+				'How long to wait before sending another AFK reply to the same sender. Minimum enforced value is 60 seconds regardless of input.',
+				80
+			)
+
+			# -- Capture toggles --
+			outer.pack_start(Gtk::Separator.new(:horizontal), false, false, 4)
+			hdr4 = Gtk::Label.new
+			hdr4.use_markup = true
+			hdr4.label = "<b>Capture Settings:</b>"
+			hdr4.set_xalign(0.0)
+			outer.pack_start(hdr4, false, false, 0)
+
+			make_check.call(
+				'Capture Whispers',
+				'capture_whispers', true,
+				'Save incoming whispers to voicemail. Whisper replies use "whisper ooc <sender> <message>".'
+			)
+			make_check.call(
+				'Capture Chats (LNet Private)',
+				'capture_chats', true,
+				'Save incoming LNet private messages to voicemail. Replies use ";chat to <sender> <message>".'
+			)
+			make_check.call(
+				'Capture Thoughts (ThoughtNet)',
+				'capture_thoughts', true,
+				'Save incoming ThoughtNet focused thoughts to voicemail. Replies use "think to <sender> <message>".'
+			)
+
+			# -- Buttons --
+			outer.pack_start(Gtk::Separator.new(:horizontal), false, false, 6)
+			btn_row = Gtk::Box.new(:horizontal, 8)
+			btn_row.set_halign(:end)
+
+			save_btn = Gtk::Button.new(label: 'Save')
+			save_btn.signal_connect('clicked') do
+				new_settings = {}
+				entries.each do |key, widget|
+					if widget.is_a?(Gtk::CheckButton)
+						new_settings[key] = widget.active?
+					else
+						new_settings[key] = widget.text.strip
+					end
+				end
+				cooldown = new_settings['afk_cooldown'].to_i
+				new_settings['afk_cooldown'] = [cooldown, MIN_AFK_COOLDOWN].max
+				save_settings(new_settings)
+				$vm_settings = new_settings
+				respond "Voicemail: settings saved."
+				GLib::Idle.add { window&.destroy; false }
+			end
+
+			cancel_btn = Gtk::Button.new(label: 'Cancel')
+			cancel_btn.signal_connect('clicked') do
+				GLib::Idle.add { window&.destroy; false }
+			end
+
+			btn_row.pack_start(cancel_btn, false, false, 0)
+			btn_row.pack_start(save_btn, false, false, 0)
+			outer.pack_start(btn_row, false, false, 0)
+
+			GLib::Idle.add do
+				window.show_all
+				false
+			end
+		rescue => e
+			respond "Voicemail: setup window error -- #{e.message}"
+		end
+	end
+end
+
+# ---------------------------------------------------------------------------
 # Handle launch-time arguments
 # ---------------------------------------------------------------------------
+
 case variable[1].to_s.downcase
 when 'help', '?'
 	help_display
+	exit
+when 'setup'
+	open_setup_window
+	loop { sleep 0.5 }
+when 'afk'
+	case variable[2].to_s.downcase
+	when 'on'
+		$vm_afk = true
+		respond "Voicemail: AFK mode ON. Auto-reply and call forwarding enabled."
+	when 'off'
+		$vm_afk = false
+		$vm_afk_sent.clear
+		respond "Voicemail: AFK mode OFF."
+	end
+	exit
+when 'check'
+	type = variable[2].to_s.empty? ? 'all' : variable[2].to_s.downcase
+	num  = variable[3].to_s.empty? ? 'all' : variable[3].to_s.downcase
+	check_messages(type, num)
+	exit
+when 'delete'
+	type = variable[2].to_s.empty? ? 'all' : variable[2].to_s.downcase
+	num  = variable[3].to_s.empty? ? 'all' : variable[3].to_s.downcase
+	delete_message(type, num)
 	exit
 end
 
 # ---------------------------------------------------------------------------
 # If a listener instance is already running, don't start a second one.
-# Script.list includes the current instance, so check for count > 1.
 # ---------------------------------------------------------------------------
+
 if Script.list.count { |s| s.name == 'voicemail' } > 1
 	respond "Voicemail: listener is already running."
 	exit
 end
 
 # ---------------------------------------------------------------------------
-# UpstreamHook -- intercepts ;voicemail commands before they reach the game
-# server. Returns nil to swallow the command, or xml to pass it through.
+# UpstreamHook - intercepts ;voicemail commands typed in game
 # ---------------------------------------------------------------------------
+
 VOICEMAIL_HOOK = 'voicemail_command_hook'
 UpstreamHook.remove(VOICEMAIL_HOOK)
 
@@ -157,17 +515,30 @@ $voicemail_hook = proc do |xml|
 	next xml unless xml.start_with?('<c>')
 	cmd = xml.sub(/\A<c>/i, '').sub(/<\/c>\z/i, '').strip
 	case cmd
-	when /^voicemail\s+check$/i
-		check_messages
-		nil
 	when /^voicemail\s+help$/i
 		help_display
 		nil
-	when /^voicemail\s+delete\s+all$/i
-		delete_all_messages
+	when /^voicemail\s+setup$/i
+		open_setup_window
 		nil
-	when /^voicemail\s+delete\s+(\d+)$/i
-		delete_message($1)
+	when /^voicemail\s+afk\s+on$/i
+		$vm_afk = true
+		respond "Voicemail: AFK mode ON."
+		nil
+	when /^voicemail\s+afk\s+off$/i
+		$vm_afk = false
+		$vm_afk_sent.clear
+		respond "Voicemail: AFK mode OFF."
+		nil
+	when /^voicemail\s+check(?:\s+(\S+)(?:\s+(\S+))?)?$/i
+		type = ($1 || 'all').downcase
+		num  = ($2 || 'all').downcase
+		check_messages(type, num)
+		nil
+	when /^voicemail\s+delete(?:\s+(\S+)(?:\s+(\S+))?)?$/i
+		type = ($1 || 'all').downcase
+		num  = ($2 || 'all').downcase
+		delete_message(type, num)
 		nil
 	else
 		xml
@@ -177,37 +548,84 @@ end
 UpstreamHook.add(VOICEMAIL_HOOK, $voicemail_hook)
 
 # ---------------------------------------------------------------------------
-# Cleanup on stop -- remove the hook so no orphaned intercepts remain.
+# Cleanup on stop
 # ---------------------------------------------------------------------------
+
 before_dying do
 	UpstreamHook.remove(VOICEMAIL_HOOK)
 end
 
 # ---------------------------------------------------------------------------
-# Ensure YAML exists before entering the main loop
+# Ensure YAML exists
 # ---------------------------------------------------------------------------
+
 load_messages
 
 respond ''
-respond "Voicemail #{VERSION} running. Messages will be saved to:"
-respond "  #{VOICEMAIL_YAML}"
+respond "Voicemail #{VERSION} running."
+respond "  AFK mode: #{$vm_afk ? 'ON' : 'OFF'} -- type ;voicemail afk on to enable"
+respond "  Settings: ;voicemail setup"
+respond "  Messages: #{VOICEMAIL_YAML}"
 respond ''
 
 # ---------------------------------------------------------------------------
 # Main game-line listener
 # ---------------------------------------------------------------------------
+
 while (line = get)
 	case line
+
+	# ThoughtNet (Focused)
 	when /^\[Focused\] (\S+) \S+, "(.+)"/
-		person  = $1
-		message = $2
-		ts      = Time.now.strftime('%Y-%m-%d %H:%M:%S')
-		append_message("#{ts}: #{person} thought, \"#{message}\"")
+		next unless $vm_settings['capture_thoughts']
+		sender  = $1
+		text    = $2
+		append_message('thought', sender, text)
+		if $vm_afk
+			send_afk_reply(sender, :thought)
+			send_webhook(sender, 'thought', text)
+		end
+
+	# LNet Private / Chat
 	when /^\[Private\]-GSIV:([^:]+): "(.+)"/
-		person  = $1.strip
-		message = $2
-		next if osa_noise?(message)
-		ts = Time.now.strftime('%Y-%m-%d %H:%M:%S')
-		append_message("#{ts}: #{person} chat, \"#{message}\"")
+		next unless $vm_settings['capture_chats']
+		sender  = $1.strip
+		text    = $2
+		next if osa_noise?(text)
+		append_message('chat', sender, text)
+		if $vm_afk
+			send_afk_reply(sender, :chat)
+			send_webhook(sender, 'chat', text)
+		end
+
+	# Whispers -- OOC, visible, and standard all stored as type 'whisper' with subtype label
+	when /^\(OOC\) ([A-Z][a-z]+)'s player whispers?,\s*"(.+)"/
+		next unless $vm_settings['capture_whispers']
+		sender = $1
+		text   = $2
+		append_message('whisper', sender, "[OOC] #{text}")
+		if $vm_afk
+			send_afk_reply(sender, :whisper)
+			send_webhook(sender, 'OOC whisper', text)
+		end
+	when /^([A-Z][a-z]+) leans over and whispers?,\s*"(.+)"/
+		next unless $vm_settings['capture_whispers']
+		sender = $1
+		text   = $2
+		append_message('whisper', sender, "[Visible] #{text}")
+		if $vm_afk
+			send_afk_reply(sender, :whisper)
+			send_webhook(sender, 'visible whisper', text)
+		end
+	when /^([A-Z][a-z]+) whispers?,\s*"(.+)"/
+		next unless $vm_settings['capture_whispers']
+		sender = $1
+		text   = $2
+		append_message('whisper', sender, text)
+		if $vm_afk
+			send_afk_reply(sender, :whisper)
+			send_webhook(sender, 'whisper', text)
+		end
+
 	end
 end
