@@ -1,0 +1,194 @@
+=begin
+  cfind.lic
+
+  Find a creature. Powered by huntplan script.
+  Utilizes huntplan's shortest round-trip algorithm for efficiently navigating hunting area.
+  Maximizes creature spawn rates by pausing only in spawn rooms.
+
+  ";cfind giant rat" - Runs huntplan to cache a search path for the specified creature.
+  ";cfind bounty" - Runs huntplan to cache a search path for your current creature bounty.
+  ";cfind" - Continue finding more creatures using the cached search path.
+
+  author: Mertyn
+  game: Gemstone
+  tags: bounty, advguild, bounties, hunting, combat
+  version: 1.0
+=end
+
+if !Script.exists?('huntplan')
+  _respond Lich::Messaging.monsterbold("[cfind] Downloading required script: huntplan.lic")
+  Script.run('repository', 'download huntplan.lic --author=Mertyn')
+end
+
+module CFind
+
+########################################################################################################################
+# module data members
+
+class Data
+	attr_accessor :current_rid,
+		:evaluation_time,
+		:flee_targets,
+		:move_time,
+		:own_room,
+		:route_index,
+		:hunting_route,
+		:spawn_rids
+
+	def initialize
+		@evaluation_time = 0
+		@move_time = 0
+		@own_room = false
+		@route_index = 0
+	end
+end
+
+@@data = Data.new
+def self.data
+     @@data
+end
+
+########################################################################################################################
+# skip_reasons?
+
+def self.skip_reasons?
+	reasons = Array.new
+
+	GameObj.pcs.each do |obj|
+		next if Lich::Gemstone::Group.members.any? { |group_obj| group_obj.id == obj.id }
+		reasons.push("pc{ #{obj.name} }")
+	end
+
+	GameObj.loot.each do |obj|
+		next if Lich::Gemstone::Group.disks.any? { |group_obj| group_obj.id == obj.id }
+		if obj.name =~ /([A-Z][a-z]+) (?:bassinet|cassone|chest|coffer|coffin|coffret|disk|hamper|saucer|sphere|trunk|tureen)/
+			reasons.push("loot{ #{obj.name} }")
+		end
+	end
+
+	return reasons
+end
+
+
+########################################################################################################################
+# go_next_room
+
+def self.go_next_room
+	# the move() procs often waitfor certain lines from plain text, and the xml screws it up. example room 8357
+	previous_want_downstream = Script.current.want_downstream
+	Script.current.want_downstream = true
+
+	previous_index = data.route_index
+	data.route_index = (data.route_index + 1) % data.hunting_route.length
+	target_srid = data.hunting_route[data.route_index]
+	target_rid = target_srid.to_i
+
+	way = Room.current.wayto[target_srid]
+	if way.is_a?(StringProc)
+		waitrt?
+		wait_while { stunned? || webbed? }
+		clear
+		way.call
+	elsif way.is_a?(String)
+		clear
+		move(way, 5, 9999)	# effectively disable the line count short-circuit, it triggers sometimes
+	else
+		echo "error: map database movement is neither a StringProc or a String #{Room.current.id} #{target_rid} #{way.class}"
+		exit
+	end
+
+	Script.current.want_downstream = previous_want_downstream
+
+	if Room.current.id == target_rid
+		data.move_time = data.evaluation_time
+	else
+		data.route_index = previous_index
+	end
+end
+
+
+########################################################################################################################
+# script
+
+input_creature_name = Script.current.vars[0]
+
+if input_creature_name.nil?
+	if UserVars.hp['success'] != 1
+		echo "pass a create name to configure a route"
+		exit
+	end
+else
+	Script.run('huntplan', input_creature_name)
+	if UserVars.hp['success'] != 1
+		echo "huntplan failed"
+		exit
+	end
+end
+
+target_creature_regex = UserVars.hp['kill_targets'].split(',').first
+
+data.flee_targets = UserVars.hp['flee_targets'].split(',')
+data.flee_targets ||= Array.new
+
+data.hunting_route = UserVars.hp['hunting_route'].split(',')
+
+# if we're already inside the hunting area, just continue where we left off
+data.route_index = data.hunting_route.find_index { |srid| srid.to_i == Room.current.id }
+data.route_index ||= 0
+
+hp_spawn_rids = UserVars.hp['spawn_rids']
+if hp_spawn_rids
+	hp_spawn_rids.split(',').each do |srid|
+		data.spawn_rids ||= Set.new
+		data.spawn_rids.add(srid.to_i)
+	end
+end
+
+
+loop do
+	data.evaluation_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+	ready_to_move = data.evaluation_time - data.move_time >= 1
+
+	target_srid = data.hunting_route[data.route_index]
+	target_rid = target_srid.to_i
+	if Room.current.id != target_rid
+		wait_while { Script.running?('go2') }
+		Script.run('go2', target_srid)
+		data.move_time = data.evaluation_time
+		next
+	end
+
+	if data.current_rid != target_rid
+		reasons = skip_reasons?
+		data.own_room = reasons.empty?
+		if !reasons.empty?
+			_respond Lich::Messaging.monsterbold("[cfind] skipping: #{reasons.join(" | ")}")
+		end
+		data.current_rid = target_rid
+	end
+
+	if data.flee_targets.any?{ |target| obj.name =~ /#{target}/i }
+		data.own_room = false
+	end
+
+	if data.own_room
+		creature = GameObj.targets.find { |obj| obj.name =~ /#{target_creature_regex}/i }
+		if creature
+			_respond Lich::Messaging.monsterbold("[cfind] found #{creature.name}")
+			exit
+		end
+	end
+
+	fput "stand" if !checkstanding
+
+	if data.own_room && !ready_to_move && (data.spawn_rids.nil? || data.spawn_rids.include?(data.current_rid))
+		sleep 0.1
+		next
+	else
+		go_next_room()
+		next
+	end
+end
+
+
+end # module CFind
