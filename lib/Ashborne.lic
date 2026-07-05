@@ -25,6 +25,9 @@ require 'time'
 before_dying do
   Ashborne_toolkit.mark_group_not_ready if defined?(Ashborne_toolkit)
   Ashborne_toolkit.remove_anti_caster_hook if defined?(Ashborne_toolkit)
+  Ashborne_toolkit.remove_environmental_danger_hook if defined?(Ashborne_toolkit)
+  Ashborne_toolkit.remove_self_danger_hook if defined?(Ashborne_toolkit)
+  Ashborne_toolkit.remove_disarm_recovery_hook if defined?(Ashborne_toolkit)
 end
 ASHBORNE_REQUIRED_LICH_VERSION = "5.17.1"
 begin
@@ -230,6 +233,25 @@ module Ashborne_toolkit
   ANTI_CASTER_STATE_TTL = 4
   GROUP_JOBS = %w[interrupt control guardian healer dispel damage scout].freeze
   ROLE_NAMES = (["auto"] + GROUP_JOBS).freeze
+  ROLE_ALIASES = {
+    "tank" => "guardian",
+    "guard" => "guardian",
+    "protector" => "guardian",
+    "dps" => "damage",
+    "melee" => "damage",
+    "caster" => "damage",
+    "nuker" => "damage",
+    "cc" => "control",
+    "crowd" => "control",
+    "crowdcontrol" => "control",
+    "interruptor" => "interrupt",
+    "interrupter" => "interrupt",
+    "medic" => "healer",
+    "heals" => "healer",
+    "stripper" => "dispel",
+    "debuffer" => "dispel",
+    "spotter" => "scout"
+  }.freeze
   DISPEL_SPELLS = [119, 417].freeze
   VERIFIED_REACTIVE_SPELLS = [210, 214, 301, 609, 610, 1005, 1008, 1602, 1615].freeze
   VERIFIED_REACTIVE_SKILLS = ["Throatchop", "Shield Bash", "Shield Charge"].freeze
@@ -974,6 +996,8 @@ module Ashborne_toolkit
     $ashborne_huntplan_catalog_anchor = anchor.to_i
     $ashborne_huntplan_catalog_names = Array(names)
     $ashborne_huntplan_catalog_recent_rooms = []
+    $ashborne_huntplan_catalog_sweep_counter = 0
+    $ashborne_huntplan_catalog_last_sweep_at = 0.0
     $ashborne_my_area_level = level.to_i
     $ashborne_my_area_type = creature_type.to_s.empty? ? "Living" : creature_type.to_s
 
@@ -996,6 +1020,8 @@ module Ashborne_toolkit
     $ashborne_huntplan_catalog_anchor = nil
     $ashborne_huntplan_catalog_names = nil
     $ashborne_huntplan_catalog_recent_rooms = []
+    $ashborne_huntplan_catalog_sweep_counter = 0
+    $ashborne_huntplan_catalog_last_sweep_at = 0.0
     nil
   rescue
     nil
@@ -1043,6 +1069,45 @@ module Ashborne_toolkit
     Ashborne_toolkit.catalog_go2(destination, "catalog hunting movement")
   end
 
+  def catalog_sweep_destination(current_id, local_candidates = [])
+    return nil unless Ashborne_toolkit.huntplan_catalog_zone?
+    return nil unless current_id
+    return nil unless GameObj.targets.empty? && GameObj.dead.empty?
+
+    allowed = Array($ashborne_huntplan_catalog_rooms).map(&:to_i).uniq
+    return nil if allowed.length <= 3
+
+    now = Time.now.to_f
+    $ashborne_huntplan_catalog_sweep_counter = $ashborne_huntplan_catalog_sweep_counter.to_i + 1
+    return nil if $ashborne_huntplan_catalog_sweep_counter < 7
+    return nil if now - $ashborne_huntplan_catalog_last_sweep_at.to_f < 25.0
+
+    recent = Array($ashborne_huntplan_catalog_recent_rooms).map(&:to_i)
+    local = Array(local_candidates).map(&:to_i)
+    stats = $ashborne_room_yield_stats || {}
+    candidates = allowed.reject { |room_id| room_id.to_i == current_id.to_i }
+    candidates.reject! { |room_id| Ashborne_toolkit.avoided_room_reason(room_id) }
+    remote = candidates.reject { |room_id| local.include?(room_id.to_i) }
+    candidates = remote unless remote.empty?
+    candidates.reject! { |room_id| recent.last(6).include?(room_id.to_i) }
+    return nil if candidates.empty?
+
+    candidates.min_by do |room_id|
+      room_stats = stats[room_id.to_s] || {}
+      visits = Array(room_stats["visits"])
+      [visits.empty? ? 0 : 1, visits.last.to_f, rand]
+    end
+  rescue
+    nil
+  end
+
+  def reset_catalog_sweep_timer
+    $ashborne_huntplan_catalog_sweep_counter = 0
+    $ashborne_huntplan_catalog_last_sweep_at = Time.now.to_f
+  rescue
+    nil
+  end
+
   def huntplan_catalog_walk
     return nil unless Ashborne_toolkit.huntplan_catalog_zone?
 
@@ -1069,6 +1134,17 @@ module Ashborne_toolkit
     end
 
     recent = Array($ashborne_huntplan_catalog_recent_rooms).map(&:to_i)
+    open_candidates = candidates.reject { |room_id| Ashborne_toolkit.avoided_room_reason(room_id) }
+    candidates = open_candidates unless open_candidates.empty?
+    sweep_destination = Ashborne_toolkit.catalog_sweep_destination(current_id, candidates)
+    if sweep_destination
+      respond "Ashborne catalog sweep: checking room #{sweep_destination} for missed spawns." if $ashborne_qc_debug == "1"
+      Ashborne_toolkit.reset_catalog_sweep_timer
+      Ashborne_toolkit.huntplan_catalog_step(current_room, sweep_destination)
+      $ashborne_huntplan_catalog_recent_rooms = (recent + [current_id, sweep_destination.to_i]).last(8)
+      return true
+    end
+
     preferred = candidates.reject { |room_id| recent.last(5).include?(room_id.to_i) }
     destination = (preferred.empty? ? candidates : preferred).sample
     Ashborne_toolkit.huntplan_catalog_step(current_room, destination)
@@ -1439,6 +1515,8 @@ module Ashborne_toolkit
 
   def normalized_role(value)
     role = value.to_s.downcase.strip
+    role = role.gsub(/[^a-z]/, "")
+    role = ROLE_ALIASES[role] || role
     ROLE_NAMES.include?(role) ? role : "auto"
   end
 
@@ -1735,6 +1813,26 @@ module Ashborne_toolkit
   def mana_reserve
     value = defined?($ashborne_mana_reserve) ? $ashborne_mana_reserve : 40
     [[value.to_i, 0].max, 95].min
+  end
+
+  def style9_low_mana_finisher_available?
+    return false unless $ashborne_my_style.to_s == "9"
+    return false if $ashborne_disable_mana == "1"
+    return false if GameObj.targets.empty?
+    return false unless Spell[1700].known? && Spell[1700].affordable?
+
+    true
+  rescue
+    false
+  end
+
+  def trigger_style9_low_mana_finisher
+    $ashborne_style9_blastround = "1"
+    $ashborne_style9_low_mana_return = "1"
+    $ashborne_return_why = "You have low mana after finishing the current target."
+    true
+  rescue
+    false
   end
 
   def stamina_reserve
@@ -2238,8 +2336,15 @@ module Ashborne_toolkit
     respond ";ashborne doctor               Installation and configuration check"
     respond ";ashborne setup preflight      Group safety and readiness report"
     respond ";ashborne plan                 Show elected group jobs"
+    respond ";ashborne bounty               Read your current Adventurer's Guild bounty and hunt it"
     respond ";ashborne support              Write a compact diagnostic report"
     respond ";ashborne import huntpro       Import this character's HuntPro settings"
+    respond ";ashborne setup change role X  Set role preference: auto, tank, melee, caster, cc, interrupt, healer, scout"
+    respond
+    respond "BOUNTY MODE"
+    respond ";ashborne bounty uses Lich's Bounty.task when available."
+    respond "Current supported bounty hunts: creature kills, dangerous creature, skinning, and heirloom-from-critter tasks."
+    respond "Ashborne maps the critter to its internal hunting catalog, sets priority targets, and launches the hunt."
     respond
     respond "Ashborne control traffic uses Borg and local files, not group whispers or ;chat."
     respond "A direct whisper to a named empath is used only when healing requests are enabled."
@@ -2858,7 +2963,16 @@ module Ashborne_toolkit
 
   def safe_walk
     return nil unless Ashborne_toolkit.group_wait_for_followers_to_move
+    return nil if Ashborne_toolkit.group_disarm_recovery_active?
     return nil unless Ashborne_toolkit.movement_guard
+    return nil if Ashborne_toolkit.recover_disarmed_item_if_needed
+
+    Ashborne_toolkit.learn_room_yield
+    avoided_reason = Ashborne_toolkit.avoided_room_reason
+    if avoided_reason
+      respond "Avoiding this room for #{avoided_reason}; moving on."
+      return Ashborne_toolkit.walk_avoiding_environmental_rooms(avoided_reason)
+    end
 
     if !GameObj.targets.empty?
       respond "Movement paused because a hostile creature arrived."
@@ -2875,6 +2989,12 @@ module Ashborne_toolkit
     end
     result = walk
     sleep 0.10
+    Ashborne_toolkit.learn_room_yield
+    avoided_reason = Ashborne_toolkit.avoided_room_reason
+    if avoided_reason && GameObj.targets.empty?
+      respond "Landed in avoided room for #{avoided_reason}; moving on."
+      Ashborne_toolkit.walk_avoiding_environmental_rooms(avoided_reason)
+    end
     if starting_room && Room.current && Room.current.id.to_s == starting_room && !GameObj.targets.empty?
       respond "Movement failed into combat; engaging before trying to move again."
       Ashborne_toolkit.target_check
@@ -5785,7 +5905,10 @@ module Ashborne_toolkit
 
   def combat_unique_to_ashborne
     return if Ashborne_toolkit.solo_swarm_retreat_if_needed
+    return if Ashborne_toolkit.recover_disarmed_item_if_needed
+    return if Ashborne_toolkit.environmental_danger_retreat_if_needed
     return if Ashborne_toolkit.medical_retreat_if_needed
+    return if Ashborne_toolkit.post_fight_sanity_sweep
     return if Ashborne_toolkit.group_danger_status_check
     if $ashborne_group_ai == "0" ? GameObj.pcs.any? : Ashborne_toolkit.visible_non_group_players.any?
       Ashborne_toolkit.leave_occupied_room
@@ -5800,6 +5923,7 @@ module Ashborne_toolkit
     if Ashborne_toolkit.group_follower_safe_hold
       return
     end
+    Ashborne_toolkit.combat_stuck_recovery
     Ashborne_toolkit.active_group_combat
     Ashborne_toolkit.customize_block_1
     Ashborne_toolkit.stand_check
@@ -7663,6 +7787,7 @@ module Ashborne_toolkit
   end
 
   def endcombat_actionreset
+    Ashborne_toolkit.post_fight_sanity_sweep
     Ashborne_toolkit.stance_guarded
 
     if $ashborne_action == 4
@@ -7983,6 +8108,8 @@ module Ashborne_toolkit
     flags << "stunned" if checkstunned
     flags << "webbed" if webbed?
     flags << "bound" if bound?
+    flags << "disarmed" if defined?($ashborne_disarm_recovery_needed) && $ashborne_disarm_recovery_needed == "1"
+    flags << "recovering" if defined?($ashborne_disarm_recovery_active) && $ashborne_disarm_recovery_active == "1"
     if $ashborne_looting_active == "1" ||
         ($ashborne_loot_script.to_s != "" && Script.running?($ashborne_loot_script.to_s))
       flags << "looting"
@@ -8490,6 +8617,29 @@ module Ashborne_toolkit
     nil
   end
 
+  def group_disarm_recovery_active?
+    return false if $ashborne_group_ai == "0"
+
+    names = Ashborne_toolkit.group_session_names
+    names = Ashborne_toolkit.configured_group_names if names.empty?
+    recovering = names.map { |name| Ashborne_toolkit.read_group_state(name) }.compact.find do |state|
+      next false if state["name"].to_s.casecmp(Char.name.to_s).zero?
+      next false if Time.now.to_i - state["timestamp"].to_i > 12
+
+      state["flags"].to_s =~ /(?:disarmed|recovering)/
+    end
+    return false unless recovering
+
+    if Time.now.to_f - $ashborne_last_group_disarm_notice_at.to_f >= 4.0
+      respond "Group movement paused while #{recovering['name']} recovers a disarmed item."
+      $ashborne_last_group_disarm_notice_at = Time.now.to_f
+    end
+    Ashborne_toolkit.publish_group_move_state(false) if $ashborne_group_ai != "0"
+    true
+  rescue
+    false
+  end
+
   def visible_non_group_players
     group_names = Ashborne_toolkit.configured_group_names.map { |name| name.to_s.downcase }
     GameObj.pcs.select do |pc|
@@ -8935,6 +9085,491 @@ module Ashborne_toolkit
     nil
   rescue
     nil
+  end
+
+  def environmental_danger_hard_line?(line)
+    line.to_s =~ /You lose your balance and fall over|You feel weak and feeble, your movements sluggish/i
+  end
+
+  def environmental_danger_soft_line?(line)
+    line.to_s =~ /The ground begins to shake violently|tail strikes the ground, raising a flurry of sparks|spell clashes with the tremors already rocking the area/i
+  end
+
+  def observe_environmental_danger_line(line)
+    text = line.to_s
+    hard_danger = Ashborne_toolkit.environmental_danger_hard_line?(text)
+    soft_danger = Ashborne_toolkit.environmental_danger_soft_line?(text)
+    return line unless hard_danger || soft_danger
+
+    now = Time.now.to_i
+    if now - $ashborne_environmental_danger_seen_at.to_i > 30
+      $ashborne_environmental_danger_hits = 0
+    end
+    $ashborne_environmental_danger_hits = $ashborne_environmental_danger_hits.to_i + 1
+    $ashborne_environmental_danger_seen_at = now
+    $ashborne_environmental_danger_until = now + 12
+    $ashborne_environmental_danger_room = Room.current && Room.current.id ? Room.current.id.to_s : ""
+
+    $ashborne_return_why = hard_danger ? "Environmental knockdown/feeble danger." : "Repeated environmental tremor danger." if hard_danger
+    line
+  rescue
+    line
+  end
+
+  def install_environmental_danger_hook
+    return nil if $ashborne_environmental_danger_hook_name
+
+    $ashborne_environmental_danger_hook_name = "ashborne_environmental_danger_#{Char.name}"
+    DownstreamHook.add(
+      $ashborne_environmental_danger_hook_name,
+      proc { |line| Ashborne_toolkit.observe_environmental_danger_line(line) }
+    )
+    nil
+  rescue => error
+    respond "Ashborne could not start environmental danger monitoring: #{error.message}"
+    nil
+  end
+
+  def remove_environmental_danger_hook
+    return nil unless $ashborne_environmental_danger_hook_name
+
+    DownstreamHook.remove($ashborne_environmental_danger_hook_name)
+    $ashborne_environmental_danger_hook_name = nil
+    nil
+  rescue
+    nil
+  end
+
+  def self_danger_line_reason(line)
+    text = line.to_s
+    return "dead" if text =~ /It seems you have died|You have died|^DEAD>/i
+    return "stunned" if text =~ /You are stunned|You are still stunned/i
+    return "webbed" if text =~ /You are webbed|webbing pins you|you are caught in .*web/i
+    return "bound" if text =~ /You are bound|you are entangled|you are immobilized/i
+
+    nil
+  rescue
+    nil
+  end
+
+  def observe_self_danger_line(line)
+    reason = Ashborne_toolkit.self_danger_line_reason(line)
+    return line unless reason
+
+    now = Time.now.to_f
+    return line if now - $ashborne_last_self_danger_at.to_f < 1.0
+
+    $ashborne_last_self_danger_at = now
+    $ashborne_group_danger_active = "1"
+    $ashborne_action = 99
+    $ashborne_return_why = reason == "dead" ? "You died." : "Emergency retreat: #{reason}."
+    if defined?($ashborne_group_ai) && $ashborne_group_ai != "0"
+      Ashborne_toolkit.publish_group_danger(reason)
+      Ashborne_toolkit.publish_group_state(true)
+    end
+    line
+  rescue
+    line
+  end
+
+  def install_self_danger_hook
+    return nil if $ashborne_self_danger_hook_name
+
+    $ashborne_self_danger_hook_name = "ashborne_self_danger_#{Char.name}"
+    DownstreamHook.add(
+      $ashborne_self_danger_hook_name,
+      proc { |line| Ashborne_toolkit.observe_self_danger_line(line) }
+    )
+    nil
+  rescue => error
+    respond "Ashborne could not start self-danger monitoring: #{error.message}"
+    nil
+  end
+
+  def remove_self_danger_hook
+    return nil unless $ashborne_self_danger_hook_name
+
+    DownstreamHook.remove($ashborne_self_danger_hook_name)
+    $ashborne_self_danger_hook_name = nil
+    nil
+  rescue
+    nil
+  end
+
+  def disarm_recovery_line?(line)
+    text = line.to_s
+    return false if text =~ /^\s*Disarm Weapon\s+disarm\b/i
+    return false if text =~ /^\s*(?:Skill|Mnemonic|Ranks|Type|Category|Subcategory)\b/i
+
+    return true if text =~ /attempts? to disarm you/i
+    return true if text =~ /Use the RECOVER ITEM command/i
+    return true if text =~ /You (?:are|have been) disarmed/i
+    return true if text =~ /knock(?:s|ed)? .* (?:from|out of) .* hand/i
+    return true if text =~ /flies from .* grasp/i
+    return true if text =~ /sent .* flying/i
+    return true if text =~ /weapon .* clatters/i
+    return true if text =~ /los(?:e|t) .* grip/i
+    return true if text =~ /wrenched .* from .* hand/i
+    return true if text =~ /drops? .* weapon/i
+
+    false
+  rescue
+    false
+  end
+
+  def bonded_weapon_return_line?(line)
+    line.to_s =~ /rises out of .* flies back to .* hand/i
+  rescue
+    false
+  end
+
+  def observe_disarm_recovery_line(line)
+    if Ashborne_toolkit.bonded_weapon_return_line?(line)
+      $ashborne_disarm_recovery_returned = "1"
+      $ashborne_disarm_recovery_needed = "0"
+      $ashborne_disarm_recovery_active = "0"
+      Ashborne_toolkit.publish_group_state(true) if defined?($ashborne_group_ai) && $ashborne_group_ai != "0"
+      return line
+    end
+
+    if Ashborne_toolkit.disarm_recovery_line?(line)
+      $ashborne_disarm_recovery_needed = "1"
+      $ashborne_disarm_recovery_seen_at = Time.now.to_i
+      Ashborne_toolkit.publish_group_state(true) if defined?($ashborne_group_ai) && $ashborne_group_ai != "0"
+    end
+    line
+  rescue
+    line
+  end
+
+  def install_disarm_recovery_hook
+    return nil if $ashborne_disarm_recovery_hook_name
+
+    $ashborne_disarm_recovery_hook_name = "ashborne_disarm_recovery_#{Char.name}"
+    DownstreamHook.add(
+      $ashborne_disarm_recovery_hook_name,
+      proc { |line| Ashborne_toolkit.observe_disarm_recovery_line(line) }
+    )
+    nil
+  rescue => error
+    respond "Ashborne could not start disarm recovery monitoring: #{error.message}"
+    nil
+  end
+
+  def remove_disarm_recovery_hook
+    return nil unless $ashborne_disarm_recovery_hook_name
+
+    DownstreamHook.remove($ashborne_disarm_recovery_hook_name)
+    $ashborne_disarm_recovery_hook_name = nil
+    nil
+  rescue
+    nil
+  end
+
+  def weapon_style_needs_disarm_recovery?
+    return false unless $ashborne_my_style.to_s =~ /\A[3-8]\z/
+    return true if $ashborne_disarm_recovery_needed == "1"
+    return true if $ashborne_group_ai != "0" && !GameObj.targets.empty? && checkright.nil?
+
+    false
+  rescue
+    false
+  end
+
+  def disarm_recovery_control
+    return false if GameObj.targets.empty?
+    return false unless Spell[610].known? && Spell[610].affordable? && Stats.level >= 10
+    return false unless Ashborne_toolkit.ability_allowed?("spell", 610)
+    return false unless Ashborne_toolkit.group_spell_claim("610", true)
+
+    respond "Disarm recovery: casting Tangleweed (610) to buy time." if $ashborne_qc_debug == "1"
+    Spell[610].cast
+    waitcastrt? if checkcastrt.to_f > 0
+    true
+  rescue
+    false
+  end
+
+  def recover_disarmed_item_if_needed
+    return false unless Ashborne_toolkit.weapon_style_needs_disarm_recovery?
+    if $ashborne_disarm_recovery_needed == "1" && Time.now.to_i - $ashborne_disarm_recovery_seen_at.to_i > 300
+      $ashborne_disarm_recovery_needed = "0"
+      return false
+    end
+
+    $ashborne_disarm_recovery_returned = "0"
+    $ashborne_disarm_recovery_active = "1"
+    Ashborne_toolkit.publish_group_state(true) if $ashborne_group_ai != "0"
+    Ashborne_toolkit.stance_defensive
+    waitrt? if checkrt.to_f > 0
+    Ashborne_toolkit.disarm_recovery_control if $ashborne_group_ai != "0"
+    fput "stow all" if checkright || checkleft
+    waitrt? if checkrt.to_f > 0
+
+    recovered_any = false
+    2.times do
+      result = dothistimeout "recover item", 5, /You spy .* recover it|rises out of .* flies back to .* hand|In order to recover something|must get down on your hands and knees|You don't see|You do not see|Recover what|Roundtime/i
+      if result.to_s =~ /rises out of .* flies back to .* hand/i
+        recovered_any = true
+        break
+      end
+      if result.to_s =~ /In order to recover something|must get down on your hands and knees/i
+        sleep 0.5
+        if $ashborne_disarm_recovery_returned == "1"
+          recovered_any = true
+          break
+        end
+        fput "kneel"
+        waitrt? if checkrt.to_f > 0
+        result = dothistimeout "recover item", 5, /You spy .* recover it|rises out of .* flies back to .* hand|You don't see|You do not see|Recover what|Roundtime/i
+        fput "stand"
+        waitrt? if checkrt.to_f > 0
+      end
+      if result.to_s =~ /You spy .* recover it|rises out of .* flies back to .* hand/i
+        recovered_any = true
+        fput "stow all" if checkright || checkleft
+        waitrt? if checkrt.to_f > 0
+        next
+      end
+      break if result.to_s =~ /You don't see|You do not see|Recover what/i
+    end
+
+    $ashborne_disarm_recovery_needed = "0"
+    $ashborne_disarm_recovery_active = "0"
+    fput "gird"
+    waitrt? if checkrt.to_f > 0
+    Ashborne_toolkit.publish_group_state(true) if $ashborne_group_ai != "0"
+    respond "Disarm recovery: recovered lost item." if recovered_any
+    recovered_any
+  rescue => error
+    $ashborne_disarm_recovery_active = "0"
+    Ashborne_toolkit.publish_group_state(true) if defined?($ashborne_group_ai) && $ashborne_group_ai != "0"
+    respond "Disarm recovery warning: #{error.message}" if $ashborne_qc_debug == "1"
+    false
+  end
+
+  def combat_stuck_signature
+    target_ids = GameObj.targets.map { |target| target.respond_to?(:id) ? target.id.to_s : target.to_s }.sort.join(",")
+    [
+      Room.current && Room.current.id ? Room.current.id.to_s : "0",
+      target_ids,
+      $ashborne_id_placeholder.to_s,
+      $ashborne_current_target.to_s,
+      GameObj.dead.length.to_s
+    ].join("|")
+  rescue
+    ""
+  end
+
+  def combat_stuck_recovery
+    return false if GameObj.targets.empty?
+    return false if $ashborne_looting_active == "1"
+    return false if checkrt.to_f > 0 || checkcastrt.to_f > 0
+
+    signature = Ashborne_toolkit.combat_stuck_signature
+    now = Time.now.to_f
+    if signature != $ashborne_combat_stuck_signature
+      $ashborne_combat_stuck_signature = signature
+      $ashborne_combat_stuck_seen_at = now
+      return false
+    end
+    return false if now - $ashborne_combat_stuck_seen_at.to_f < 8.0
+
+    respond "Combat watchdog: refreshing target and forcing the attack loop to continue."
+    $ashborne_combat_stuck_seen_at = now
+    $ashborne_recent_eviction = "0"
+    $ashborne_action = 7
+    $ashborne_own_this_room = 1
+    Ashborne_toolkit.target_check
+    false
+  rescue => error
+    respond "Combat watchdog warning: #{error.message}" if $ashborne_qc_debug == "1"
+    false
+  end
+
+  def post_fight_sanity_sweep
+    return false unless GameObj.targets.empty?
+    return true if Ashborne_toolkit.medical_retreat_if_needed
+    return true if Ashborne_toolkit.recover_disarmed_item_if_needed
+
+    if GameObj.dead.length >= 1
+      Ashborne_toolkit.loot_script("#{$ashborne_loot_script}")
+      return true if GameObj.dead.empty? || Script.running?($ashborne_loot_script.to_s)
+    end
+
+    if $ashborne_my_style.to_s =~ /\A[12]\z/
+      Ashborne_toolkit.enforce_uac_empty_hands
+    elsif !checkright.nil? || !checkleft.nil?
+      fput "gird" if $ashborne_my_style.to_s =~ /\A[3-8]\z/
+    end
+    false
+  rescue
+    false
+  end
+
+  def environmental_danger_active?
+    return false if $ashborne_environmental_danger_until.to_i <= Time.now.to_i
+    return true if $ashborne_environmental_danger_room.to_s.empty?
+
+    Room.current && Room.current.id && Room.current.id.to_s == $ashborne_environmental_danger_room.to_s
+  rescue
+    false
+  end
+
+  def mark_environmental_room_avoid(room_id = nil, seconds = 20, reason = "environmental danger")
+    room = room_id || (Room.current && Room.current.id)
+    return false unless room
+
+    $ashborne_avoided_rooms ||= {}
+    $ashborne_avoided_rooms[room.to_s] = {
+      "until" => Time.now.to_i + seconds.to_i,
+      "reason" => reason.to_s
+    }
+    true
+  rescue
+    false
+  end
+
+  def avoided_room_reason(room_id = nil)
+    room = room_id || (Room.current && Room.current.id)
+    return nil unless room
+
+    $ashborne_avoided_rooms ||= {}
+    data = $ashborne_avoided_rooms[room.to_s]
+    return nil unless data
+    if data["until"].to_i <= Time.now.to_i
+      $ashborne_avoided_rooms.delete(room.to_s)
+      return nil
+    end
+    data["reason"].to_s
+  rescue
+    nil
+  end
+
+  def learn_room_yield
+    room = Room.current && Room.current.id
+    return false unless room
+
+    now = Time.now.to_f
+    targets = GameObj.targets.length rescue 0
+    dead = GameObj.dead.length rescue 0
+    loot = GameObj.loot.length rescue 0
+    $ashborne_room_yield_stats ||= {}
+    stats = ($ashborne_room_yield_stats[room.to_s] ||= {
+      "visits" => [],
+      "empty_visits" => [],
+      "loot_only_visits" => []
+    })
+    stats["visits"] = Array(stats["visits"]).select { |stamp| now - stamp.to_f <= 45.0 }
+    stats["empty_visits"] = Array(stats["empty_visits"]).select { |stamp| now - stamp.to_f <= 45.0 }
+    stats["loot_only_visits"] = Array(stats["loot_only_visits"]).select { |stamp| now - stamp.to_f <= 75.0 }
+    stats["visits"] << now
+
+    if targets > 0 || dead > 0
+      stats["empty_visits"] = []
+      stats["loot_only_visits"] = []
+      return false
+    end
+
+    stats["empty_visits"] << now
+    stats["loot_only_visits"] << now if loot >= 6
+    return false if Ashborne_toolkit.avoided_room_reason(room)
+
+    if stats["loot_only_visits"].length >= 2
+      Ashborne_toolkit.mark_environmental_room_avoid(room, 60, "stale debris room")
+      respond "Room #{room} looks stale with debris and no targets; avoiding it for 60 seconds." if $ashborne_qc_debug == "1"
+      return true
+    end
+
+    if stats["visits"].length >= 5 && stats["empty_visits"].length >= 4
+      Ashborne_toolkit.mark_environmental_room_avoid(room, 35, "low-yield loop")
+      respond "Room #{room} has been empty too often; avoiding it for 35 seconds." if $ashborne_qc_debug == "1"
+      return true
+    end
+
+    false
+  rescue
+    false
+  end
+
+  def walk_avoiding_environmental_rooms(reason = "environmental danger")
+    starting_room = Room.current && Room.current.id ? Room.current.id.to_s : nil
+    Ashborne_toolkit.mark_environmental_room_avoid(starting_room, 20, reason) if starting_room
+    moved = false
+
+    3.times do
+      moved = Ashborne_toolkit.direct_environmental_room_escape(starting_room)
+      walk unless moved
+      sleep 0.15
+      current_room = Room.current && Room.current.id ? Room.current.id.to_s : nil
+      moved = starting_room.nil? || current_room != starting_room
+      break if moved && Ashborne_toolkit.avoided_room_reason(current_room).nil?
+      waitrt? if checkrt.to_f > 0
+    end
+
+    moved && Ashborne_toolkit.avoided_room_reason.nil?
+  rescue
+    false
+  end
+
+  def direct_environmental_room_escape(starting_room = nil)
+    room = Room.current
+    return false unless room && room.respond_to?(:wayto)
+
+    routes = room.wayto
+    return false unless routes.respond_to?(:keys)
+
+    allowed_rooms = Ashborne_toolkit.huntplan_catalog_zone? ? Array($ashborne_huntplan_catalog_rooms).map(&:to_i) : nil
+    candidates = routes.keys.map(&:to_i).uniq
+    candidates.select! { |room_id| allowed_rooms.include?(room_id) } if allowed_rooms && !allowed_rooms.empty?
+    candidates.reject! { |room_id| room_id.to_s == starting_room.to_s }
+    candidates.reject! { |room_id| Ashborne_toolkit.avoided_room_reason(room_id) }
+    return false if candidates.empty?
+
+    recent = Array($ashborne_environmental_recent_escape_rooms).map(&:to_i)
+    destination = (candidates - recent).first || candidates.first
+    command = Ashborne_toolkit.huntplan_catalog_simple_exit(room, destination)
+    return false unless command
+
+    fput command
+    waitrt? if checkrt.to_f > 0
+    sleep 0.2
+    current_room = Room.current && Room.current.id ? Room.current.id.to_i : nil
+    if current_room == destination.to_i
+      $ashborne_environmental_recent_escape_rooms = (recent + [destination.to_i]).last(6)
+      return true
+    end
+    false
+  rescue
+    false
+  end
+
+  def environmental_danger_retreat_if_needed
+    return false unless Ashborne_toolkit.environmental_danger_active?
+
+    Ashborne_toolkit.stance_defensive
+    waitrt? if checkrt.to_f > 0
+    Ashborne_toolkit.stand_check if checkprone
+
+    respond "Environmental danger detected here; leaving the room before fighting more."
+    walked = Ashborne_toolkit.walk_avoiding_environmental_rooms("environmental danger")
+
+    if walked
+      $ashborne_environmental_danger_until = 0
+      $ashborne_action = 0
+      $ashborne_own_this_room = 0
+      $ashborne_recent_eviction = "1"
+    else
+      respond "Environmental danger room-hop failed; staying defensive and trying normal movement next pass."
+      $ashborne_environmental_danger_until = 0
+      $ashborne_action = 0
+      $ashborne_own_this_room = 0
+      $ashborne_recent_eviction = "1"
+    end
+    true
+  rescue => error
+    respond "Environmental danger retreat warning: #{error.message}" if $ashborne_qc_debug == "1"
+    false
   end
 
   def parse_anti_caster_event(payload)
@@ -10072,13 +10707,18 @@ module Ashborne_toolkit
       return true
     end
 
-    return true if Ashborne_toolkit.apply_group_danger_abort
+    if Ashborne_toolkit.apply_group_danger_abort
+      Ashborne_toolkit.emergency_return_to_town_if_needed if $ashborne_group_ai == "1"
+      return true
+    end
 
     danger_reason = Ashborne_toolkit.personal_group_danger_reason
     return false if danger_reason.nil?
 
     Ashborne_toolkit.publish_group_danger(danger_reason)
     Ashborne_toolkit.apply_group_danger_abort
+    Ashborne_toolkit.emergency_return_to_town_if_needed if $ashborne_group_ai == "1"
+    true
   end
 
   def solo_emergency_return_to_town
@@ -10119,6 +10759,10 @@ module Ashborne_toolkit
     respond "I returned to town because: #{$ashborne_return_why}"
     Ashborne_toolkit.bottom_menu
     Ashborne_toolkit.ashborne_stow_all
+    force_sell = Ashborne_toolkit.encumbrance_return?
+    town_services_complete = Ashborne_toolkit.group_town_services(force_sell)
+    Ashborne_toolkit.run_post_hunt_healing_rc8 if $ashborne_rest_healing == "1" && !town_services_complete
+    Ashborne_toolkit.run_post_hunt_sale(force_sell) if (force_sell || $ashborne_rest_sell == "1") && !town_services_complete
     exit
   end
 
@@ -10253,6 +10897,10 @@ module Ashborne_toolkit
     end
 
     Ashborne_toolkit.rescue_current_group_danger
+    if $ashborne_group_ai == "1"
+      Ashborne_toolkit.emergency_return_to_town_if_needed
+      return true
+    end
     if $ashborne_group_ai == "2"
       captain = Ashborne_toolkit.canonical_character_name($ashborne_captain)
       if Ashborne_toolkit.valid_character_name?(captain) && Ashborne_toolkit.visible_group_pc(captain)
@@ -11099,11 +11747,37 @@ module Ashborne_toolkit
     waitcastrt?
   end
 
+  def current_target_valid?
+    target_id = XMLData.current_target_id.to_s rescue ""
+    return !GameObj.targets.empty? if target_id.empty? || target_id == "0"
+
+    GameObj.targets.any? { |target| target.id.to_s == target_id }
+  rescue
+    !GameObj.targets.empty?
+  end
+
+  def ensure_fresh_attack_target
+    return false if Ashborne_toolkit.environmental_danger_retreat_if_needed
+    return false if Ashborne_toolkit.medical_retreat_if_needed
+    return false if GameObj.targets.empty?
+    return true if Ashborne_toolkit.current_target_valid?
+
+    Ashborne_toolkit.target_check
+    sleep 0.05
+    Ashborne_toolkit.current_target_valid?
+  rescue
+    false
+  end
+
   def uac_round
     # respond "Debug Output - Starting UAC Round"
     if GameObj.targets.length >= 1
 
       return unless Ashborne_toolkit.enforce_uac_empty_hands
+      unless Ashborne_toolkit.ensure_fresh_attack_target
+        Ashborne_toolkit.stance_defensive
+        return false
+      end
 
       if $ashborne_uac_current_attack == 0
         $ashborne_uac_current_attack = "jab"
@@ -11112,6 +11786,10 @@ module Ashborne_toolkit
       end
 
       Ashborne_toolkit.stance_offensive
+      unless Ashborne_toolkit.ensure_fresh_attack_target
+        Ashborne_toolkit.stance_defensive
+        return false
+      end
 
       result = dothistimeout "#{$ashborne_uac_current_attack}", 2, /excellent positioning|followup jab|followup punch|followup grapple|followup kick|Roundtime/
       if result =~ /excellent positioning/
@@ -11408,14 +12086,26 @@ module Ashborne_toolkit
       return
     end
 
+    unless Ashborne_toolkit.ensure_fresh_attack_target
+      Ashborne_toolkit.stance_defensive
+      return false
+    end
     fput "attack"
   end
 
   def chicken_ambush
+    unless Ashborne_toolkit.ensure_fresh_attack_target
+      Ashborne_toolkit.stance_defensive
+      return false
+    end
     fput "ambush"
   end
 
   def chicken_fire
+    unless Ashborne_toolkit.ensure_fresh_attack_target
+      Ashborne_toolkit.stance_defensive
+      return false
+    end
     fput "fire"
   end
 
@@ -11441,10 +12131,21 @@ module Ashborne_toolkit
         # respond "Debug Output - I detected a cloud."
         if Spell[119].known? && Spell[119].affordable?
           waitcastrt?
-          fput "prep 119"
-          fput "cast cloud"
+          result = dothistimeout "prep 119", 2, /Your spell is ready|You already have a spell readied|You do not|You don't|cannot|can't/i
+          if result.to_s =~ /You do not|You don't|cannot|can't/i
+            respond "Cloud detected and dispel could not be prepared; leaving this room for 20 seconds."
+            Ashborne_toolkit.walk_avoiding_environmental_rooms("cloud hazard")
+          else
+            fput "cast cloud"
+            sleep 0.5
+            if GameObj.loot.any? { |obj| obj.noun =~ /cloud/ }
+              respond "Cloud did not clear; leaving this room for 20 seconds."
+              Ashborne_toolkit.walk_avoiding_environmental_rooms("cloud hazard")
+            end
+          end
         else
-          Ashborne_toolkit.evicted
+          respond "Cloud detected and no dispel is ready; leaving this room for 20 seconds."
+          Ashborne_toolkit.walk_avoiding_environmental_rooms("cloud hazard")
           sleep 0.025
         end
       end
@@ -14288,6 +14989,26 @@ $ashborne_mana_reserve = 40
 $ashborne_stamina_reserve = 20
 $ashborne_health_floor = 70
 $ashborne_anti_caster_hook_name = nil
+$ashborne_environmental_danger_hook_name = nil
+$ashborne_self_danger_hook_name = nil
+$ashborne_last_self_danger_at = 0.0
+$ashborne_disarm_recovery_hook_name = nil
+$ashborne_disarm_recovery_needed = "0"
+$ashborne_disarm_recovery_seen_at = 0
+$ashborne_disarm_recovery_returned = "0"
+$ashborne_disarm_recovery_active = "0"
+$ashborne_last_group_disarm_notice_at = 0.0
+$ashborne_combat_stuck_signature = ""
+$ashborne_combat_stuck_seen_at = 0.0
+$ashborne_environmental_danger_until = 0
+$ashborne_environmental_danger_seen_at = 0
+$ashborne_environmental_danger_hits = 0
+$ashborne_environmental_danger_room = ""
+$ashborne_avoided_rooms = {}
+$ashborne_environmental_recent_escape_rooms = []
+$ashborne_room_yield_stats = {}
+$ashborne_huntplan_catalog_sweep_counter = 0
+$ashborne_huntplan_catalog_last_sweep_at = 0.0
 $ashborne_last_group_state_payload = nil
 $ashborne_last_group_state_at = 0.0
 $ashborne_group_session_id = ""
@@ -14308,6 +15029,7 @@ $ashborne_aim_fail = 0
 $ashborne_turbo_crowd_control = "0"
 $ashborne_crowd_control = "0"
 $ashborne_no_crowd_control = "0"
+$ashborne_style9_low_mana_return = "0"
 $ashborne_cman_control = "0"
 $ashborne_no_cman_control = "0"
 $ashborne_cman_watch = "0"
@@ -20845,6 +21567,12 @@ ashborne_status_check = proc {
   next if Ashborne_toolkit.medical_retreat_if_needed
   Ashborne_toolkit.group_danger_status_check
 
+  if $ashborne_style9_low_mana_return == "1" && GameObj.targets.empty?
+    $ashborne_style9_blastround = "0"
+    $ashborne_return_why ||= "You have low mana after finishing combat."
+    $ashborne_action = 99 unless $ashborne_disable_mana == "1"
+  end
+
   if !checkdead
     nil
   else
@@ -20912,9 +21640,13 @@ ashborne_status_check = proc {
         $ashborne_return_why = "You have low mana." unless $ashborne_disable_mana == "1"
         $ashborne_action = 99 unless $ashborne_disable_mana == "1"
 
-      elsif $ashborne_style9_arcaneblast == "0" && percentmana <= 13
-        $ashborne_return_why = "You have low mana" unless $ashborne_disable_mana == "1"
-        $ashborne_action = 99 unless $ashborne_disable_mana == "1"
+      elsif percentmana <= 13
+        if Ashborne_toolkit.style9_low_mana_finisher_available?
+          Ashborne_toolkit.trigger_style9_low_mana_finisher
+        else
+          $ashborne_return_why = "You have low mana" unless $ashborne_disable_mana == "1"
+          $ashborne_action = 99 unless $ashborne_disable_mana == "1"
+        end
 
       # Group Mode Arcane Blast as Leader
       elsif $ashborne_style9_arcaneblast == "1"
@@ -20969,9 +21701,13 @@ ashborne_status_check = proc {
         $ashborne_return_why = "You have low mana." unless $ashborne_disable_mana == "1"
         $ashborne_action = 99 unless $ashborne_disable_mana == "1"
 
-      elsif $ashborne_style9_arcaneblast == "0" && percentmana <= 13
-        $ashborne_return_why = "You have low mana." unless $ashborne_disable_mana == "1"
-        $ashborne_action = 99 unless $ashborne_disable_mana == "1"
+      elsif percentmana <= 13
+        if Ashborne_toolkit.style9_low_mana_finisher_available?
+          Ashborne_toolkit.trigger_style9_low_mana_finisher
+        else
+          $ashborne_return_why = "You have low mana." unless $ashborne_disable_mana == "1"
+          $ashborne_action = 99 unless $ashborne_disable_mana == "1"
+        end
 
       elsif $ashborne_style9_arcaneblast == "1"
 
@@ -21018,7 +21754,8 @@ ashborne_status_check = proc {
       if $ashborne_heal_cooldown == 0
         $ashborne_heal_cooldown = 1
         fput "whisper #{$ashborne_group_empath} please heal us."
-        Script.pause('ashborne')
+        $ashborne_return_why = "You have low health and need healing."
+        $ashborne_action = 99
       elsif $ashborne_heal_cooldown == 1
         $ashborne_heal_cooldown = 0
       end
@@ -21082,7 +21819,8 @@ ashborne_status_check = proc {
         if $ashborne_heal_cooldown == 0
           $ashborne_heal_cooldown = 1
           fput "whisper #{$ashborne_group_empath} please heal us."
-          Script.pause('ashborne')
+          $ashborne_return_why = "You are injured and need healing."
+          $ashborne_action = 99
         elsif $ashborne_heal_cooldown == 1
           $ashborne_heal_cooldown = 0
         end
@@ -25010,9 +25748,15 @@ ashborne_run_script.call unless $ashborne_zonescripts == "1"
 
 Ashborne_toolkit.publish_group_state(true)
 Ashborne_toolkit.coordinate_group_looter if $ashborne_group_ai == "1"
+Ashborne_toolkit.install_environmental_danger_hook
+Ashborne_toolkit.install_self_danger_hook
+Ashborne_toolkit.install_disarm_recovery_hook
 Ashborne_toolkit.install_anti_caster_hook
 if $ashborne_preflight == "1" && ($ashborne_group_ai != "0" || Ashborne_toolkit.noise_lockdown?)
   unless Ashborne_toolkit.preflight_report(true)
+    Ashborne_toolkit.remove_environmental_danger_hook
+    Ashborne_toolkit.remove_self_danger_hook
+    Ashborne_toolkit.remove_disarm_recovery_hook
     Ashborne_toolkit.remove_anti_caster_hook
     ashborne_kill_script.call
     exit

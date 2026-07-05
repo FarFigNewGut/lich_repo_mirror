@@ -1,5 +1,5 @@
 =begin
-	   OSACommander Version: '4.0.25 (June 27, 2026)
+	   OSACommander Version: '4.0.26 (July 3, 2026)
 	
 	   Usage: 
 	
@@ -96,6 +96,11 @@
                             on crew channel, leads group to medical officer, and sends 20 mana. If commander knows Spell[220]
                             they also cast it themselves after releasing any prepared spell. Added ";osacommander back" command
                             which broadcasts "Take Us Back <medical officer>" on crew channel to signal return.
+             July 3, 2026  - Added commander_held_box, commander_held_box_count, commander_drop_held_boxes, commander_pool_held_box,
+                             commander_deliver_held_boxes, and commander_prepare_held_boxes_for_pool to handle full-inventory box
+                             routing during enemy ship encounters. commander_have_boxes now catches inventory-full responses and
+                             routes held boxes to disk, pool, or security officer before recursing. give_boxes_to_security_officer
+                             drops held boxes first. ph_on and ;osacommander begin now reset boarding flag to false on activation.
 =end 
 
 def load_yaml_file(path)
@@ -1962,6 +1967,90 @@ def commander_after_balance
 	save_to_commander("afterbalance", @bankbalance)
 end
 
+def commander_held_box
+	return GameObj.right_hand if GameObj.right_hand.id && GameObj.right_hand.type =~ /box/
+	return GameObj.left_hand if GameObj.left_hand.id && GameObj.left_hand.type =~ /box/
+	nil
+end
+
+def commander_held_box_count
+	count = 0
+	count += 1 if GameObj.right_hand.id && GameObj.right_hand.type =~ /box/
+	count += 1 if GameObj.left_hand.id && GameObj.left_hand.type =~ /box/
+	count
+end
+
+def commander_drop_extra_held_box_for_pool
+	return unless commander_held_box_count > 1
+	# Keep both boxes in hand. Dropping one here can make the commander return
+	# to the ship, pick the same box back up, and loop forever when storage is full.
+end
+
+def commander_drop_held_boxes
+	fput "drop right" if GameObj.right_hand.id && GameObj.right_hand.type =~ /box/
+	fput "drop left" if GameObj.left_hand.id && GameObj.left_hand.type =~ /box/
+end
+
+def commander_pool_held_box
+	start_script("go2", [osacrew_data["gangplank"]])
+	wait_while { running?("go2") }
+	start_script("eloot", ['pool'])
+	wait_while { running?("eloot") }
+	pause 0.5
+	main_deck
+end
+
+def commander_deliver_held_boxes
+	if @commander_data["use_security_officer"]
+		start_script("go2", [@commander_data["security_officer_location"]])
+		wait_while { running?("go2") }
+		give_boxes_to_security_officer
+		pause 0.5
+		main_deck
+	elsif @commander_data["no_script_picking"]
+		captains_quarters
+		commander_drop_held_boxes
+		pause 0.5
+		main_deck
+	else
+		commander_pool_held_box
+	end
+end
+
+def commander_prepare_held_boxes_for_pool
+	return false unless commander_held_box
+	unless defined?(Disk) && Disk.mine
+		commander_drop_extra_held_box_for_pool
+		return :pool
+	end
+
+	disk = GameObj[Disk.mine.id]
+	unless disk
+		commander_drop_extra_held_box_for_pool
+		return :pool
+	end
+
+	open_result = dothistimeout "open ##{disk.id}", 3, /already open|You open|What were you referring to/
+	if open_result.to_s =~ /What were you referring to/
+		commander_drop_extra_held_box_for_pool
+		return :pool
+	end
+
+	stored_any = false
+	while (box = commander_held_box)
+		put_result = dothistimeout "put ##{box.id} in ##{disk.id}", 5, /You put|won't fit|can't put|closed|What were you referring to|Get what|You need a free hand/
+		if put_result.to_s =~ /You put/
+			stored_any = true
+			pause 0.2
+		else
+			commander_drop_extra_held_box_for_pool
+			return :pool
+		end
+	end
+
+	stored_any ? :disk : false
+end
+
 def commander_left_hand
 	if GameObj.left_hand.id.nil?
 		return
@@ -2005,6 +2094,7 @@ end
 
 def give_boxes_to_security_officer
 	wait_until { checkpcs.include? (@commander_data["securityofficer"]) }
+	commander_drop_held_boxes
 	#start_script('foreach', ['box', 'in', 'inventory;get', 'item;move', 'item', 'to', 'ground;sleep', '0.5'])
 	#wait_while { running?("foreach") }
 	ELoot.find_boxes.each do | box_in_inventory |
@@ -2102,9 +2192,19 @@ def commander_yes_boxes
 end
 
 def commander_have_boxes
-	result = dothistimeout "loot room", 3, /There is no loot/
+	result = dothistimeout "loot room", 3, /There is no loot|no space in which to stow it|no room to stow either|leaving .* in your hand/
 	if result.to_s =~ /There is no loot/
 		@done_with_sec_off = true
+	elsif result.to_s =~ /no space in which to stow it|no room to stow either|leaving .* in your hand/
+		case commander_prepare_held_boxes_for_pool
+		when :disk
+			commander_have_boxes
+			return
+		when :pool
+			commander_deliver_held_boxes
+			commander_have_boxes
+			return
+		end
 	end
 		commander_yes_boxes
 	if !@done_with_sec_off
@@ -3069,6 +3169,7 @@ end
 
 def ph_on
 	if !osacommander_data["piratehunter"]
+		save_to_crew("boarding", false)
 		save_to_commander("piratehunter", true)
 		respond "    *===============================================================================*
 				|                    *****Enemy Ship Detection Enabled*****                     |     
@@ -3720,6 +3821,7 @@ def commander_begin_it
 			return
 		end
 	elsif variable[1] =~ /begin/
+		save_to_crew("boarding", false)
 		commander_start_up
 	elsif variable[1] =~ /testcon/
 		lnet_crew("Connection Test: #{variable[2].capitalize}")
@@ -4488,7 +4590,7 @@ def self.load_commander_yaml
 	path
 end
 
-save_to_commander("commanderversion", "4.0.25 (June 27, 2026)", push: false)
+save_to_commander("commanderversion", "4.0.26 (July 3, 2026)", push: false)
 TITLE = "OSACommander: v. (#{@commander_data["commanderversion"]})"
 require "yaml"
 require "gtk3"
