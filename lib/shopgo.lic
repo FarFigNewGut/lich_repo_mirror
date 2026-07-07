@@ -1,0 +1,323 @@
+=begin
+    Finds a player shop by partial/exact name and travels there. 
+    This is a rewrite of go2shop.lic by LostRanger
+
+    Usage:
+       ;shopgo <partial name of shop>
+       ;shopgo reset              - force-refresh the cached shop directory
+
+    Shop directory data is cached in memory for 12 hours (or until login).
+
+    author: Mara
+    contact: mara.lilly on Discord, @Lillymara on GitHub
+    co-author: Claude (Anthropic) - claude.ai/code
+    game: GS
+    tags: utility
+    required: Lich >= 4.6.0.
+
+  version: 1.5
+
+  changelog:
+    version 1.5 (2026-07-07)
+      * shop browse now includes a room UID; resolved via Map.ids_from_uid for a go2 fast
+        path, falling back to the old title-search if the room isn't mapped locally.
+      * Fixed shop_browse regex for the game's new "(room#)" format.
+      * Renamed from go2shop.lic (no findshop dependency, no more ";go2" collision).
+=end
+
+module ShopGo
+    VERSION = '1.5'
+    MAXAGE = 86400 / 2 # seconds the cached directory stays valid
+    END_TAG = /^<prompt/
+
+    PATTERNS = {
+        town_list:    /^You must specify in which town.*Valid options include: (.*)$/,
+        town_pattern: /<d cmd=['"]shop directory (.+?)['"]>(.*?)<\/d>/,
+        dir_start:    /^<output class="mono"\/>/,
+        shop_pattern: /<d cmd=['"]shop browse (.+?) (\d+)['"]>(.*?)<\/d>/,
+        # room title bracket may be followed by a "(room#)" before "at" since a 2026 game update.
+        # That number is the game's internal room UID, not a Lich mapdb id -- resolved via
+        # Map.ids_from_uid before use rather than handed to go2 as-is.
+        shop_browse:  /^(?:(.*) is located (?:.*?)(\[.*?\])(?: \((-?\d+)\))? at (a |an |the )<a exist="(-?\d+)"(?:.*?)>(.*?)<\/a>)|(Unknown town specified)|(That is not a valid shop number)/,
+    }.freeze
+
+    @db ||= {}
+    @last_refreshed ||= nil
+
+    # Sends `command`, hides the reply from the screen, and returns the lines
+    # between start_pattern and END_TAG (inclusive).
+    def self.quiet_command(command, start_pattern, end_pattern = END_TAG, timeout = 5)
+        result = []
+        name = "ShopGo::#{Time.now.to_f}-#{rand(10000)}"
+        filtering = false
+
+        Timeout.timeout(timeout, Interrupt) do
+            DownstreamHook.add(name, proc do |xml|
+                if filtering
+                    if xml =~ end_pattern
+                        DownstreamHook.remove(name)
+                        filtering = false
+                    end
+                    next nil
+                elsif xml =~ start_pattern
+                    filtering = true
+                    next nil
+                end
+                xml
+            end)
+
+            fput command
+            until (xml = get) =~ start_pattern; end
+            result << xml.rstrip
+            until (xml = get) =~ end_pattern
+                result << xml.rstrip
+            end
+            result << xml.rstrip
+        end
+        result
+    rescue Interrupt
+        result
+    end
+
+    def self.reset_database
+        echo "Refreshing shop directory..."
+        db = {}
+        waitrt?
+        quiet_command("shop directory", PATTERNS[:town_list]).each do |line|
+            line.scan(PATTERNS[:town_pattern]).each { |id, name| db[id] = { name: name, shops: {} } }
+        end
+
+        db.each_key do |town|
+            waitrt?
+            quiet_command("shop directory #{town}", PATTERNS[:dir_start]).each do |line|
+                line.scan(PATTERNS[:shop_pattern]).each do |t, id, name|
+                    db[t][:shops][id.to_i] = { name: name, id: id.to_i, town: t }
+                end
+            end
+        end
+
+        @db, @last_refreshed = db, Time.now
+        echo "Shop directory refreshed (next refresh #{@last_refreshed + MAXAGE})."
+        @db
+    end
+
+    def self.get_database
+        (@last_refreshed && @last_refreshed + MAXAGE >= Time.now) ? @db : reset_database
+    end
+
+    # Resolves the game's room UID to a Lich mapdb room id, if that room is mapped locally.
+    def self.resolve_room_uid(uid)
+        return nil unless uid && defined?(Map.ids_from_uid)
+        Map.ids_from_uid(uid).first
+    end
+
+    def self.update_shop(shop)
+        waitrt?
+        lines = quiet_command("shop browse #{shop[:town]} #{shop[:id]}", PATTERNS[:shop_browse])
+        match = lines.map { |l| PATTERNS[:shop_browse].match(l) }.find(&:itself)
+        unless match
+            echo "Failed to update shop (no data found): #{shop.inspect}"
+            return shop
+        end
+        if match[7]
+            echo "Failed to update shop (#{match[7]}): #{shop.inspect}"
+            exit
+        end
+        shop.merge!(exist: match[5], exist_name: match[6], exist_article: match[4],
+                    room_title: match[2], room_id: resolve_room_uid(match[3]&.to_i), shop_room_id: nil)
+    end
+
+    def self.get_shop(shop)
+        shop[:exist] ? shop : update_shop(shop)
+    end
+
+    def self.find_shop(query)
+        shops = get_database.values.flat_map { |t| t[:shops].values }
+        exact = shops.select { |s| s[:name].downcase == query }
+        matches = exact.empty? ? shops.select { |s| s[:name].downcase.include?(query) } : exact
+
+        if matches.empty?
+            echo "No shops found matching '#{query}'."
+            return
+        end
+        return matches.first if matches.length == 1
+
+        if matches.length > 10
+            echo "Too many matching shops, skipping in-depth data collection."
+        else
+            matches.each { |s| get_shop(s) }
+        end
+
+        pick_shop(matches, !exact.empty?)
+    end
+
+    def self.pick_shop(matches, exact)
+        respond exact ? "Multiple exact matches found" : "Multiple matching shops found"
+        pad = matches.map { |s| s[:name].length }.max
+        db = @db
+        lines = []
+
+        matches.each_with_index do |shop, i|
+            ix = i + 1
+            town = db[shop[:town]][:name]
+            info = shop[:room_title] ? "(#{town} shop ##{shop[:id]}, #{shop[:exist_article]}#{shop[:exist_name]} at #{shop[:room_title]})" : "(#{town} shop ##{shop[:id]})"
+            name = shop[:name].ljust(pad)
+
+            if @stormfront
+                link = REXML::Element.new("d")
+                link.add_attribute("cmd", "#{$lich_char}send #{ix}")
+                link.add_text(name)
+                lines << "#{ix.to_s.rjust(6)}: #{link} #{REXML::Text.new(info)}"
+            else
+                respond "#{ix.to_s.rjust(6)}: #{name} #{info}"
+            end
+        end
+
+        if @stormfront
+            cancel = REXML::Element.new("d")
+            cancel.add_attribute("cmd", "#{$lich_char}send 0")
+            cancel.add_text("CANCEL")
+            puts(['<output class="mono"/>', *lines, "     0: #{cancel}", '<output class=""/>'].join("\n"))
+            respond "Select a shop with #{$lich_char}send <#> or by clicking it."
+        else
+            respond "     0: CANCEL"
+            respond "Select a shop with #{$lich_char}send <#>."
+        end
+
+        toggle_unique
+        line = nil
+        n = nil
+        loop do
+            line = get until line.to_s.strip =~ /^\d+$/
+            n = line.to_i
+            break if n <= matches.length
+            echo "Value out of range. (Expected 0-#{matches.length})"
+            line = nil
+        end
+        toggle_unique
+
+        if n.zero?
+            echo "Cancelled."
+            nil
+        else
+            matches[n - 1]
+        end
+    end
+
+    def self.visit_room(id)
+        if id == Room.current.id
+            echo "Already at target room"
+            return
+        end
+        Script.run("go2", id.to_s)
+        if Room.current.id.to_s != id.to_s
+            echo "go2 stopped before arriving at our destination.  Assuming it was killed and stopping here."
+            exit
+        end
+        echo "Arrived at destination"
+    end
+
+    def self.visit_adjacent_room(candidates)
+        wayto = Room.current.wayto
+        candidates.each do |id|
+            dir = wayto[id] || wayto[id.to_s]
+            next unless dir
+            dir.is_a?(String) ? move(dir) : dir.call
+            return true
+        end
+        false
+    end
+
+    def self.visit_shop(shop)
+        if shop[:room_id]
+            if shop[:shop_room_id]
+                visit_room(shop[:shop_room_id])
+            else
+                visit_room(shop[:room_id])
+                move "go ##{shop[:exist]}"
+                echo "Went to #{shop[:exist_article]}#{shop[:exist_name]} in room #{shop[:room_id]}"
+                shop[:shop_room_id] = Room.current.id
+            end
+            return
+        end
+
+        unless shop[:room_title] && shop[:exist]
+            echo "Unable to locate shop (missing room/exist data): #{shop.inspect}"
+            exit
+        end
+
+        exist = shop[:exist]
+        location = nil
+        pending = Room.list.select { |r| r.title.include?(shop[:room_title]) }
+                            .each_with_object(Set.new) { |r, set| location ||= r.location; set << r.id }
+
+        if pending.empty?
+            echo "Unable to locate shop (room title not found in mapdb): #{shop.inspect}"
+            exit
+        end
+
+        echo "Searching for shop in #{pending.length} room(s)..."
+        first = true
+
+        until pending.empty?
+            nextroom = Room.current.find_nearest(pending)
+            unless nextroom
+                echo "I couldn't find a route to that shop."
+                echo "If it is in Mist Harbor and you aren't (or vice versa), try: ;go2 --fwi-trinket=<trinket>, then try again."
+                exit
+            end
+
+            if first
+                first = false
+                path_length = Room.current.path_to(nextroom).length
+                if path_length > 40
+                    respond "There are approximately #{path_length} rooms between you and the shop's neighborhood of #{shop[:room_title]} in #{location || shop[:town]}."
+                    respond "\nTo go here, unpause the script.  To abort, kill the script."
+                    pause_script
+                end
+            end
+
+            visit_room(nextroom)
+
+            loop do
+                pending.delete(Room.current.id)
+                pending.delete(Room.current.id.to_s)
+                if GameObj.loot.find { |x| x.id == exist }
+                    shop[:room_id] = Room.current.id
+                    move "go ##{exist}"
+                    echo "Learned that #{shop[:name]} is #{shop[:exist_article]}#{shop[:exist_name]} in room #{shop[:room_id]}"
+                    shop[:shop_room_id] = Room.current.id
+                    return
+                end
+                break unless visit_adjacent_room(pending)
+            end
+        end
+    end
+
+    def self.run(script)
+        @stormfront = ($frontend == 'stormfront')
+        script.want_downstream = false
+        script.want_downstream_xml = true
+
+        arg = script.vars[0].strip.downcase
+        if arg.empty?
+            respond [
+                "#{script.name} version #{VERSION}",
+                "Usage: #{$lich_char}#{script.name} <search string> - Go to the shop matching this name.",
+                "Usage: #{$lich_char}#{script.name} reset           - Force-refresh the shop directory cache.",
+            ]
+            exit
+        end
+
+        if arg == 'reset'
+            reset_database
+            exit
+        end
+
+        shop = find_shop(arg)
+        exit unless shop
+        visit_shop(get_shop(shop))
+    end
+end
+
+ShopGo.run(script)
