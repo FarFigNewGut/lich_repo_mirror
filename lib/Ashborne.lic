@@ -4552,6 +4552,45 @@ module Ashborne_toolkit
     false
   end
 
+  def held_storage_blocker_for_sale
+    item = checkright || checkleft
+    return "" if item.nil?
+
+    item_name = item.to_s.strip
+    return "" if item_name.empty?
+
+    configured_hands = [$ashborne_right_hand_detect, $ashborne_left_hand_detect].map { |value| value.to_s.strip.downcase }
+    return "" if configured_hands.include?(item_name.downcase)
+
+    # This recovery is only for loot ELoot left in hand because storage was full.
+    # Do not sell obvious personal gear just because it happens to be held.
+    return "" if item_name =~ /\b(?:runestaff|staff-of-|spikestar|shield|buckler|weapon harness|scabbard|sheath|cloak|pack|backpack|satchel|tote|container)\b/i
+
+    item_name.sub(/\A(?:a|an|some|the)\s+/i, "").strip
+  rescue
+    ""
+  end
+
+  def sell_held_storage_blocker
+    blocker = Ashborne_toolkit.held_storage_blocker_for_sale
+    return false if blocker.empty?
+
+    respond "Ashborne is selling the hand-held storage blocker at the pawnshop: #{blocker}."
+    Script.kill("go2") if Script.running?("go2")
+    Script.run("go2", "pawnshop")
+    wait_while { Script.running?("go2") }
+
+    result = dothistimeout "sell #{blocker}", 8, /You offer to sell|hands you|takes your|accepts|You'll have to|isn't interested|You don't seem|What were you referring|Sell what|You can't sell/i
+    sleep 0.5
+    return true if checkright.nil? && checkleft.nil?
+
+    respond "Ashborne could not clear the hand-held storage blocker with pawnshop sell." if result
+    false
+  rescue => error
+    respond "Ashborne could not sell the hand-held storage blocker: #{error.message}"
+    false
+  end
+
   def cman_control
     Ashborne_toolkit.cman_debugger
 
@@ -9520,6 +9559,9 @@ module Ashborne_toolkit
   def learn_room_yield
     room = Room.current && Ashborne_toolkit.current_room_id
     return false unless room
+    # Stale-debris learning was too aggressive in weapon-dropping hunting areas.
+    # Keep environmental and occupied-room avoidance, but never prune normal hunting rooms.
+    return false
     return false if Ashborne_toolkit.huntplan_catalog_zone?
 
     now = Time.now.to_f
@@ -10098,8 +10140,50 @@ module Ashborne_toolkit
 
     respond "#{Char.name} is selling post-hunt loot with ;eloot sell."
     wait_while { Script.running?("eloot") }
-    Script.run("eloot", "sell")
-    wait_while { Script.running?("eloot") }
+    attempts = 0
+    clean_sale = false
+    needs_retry = false
+    begin
+      attempts += 1
+      clean_sale = false
+      needs_retry = false
+      Script.run("eloot", "sell")
+      held_state = nil
+      held_since = nil
+      deadline = Time.now + 900
+      saw_eloot_running = false
+      interrupted_sale = false
+      while Script.running?("eloot")
+        saw_eloot_running = true
+        storage_failed, held_state, held_since = Ashborne_toolkit.loot_storage_failure_detected?("eloot", held_state, held_since)
+        if storage_failed
+          respond "Ashborne detected ;eloot sell is paused or stuck with loot in hand; clearing the hand-held blocker before retrying."
+          interrupted_sale = true
+          needs_retry = true
+          Script.kill("eloot")
+          sleep 0.5
+          Ashborne_toolkit.sell_held_storage_blocker || Ashborne_toolkit.ashborne_stow_all
+          break
+        end
+        if Time.now >= deadline
+          respond "Ashborne stopped waiting for ;eloot sell after 15 minutes."
+          interrupted_sale = true
+          Script.kill("eloot")
+          break
+        end
+        sleep 0.25
+      end
+      clean_sale = !interrupted_sale && saw_eloot_running
+    end while attempts < 4 && Script.exists?("eloot") && (needs_retry || !checkright.nil? || !checkleft.nil?)
+
+    if !checkright.nil? || !checkleft.nil?
+      respond "#{Char.name} still has something in hand after ;eloot sell; town services need attention before hunting."
+      return false
+    end
+    unless clean_sale
+      respond "#{Char.name}'s post-hunt sale did not finish cleanly; staying in town instead of falsely advancing the repeat queue."
+      return false
+    end
     respond "#{Char.name} finished selling post-hunt loot."
     true
   rescue => error
@@ -10115,7 +10199,7 @@ module Ashborne_toolkit
 
   def repeat_hunt_block_reason
     return "this character is a follower" if $ashborne_group_ai == "2"
-    return "group danger is active" if $ashborne_group_danger_active == "1"
+    return "group danger is active" if $ashborne_group_danger_active == "1" && !Ashborne_toolkit.encumbrance_return?
     return "this character is dead" if checkdead
     return "the #{$ashborne_my_area} mode does not support repeat hunts" if $ashborne_my_area.to_s =~ /qlite|quick|drarena|drlite|grounded/
     if $ashborne_hunt_cycle.to_i >= $ashborne_hunt_cycles.to_i
