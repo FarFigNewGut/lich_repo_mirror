@@ -1,0 +1,4476 @@
+# encoding: utf-8
+=begin
+
+Chrism Forge!
+Helps clerics make chrisms and keep chrism gems organized.
+
+Author: Mystienne
+
+Contributor credits:
+  Timbalt - chrism-maker automation and tracking
+  Aethor - original script basis
+  Leafiara - chrismable gem list (from PurifyL)
+  Tatterclaws - chrism sort function (from chrismsort)
+
+Who this is for:
+  Chrism Forge is for clerics who make chrisms and for any character who wants to sort chrism gems.
+
+What this script does:
+  The setup window lets you pick containers from drop-down lists.
+  The Chrismarium tab can fill your chrismarium from saved finished chrisms by selected quality.
+  The Gemcutting tab can save a lapidary box and pick designs for chrism-run outcomes.
+  Count Gems shows what gems are in the saved containers.
+  Stage Gems quietly checks inventory and moves likely chrism gems into the gems-to-try container.
+  Sort Chrisms looks for cobalt liquid and moves finished chrisms into the finished-chrism container.
+  The main run casts 325 on each gem in the gems-to-try container, then moves successes and failures where they belong.
+  If enabled in the Gemcutting tab, the run can cut each gem after it knows the outcome.
+  If GemGuard has saved a gem's orb status and value, Chrism Forge can skip known non-orbs
+  and orb gems under 3000 silver before spending mana on 325.
+  When Chrism Forge makes a chrism, it saves that result back to GemGuard for later.
+  Chrismarium mode pushes finished chrisms into your chrismarium instead of just storing them loose.
+  Check Skills tells whether the current character can make chrisms and what retained-experience fullness they can make.
+  The progress window shows a live status panel and can stop cleanly while keeping the report visible.
+
+Important notes:
+  A gem is only proven able to become a chrism after the script tries casting 325 on it.
+  Cobalt liquid is how the script tells that a gem already has a chrism.
+  The fullness wording shows retained experience and comes from Blessings ranks.
+  The cobalt-liquid strength wording, like dull or bright, comes from gem value.
+  GemGuard value help is used for known non-orbs and for orb gems that are too low value.
+
+       author: Mystienne
+  contributor: Timbalt, Aethor, Leafiara, Tatterclaws
+         game: gs
+      version: 0.12.4
+        build: 07052026.7
+         tags: cleric, chrism, utility, gtk
+     required: Lich >= 5.11.0
+        email: Mystienne@mystienne.com
+      discord: Mystienne
+
+=end
+
+VERSION = '0.12.4'
+AUTHOR = 'Mystienne'
+SCRIPT_COMMAND = 'chrismforge'
+CHRISMFORGE_NONE_LABEL = '(none)'
+CHRISMFORGE_SETUP_LABEL_WIDTH = 230
+
+script = Script.current
+require 'yaml'
+require 'fileutils'
+require 'timeout'
+
+# Builds the GTK title text with the current character name when Lich has it.
+#
+# @param base [String] base window title before version and character
+# @return [String] title text for GTK windows
+def cm_window_title(base)
+  name = Char.name.to_s.strip
+  suffix = name.empty? ? '' : " - #{name}"
+  "#{base} #{VERSION}#{suffix}"
+rescue
+  "#{base} #{VERSION}"
+end
+
+CHRISMFORGE_SETTINGS_DEFAULTS = {
+  'containers' => {
+    'gems_to_try' => '',
+    'finished_chrisms' => '',
+    'failed_gems' => '',
+    'too_crude_orbs' => '',
+    'chrismarium_storage' => ''
+  },
+  'ignore_containers' => [],
+  'chrismarium' => {
+    'when_full' => 'continue',
+    'fill_strengths' => ['dull', 'ordinary', 'bright', 'vibrant', 'glowing'],
+    'fill_fullnesses' => ['half full', 'more than half full', 'three quarters full', 'almost full', 'full'],
+    'status' => {}
+  },
+  'lapidary' => {
+    'box' => '',
+    'designs' => [],
+    'cut_during_run' => 'false',
+    'patterns' => {
+      'orb' => '',
+      'chrism' => '',
+      'purified' => '',
+      'regular' => ''
+    },
+    'last_analyzed_at' => ''
+  },
+  'run' => {
+    'clear_hands' => true,
+    'hand_clear_command' => 'stow all'
+  }
+}.freeze
+
+CHRISMFORGE_SETTING_PATHS = {
+  orbsack: ['containers', 'gems_to_try'],
+  chrismsack: ['containers', 'finished_chrisms'],
+  lootsack: ['containers', 'failed_gems'],
+  toocrudesack: ['containers', 'too_crude_orbs'],
+  chrismariumsack: ['containers', 'chrismarium_storage'],
+  ignoresacks: ['ignore_containers'],
+  chrismariumfull: ['chrismarium', 'when_full'],
+  chrismariumfillstrengths: ['chrismarium', 'fill_strengths'],
+  chrismariumfillfullnesses: ['chrismarium', 'fill_fullnesses'],
+  chrismariumstatus: ['chrismarium', 'status'],
+  lapidarybox: ['lapidary', 'box'],
+  lapidarydesigns: ['lapidary', 'designs'],
+  lapidarycutduringrun: ['lapidary', 'cut_during_run'],
+  lapidaryorbpattern: ['lapidary', 'patterns', 'orb'],
+  lapidarychrismpattern: ['lapidary', 'patterns', 'chrism'],
+  lapidarypurifiedpattern: ['lapidary', 'patterns', 'purified'],
+  lapidaryregularpattern: ['lapidary', 'patterns', 'regular'],
+  lapidaryanalyzedat: ['lapidary', 'last_analyzed_at']
+}.freeze
+
+# Normalizes Lich script arguments before command dispatch.
+#
+# Lich can sometimes pass duplicated command text through script variables.
+# This helper keeps command handling predictable and removes the script name
+# when the user typed it into the command line.
+#
+# @param raw_args [Array<#to_s>] raw Lich script arguments
+# @return [Array<String>] normalized command arguments
+def cm_normalize_args(raw_args)
+  normalized = raw_args.to_a.flat_map { |arg| arg.to_s.strip.split(/\s+/) }.reject(&:empty?)
+  half = normalized.length / 2
+  normalized = normalized.first(half) if normalized.length.even? && half.positive? && normalized.first(half) == normalized.last(half)
+  normalized = normalized.drop(1) if normalized.first.to_s.casecmp(SCRIPT_COMMAND).zero?
+  normalized
+end
+
+args = cm_normalize_args(script.vars)
+use_chrismarium = args.any? { |arg| arg =~ /^chrismarium$/i }
+use_gtk_progress = args.any? { |arg| arg =~ /^(?:gtk-progress|progress)$/i }
+
+# Reset the cached profession check at the start of each invocation
+# so character switches between runs are picked up.
+$cm_chrismforge_cleric_cache = nil
+
+CHRISMABLE_GEM_NOUNS = %w[
+  aetherstone alexandrite auboraline azel beryl blazestar bloodjewel bluerock caederine
+  carnelian cinderstone despanal diamond doomstone duskjewel emerald eostone faenor
+  feystone firedrop firestone galena goldstone heliotrope jacinth lichstone mekret
+  nightstone pearl prehnite rhimar riftshard riftstone rivertear roestone rosepar sandruby
+  saewehna shadowglass smoldereye snowstone spherine tanzanite thunderstone waterweb
+  wraithaline wyrdshard
+].freeze
+
+CHRISMABLE_GEM_NAMES = [
+  "aster opal", "azure salt sapphire", "black opal", "black-cored emerald orb",
+  "blackened feystone core", "blue-green glacial core", "blue green lagoon opal",
+  "blue sapphire", "blue shimmarglin sapphire", "blue sky opal", "blue-veined volcanic obsidian",
+  "bluish black razern-bloom", "brilliant lilac glimaerstone", "brilliant wyrm's-tooth amethyst",
+  "cabochon of striated grape jade", "carmine cinnabar stone", "cerulean glimaerstone",
+  "chameleon agate", "chunk of pale blue ice stone", "chunk of snowy white ice stone",
+  "cloud opal", "cloudy alexandrite shard", "craggy orb of coppery blue azurite",
+  "cushion-cut vibrant carmine ruby", "dark blue tempest stone", "dark-forked ivory dendritic agate",
+  "dark ivory aranthium-bloom", "deep blue mermaid's-tear sapphire", "deep blue tide's-heart opal",
+  "dragon's-fang quartz", "dragon's-tear ruby", "dragonfire opal", "dragonsbreath sapphire",
+  "dragonseye sapphire", "droplet of honey amber", "ebon winternight sapphire",
+  "ebon-washed carnelian red ammolite", "faceted teal sapphire", "faceted wyrm's heart sapphire",
+  "fiery gold-flecked sunstone", "flickering snowfire ruby", "fossilized bessho lizard spur",
+  "fragment of pale green-blue aquamarine", "gilt-sprouted icy white quartz", "golden glimaerstone",
+  "golden moonstone", "golden rhimar-bloom", "gold-haloed pale dragonseye sapphire",
+  "gold-suffused resinous honey opal", "green alexandrite stone", "grooved burnt orange sea star",
+  "indigo-cored stormy violet amethyst", "lavender shimmarglin sapphire",
+  "lilac-crested molten gold ametrine", "misty grey deathstone", "misty silver crystalline spiral",
+  "moonglae opal", "nearly black pomegranate red garnet", "nival everfrost shard",
+  "niveous snowdrop", "opaline moonstone", "pale green moonstone", "pastel-hued wintersbite pearl",
+  "peach glimaerstone", "pear-shaped greenish yellow citrine", "pearly grey ice stone",
+  "Phoen's eye topaz", "piece of dusky blue sapphire", "pink sapphire", "plum-flecked ruby zoisite",
+  "polished dark blue amber", "prismatic rose gold fire agate", "purple black thunderhead opal",
+  "rainbow-swept royal blue moonstone", "raw chunk of titian orange sunstone",
+  "red-clouded black moonstone", "red starstone", "red sunstone",
+  "rich cerulean mermaid's-tear sapphire", "rough-edged matte white soulstone",
+  "rutilated frostbite amethyst", "sanguine pyrope teardrop", "scaled indigo ammolite",
+  "scintillating fiery scarlet starstone", "shadow amethyst", "shard of rainbow quartz",
+  "silver-cored vortex stone", "silvery moonstone", "smooth dolphin stone disc",
+  "sparkling ice blue dreamstone", "sylvarraend ruby", "tangerine wulfenite crystal",
+  "thin blade of verdant sea glass", "tigerfang crystal", "twilight blue azurite crystal",
+  "ultramarine glimaerstone", "uncut ruby", "uncut sunstone", "variegated mushroom-hued jasper",
+  "verdigris Kai Toka tradebar", "versicolored sharp crimson crystal", "vinous gigasblood ruby",
+  "vivid cobalt blue spinel", "volcanic blue larimar stone", "white sunstone", "yellow sunstone"
+].freeze
+
+CHRISM_QUALITY_NOTES = {
+  'dull' => '3,000-4,999 silver gem tier; about 27-30% initial stat loss',
+  'ordinary' => '5,000-7,999 silver gem tier; about 21-26% initial stat loss',
+  'bright' => '8,000-12,999 silver gem tier; about 11-20% initial stat loss',
+  'vibrant' => '13,000+ silver gem tier; about 10% or less initial stat loss',
+  'glowing' => 'highest observed tier; exact gem value range is still unclear'
+}.freeze
+
+CHRISM_FULLNESS_NOTES = {
+  'half full' => '55% experience retained; about 11 Blessings ranks',
+  'more than half full' => '60-70% experience retained; about 13-20 Blessings ranks',
+  'three quarters full' => '75-80% experience retained; about 25-31 Blessings ranks',
+  'almost full' => '85-95% experience retained; about 38-55 Blessings ranks',
+  'full' => '100% experience retained; about 65 Blessings ranks'
+}.freeze
+
+CHRISMFORGE_CHRISM_STRENGTHS = CHRISM_QUALITY_NOTES.keys.freeze
+CHRISMFORGE_CHRISM_FULLNESSES = CHRISM_FULLNESS_NOTES.keys.freeze
+
+CHRISM_REQUIREMENTS = {
+  cleric_spell: 25,
+  blessings: 10,
+  religion: 25,
+  summoning: 15
+}.freeze
+
+CHRISM_MINIMUM_MANA_COST = 25
+CHRISMFORGE_GEMGUARD_CHRISM_VALUE_MINIMUM = 3000
+
+CHRISMARIUM_FULL_CHOICES = {
+  'continue' => 'Continue using finished-chrism pouch',
+  'stop' => 'Stop and print report'
+}.freeze
+
+CHRISMARIUM_FULL_LABELS = CHRISMARIUM_FULL_CHOICES.invert.freeze
+
+CHRISMARIUM_RETENTION_NOTES = {
+  'diluted to half strength' => 'Same as half full chrisms, 55% experience retained.',
+  'diluted to more than half strength' => 'Same as more than half full chrisms, 60-70% experience retained.',
+  'somewhat diluted' => 'Same as three quarters full chrisms, 75-80% experience retained.',
+  'slightly diluted' => 'Same as almost full chrisms, 85-95% experience retained.',
+  'pure and undiluted' => 'Same as full chrisms, 100% experience retained.'
+}.freeze
+
+CHRISM_REPORT_FULLNESS_NOTES = {
+  'half full' => '55% experience retained',
+  'more than half full' => '60-70% experience retained',
+  'three quarters full' => '75-80% experience retained',
+  'almost full' => '85-95% experience retained',
+  'full' => '100% experience retained'
+}.freeze
+
+CONTAINER_FULL_MESSAGE_PATTERN = "will not fit|won't fit|no room|too full|full to|could not possibly fit|overstuffed".freeze
+CONTAINER_FULL_MESSAGE_REGEX = /#{CONTAINER_FULL_MESSAGE_PATTERN}/i
+
+def cm_mono_block(text)
+  if defined?(_respond)
+    _respond %Q{<output class="mono"/>\n#{text}<output class=""/>}
+  else
+    respond text
+  end
+end
+
+def cm_inline_preset(preset, text)
+  preset = preset.to_s
+  if %w[monster creature error yellow bold].include?(preset)
+    "#{monsterbold_start}#{text}#{monsterbold_end}"
+  else
+    "<preset id=\"#{preset}\">#{text}</preset>"
+  end
+end
+
+def cm_bold(text)
+  cm_inline_preset('speech', text)
+end
+
+def cm_gtk_markup_escape(text)
+  text.to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;')
+end
+
+def cm_status_warning_markup(text)
+  "<span foreground=\"#ffbf40\" weight=\"bold\">#{cm_gtk_markup_escape(text)}</span>"
+end
+
+def cm_deep_copy(obj)
+  Marshal.load(Marshal.dump(obj))
+end
+
+def cm_deep_merge(base, override)
+  merged = cm_deep_copy(base)
+  override.to_h.each do |key, value|
+    if merged[key].is_a?(Hash) && value.is_a?(Hash)
+      merged[key] = cm_deep_merge(merged[key], value)
+    else
+      merged[key] = value
+    end
+  end
+  merged
+end
+
+def cm_script_root
+  return DATA_DIR if defined?(DATA_DIR) && DATA_DIR
+
+  File.expand_path(File.join(File.dirname(__FILE__), '..'))
+rescue
+  File.expand_path('.')
+end
+
+def cm_settings_dir
+  File.join(cm_script_root, SCRIPT_COMMAND)
+end
+
+def cm_settings_path
+  File.join(cm_settings_dir, 'settings.yaml')
+end
+
+def cm_setting_set(data, path, value)
+  return if value.nil?
+
+  target = data
+  path[0...-1].each { |key| target = (target[key] ||= {}) }
+  target[path.last] = value
+end
+
+# Loads saved Chrism Forge settings from YAML and fills in any missing defaults.
+#
+# Side effects: creates the settings file with defaults if it does not exist.
+#
+# @return [Hash] merged settings for this script
+def cm_load_settings
+  path = cm_settings_path
+  if File.exist?(path)
+    loaded = YAML.load_file(path)
+    return cm_deep_merge(CHRISMFORGE_SETTINGS_DEFAULTS, loaded.is_a?(Hash) ? loaded : {})
+  end
+
+  settings = cm_deep_copy(CHRISMFORGE_SETTINGS_DEFAULTS)
+  cm_save_settings(settings)
+  settings
+rescue
+  cm_deep_copy(CHRISMFORGE_SETTINGS_DEFAULTS)
+end
+
+# Saves Chrism Forge settings to the script YAML file.
+#
+# Side effects: creates the settings folder when needed and writes settings.yaml.
+#
+# @param settings [Hash] settings to save
+# @return [void]
+def cm_save_settings(settings = $chrismforge_settings)
+  FileUtils.mkdir_p(cm_settings_dir) unless Dir.exist?(cm_settings_dir)
+  File.open(cm_settings_path, 'w') { |file| file.write(settings.to_yaml) }
+rescue => error
+  message("Could not save Chrism Forge settings: #{error.message}") if defined?(message)
+end
+
+$chrismforge_settings = cm_load_settings
+
+def message(text = '')
+  string = text.to_s.gsub(/^(\s*)~ ?/, '\1')
+  puts string
+  $chrism_maker_progress_callback.call(text.to_s) if $chrism_maker_progress_callback
+end
+
+def cm_timestamp
+  Time.now.strftime('%H:%M:%S')
+end
+
+def cm_timestamp_text(text)
+  source = text.to_s
+  marker = source =~ /\A\s*~/ ? '~ ' : ''
+  clean = source.gsub(/\A\s*~\s*/, '')
+  "#{marker}[#{cm_timestamp}] #{clean}"
+end
+
+# Sends a progress update to the GTK window or the game line.
+#
+# If GTK progress is open, this updates the live panel. Without GTK progress,
+# the line still goes to the game so command-line users get feedback.
+#
+# @param text [String] progress text
+# @param state [Hash, nil] current run state for GTK timer updates
+# @return [void]
+def cm_progress_status(text, state = nil)
+  clean = text.to_s.gsub(/\A\s*~\s*/, '')
+  text = cm_timestamp_text(text)
+  display_text = text.to_s.gsub(/\A~\s*/, '')
+  if state
+    if clean =~ /\AWaiting for/i
+      state[:highlight_status] = display_text
+    elsif clean =~ /\AChrismarium is full/i
+      state[:highlight_status] = display_text
+      state[:activity_status] = display_text
+    elsif clean =~ /\AProcessed:/i
+      state[:last_progress_line] = display_text
+      state[:activity_status] = display_text
+      state[:highlight_status] = nil
+    else
+      state[:activity_status] = display_text
+      state[:last_progress_line] ||= display_text if clean =~ /\AStarting/i
+    end
+  end
+  if $chrism_maker_progress_callback
+    $chrism_maker_progress_callback.call(text.to_s, state)
+  else
+    puts text.to_s.gsub(/^(\s*)~ ?/, '\1')
+  end
+end
+
+def help
+  output = "\n"
+  command_width = 62
+  help_section = proc { |text| output.concat "\n#{cm_inline_preset('thought', "#{text}:")}\n" }
+  help_line = proc do |command_text, description = ''|
+    command_text = command_text.to_s
+    padding = ' ' * [command_width - command_text.length, 2].max
+    output.concat "   #{cm_inline_preset('speech', command_text)}#{padding}#{description}\n"
+  end
+  help_note = proc { |text| output.concat "      #{text}\n" }
+
+  output.concat "#{cm_inline_preset('thought', "Chrism Forge #{VERSION}:")}\n"
+
+  help_section.call('setup')
+  help_line.call(";#{SCRIPT_COMMAND}", 'open setup and save YAML settings')
+  help_line.call(";#{SCRIPT_COMMAND} setup", 'open setup and save YAML settings')
+  help_line.call(";#{SCRIPT_COMMAND} config", 'same as setup')
+  help_line.call(";#{SCRIPT_COMMAND} gtk", 'same as setup')
+  help_line.call(";#{SCRIPT_COMMAND} gui", 'same as setup')
+
+  help_section.call('make chrisms')
+  help_line.call(";#{SCRIPT_COMMAND} run", 'make chrisms from Gems to try')
+  help_line.call(";#{SCRIPT_COMMAND} run progress", 'run and open the progress window')
+  help_line.call(";#{SCRIPT_COMMAND} run gtk-progress", 'same as run progress')
+  help_line.call(";#{SCRIPT_COMMAND} chrismarium", 'fill your chrismarium instead')
+  help_line.call(";#{SCRIPT_COMMAND} chrismarium progress", 'chrismarium mode with progress window')
+  help_line.call(";#{SCRIPT_COMMAND} chrismarium gtk-progress", 'same as chrismarium progress')
+
+  help_section.call('organize')
+  help_line.call(";#{SCRIPT_COMMAND} count", 'count saved pouch contents')
+  help_line.call(";#{SCRIPT_COMMAND} stage", 'move likely chrism gems into Gems to try')
+  help_line.call(";#{SCRIPT_COMMAND} stage (source pouch)", 'stage from one pouch')
+  help_line.call(";#{SCRIPT_COMMAND} stage-gems", 'same as stage')
+  help_line.call(";#{SCRIPT_COMMAND} rawsort", 'same as stage')
+  help_line.call(";#{SCRIPT_COMMAND} sort", 'move finished chrisms into Finished chrisms')
+  help_line.call(";#{SCRIPT_COMMAND} sort (source pouch)", 'sort one pouch')
+  help_line.call(";#{SCRIPT_COMMAND} sort (source pouch) (gem pouch) (chrism pouch)", 'sort with chosen pouches')
+  help_line.call(";#{SCRIPT_COMMAND} chrismsort", 'same as sort')
+  help_line.call(";#{SCRIPT_COMMAND} sort-chrisms", 'same as sort')
+
+  help_section.call('info')
+  help_line.call(";#{SCRIPT_COMMAND} quality", 'check whether this character can make chrisms')
+  help_line.call(";#{SCRIPT_COMMAND} skill", 'same as quality')
+  help_line.call(";#{SCRIPT_COMMAND} skills", 'same as quality')
+  help_line.call(";#{SCRIPT_COMMAND} check", 'same as quality')
+  help_line.call(";#{SCRIPT_COMMAND} canmake", 'same as quality')
+  help_line.call(";#{SCRIPT_COMMAND} changelog", 'show important changes')
+  help_line.call(";#{SCRIPT_COMMAND} changes", 'same as changelog')
+  help_line.call(";#{SCRIPT_COMMAND} version", 'same as changelog')
+  help_line.call(";#{SCRIPT_COMMAND} help", 'show this help')
+  help_line.call(";#{SCRIPT_COMMAND} --help", 'same as help')
+  help_line.call(";#{SCRIPT_COMMAND} -h", 'same as help')
+  help_line.call(";#{SCRIPT_COMMAND} ?", 'same as help')
+
+  help_section.call('settings')
+  help_note.call("Use ;#{SCRIPT_COMMAND} setup. Chrism Forge does not use ;vars.")
+  help_note.call('When GemGuard has saved orb status and value, Chrism Forge uses that before casting 325.')
+  help_note.call('Known non-orbs and orb gems under 3000 silver are skipped to save mana.')
+  help_note.call('Use the Chrismarium tab to choose which finished chrisms go into your chrismarium.')
+  help_note.call('Use the Gemcutting tab to save a lapidary box and optionally cut gems during chrism runs.')
+  output.concat "\n"
+
+  cm_mono_block(output)
+end
+
+def changelog
+  output = "\n"
+  output.concat "#{cm_inline_preset('thought', 'chrismforge changelog:')}\n\n"
+  output.concat "07-05-2026\n"
+  output.concat "   0.12.4 - fix(gemcutting): Recognized grab and hand-swap messages while preparing the saved lapidary box.\n"
+  output.concat "   0.12.3 - fix(setup): Made closing a Chrism Forge window request a safe stop after the current action.\n"
+  output.concat "   0.12.2 - fix(gemcutting): Made the manual Cut Saved Pouch button change to Stop while cutting and stop after the current gem.\n"
+  output.concat "   0.12.1 - fix(gemcutting): Made manual pouch cutting count already-cut gems before cutting and reuse the lapidary box setup for the batch.\n"
+  output.concat "   0.12.0 - feat(gemcutting): Added a Gemcutting tab button to cut uncut gems in a chosen saved pouch outside chrism-making runs.\n"
+  output.concat "   0.11.2 - fix(setup): Saved checkbox changes immediately and refreshed the Gemcutting summary when the run-cut toggle changes.\n"
+  output.concat "   0.11.1 - fix(gemcutting): Skipped the lapidary cutter when a gem already shows one of the saved cut designs.\n\n"
+  output.concat "07-04-2026\n"
+  output.concat "   0.11.0 - feat(gemcutting): Added an opt-in chrism-run cutter that uses saved lapidary patterns after each gem outcome is known.\n\n"
+  output.concat "07-03-2026\n"
+  output.concat "   0.10.10 - fix(gemguard): Saved newly made chrism status, strength, and fullness back to GemGuard's item database.\n"
+  output.concat "   0.10.9 - docs(help): Clarified that Chrism Forge uses GemGuard orb status and value data before casting 325.\n"
+  output.concat "   0.10.8 - fix(progress): Replaced the old non-orb failed label with separate non-orb, low-value orb, and other failed counts.\n"
+  output.concat "   0.10.7 - fix(chrismarium): Made chrismarium run mode respect saved strength and fullness filters before pushing new chrisms.\n"
+  output.concat "   0.10.6 - fix(setup): Right-aligned setup labels and widened the label column so dropdowns line up cleanly.\n"
+  output.concat "   0.10.5 - fix(report): Split low-value orb gems out of non-orb failed counts and clarified the setup pouch label.\n"
+  output.concat "   0.10.4 - fix(progress): Renamed estimated finish to finish around so it is clear that the value is a clock time.\n"
+  output.concat "   0.10.3 - fix(setup): Added the current character name to setup and progress window titles.\n\n"
+  output.concat "06-30-2026\n"
+  output.concat "   0.10.2 - fix(gemcutting): Added separate saved pattern choices for orb, chrism, purified, and regular gems, allowed held gemcutting tools and safer typed-name fallbacks, and captured full ANALYZE output so lapidary boxes save their designs correctly.\n\n"
+  output.concat "06-29-2026\n"
+  output.concat "   0.9.0 - feat(setup): Added chrismarium status refresh and gemcutter support for saved gemcutting designs.\n"
+  output.concat "   0.8.0 - feat(lapidary): Added a Lapidary setup tab that analyzes a saved box and stores its current designs.\n"
+  output.concat "   0.7.0 - feat(chrismarium): Added a Chrismarium setup tab that fills the chrismarium from finished chrisms by selected strength and fullness.\n"
+  output.concat "   0.6.1 - fix(gemguard): Skipped GemGuard-known non-orbs without needing saved value and renamed the failed-gem pouch text to Non-orb gems.\n"
+  output.concat "   0.6.0 - feat(gemguard): Used GemGuard's saved value and orb status to skip gems that cannot make chrisms.\n\n"
+  output.concat "06-28-2026\n"
+  output.concat "   0.5.2 - Renamed the low-value orb category to Not chrismable orbs.\n"
+  output.concat "   0.5.1 - Renamed the low-value orb category to Non-chrism orbs.\n"
+  output.concat "   0.5.0 - Added an optional pouch for non-chrism orbs.\n"
+  output.concat "   0.4.30 - Report orbs that are too low value to accept a blessing.\n"
+  output.concat "   0.4.29 - Made progress-window timers update live once per second.\n"
+  output.concat "   0.4.28 - Show the actual finished-chrism container name in progress.\n"
+  output.concat "   0.4.27 - Removed the duplicate status row and made chrismarium-full progress clearer.\n"
+  output.concat "   0.4.26 - Kept last progress visible while showing mana waits separately.\n"
+  output.concat "   0.4.25 - Made the progress window show one live status panel with timers.\n"
+  output.concat "   0.4.24 - Renamed progress mana totals to Mana used for clarity.\n"
+  output.concat "   0.4.23 - Made the progress window show the newest lines at the top.\n"
+  output.concat "   0.4.22 - Updated the header and help text to follow the current script rules.\n\n"
+  output.concat "06-24-2026\n"
+  output.concat "   0.4.21 - Made GTK window X closes hide safely instead of destroying from delete-event.\n\n"
+  output.concat "06-16-2026\n"
+  output.concat "   0.4.20 - Show full container labels in setup while saving safe interaction names.\n\n"
+  output.concat "06-14-2026\n"
+  output.concat "   0.4.19 - Made XML container discovery display full GameObj names when available.\n"
+  output.concat "   0.4.18 - Changed setup container discovery to prefer XML object links like tpick.\n"
+  output.concat "   0.4.17 - Made setup container dropdowns default to none instead of stale or first-found containers.\n"
+  output.concat "   0.4.16 - Fixed setup container parsing so descriptive clauses are not shown as ignore choices.\n"
+  output.concat "   0.4.15 - Matched help and changelog colors and alignment to xp2 and tutelog.\n\n"
+  output.concat "06-13-2026\n"
+  output.concat "   0.4.14 - Reset unreleased development versioning to 0.x before any first upload.\n"
+  output.concat "   0.4.14 - Added safer full-pouch handling so the current gem is returned or clearly reported.\n\n"
+  output.concat "06-10-2026\n"
+  output.concat "   0.4.12-0.4.13 - Made the progress window wider and kept it scrolled to the newest line.\n"
+  output.concat "   0.4.12-0.4.13 - Made mana waiting learn from the full cast-and-bless cycle.\n\n"
+  output.concat "06-06-2026\n"
+  output.concat "   0.4.7-0.4.11 - Fixed the top header so Lich no longer mistakes credit lines for script labels.\n"
+  output.concat "   0.4.7-0.4.11 - Improved full-container handling so pouch-full stops are caught consistently.\n"
+  output.concat "   0.4.7-0.4.11 - Fixed help examples hidden by angle-bracket placeholders in Lich output.\n"
+  output.concat "   0.4.7-0.4.11 - Removed old Lich Vars migration so settings now come only from the YAML file.\n"
+  output.concat "   0.4.7-0.4.11 - Redesigned help into a cleaner task-grouped menu.\n\n"
+  output.concat "06-01-2026\n"
+  output.concat "   0.4.5-0.4.6 - Cleaned up the script header so it only describes the script and credits contributors.\n"
+  output.concat "   0.4.5-0.4.6 - Moved changelog history out of the header and into this command.\n"
+  output.concat "   0.4.5-0.4.6 - Updated help so it lists the current CLI commands, aliases, and progress option.\n\n"
+  output.concat "05-31-2026\n"
+  output.concat "   0.4.0-0.4.4 - Added YAML settings saved in Lich's data folder.\n"
+  output.concat "   0.4.0-0.4.4 - Added GTK setup and progress windows with container dropdowns.\n"
+  output.concat "   0.4.0-0.4.4 - Added gem counting, raw gem staging, and finished chrism sorting.\n"
+  output.concat "   0.4.0-0.4.4 - Added chrismarium mode and a setting for when the chrismarium is full.\n"
+  output.concat "   0.4.0-0.4.4 - Added clean stop behavior with a final report.\n"
+  output.concat "   0.4.0-0.4.4 - Added timestamps to progress updates, mana waits, and final reports.\n"
+  output.concat "   0.4.0-0.4.4 - Added skill checks so only characters who can cast chrisms can run chrism-making.\n"
+  output.concat "   0.4.0-0.4.4 - Improved pouch handling so full containers stop cleanly instead of filling your hands.\n\n"
+  output.concat "05-30-2026\n"
+  output.concat "   0.3.4-0.3.7 - Renamed the custom script to Chrism Forge so it does not conflict with repository chrism scripts.\n"
+  output.concat "   0.3.4-0.3.7 - Added the chrismable gem list from PurifyL.\n"
+  output.concat "   0.3.4-0.3.7 - Added quality and fullness notes from LOOK so finished chrisms are easier to understand.\n\n"
+
+  cm_mono_block(output)
+end
+
+def setting_value(name)
+  path = CHRISMFORGE_SETTING_PATHS[name.to_sym]
+  value = if path
+            path.inject($chrismforge_settings) { |data, key| data.is_a?(Hash) ? data[key] : nil }
+          else
+            nil
+          end
+  value.to_s.strip unless value.nil? || value.to_s.strip.empty?
+end
+
+def cm_setting_array(name)
+  path = CHRISMFORGE_SETTING_PATHS[name.to_sym]
+  value = path ? path.inject($chrismforge_settings) { |data, key| data.is_a?(Hash) ? data[key] : nil } : nil
+  Array(value).map(&:to_s).map(&:strip).reject(&:empty?)
+end
+
+def cm_setting_write(name, value)
+  path = CHRISMFORGE_SETTING_PATHS[name.to_sym]
+  return unless path
+
+  cm_setting_set($chrismforge_settings, path, value)
+end
+
+def cm_chrismarium_full_setting
+  value = setting_value(:chrismariumfull)
+  value =~ /^stop/i ? 'stop' : 'continue'
+end
+
+def cm_chrismarium_full_label
+  CHRISMARIUM_FULL_CHOICES[cm_chrismarium_full_setting] || CHRISMARIUM_FULL_CHOICES['continue']
+end
+
+def cm_chrismarium_fill_strengths
+  selected = cm_setting_array(:chrismariumfillstrengths) & CHRISMFORGE_CHRISM_STRENGTHS
+  selected.empty? ? CHRISMFORGE_CHRISM_STRENGTHS : selected
+end
+
+def cm_chrismarium_fill_fullnesses
+  selected = cm_setting_array(:chrismariumfillfullnesses) & CHRISMFORGE_CHRISM_FULLNESSES
+  selected.empty? ? CHRISMFORGE_CHRISM_FULLNESSES : selected
+end
+
+def cm_chrismarium_fill_filter_text(strengths = nil, fullnesses = nil)
+  strengths = Array(strengths || cm_chrismarium_fill_strengths)
+  fullnesses = Array(fullnesses || cm_chrismarium_fill_fullnesses)
+  [
+    "Strength: #{strengths.join(', ')}",
+    "Fullness: #{fullnesses.join(', ')}"
+  ].compact.join("\n")
+end
+
+def cm_chrismarium_saved_status
+  value = setting_value(:chrismariumstatus)
+  value.is_a?(Hash) ? value : {}
+end
+
+def cm_lapidary_box_name
+  setting_value(:lapidarybox).to_s
+end
+
+def cm_lapidary_designs
+  cm_setting_array(:lapidarydesigns)
+end
+
+def cm_lapidary_pattern_value(kind)
+  setting_value("lapidary#{kind}pattern".to_sym).to_s
+end
+
+def cm_lapidary_cut_during_run?
+  value = setting_value(:lapidarycutduringrun).to_s
+  value =~ /\A(?:true|yes|on|1)\z/i ? true : false
+end
+
+# Returns available gemcutting pattern names, including saved choices that may
+# not be in the latest analyzed list.
+#
+# @param designs [Array<String>, nil] current analyzed design names
+# @return [Array<String>] design choices for setup dropdowns
+def cm_lapidary_pattern_choices(designs = nil)
+  designs = Array(designs || cm_lapidary_designs)
+  saved = %w[orb chrism purified regular].map { |kind| cm_lapidary_pattern_value(kind) }
+  (designs + saved).map(&:to_s).map(&:strip).reject(&:empty?).uniq
+end
+
+def cm_lapidary_outcome_label(kind)
+  labels = {
+    'orb' => 'Low-value orb gems',
+    'chrism' => 'Finished chrisms',
+    'purified' => 'Non-orb gems',
+    'regular' => 'Other failed gems',
+    'not_chrismable_orb' => 'Low-value orb gems',
+    'non_orb' => 'Non-orb gems',
+    'other_failed' => 'Other failed gems'
+  }
+  labels[kind.to_s] || kind.to_s
+end
+
+# Chooses the saved lapidary design for a chrism-run outcome.
+#
+# @param outcome [Symbol] :chrism, :not_chrismable_orb, :non_orb, or :other_failed
+# @return [String] saved design name, or empty when cutting is disabled for it
+def cm_lapidary_pattern_for_outcome(outcome)
+  case outcome.to_sym
+  when :chrism
+    cm_lapidary_pattern_value('chrism')
+  when :not_chrismable_orb
+    cm_lapidary_pattern_value('orb')
+  when :non_orb
+    cm_lapidary_pattern_value('purified')
+  else
+    cm_lapidary_pattern_value('regular')
+  end
+rescue
+  ''
+end
+
+# Builds the pouch choices available to the manual lapidary cutter.
+#
+# @return [Array<Hash>] dropdown choices with outcome keys
+def cm_lapidary_manual_bag_choices
+  [
+    cm_container_choice('Finished chrisms', 'chrism'),
+    cm_container_choice('Low-value orb gems', 'not_chrismable_orb'),
+    cm_container_choice('Non-orb gems', 'non_orb'),
+    cm_container_choice('Other failed gems', 'other_failed')
+  ]
+end
+
+# Finds the saved container setting used by a gemcutting outcome.
+#
+# @param outcome [Symbol, String] chrism-run outcome
+# @return [Symbol] setting key for the saved container
+def cm_lapidary_container_setting_for_outcome(outcome)
+  case outcome.to_sym
+  when :chrism
+    :chrismsack
+  when :not_chrismable_orb
+    :toocrudesack
+  else
+    :lootsack
+  end
+rescue
+  :chrismsack
+end
+
+# Builds the saved gemcutting pattern summary for setup and reports.
+#
+# @return [Array<String>] plain display lines for saved pattern choices
+def cm_lapidary_pattern_lines
+  lines = ["Cut during chrism run: #{cm_lapidary_cut_during_run? ? 'yes' : 'no'}", 'Saved pattern choices:']
+  %w[chrism orb purified regular].each do |kind|
+    value = cm_lapidary_pattern_value(kind)
+    lines << "  #{cm_lapidary_outcome_label(kind)}: #{value.empty? ? CHRISMFORGE_NONE_LABEL : value}"
+  end
+  lines
+end
+
+def cm_lapidary_analyzed_at
+  setting_value(:lapidaryanalyzedat).to_s
+end
+
+def require_setting(name, description)
+  value = setting_value(name)
+  return value if value
+
+  message("~ Missing setting: open ;#{SCRIPT_COMMAND} setup and choose the #{description}.")
+  nil
+end
+
+# Reduces a typed item name to the part most useful for matching.
+#
+# @param text [String] typed item name or GameObj label
+# @return [String] normalized item core without articles or trailing adornment
+def cm_item_lookup_core(text)
+  text.to_s.downcase
+      .sub(/\A(?:my|your|an?|the|some)\s+/, '')
+      .sub(/\s+(?:with|accented by|adorned with|set with|inlaid with|painted with|carved with|trimmed with)\s+.+\z/, '')
+      .strip
+end
+
+# Returns inventory and held objects for loose item lookup.
+#
+# @return [Array<Object>] GameObj inventory and hand items
+def cm_inventory_lookup_candidates
+  (GameObj.inv.to_a + cm_hand_items).compact.reject { |obj| obj.name.to_s == 'Empty' }.uniq { |obj| obj.respond_to?(:id) ? obj.id.to_s : obj.object_id }
+rescue
+  GameObj.inv.to_a
+end
+
+def find_inventory_container(setting)
+  setting_str = setting.to_s.strip
+  return nil if setting_str.empty?
+
+  if setting_str =~ /\A#?(\d+)\z/
+    id = Regexp.last_match(1)
+    return cm_inventory_lookup_candidates.find { |obj| obj.id.to_s == id }
+  end
+
+  normalized = setting_str.downcase
+  core = cm_item_lookup_core(normalized)
+  core_words = core.split(/\s+/)
+  setting_noun = core_words.last.to_s
+  setting_adjs = core_words[0...-1].to_a
+  candidates = cm_inventory_lookup_candidates
+
+  match = candidates.find { |obj| cm_container_match_labels(obj).any? { |label| label.downcase == normalized } }
+  return match if match
+
+  match = candidates.find do |obj|
+    cm_container_match_labels(obj).any? do |label|
+      obj_core = cm_item_lookup_core(label)
+      !obj_core.empty? && obj_core == core
+    end
+  end
+  return match if match
+
+  match = candidates.find do |obj|
+    cm_container_match_labels(obj).any? do |label|
+      obj_name = label.downcase
+      obj_core = cm_item_lookup_core(obj_name)
+      !obj_core.empty? && (obj_name.include?(core) || core.include?(obj_core))
+    end
+  end
+  return match if match
+
+  return nil if setting_noun.empty?
+
+  match = candidates.find do |obj|
+    next false unless obj.noun.to_s.downcase == setting_noun
+    cm_container_match_labels(obj).any? do |label|
+      obj_name = label.downcase
+      setting_adjs.all? { |adj| obj_name.include?(adj) }
+    end
+  end
+  return match if match
+
+  noun_matches = candidates.select { |obj| obj.noun.to_s.downcase == setting_noun }
+  noun_matches.length == 1 ? noun_matches.first : nil
+end
+
+def cm_silently_refresh_inventory
+  cm_quiet_command(
+    'inventory full',
+    6,
+    /You are currently|You are wearing|You are carrying/i,
+    /<prompt|R>/i,
+    /You are currently|You are wearing|You are carrying|Total items|items displayed/i
+  )
+rescue
+  nil
+end
+
+# Parses gem-shaping tool ANALYZE output for saved design names.
+#
+# @param text [String] output from ANALYZE
+# @return [Hash] parsed gem-shaping details, including designs
+def cm_parse_lapidary_analysis(text)
+  source = text.to_s
+  designs = []
+  source.each_line do |line|
+    clean = cm_strip_xml(line).strip
+    next unless clean =~ /\A(\d+)\.\s+(.+?)\s*\z/
+
+    designs << Regexp.last_match(2).strip
+  end
+
+  {
+    lapidary: source =~ /lapidary box|gem\s*cutter|gemcutter|Current Designs:|currently has\s+\d+\s+unlocked design slots|WHISPER DESIGN/i ? true : false,
+    slots: source[/currently has\s+(\d+)\s+unlocked design slots/i, 1].to_i,
+    designs: designs
+  }
+end
+
+# Sends ANALYZE and captures the full gemcutting-tool output for parsing.
+#
+# Side effects: sends ANALYZE to the game.
+#
+# @param command [String] ANALYZE command to send
+# @return [String] captured game output
+def cm_lapidary_analyze_output(command)
+  lines = []
+  fput command
+  Timeout.timeout(10) do
+    while (line = get)
+      text = line.to_s.rstrip
+      lines << text
+      break if text =~ /Try as you might|as light as it can get|could get any deeper|What were you|I could not/i
+    end
+  end
+  lines.join("\n")
+rescue Timeout::Error
+  lines.join("\n")
+rescue
+  lines.join("\n")
+end
+
+# Builds safe ANALYZE commands for a gemcutting tool.
+#
+# @param box_name [String] typed item name, noun, or id
+# @param box [Object, nil] matched GameObj item when available
+# @return [Array<String>] ANALYZE command attempts, most precise first
+def cm_lapidary_analyze_commands(box_name, box = nil)
+  commands = []
+  if box && box.respond_to?(:id) && !box.id.to_s.empty?
+    commands << "analyze ##{box.id}"
+    commands << "analyze my #{box.noun}" unless box.noun.to_s.empty?
+  end
+
+  typed = box_name.to_s.strip
+  core = cm_item_lookup_core(typed)
+  noun = core.split(/\s+/).last.to_s
+  [typed, core, noun].each do |name|
+    name = name.to_s.strip
+    next if name.empty? || name =~ /\A#?\d+\z/
+
+    name = name.sub(/\A(?:my|your)\s+/i, '')
+    commands << "analyze my #{name}"
+  end
+  commands.map(&:strip).reject(&:empty?).uniq
+end
+
+# Analyzes a saved gem-shaping tool and saves its current designs.
+#
+# Side effects: sends ANALYZE to the game and writes gemcutting settings.
+#
+# @param box_name [String] item name, noun, or id for the gem-shaping tool
+# @return [String] plain-language report of saved designs
+def cm_analyze_lapidary_box(box_name)
+  box_name = box_name.to_s.strip
+  return 'Lapidary box is not set.' if box_name.empty?
+
+  cm_silently_refresh_inventory
+  box = find_inventory_container(box_name)
+  commands = cm_lapidary_analyze_commands(box_name, box)
+  return "Could not build an analyze command for lapidary box '#{box_name}'." if commands.empty?
+
+  output = nil
+  parsed = nil
+  commands.each do |command|
+    output = cm_lapidary_analyze_output(command)
+    parsed = cm_parse_lapidary_analysis(output)
+    break if parsed[:lapidary]
+  end
+  unless parsed[:lapidary]
+    target = box ? cm_container_label(box) : box_name
+    return "Analyze did not show a lapidary box for #{target}."
+  end
+
+  saved_label = box ? cm_container_label(box) : box_name
+  cm_setting_write(:lapidarybox, saved_label)
+  cm_setting_write(:lapidarydesigns, parsed[:designs])
+  cm_setting_write(:lapidaryanalyzedat, Time.now.strftime('%m/%d/%Y %H:%M:%S %z'))
+  cm_save_settings
+
+  lines = [
+    "Lapidary box saved: #{saved_label}",
+    "Unlocked design slots: #{parsed[:slots].positive? ? parsed[:slots] : 'unknown'}"
+  ]
+  if parsed[:designs].empty?
+    lines << 'No designs were found in ANALYZE output.'
+  else
+    lines << 'Current designs:'
+    parsed[:designs].each_with_index { |design, index| lines << "  #{index + 1}. #{design}" }
+  end
+  lines << ''
+  lines.concat(cm_lapidary_pattern_lines)
+  lines.join("\n")
+end
+
+# Normalizes a saved lapidary design so punctuation in LOOK output does not
+# make a proven design look different.
+#
+# @param pattern [String] design name from settings or game output
+# @return [String] comparable design key
+def cm_lapidary_pattern_key(pattern)
+  pattern.to_s.strip.downcase.sub(/[[:punct:]\s]+\z/, '')
+rescue
+  ''
+end
+
+# Normalizes a lapidary design or gem name for already-cut checks.
+#
+# @param text [String] design or gem name
+# @return [String] comparable text without leading articles
+def cm_lapidary_cut_name_key(text)
+  cm_lapidary_pattern_key(cm_strip_xml(text).sub(/\s*\(\d+\)\s*\z/, '')).sub(/\A(?:a|an|the|some)\s+/, '')
+rescue
+  ''
+end
+
+# Checks whether a gem already appears to have one of the saved cut designs.
+#
+# @param gem [Object] GameObj gem
+# @return [Boolean] true when the gem name already begins with a saved design
+def cm_lapidary_gem_already_cut?(gem)
+  return false unless gem
+
+  design_keys = cm_lapidary_designs.map { |design| cm_lapidary_cut_name_key(design) }.reject(&:empty?)
+  return false if design_keys.empty?
+
+  labels = [
+    gem.name.to_s,
+    (gem.full_name if gem.respond_to?(:full_name)),
+    (gem.long_name if gem.respond_to?(:long_name))
+  ].compact.map { |label| cm_lapidary_cut_name_key(label) }.reject(&:empty?)
+
+  labels.any? do |label|
+    design_keys.any? do |design|
+      label == design || label.start_with?("#{design} ") || label.start_with?("#{design},")
+    end
+  end
+rescue
+  false
+end
+
+# Finds the 1-based saved lapidary design slot for a pattern name.
+#
+# @param pattern [String] saved design name
+# @return [Integer, nil] design slot number
+def cm_lapidary_design_index(pattern)
+  wanted = cm_lapidary_pattern_key(pattern)
+  return nil if wanted.empty?
+
+  index = cm_lapidary_designs.find_index { |design| cm_lapidary_pattern_key(design) == wanted }
+  index ? index + 1 : nil
+end
+
+# Builds the command target for a held lapidary box.
+#
+# @param box [Object] lapidary box object
+# @return [String] "my noun" when possible, otherwise the item id target
+def cm_lapidary_box_target(box)
+  noun = box.respond_to?(:noun) ? box.noun.to_s.strip : ''
+  return "my #{noun}" unless noun.empty?
+
+  "##{box.id}"
+rescue
+  ''
+end
+
+# Finds one visible inventory or held item by saved name, noun, or item id.
+#
+# @param setting [String] item name, noun, or id
+# @return [Object, nil] matching GameObj item
+def cm_find_inventory_item(setting)
+  wanted = cm_item_lookup_core(setting)
+  return nil if wanted.empty?
+
+  if setting.to_s.strip =~ /\A#?(\d+)\z/
+    id = Regexp.last_match(1)
+    direct = GameObj[id] rescue nil
+    return direct if direct
+  end
+
+  cm_inventory_lookup_candidates.find do |item|
+    labels = [
+      item.name.to_s,
+      item.noun.to_s,
+      (item.full_name if item.respond_to?(:full_name)),
+      (item.long_name if item.respond_to?(:long_name)),
+      (item.respond_to?(:after_name) ? "#{item.name} #{item.after_name}" : nil)
+    ].compact.map { |label| cm_item_lookup_core(label) }.reject(&:empty?)
+    labels.any? { |label| label == wanted || label.include?(wanted) || wanted.include?(label) }
+  end
+rescue
+  nil
+end
+
+# Finds a live item by id, including held items.
+#
+# @param id [String, Integer] item id
+# @return [Object, nil] matching GameObj item
+def cm_item_by_id(id)
+  id = id.to_s
+  return nil if id.empty?
+
+  direct = GameObj[id] rescue nil
+  return direct if direct
+
+  (GameObj.inv.to_a + cm_hand_items).compact.find { |item| item.id.to_s == id }
+rescue
+  nil
+end
+
+# Checks whether an item is held.
+#
+# @param item [Object] GameObj item
+# @param hand [Symbol, nil] :left, :right, or nil for either hand
+# @return [Boolean] true when the item is held in the requested hand
+def cm_item_in_hand?(item, hand = nil)
+  return false unless item
+
+  hands = hand ? [hand.to_sym == :left ? GameObj.left_hand : GameObj.right_hand] : [GameObj.left_hand, GameObj.right_hand]
+  hands.compact.any? { |held| held.id.to_s == item.id.to_s }
+rescue
+  false
+end
+
+# Moves an item to a chosen hand using command output and GameObj state as proof.
+#
+# Side effects: may send STOW and _drag commands.
+#
+# @param item [Object] GameObj item
+# @param hand [Symbol] :left or :right
+# @return [Boolean] true when the item is held
+def cm_drag_item_to_hand(item, hand = :right)
+  return false unless item
+  return true if cm_item_in_hand?(item, hand)
+
+  hand = hand.to_sym == :left ? :left : :right
+  held = hand == :left ? GameObj.left_hand : GameObj.right_hand
+  if held && held.id.to_s != item.id.to_s && held.name.to_s != 'Empty'
+    dothistimeout "stow #{hand}", 3, /You put|You stow|You return|Stow what|You need|closed|can't/i
+  end
+  result = dothistimeout(
+    "_drag ##{item.id} #{hand}",
+    6,
+    /You remove|You take|You get|You grab|You swap|already holding|Get what|could not find|unable to handle|But you're already holding/i
+  ).to_s
+  return true if result =~ /You remove|You take|You get|You grab|You swap|already holding/i
+
+  20.times do
+    return true if cm_item_in_hand?(item, hand)
+    sleep 0.1
+  end
+  cm_item_in_hand?(item, hand)
+rescue
+  false
+end
+
+# Builds safe GET commands for a saved lapidary box name.
+#
+# @param box_name [String] saved box name, noun, or id
+# @return [Array<String>] GET command attempts
+def cm_lapidary_get_commands(box_name)
+  typed = box_name.to_s.strip
+  return [] if typed.empty? || typed =~ /\A#?\d+\z/
+
+  core = cm_item_lookup_core(typed)
+  noun = core.split(/\s+/).last.to_s
+  [typed, core, noun].map(&:to_s).map(&:strip).reject(&:empty?).uniq.map do |name|
+    name = name.sub(/\A(?:my|your)\s+/i, '')
+    "get my #{name}"
+  end
+end
+
+# Gets the saved lapidary box into the left hand so the right hand can hold the gem.
+#
+# Side effects: sends game commands and may move the box from inventory.
+#
+# @param box_name [String] saved lapidary box name, noun, or id
+# @return [Object, nil] held lapidary box
+def cm_get_lapidary_box(box_name)
+  box_name = box_name.to_s.strip
+  return nil if box_name.empty?
+
+  box = cm_find_inventory_item(box_name) || find_inventory_container(box_name)
+  return box if box && cm_item_in_hand?(box, :left)
+  return box if box && cm_drag_item_to_hand(box, :left)
+
+  cm_lapidary_get_commands(box_name).each do |command|
+    dothistimeout command, 5, /You remove|You take|You get|You grab|already holding|Get what|could not find|What were|You need/i
+    box = cm_find_inventory_item(box_name) || (GameObj.left_hand rescue nil)
+    return box if box && cm_drag_item_to_hand(box, :left)
+  end
+
+  nil
+rescue
+  nil
+end
+
+# Reads the visible lapidary box design from LOOK.
+#
+# Side effects: sends LOOK to the game.
+#
+# @param box [Object] lapidary box object
+# @return [Array<String, String>] current pattern text and raw LOOK output
+def cm_lapidary_visible_pattern(box)
+  target = cm_lapidary_box_target(box)
+  text = dothistimeout(
+    "look #{target}",
+    5,
+    /reveal(?:s)?(?:\s+the)?\s+words?,?\s+"[^"]+"|currently set to:\s+"[^"]+"|What were|could not|You do not|doesn't seem/i
+  ).to_s
+  pattern = text[/reveal(?:s)?(?:\s+the)?\s+words?,?\s+"([^"]+)"/i, 1].to_s.strip
+  pattern = text[/currently set to:\s+"([^"]+)"/i, 1].to_s.strip if pattern.empty?
+  [pattern, text]
+rescue => error
+  ['', error.message]
+end
+
+# Turns a lapidary box until its visible design matches the requested design.
+#
+# Side effects: sends TURN and LOOK commands to the game.
+#
+# @param box [Object] lapidary box object
+# @param pattern [String] desired design name
+# @return [Array(Boolean, String)] success flag and status text
+def cm_lapidary_turn_to_pattern(box, pattern)
+  target = cm_lapidary_box_target(box)
+  limit = [cm_lapidary_designs.length, 1].max
+  limit.times do
+    turn = dothistimeout(
+      "turn #{target}",
+      5,
+      /set to|click|turn|reveal(?:s)?(?:\s+the)?\s+words?,?\s+"[^"]+"|What were|could not|You do not|doesn't seem/i
+    ).to_s
+    current = turn[/currently set to:\s+"([^"]+)"/i, 1].to_s.strip
+    next unless cm_lapidary_pattern_key(current) == cm_lapidary_pattern_key(pattern)
+
+    confirmed, look = cm_lapidary_visible_pattern(box)
+    return [true, "Set lapidary pattern to #{pattern}."] if cm_lapidary_pattern_key(confirmed) == cm_lapidary_pattern_key(pattern)
+
+    detail = confirmed.empty? ? look.strip : confirmed
+    return [false, "Could not confirm #{pattern}; box shows #{detail.empty? ? 'unknown' : detail}."]
+  end
+
+  current, look = cm_lapidary_visible_pattern(box)
+  detail = current.empty? ? look.strip : current
+  [false, "Could not confirm #{pattern}; box shows #{detail.empty? ? 'unknown' : detail}."]
+rescue => error
+  [false, "Could not set #{pattern}: #{error.message}"]
+end
+
+# Selects a saved lapidary box design.
+#
+# Side effects: may move the box to the left hand and send LOOK/TURN commands.
+#
+# @param box [Object] lapidary box object
+# @param pattern [String] saved design name
+# @return [Array(Boolean, String)] success flag and status text
+def cm_lapidary_select_pattern(box, pattern)
+  return [false, 'Lapidary box was not found.'] unless box
+
+  pattern = pattern.to_s.strip
+  index = cm_lapidary_design_index(pattern)
+  return [false, "Pattern #{pattern} is not in the saved lapidary designs."] unless index
+  return [false, 'Could not hold the lapidary box.'] unless cm_drag_item_to_hand(box, :left)
+
+  current, = cm_lapidary_visible_pattern(box)
+  return [true, "Set lapidary pattern to #{pattern}."] if cm_lapidary_pattern_key(current) == cm_lapidary_pattern_key(pattern)
+
+  cm_lapidary_turn_to_pattern(box, pattern)
+rescue => error
+  [false, "Could not set #{pattern}: #{error.message}"]
+end
+
+# Waits for physical roundtime after pushing a lapidary box.
+#
+# @param text [String] command output that may include a Roundtime line
+# @return [Boolean] true when a wait happened
+def cm_wait_physical_roundtime(text = '')
+  10.times do
+    break if defined?(checkrt) && checkrt.to_i.positive?
+    sleep 0.1
+  end
+  if defined?(checkrt) && checkrt.to_i.positive?
+    wait_while { checkrt.to_i.positive? }
+    sleep 0.2
+    return true
+  end
+
+  seconds = text.to_s[/Roundtime:\s*(\d+)\s*sec/i, 1].to_i
+  if seconds.positive?
+    sleep seconds
+    return true
+  end
+  false
+rescue
+  false
+end
+
+# Cuts one gem with a lapidary box whose pattern has already been selected.
+#
+# Side effects: moves the gem through the box, pushes the box, waits roundtime,
+# and optionally stows the box afterward.
+#
+# @param gem [Object] gem to cut
+# @param box [Object] held lapidary box
+# @param pattern [String] saved lapidary design, used in status text
+# @param stow_box_after [Boolean] stow the box after this cut
+# @return [Array(Object, Symbol, String)] current gem object, result, and status text
+def cm_lapidary_cut_with_box(gem, box, pattern = '', stow_box_after = true)
+  return [gem, :failed, 'Lapidary box was not found.'] unless box
+
+  current_gem = cm_item_by_id(gem.id) || gem
+  unless cm_drag_item_to_hand(current_gem, :right)
+    dothistimeout 'stow left', 3, /You put|You stow|You return|Stow what|You need|closed|can't/i if stow_box_after && cm_item_in_hand?(box, :left)
+    return [gem, :failed, 'Could not hold gem for cutting.']
+  end
+
+  target = "##{box.id}"
+  dothistimeout "open #{target}", 4, /open|already open|revealing|could not|locked|closed|shut/i
+  put = dothistimeout(
+    "_drag ##{current_gem.id} #{target}",
+    6,
+    /You pop|You put|carefully place|comes to rest|will only hold|closed|full|could not|unable|won't fit/i
+  ).to_s
+  unless put =~ /You pop|You put|carefully place|comes to rest/i
+    dothistimeout 'stow left', 3, /You put|You stow|You return|Stow what|You need|closed|can't/i if stow_box_after && cm_item_in_hand?(box, :left)
+    return [current_gem, :failed, 'Could not load gem into lapidary box.']
+  end
+
+  dothistimeout "close #{target}", 4, /close|fasten|snapping|already closed|could not|What were/i
+  push = dothistimeout(
+    "push #{target}",
+    35,
+    /tumbling out|directly into your palm|perfectly cut|Roundtime|empty|no gem|could not|What were|must be holding/i
+  ).to_s
+  cm_wait_physical_roundtime(push)
+  sleep 0.2
+
+  cut_gem = cm_item_by_id(current_gem.id)
+  cut_gem ||= cm_hand_items.find { |item| item.type.to_s =~ /gem/i }
+  dothistimeout 'stow left', 3, /You put|You stow|You return|Stow what|You need|closed|can't/i if stow_box_after && cm_item_in_hand?(box, :left)
+  [cut_gem || current_gem, :cut, "Cut gem as #{pattern}."]
+rescue => error
+  [gem, :failed, "Cut failed: #{error.message}"]
+end
+
+# Cuts the held gem with the saved lapidary box and pattern.
+#
+# Side effects: sends box, gem movement, PUSH, and STOW commands. This is best
+# effort and returns the original gem when cutting cannot be completed.
+#
+# @param gem [Object] held gem object
+# @param pattern [String] saved lapidary design
+# @param chrismarium_container [Object, String, nil] storage for a held chrismarium
+# @param require_run_toggle [Boolean] true when automatic run cutting must be enabled
+# @return [Array(Object, Symbol, String)] current gem object, result, and status text
+def cm_lapidary_cut_held_gem(gem, pattern, chrismarium_container = nil, require_run_toggle = true)
+  return [gem, :skipped, 'Gemcutting is off.'] if require_run_toggle && !cm_lapidary_cut_during_run?
+
+  pattern = pattern.to_s.strip
+  return [gem, :skipped, 'No gemcutting pattern is saved.'] if pattern.empty?
+
+  stow_chrismarium(chrismarium_container) if holding_chrismarium?
+  box = cm_get_lapidary_box(cm_lapidary_box_name)
+  return [gem, :failed, 'Could not get lapidary box.'] unless box
+
+  selected, select_message = cm_lapidary_select_pattern(box, pattern)
+  unless selected
+    dothistimeout 'stow left', 3, /You put|You stow|You return|Stow what|You need|closed|can't/i if cm_item_in_hand?(box, :left)
+    return [gem, :failed, select_message]
+  end
+
+  cm_lapidary_cut_with_box(gem, box, pattern, true)
+rescue => error
+  [gem, :failed, "Cut failed: #{error.message}"]
+end
+
+# Runs a game command while trying to keep command output quiet.
+#
+# Side effects: sends a command to the game. Uses Lich XML quiet command support
+# when available and falls back to dothistimeout otherwise.
+#
+# @param command [String] game command to send
+# @param timeout [Numeric] seconds to wait
+# @param start_pattern [Regexp] pattern that marks the start of output
+# @param end_pattern [Regexp] pattern that marks the end of output
+# @param wait_pattern [Regexp] fallback wait pattern
+# @return [String] captured command output
+def cm_quiet_command(command, timeout, start_pattern, end_pattern, wait_pattern)
+  if defined?(Lich::Util) && Lich::Util.respond_to?(:quiet_command_xml)
+    lines = Lich::Util.quiet_command_xml(command, start_pattern, end_pattern, true, timeout, true)
+    return Array(lines).join("\n")
+  end
+
+  dothistimeout(command, timeout, wait_pattern)
+rescue
+  dothistimeout(command, timeout, wait_pattern)
+end
+
+def cm_strip_xml(text)
+  text.to_s.gsub(/<[^>]+>/, '').gsub(/\s+/, ' ').strip
+end
+
+def cm_inventory_container_clause?(text)
+  clause = text.to_s.strip
+  return false if clause.empty?
+  return false if clause =~ /\bno containers\b/i
+  return false if clause =~ /\A(?:which|that|who|whose|where|when)\b/i
+
+  true
+end
+
+def cm_container_choice(display, value = nil)
+  display = display.to_s.strip
+  value = value.to_s.strip
+  value = display if value.empty?
+  { display: display, value: value }
+end
+
+def cm_choice_display(choice)
+  return choice[:display].to_s.strip if choice.is_a?(Hash) && choice.key?(:display)
+  return choice['display'].to_s.strip if choice.is_a?(Hash) && choice.key?('display')
+
+  choice.to_s.strip
+end
+
+def cm_choice_value(choice)
+  if choice.is_a?(Hash)
+    value = choice.key?(:value) ? choice[:value] : choice['value']
+    value = value.to_s.strip
+    return value unless value.empty?
+  end
+
+  cm_choice_display(choice)
+end
+
+def cm_choice_matches?(choice, selected)
+  selected = selected.to_s.strip
+  return false if selected.empty?
+
+  [cm_choice_value(choice), cm_choice_display(choice)].any? { |text| text.to_s.casecmp(selected).zero? }
+end
+
+def cm_unique_container_choices(choices)
+  seen = {}
+  Array(choices).each_with_object([]) do |choice, list|
+    display = cm_choice_display(choice)
+    value = cm_choice_value(choice)
+    next if display.empty?
+
+    key = value.empty? ? display.downcase : value.downcase
+    next if seen[key]
+
+    seen[key] = true
+    list << cm_container_choice(display, value)
+  end
+end
+
+def cm_parse_container_xml_names(text)
+  choices = []
+  text.to_s.scan(%r{<a\b([^>]*)>(.*?)</a>}i).each do |attrs, name|
+    next unless attrs =~ /\bexist=(?:'|")([^'"]+)(?:'|")/i
+
+    id = Regexp.last_match(1)
+    next unless attrs =~ /\bnoun=(?:'|")[^'"]+(?:'|")/i
+
+    obj = GameObj.inv.find { |item| item.id.to_s == id.to_s } rescue nil
+    fallback = cm_strip_xml(name)
+    display = obj ? cm_container_display_label(obj, fallback) : fallback
+    value = obj ? cm_container_label(obj) : fallback
+    next unless cm_inventory_container_clause?(display)
+
+    choices << cm_container_choice(display, value)
+  end
+  cm_unique_container_choices(choices)
+end
+
+def cm_parse_container_names(text)
+  choices = []
+  cm_strip_xml(text).scan(/You are (?:holding|wearing) (.*?)(?:\.|$)/i).each do |match|
+    list = match.first.to_s.strip
+    next if list =~ /\bno containers\b/i
+
+    list.gsub(/\s+and\s+/, ', ').split(/\s*,\s*/).each do |container|
+      container = container.strip
+      next unless cm_inventory_container_clause?(container)
+
+      choices << cm_container_choice(container, container)
+    end
+  end
+  cm_unique_container_choices(choices)
+end
+
+# Finds inventory containers for the setup window.
+#
+# Side effects: sends INVENTORY CONTAINER to the game. The returned choices may
+# show a full item label in GTK while saving a shorter name that is safer for
+# later container lookup.
+#
+# @return [Array<Hash>] container choices with display and saved values
+def cm_scan_container_names
+  output = cm_quiet_command(
+    'inventory container',
+    6,
+    /You are (?:holding|wearing)/i,
+    /<prompt|R>/i,
+    /You are (?:holding|wearing)|containers at this time|R>/i
+  )
+  names = cm_parse_container_xml_names(output)
+  names = cm_parse_container_names(output) if names.empty?
+  names = GameObj.inv.find_all { |obj| obj.respond_to?(:contents) }.map { |obj| cm_container_choice(cm_container_display_label(obj), cm_container_label(obj)) } if names.empty?
+  names
+rescue
+  []
+end
+
+def cm_skill_api_rank(method_name)
+  return 0 unless defined?(Skills) && Skills.respond_to?(method_name)
+
+  Skills.send(method_name).to_i
+rescue
+  0
+end
+
+def cm_parse_skill_rank(output, skill_name)
+  pattern = /#{Regexp.escape(skill_name)}\.*\|\s+(?:\d+\s+)?(\d+)/i
+  output.to_s[pattern, 1].to_i
+end
+
+def cm_skill_output
+  cm_quiet_command(
+    'skill',
+    8,
+    /Skill Name|Spell Lists/i,
+    /Further information|<prompt|R>/i,
+    /Further information|Skill Name|R>/i
+  )
+rescue
+  ''
+end
+
+def cm_chrism_skill_profile
+  profession = defined?(Char) && Char.respond_to?(:prof) ? Char.prof.to_s : ''
+
+  # Non-Clerics can never make chrisms, so skip the (expensive) skill lookup
+  # entirely. No Skills API call, no SKILL command fallback.
+  unless profession.casecmp('cleric').zero?
+    return {
+      profession: profession,
+      cleric_spell: 0,
+      blessings: 0,
+      religion: 0,
+      summoning: 0
+    }
+  end
+
+  blessings = cm_skill_api_rank(:slblessings)
+  religion = cm_skill_api_rank(:slreligion)
+  summoning = cm_skill_api_rank(:slsummoning)
+  cleric_spell = cm_skill_api_rank(:cleric)
+
+  if [blessings, religion, summoning, cleric_spell].any?(&:zero?)
+    output = cm_skill_output
+    blessings = cm_parse_skill_rank(output, 'Spiritual Lore - Blessings') if blessings.zero?
+    religion = cm_parse_skill_rank(output, 'Spiritual Lore - Religion') if religion.zero?
+    summoning = cm_parse_skill_rank(output, 'Spiritual Lore - Summoning') if summoning.zero?
+    cleric_spell = cm_parse_skill_rank(output, 'Cleric') if cleric_spell.zero?
+  end
+
+  {
+    profession: profession,
+    cleric_spell: cleric_spell,
+    blessings: blessings,
+    religion: religion,
+    summoning: summoning
+  }
+end
+
+def cm_chrism_fullness_for_blessings(blessings)
+  ranks = blessings.to_i
+  case ranks
+  when 65.. then ['full', '100% retained experience']
+  when 55..64 then ['almost full', '95% retained experience']
+  when 46..54 then ['almost full', '90% retained experience']
+  when 38..45 then ['almost full', '85% retained experience']
+  when 31..37 then ['three quarters full', '80% retained experience']
+  when 25..30 then ['three quarters full', '75% retained experience']
+  when 20..24 then ['more than half full', '70% retained experience']
+  when 16..19 then ['more than half full', '65% retained experience']
+  when 13..15 then ['more than half full', '60% retained experience']
+  when 11..12 then ['half full', '55% retained experience']
+  else ['below chrism fullness table', 'below 55% retained experience tier']
+  end
+end
+
+def cm_chrism_missing_requirements(profile)
+  missing = []
+  missing << "Cleric profession" unless profile[:profession] =~ /^cleric$/i
+  missing << "Cleric spell ranks #{profile[:cleric_spell]}/#{CHRISM_REQUIREMENTS[:cleric_spell]}" if profile[:cleric_spell] < CHRISM_REQUIREMENTS[:cleric_spell]
+  missing << "Spiritual Lore - Blessings #{profile[:blessings]}/#{CHRISM_REQUIREMENTS[:blessings]}" if profile[:blessings] < CHRISM_REQUIREMENTS[:blessings]
+  missing << "Spiritual Lore - Religion #{profile[:religion]}/#{CHRISM_REQUIREMENTS[:religion]}" if profile[:religion] < CHRISM_REQUIREMENTS[:religion]
+  missing << "Spiritual Lore - Summoning #{profile[:summoning]}/#{CHRISM_REQUIREMENTS[:summoning]}" if profile[:summoning] < CHRISM_REQUIREMENTS[:summoning]
+  missing
+end
+
+def cm_chrism_skill_report
+  profile = cm_chrism_skill_profile
+
+  unless profile[:profession] =~ /^cleric$/i
+    lines = ['Chrism skill check', '']
+    lines << "Profession: #{profile[:profession].empty? ? 'unknown' : profile[:profession]}"
+    lines << ''
+    lines << 'Making chrisms is a Cleric-only thing, so the chrism-making run is not available.'
+    lines << ''
+    lines << 'You can still use these parts of Chrism Forge:'
+    lines << '  Count Gems   - count gems in your saved pouches'
+    lines << '  Stage Gems   - move likely chrism gems into your "Gems to try" pouch'
+    lines << '  Sort Chrisms - move finished chrisms into your "Finished chrisms" pouch'
+    return lines.join("\n")
+  end
+
+  fullness, retained = cm_chrism_fullness_for_blessings(profile[:blessings])
+  missing = cm_chrism_missing_requirements(profile)
+  lines = ['Chrism skill check', '']
+  lines << "Profession: #{profile[:profession]}"
+  lines << "Cleric spell ranks: #{profile[:cleric_spell]}"
+  lines << "Spiritual Lore - Blessings: #{profile[:blessings]}"
+  lines << "Spiritual Lore - Religion: #{profile[:religion]}"
+  lines << "Spiritual Lore - Summoning: #{profile[:summoning]}"
+  lines << ''
+
+  if missing.empty?
+    lines << 'Can make chrisms: yes'
+    lines << "Best retained-experience fullness: #{fullness} (#{retained})"
+  else
+    lines << 'Can make chrisms: no'
+    lines << 'Missing:'
+    missing.each { |item| lines << "  #{item}" }
+  end
+
+  lines << ''
+  lines << 'Note: dull/ordinary/bright/vibrant/glowing comes from the gem value, not your skills.'
+  lines << 'LOOK at a finished chrism to see both the fullness and cobalt-liquid strength.'
+  lines.join("\n")
+end
+
+def cm_is_cleric?
+  return $cm_chrismforge_cleric_cache unless $cm_chrismforge_cleric_cache.nil?
+
+  result = false
+  begin
+    if defined?(Char) && Char.respond_to?(:prof)
+      result = Char.prof.to_s.casecmp('cleric').zero?
+    end
+  rescue
+    result = false
+  end
+  $cm_chrismforge_cleric_cache = result
+end
+
+def cm_can_make_chrisms?
+  return false unless cm_is_cleric?
+  cm_chrism_missing_requirements(cm_chrism_skill_profile).empty?
+end
+
+def cm_container_label(container)
+  container.name.to_s.empty? ? container.noun.to_s : container.name.to_s
+end
+
+def cm_container_display_label(container, fallback = '')
+  [
+    (container.full_name if container.respond_to?(:full_name)),
+    (container.name if container.respond_to?(:name)),
+    fallback,
+    (container.noun if container.respond_to?(:noun))
+  ].compact.map(&:to_s).map(&:strip).reject(&:empty?).first.to_s
+end
+
+def cm_container_match_labels(container)
+  [
+    cm_container_label(container),
+    cm_container_display_label(container),
+    (container.noun if container.respond_to?(:noun))
+  ].compact.map(&:to_s).map(&:strip).reject(&:empty?).uniq
+end
+
+def cm_ignore_settings
+  cm_setting_array(:ignoresacks)
+end
+
+def cm_save_ignore_setting(list)
+  cleaned = Array(list).map(&:to_s).map(&:strip).reject(&:empty?).uniq
+  cm_setting_write(:ignoresacks, cleaned)
+  cm_save_settings
+end
+
+def cm_inventory_gem_sources(excluded_containers = [], ignore_names = [])
+  excluded_ids = excluded_containers.compact.map { |container| container.id.to_s }
+  ignore_names.each do |name|
+    obj = find_inventory_container(name)
+    excluded_ids << obj.id.to_s if obj
+  end
+  excluded_ids = excluded_ids.uniq
+
+  GameObj.inv.find_all do |container|
+    next false if excluded_ids.include?(container.id.to_s)
+    next false unless container.respond_to?(:contents) && container.contents
+
+    container.contents.any? { |obj| obj.type.to_s =~ /gem/i }
+  end
+end
+
+def chrismable_gem?(gem)
+  return false unless gem
+  return false if gem.name.to_s =~ /smooth stone/i
+
+  noun = gem.noun.to_s.downcase
+  name = gem.name.to_s.downcase.sub(/\s*\(\d+\)\s*\z/, '')
+  CHRISMABLE_GEM_NOUNS.include?(noun) || CHRISMABLE_GEM_NAMES.any? { |gem_name| name.include?(gem_name.downcase) }
+end
+
+# Finds the per-character GemGuard inventory cache for the current character.
+#
+# @return [String, nil] path to GemGuard's saved gem data, or nil when the
+#   character data folder cannot be found
+def cm_gemguard_inventory_path
+  return nil unless defined?(DATA_DIR) && DATA_DIR
+  return nil unless defined?(XMLData) && XMLData.respond_to?(:game)
+  return nil unless defined?(Char) && Char.respond_to?(:name)
+
+  File.join(DATA_DIR, XMLData.game.to_s, Char.name.to_s, 'gemguard-inventory.yaml')
+rescue
+  nil
+end
+
+# Loads GemGuard's saved per-item gem data.
+#
+# @return [Hash] GemGuard inventory records keyed by item id
+def cm_gemguard_inventory_items
+  path = cm_gemguard_inventory_path
+  return {} unless path && File.exist?(path)
+
+  loaded = YAML.load_file(path)
+  items = loaded.is_a?(Hash) ? (loaded['items'] || loaded[:items]) : nil
+  items.is_a?(Hash) ? items : {}
+rescue
+  {}
+end
+
+# Loads GemGuard's full per-character inventory database.
+#
+# @return [Hash, nil] GemGuard inventory database, or nil when unavailable
+def cm_gemguard_inventory_db
+  path = cm_gemguard_inventory_path
+  return nil unless path
+  return { 'script' => 'gemguard', 'items' => {} } unless File.exist?(path)
+
+  loaded = YAML.load_file(path)
+  loaded.is_a?(Hash) ? loaded : { 'script' => 'gemguard', 'items' => {} }
+rescue
+  nil
+end
+
+# Saves GemGuard's per-character inventory database.
+#
+# This changes GemGuard's YAML item cache so future scans can reuse known
+# chrism status without another LOOK.
+#
+# @param db [Hash] inventory database to save
+# @return [Boolean] true when the file was saved
+def cm_gemguard_write_inventory_db(db)
+  path = cm_gemguard_inventory_path
+  return false unless path
+
+  db = db.is_a?(Hash) ? db : {}
+  db['script'] ||= 'gemguard'
+  db['items'] = {} unless db['items'].is_a?(Hash)
+  FileUtils.mkdir_p(File.dirname(path))
+  File.write(path, db.to_yaml)
+  @chrismforge_gemguard_items = db['items']
+  true
+rescue
+  false
+end
+
+# Reads one GemGuard saved record for a live gem by item id.
+#
+# @param gem [Object] Lich gem object
+# @return [Hash, nil] saved GemGuard data for the same item id
+def cm_gemguard_record_for_gem(gem)
+  return nil unless gem
+
+  id = gem.id.to_s
+  return nil if id.empty?
+
+  @chrismforge_gemguard_items ||= cm_gemguard_inventory_items
+  record = @chrismforge_gemguard_items[id] || @chrismforge_gemguard_items[id.to_sym]
+  record.is_a?(Hash) ? record : nil
+rescue
+  nil
+end
+
+# Saves a newly made chrism to GemGuard's item cache.
+#
+# This changes GemGuard's YAML data for the matching item id.
+#
+# @param gem [Object] Lich gem object that became a chrism
+# @param quality [Hash, nil] strength and fullness parsed from LOOK output
+# @param look_text [String] LOOK output that proved the chrism
+# @return [Boolean] true when GemGuard data was updated
+def cm_update_gemguard_chrism_record(gem, quality, look_text)
+  return false unless gem
+
+  id = gem.id.to_s
+  return false if id.empty?
+
+  db = cm_gemguard_inventory_db
+  return false unless db
+
+  db['items'] = {} unless db['items'].is_a?(Hash)
+  record = db['items'][id].is_a?(Hash) ? db['items'][id].dup : {}
+  now = Time.now.strftime('%m/%d/%Y %H:%M:%S %z')
+  record['cache_id'] = record['cache_id'].to_s.empty? ? id : record['cache_id'].to_s
+  record['id'] = id
+  record['name'] = gem.name.to_s
+  record['noun'] = gem.noun.to_s
+  record['chrism'] = true
+  record['status'] = 'chrism'
+  record['chrism_output'] = look_text.to_s[0, 500]
+  if quality.is_a?(Hash)
+    record['chrism_strength'] = quality[:strength].to_s unless quality[:strength].to_s.empty?
+    record['chrism_fullness'] = quality[:fullness].to_s unless quality[:fullness].to_s.empty?
+  end
+  record['last_seen_at'] = now
+  record['updated_at'] = now
+  db['items'][id] = record
+  cm_gemguard_write_inventory_db(db)
+rescue
+  false
+end
+
+# Converts a saved GemGuard value into silver.
+#
+# @param value [Object] saved value text, such as "3,500" or "3,500 silver"
+# @return [Integer, nil] silver value, or nil when unknown
+def cm_gemguard_silver_value(value)
+  text = value.to_s
+  return nil unless text =~ /\d/
+
+  text.gsub(/[^\d]/, '').to_i
+rescue
+  nil
+end
+
+# Interprets GemGuard's saved orb status only when it is proven.
+#
+# @param record [Hash] saved GemGuard item data
+# @return [Boolean, nil] true for orb, false for known non-orb, nil for unknown
+def cm_gemguard_orb_status(record)
+  return nil unless record.is_a?(Hash)
+
+  return true if record['orb'] == true || record[:orb] == true
+
+  status_text = [
+    record['status'], record[:status],
+    record['purify_status'], record[:purify_status],
+    record['orb_test_result'], record[:orb_test_result]
+  ].compact.map(&:to_s).join(' ')
+
+  return false if status_text =~ /\b(?:purified|not[_ -]?orb|not\s+pure|shattered)\b/i
+  return true if status_text =~ /\b(?:pure\s+)?orb\b/i
+
+  orb_tested = record['orb_tested'] == true || record[:orb_tested] == true
+  return false if orb_tested && status_text =~ /\b(?:not[_ -]?orb|not\s+pure)\b/i
+
+  nil
+rescue
+  nil
+end
+
+# Decides whether known GemGuard data proves a gem should not be tried.
+#
+# Known non-orbs are skipped immediately. Known orbs need a known value before
+# Chrism Forge skips them as too low for chrism-making.
+#
+# @param gem [Object] Lich gem object
+# @return [Hash, nil] skip details, or nil when the gem should still be tried
+def cm_gemguard_chrism_skip(gem)
+  record = cm_gemguard_record_for_gem(gem)
+  return nil unless record
+
+  value = cm_gemguard_silver_value(record['value'] || record[:value])
+  orb_status = cm_gemguard_orb_status(record)
+  return nil if orb_status.nil?
+
+  if !orb_status
+    value_text = value.nil? ? '' : ", value #{value} silver"
+    return {
+      target: :loot,
+      note: "GemGuard says not an orb#{value_text}",
+      detail: "not an orb#{value_text}"
+    }
+  end
+
+  return nil if value.nil?
+  return nil if value > CHRISMFORGE_GEMGUARD_CHRISM_VALUE_MINIMUM
+
+  {
+    target: :not_chrismable_orb,
+    note: "GemGuard says orb value is #{value} silver",
+    detail: "orb, value #{value} silver"
+  }
+end
+
+def cm_chrism_quality_from_look(text)
+  source = text.to_s
+  strength = source[/\b(dull|ordinary|bright|vibrant|glowing),?\s+cobalt liquid/i, 1].to_s.downcase
+  fullness_text = source[/outer shell of the (.*?) allows you to see/i, 1].to_s.downcase
+  fullness = fullness_text[/\b(half full|more than half full|three quarters full|almost full|full)\b/i, 1].to_s.downcase
+  return nil if strength.empty? && fullness.empty?
+
+  {
+    strength: strength.empty? ? nil : strength,
+    fullness: fullness.empty? ? nil : fullness,
+    strength_note: strength.empty? ? nil : CHRISM_QUALITY_NOTES[strength],
+    fullness_note: fullness.empty? ? nil : CHRISM_FULLNESS_NOTES[fullness]
+  }
+end
+
+def cm_chrism_quality_line(quality)
+  return nil unless quality
+
+  parts = []
+  parts << "strength: #{quality[:strength]}" if quality[:strength]
+  parts << quality[:strength_note] if quality[:strength_note]
+  parts << "fullness: #{quality[:fullness]}" if quality[:fullness]
+  parts << quality[:fullness_note] if quality[:fullness_note]
+  parts.join(' - ')
+end
+
+# Builds the state hash used for run reports and GTK progress.
+#
+# @param total_gems [Integer] number of gems found at run start
+# @param use_chrismarium [Boolean] whether chrismarium mode started enabled
+# @param chrismarium_full_action [String] saved action for a full chrismarium
+# @param finished_container_label [String, nil] display name for finished chrisms
+# @return [Hash] mutable run state
+def cm_new_run_state(total_gems, use_chrismarium, chrismarium_full_action, finished_container_label = nil)
+  {
+    started_at: Time.now,
+    total_gems: total_gems.to_i,
+    processed: 0,
+    chrismed: 0,
+    failed: 0,
+    non_orb: 0,
+    other_failed: 0,
+    too_crude: 0,
+    too_crude_counts: Hash.new(0),
+    gemguard_skipped: 0,
+    gemguard_skip_counts: Hash.new(0),
+    cut_gems: 0,
+    already_cut: 0,
+    cut_failed: 0,
+    stored_chrismarium: 0,
+    stored_pouch: 0,
+    chrismarium_filtered: 0,
+    already_chrisms: 0,
+    finished_container_label: finished_container_label.to_s.strip.empty? ? 'finished-chrism pouch' : finished_container_label.to_s.strip,
+    mana_used: 0,
+    mana_needed: CHRISM_MINIMUM_MANA_COST,
+    last_progress_line: nil,
+    activity_status: nil,
+    highlight_status: nil,
+    chrismarium_status: nil,
+    quality_counts: Hash.new(0),
+    fullness_counts: Hash.new(0),
+    use_chrismarium_started: use_chrismarium,
+    use_chrismarium_current: use_chrismarium,
+    chrismarium_full: false,
+    chrismarium_full_action: chrismarium_full_action,
+    chrismarium_measure: nil,
+    item_safety_note: nil,
+    stop_requested: false,
+    close_requested: false,
+    stop_reason: 'completed',
+    reported: false
+  }
+end
+
+def cm_note_chrism_quality(state, quality, count = 1)
+  return unless state && quality
+
+  state[:quality_counts][quality[:strength] || 'unknown'] += count if quality[:strength]
+  state[:fullness_counts][quality[:fullness] || 'unknown'] += count if quality[:fullness]
+end
+
+# Records a gem that cannot become a chrism because its orb value is too low.
+#
+# @param state [Hash] current run state
+# @param gem_name [String] gem name to show in the report
+# @param count [Integer] number of matching gems
+# @param note [String] plain-language reason for the report
+# @return [void]
+def cm_record_not_chrismable_orb(state, gem_name, count = 1, note = 'orb was too low value to accept the blessing')
+  return unless state
+
+  amount = [count.to_i, 1].max
+  state[:too_crude] += amount
+  label = gem_name.to_s.strip
+  label = 'unknown gem' if label.empty?
+  detail = note.to_s.strip
+  label = "#{label} - #{detail}" unless detail.empty?
+  state[:too_crude_counts][label] += amount
+end
+
+# Records a gem skipped because GemGuard already knew its value and orb status.
+#
+# @param state [Hash] current run state
+# @param gem_name [String] gem name to show in the report
+# @param count [Integer] number of matching gems
+# @param detail [String] known GemGuard facts used for the skip
+# @return [void]
+def cm_record_gemguard_skip(state, gem_name, count = 1, detail = '')
+  return unless state
+
+  amount = [count.to_i, 1].max
+  state[:gemguard_skipped] += amount
+  label = gem_name.to_s.strip
+  label = 'unknown gem' if label.empty?
+  detail = detail.to_s.strip
+  label = "#{label} - #{detail}" unless detail.empty?
+  state[:gemguard_skip_counts][label] += amount
+end
+
+# Records the result of an optional lapidary cut during the chrism run.
+#
+# @param state [Hash] current run state
+# @param result [Symbol] :cut, :already_cut, :failed, or :skipped
+# @param count [Integer] number of matching gems
+# @return [void]
+def cm_note_lapidary_cut(state, result, count = 1)
+  return unless state
+
+  amount = [count.to_i, 1].max
+  case result
+  when :cut
+    state[:cut_gems] += amount
+  when :already_cut
+    state[:already_cut] += amount
+  when :failed
+    state[:cut_failed] += amount
+  end
+end
+
+# Parses chrismarium ANALYZE output for stable item details.
+#
+# @param text [String] output from ANALYZE
+# @return [Hash] parsed chrismarium details
+def cm_parse_chrismarium_analysis(text)
+  source = text.to_s
+  tier = source[/tier\s+(\d+)\s+out of\s+(\d+)/i, 1]
+  max_tier = source[/tier\s+(\d+)\s+out of\s+(\d+)/i, 2]
+  {
+    chrismarium: source =~ /This is a chrismarium/i ? true : false,
+    tier: tier,
+    max_tier: max_tier,
+    max_charges: source[/hold a maximum of\s+(\d+)\s+charges/i, 1],
+    messaging_style: source[/currently using the "([^"]+)"/i, 1]
+  }
+end
+
+# Parses chrismarium MEASURE output for current charge and quality details.
+#
+# @param text [String] output from MEASURE
+# @return [Hash] parsed current chrismarium details
+def cm_parse_chrismarium_measure(text)
+  source = text.to_s
+  strength = source[/\b(dull|ordinary|bright|vibrant|glowing)\s+cobalt liquid/i, 1].to_s.downcase
+  retention = source[/\b(diluted to half strength|diluted to more than half strength|somewhat diluted|slightly diluted|pure and undiluted)\b/i, 1].to_s.downcase
+  charges = source[/allow for\s+(\d+)\s+applications/i, 1].to_i
+  empty_chrismarium = source =~ /devoid|empty/i
+  charges = 0 if charges.zero? && empty_chrismarium
+  {
+    charges: charges.zero? && !empty_chrismarium ? nil : charges,
+    strength: strength.empty? ? nil : strength,
+    retention: retention.empty? ? nil : retention
+  }
+end
+
+def cm_chrismarium_measure(chrismarium_container = nil)
+  was_holding = holding_chrismarium?
+  if !was_holding && chrismarium_container
+    ref = cm_container_ref(chrismarium_container)
+    dothistimeout "get my chrismarium from #{ref}", 5, /You (?:remove|retrieve|get)|already|I could not|What were you/
+  end
+  return nil unless holding_chrismarium?
+
+  output = dothistimeout 'measure my chrismarium', 5, /applications|devoid|cobalt liquid|diluted|undiluted|I could not/
+  result = cm_parse_chrismarium_measure(output)
+  stow_chrismarium(chrismarium_container) if !was_holding && chrismarium_container
+  result
+rescue
+  nil
+end
+
+def cm_chrismarium_quality_lines(measure)
+  return ['  Current charges: unknown'] unless measure
+
+  lines = []
+  charges = measure.key?(:charges) && !measure[:charges].nil? ? measure[:charges] : 'unknown'
+  lines << "  Current charges: #{charges}"
+  if measure[:strength]
+    note = CHRISM_QUALITY_NOTES[measure[:strength]]
+    lines << "  Death's Sting strength:"
+    lines << "    #{measure[:strength]} cobalt liquid"
+    lines << "    #{note}." if note
+  end
+  if measure[:retention]
+    note = CHRISMARIUM_RETENTION_NOTES[measure[:retention]]
+    lines << '  Experience retention:'
+    lines << "    #{measure[:retention]}"
+    lines << "    #{note}" if note
+  end
+  lines
+end
+
+# Builds the text shown in the Chrismarium setup tab.
+#
+# @param status [Hash, nil] saved or freshly read chrismarium details
+# @return [String] plain status text for the setup window
+def cm_chrismarium_status_text(status = nil)
+  status = status.is_a?(Hash) ? status : cm_chrismarium_saved_status
+  lines = ['Chrismarium status']
+  storage = setting_value(:chrismariumsack).to_s
+  lines << "Storage pouch: #{storage.empty? ? CHRISMFORGE_NONE_LABEL : storage}"
+  lines << "When full: #{cm_chrismarium_full_label}"
+  lines << ''
+  lines << 'Fill choices:'
+  cm_chrismarium_fill_filter_text.each_line { |line| lines << "  #{line.chomp}" }
+  lines << ''
+  if status.empty?
+    lines << 'No chrismarium status saved yet.'
+    lines << 'Use Refresh Chrismarium Status to read current charges.'
+    return lines.join("\n")
+  end
+
+  charges = status['charges'] || status[:charges] || 'unknown'
+  max_charges = status['max_charges'] || status[:max_charges] || 'unknown'
+  tier = status['tier'] || status[:tier]
+  max_tier = status['max_tier'] || status[:max_tier]
+  style = status['messaging_style'] || status[:messaging_style]
+  strength = status['strength'] || status[:strength]
+  retention = status['retention'] || status[:retention]
+  checked = status['last_checked_at'] || status[:last_checked_at]
+
+  lines << "Current charges: #{charges} / #{max_charges}"
+  lines << "Tier: #{tier} of #{max_tier}" if tier && max_tier
+  lines << "Messaging style: #{style}" if style && !style.to_s.empty?
+  lines << ''
+  if strength || retention
+    lines << 'Current oil:'
+    lines << "  Strength: #{strength || 'unknown'}"
+    lines << "  Fullness: #{retention || 'unknown'}"
+  else
+    lines << 'Current oil: unknown'
+  end
+  lines << ''
+  lines << "Last checked: #{checked}" if checked && !checked.to_s.empty?
+  lines.join("\n")
+end
+
+# Analyzes and measures the saved chrismarium, then saves a status snapshot.
+#
+# Side effects: sends ANALYZE and MEASURE commands, may move the chrismarium
+# between hand and saved storage, and writes chrismarium status settings.
+#
+# @param chrismarium_container_name [String] saved storage container name
+# @return [String] refreshed chrismarium status text
+def cm_refresh_chrismarium_status(chrismarium_container_name)
+  chrismarium_container_name = chrismarium_container_name.to_s.strip
+  return 'Chrismarium storage pouch is not set.' if chrismarium_container_name.empty?
+
+  cm_silently_refresh_inventory
+  chrismarium_container = find_inventory_container(chrismarium_container_name)
+  return "Could not find chrismarium storage pouch '#{chrismarium_container_name}'." unless chrismarium_container
+
+  was_holding = holding_chrismarium?
+  ref = cm_container_ref(chrismarium_container)
+  dothistimeout "get my chrismarium from #{ref}", 5, /You (?:remove|retrieve|get)|already|I could not|What were you/ unless was_holding
+  return 'Could not get your chrismarium.' unless holding_chrismarium?
+
+  analyze_output = dothistimeout 'analyze my chrismarium', 8, /Unlocked verbs|lightened|What were you|I could not/i
+  analysis = cm_parse_chrismarium_analysis(analyze_output)
+  return 'Analyze did not show a chrismarium.' unless analysis[:chrismarium]
+
+  measure_output = dothistimeout 'measure my chrismarium', 5, /applications|devoid|cobalt liquid|diluted|undiluted|I could not/
+  measure = cm_parse_chrismarium_measure(measure_output)
+  saved = {
+    'charges' => measure[:charges],
+    'strength' => measure[:strength],
+    'retention' => measure[:retention],
+    'tier' => analysis[:tier],
+    'max_tier' => analysis[:max_tier],
+    'max_charges' => analysis[:max_charges],
+    'messaging_style' => analysis[:messaging_style],
+    'last_checked_at' => Time.now.strftime('%m/%d/%Y %H:%M:%S %z')
+  }.delete_if { |_key, value| value.nil? || value.to_s.empty? }
+
+  cm_setting_write(:chrismariumstatus, saved)
+  cm_save_settings
+  cm_chrismarium_status_text(saved)
+ensure
+  stow_chrismarium(chrismarium_container) if defined?(chrismarium_container) && chrismarium_container && !was_holding
+end
+
+def cm_run_report(state)
+  return '' unless state
+
+  elapsed = Time.now - (state[:started_at] || Time.now)
+  minutes = (elapsed / 60).to_i
+  seconds = (elapsed % 60).round(2)
+  unprocessed = [state[:total_gems].to_i - state[:processed].to_i, 0].max
+  lines = ["[#{cm_timestamp}] Chrism Forge Report", '']
+  lines << "Stop reason: #{state[:stop_reason]}"
+  lines << "Item safety: #{state[:item_safety_note]}" if state[:item_safety_note]
+  lines << ''
+  lines << "Gems found: #{state[:total_gems]}"
+  lines << "Processed: #{state[:processed]}"
+  lines << "Chrismed: #{state[:chrismed]}"
+  lines << "Non-orb gems: #{state[:non_orb]}"
+  lines << "Skipped with GemGuard data: #{state[:gemguard_skipped]}" if state[:gemguard_skipped].to_i > 0
+  lines << "Low-value orb gems: #{state[:too_crude]}" if state[:too_crude].to_i > 0
+  lines << "Other failed: #{state[:other_failed]}" if state[:other_failed].to_i > 0
+  lines << "Cut gems: #{state[:cut_gems]}" if state[:cut_gems].to_i > 0
+  lines << "Already cut: #{state[:already_cut]}" if state[:already_cut].to_i > 0
+  lines << "Cut failed: #{state[:cut_failed]}" if state[:cut_failed].to_i > 0
+  lines << "Stored in chrismarium: #{state[:stored_chrismarium]}" if state[:use_chrismarium_started]
+  lines << "Stored in finished-chrism pouch: #{state[:stored_pouch]}"
+  lines << "Kept out of chrismarium by filters: #{state[:chrismarium_filtered]}" if state[:chrismarium_filtered].to_i > 0
+  lines << "Already-finished chrisms sorted: #{state[:already_chrisms]}" if state[:already_chrisms].to_i > 0
+  lines << "Unprocessed: #{unprocessed}"
+  lines << "Mana used: #{state[:mana_used]}"
+  lines << "Time: #{minutes} minutes and #{seconds} seconds"
+
+  if state[:use_chrismarium_started]
+    lines << ''
+    lines << 'Chrismarium:'
+    lines << '  Started in chrismarium mode: yes'
+    lines << "  Chrismarium became full: #{state[:chrismarium_full] ? 'yes' : 'no'}"
+    if state[:chrismarium_full]
+      behavior = state[:chrismarium_full_action] == 'stop' ? 'stopped as requested' : 'continued using finished-chrism pouch'
+      lines << "  Full behavior: #{behavior}"
+    end
+    lines.concat(cm_chrismarium_quality_lines(state[:chrismarium_measure]))
+  end
+
+  unless state[:quality_counts].empty?
+    lines << ''
+    lines << 'Chrism quality:'
+    state[:quality_counts].sort.each do |quality, count|
+      note = CHRISM_QUALITY_NOTES[quality]
+      lines << "  #{count} #{quality}#{note ? " - #{note}" : ''}"
+    end
+  end
+
+  unless state[:too_crude_counts].empty?
+    lines << ''
+    lines << 'Low-value orb gems:'
+    state[:too_crude_counts].sort.each { |gem_name, count| lines << "  #{count} #{gem_name}" }
+  end
+
+  unless state[:gemguard_skip_counts].empty?
+    lines << ''
+    lines << 'Skipped with GemGuard data:'
+    state[:gemguard_skip_counts].sort.each { |gem_name, count| lines << "  #{count} #{gem_name}" }
+  end
+
+  unless state[:fullness_counts].empty?
+    lines << ''
+    lines << 'Fullness:'
+    state[:fullness_counts].sort.each do |fullness, count|
+      note = CHRISM_REPORT_FULLNESS_NOTES[fullness]
+      lines << "  #{count} #{fullness}#{note ? " - #{note}" : ''}"
+    end
+  end
+  lines.join("\n")
+end
+
+# Formats a time span for progress displays.
+#
+# @param seconds [Numeric, nil] number of seconds
+# @return [String] short plain-language duration
+def cm_format_run_duration(seconds)
+  return 'unknown' if seconds.nil?
+
+  total = [seconds.to_f.round, 0].max
+  hours = total / 3600
+  minutes = (total % 3600) / 60
+  secs = total % 60
+  if hours.positive?
+    "#{hours}h #{minutes}m #{secs}s"
+  elsif minutes.positive?
+    "#{minutes}m #{secs}s"
+  else
+    "#{secs}s"
+  end
+end
+
+# Builds the compact GTK progress-window text for a running chrism run.
+#
+# @param state [Hash] current run state
+# @param note [String] fallback status line
+# @return [String] progress panel text
+def cm_progress_panel_text(state, note = '')
+  return note.to_s unless state
+
+  now = Time.now
+  elapsed = now - (state[:started_at] || now)
+  total = state[:total_gems].to_i
+  processed = state[:processed].to_i
+  remaining = [total - processed, 0].max
+  percent = total.positive? ? ((processed.to_f / total) * 100).round(1) : 0.0
+  estimated_remaining = processed.positive? ? (elapsed / processed) * remaining : nil
+  finish_time = estimated_remaining ? (now + estimated_remaining).strftime('%H:%M:%S') : 'unknown'
+
+  [
+    "Progress: #{processed}/#{total} (#{percent}%)",
+    "Remaining: #{remaining}",
+    "Chrismed: #{state[:chrismed]}",
+    "Non-orb gems: #{state[:non_orb]}",
+    (state[:gemguard_skipped].to_i.positive? ? "GemGuard skips: #{state[:gemguard_skipped]}" : nil),
+    (state[:too_crude].to_i.positive? ? "Low-value orb gems: #{state[:too_crude]}" : nil),
+    (state[:other_failed].to_i.positive? ? "Other failed: #{state[:other_failed]}" : nil),
+    (state[:cut_gems].to_i.positive? ? "Cut gems: #{state[:cut_gems]}" : nil),
+    (state[:already_cut].to_i.positive? ? "Already cut: #{state[:already_cut]}" : nil),
+    (state[:cut_failed].to_i.positive? ? "Cut failed: #{state[:cut_failed]}" : nil),
+    "Stored in #{state[:finished_container_label] || 'finished-chrism pouch'}: #{state[:stored_pouch]}",
+    "Stored in chrismarium: #{state[:stored_chrismarium]}",
+    (state[:chrismarium_filtered].to_i.positive? ? "Kept out by chrismarium filters: #{state[:chrismarium_filtered]}" : nil),
+    (state[:chrismarium_status] ? "Chrismarium: #{state[:chrismarium_status]}" : nil),
+    "Mana used: #{state[:mana_used]}",
+    "Mana needed per attempt: #{state[:mana_needed] || CHRISM_MINIMUM_MANA_COST}",
+    '',
+    "Time running: #{cm_format_run_duration(elapsed)}",
+    "Estimated time left: #{cm_format_run_duration(estimated_remaining)}",
+    "Finish around: #{finish_time}"
+  ].compact.join("\n")
+end
+
+# Finishes a chrism-making run and prints the final report.
+#
+# Side effects: may measure the chrismarium, writes report text to the game
+# line, updates GTK progress state, and marks the run as finished.
+#
+# @param state [Hash] current run state
+# @param reason [String, nil] stop reason to show in the report
+# @param chrismarium_container [Object, nil] container holding the chrismarium
+# @return [void]
+def cm_finish_run!(state, reason = nil, chrismarium_container = nil)
+  return if state.nil? || state[:reported]
+
+  state[:stop_reason] = reason if reason
+  state[:chrismarium_measure] ||= cm_chrismarium_measure(chrismarium_container) if state[:use_chrismarium_started]
+  message('')
+  message(cm_run_report(state))
+  state[:reported] = true
+  $chrismforge_run_active = false
+  $chrismforge_run_finished = true
+  if $chrismforge_progress_state_callback
+    $chrismforge_progress_state_callback.call(:finished)
+  end
+end
+
+def cm_note_item_safety(state, note)
+  return unless state && note
+
+  state[:item_safety_note] = note
+  cm_progress_status("~ #{note}", state)
+end
+
+def cm_return_current_gem_to_source!(state, gem, source_container)
+  unless source_container
+    cm_note_item_safety(state, 'Current gem may still be in your hand; no source pouch was available.')
+    return false
+  end
+
+  source_label = cm_container_label(source_container)
+  result = cm_put_item_in_container(gem, cm_container_ref(source_container))
+  if result =~ /You put|You add/i
+    cm_note_item_safety(state, "Current gem was returned to #{source_label}.")
+    true
+  elsif cm_container_full_message?(result)
+    cm_note_item_safety(state, "Current gem is still in your hand because #{source_label} is also full.")
+    false
+  else
+    cm_note_item_safety(state, "Current gem may still be in your hand; could not return it to #{source_label}.")
+    false
+  end
+rescue
+  cm_note_item_safety(state, 'Current gem may still be in your hand; return-to-source failed.')
+  false
+end
+
+def holding_chrismarium?
+  [checkleft, checkright].compact.any? { |held| held.to_s =~ /chrismarium/i }
+end
+
+def chrismarium_in_left?
+  checkleft.to_s =~ /chrismarium/i
+end
+
+def cm_container_ref(container)
+  return nil unless container
+
+  if container.respond_to?(:id) && !container.id.to_s.empty?
+    "##{container.id}"
+  else
+    "my #{container}"
+  end
+end
+
+def stow_chrismarium(container)
+  return unless container
+  return unless holding_chrismarium?
+
+  target = container.respond_to?(:id) ? container : find_inventory_container(container)
+  ref = cm_container_ref(target) || "my #{container}"
+  fput "put my chrismarium in #{ref}"
+end
+
+def empty_hand_safely
+  empty_hands
+rescue StandardError
+  nil
+end
+
+def cm_hand_items
+  [GameObj.right_hand, GameObj.left_hand].compact.reject { |item| item.id.nil? || item.name.to_s == 'Empty' }
+rescue
+  []
+end
+
+def cm_hands_empty?
+  cm_hand_items.empty?
+end
+
+def cm_store_held_gems(source_container, chrism_container, loot_container)
+  cm_hand_items.each do |item|
+    next if item.name.to_s =~ /chrismarium/i
+    next unless item.type.to_s =~ /gem/i || item.noun.to_s =~ /gem|diamond|emerald|sapphire|ruby|pearl|opal|stone|crystal/i
+
+    look = dothistimeout "look ##{item.id}", 3, /cobalt liquid|You see|I could not/
+    target = look =~ /cobalt liquid/i ? chrism_container : source_container
+    target ||= loot_container
+    next unless target
+
+    dothistimeout "put ##{item.id} in #{cm_container_ref(target)}", 5, /You put|You add|#{CONTAINER_FULL_MESSAGE_PATTERN}|I could not/
+  end
+rescue
+  nil
+end
+
+def cm_clear_hands_before_run(source_container, chrismarium_container, chrism_container, loot_container)
+  stow_chrismarium(chrismarium_container) if holding_chrismarium?
+  cm_store_held_gems(source_container, chrism_container, loot_container)
+  return true if cm_hands_empty?
+
+  command = $chrismforge_settings.dig('run', 'hand_clear_command').to_s.strip
+  command = 'stow all' if command.empty?
+  dothistimeout command, 5, /You put|You stow|You need|Stow what|I could not|You are already/i
+  cm_hands_empty?
+rescue
+  false
+end
+
+def cm_container_full_message?(text)
+  text.to_s =~ CONTAINER_FULL_MESSAGE_REGEX
+end
+
+def cm_put_item_in_container(item, container_ref)
+  dothistimeout "put ##{item.id} in #{container_ref}", 5, /You put|You add|#{CONTAINER_FULL_MESSAGE_PATTERN}|I could not|What were you/
+end
+
+# Cuts uncut gems in one saved pouch using the selected outcome pattern.
+#
+# Side effects: opens/looks in a saved pouch, moves gems through the lapidary
+# box, and puts the cut gems back into the same pouch.
+#
+# @param outcome [Symbol, String] selected gemcutting outcome
+# @yield [String] progress text for GTK output
+# @return [String] plain-language summary
+def cm_lapidary_cut_saved_bag(outcome)
+  outcome = outcome.to_s.strip.empty? ? 'chrism' : outcome.to_s.strip
+  pattern = cm_lapidary_pattern_for_outcome(outcome)
+  label = cm_lapidary_outcome_label(outcome == 'not_chrismable_orb' ? 'orb' : outcome)
+  return "Cut failed: no pattern is saved for #{label}." if pattern.to_s.strip.empty?
+  return 'Cut failed: choose and analyze a lapidary box first.' if cm_lapidary_box_name.empty?
+
+  setting_key = cm_lapidary_container_setting_for_outcome(outcome)
+  container_name = setting_value(setting_key).to_s
+  return "Cut failed: #{label} pouch is not set." if container_name.empty?
+
+  cm_silently_refresh_inventory
+  container = find_inventory_container(container_name)
+  return "Cut failed: could not find #{label} pouch '#{container_name}'." unless container
+
+  cm_quiet_command(
+    "look in ##{container.id}",
+    5,
+    /In the |You see nothing|I could not find/i,
+    /<prompt|R>/i,
+    /In the .*?|You see nothing|I could not find/i
+  )
+  contents = container.contents || []
+  gems = contents.find_all { |obj| obj.type.to_s =~ /gem/i }
+  return "Cut #{label}: no gems found in #{cm_container_label(container)}." if gems.empty?
+
+  already_cut_gems, uncut_gems = gems.partition { |gem| cm_lapidary_gem_already_cut?(gem) }
+  counts = { found: gems.length, cut: 0, already_cut: already_cut_gems.length, failed: 0, returned: 0, stopped: false }
+  ref = cm_container_ref(container)
+  yield "Found #{gems.length} #{label}; #{already_cut_gems.length} already cut, #{uncut_gems.length} to cut." if block_given?
+
+  if uncut_gems.empty?
+    return [
+      "Cut #{label} complete.",
+      "Pouch: #{cm_container_label(container)}",
+      "Pattern: #{pattern}",
+      "Found: #{counts[:found]}",
+      "Cut: 0",
+      "Already cut: #{counts[:already_cut]}",
+      "Failed: 0",
+      "Returned to pouch: 0"
+    ].join("\n")
+  end
+
+  yield "Preparing lapidary box for #{pattern}..." if block_given?
+  box = cm_get_lapidary_box(cm_lapidary_box_name)
+  return "Cut failed: could not get lapidary box." unless box
+
+  selected, select_message = cm_lapidary_select_pattern(box, pattern)
+  unless selected
+    dothistimeout 'stow left', 3, /You put|You stow|You return|Stow what|You need|closed|can't/i if cm_item_in_hand?(box, :left)
+    return "Cut failed: #{select_message}"
+  end
+
+  uncut_gems.each_with_index do |gem, index|
+    if $chrismforge_stop_requested
+      counts[:stopped] = true
+      yield "Stopping after #{counts[:cut]} cut; #{uncut_gems.length - index} uncut gems remain." if block_given?
+      break
+    end
+
+    get_result = dothistimeout "get ##{gem.id} from ##{container.id}", 5, /You (?:remove|take|get)|Get what|already|could not|I could not/i
+    unless get_result =~ /You (?:remove|take|get)|already/i
+      counts[:failed] += 1
+      yield "Could not get #{gem.name} from #{cm_container_label(container)}." if block_given?
+      next
+    end
+
+    cut_gem, result, message = cm_lapidary_cut_with_box(gem, box, pattern, false)
+    counts[:cut] += 1 if result == :cut
+    counts[:failed] += 1 if result == :failed
+    yield message if block_given? && result == :failed
+
+    current = cut_gem || cm_item_by_id(gem.id) || cm_hand_items.find { |item| item.type.to_s =~ /gem/i } || gem
+    put_result = cm_put_item_in_container(current, ref)
+    if put_result =~ /You put|You add/i
+      counts[:returned] += 1
+    else
+      counts[:failed] += 1
+      yield "Could not return #{current.name} to #{cm_container_label(container)}." if block_given?
+    end
+    yield "Cutting #{label}: #{index + 1}/#{uncut_gems.length}; #{counts[:cut]} cut, #{counts[:already_cut]} already cut, #{counts[:failed]} failed." if block_given?
+  end
+
+  dothistimeout 'stow left', 3, /You put|You stow|You return|Stow what|You need|closed|can't/i
+  [
+    "Cut #{label} complete.",
+    "Pouch: #{cm_container_label(container)}",
+    "Pattern: #{pattern}",
+    "Found: #{counts[:found]}",
+    "Cut: #{counts[:cut]}",
+    "Already cut: #{counts[:already_cut]}",
+    "Failed: #{counts[:failed]}",
+    "Returned to pouch: #{counts[:returned]}",
+    (counts[:stopped] ? 'Stopped: yes' : nil)
+  ].join("\n")
+rescue => error
+  "Cut failed: #{error.message}"
+end
+
+def cm_gtk_debug(message_text = '')
+  message("~ GTK DEBUG: #{message_text}") if $chrism_maker_gtk_debug
+end
+
+def cm_gtk_available?
+  defined?(HAVE_GTK) && HAVE_GTK && defined?(Gtk) && Gtk.respond_to?(:queue)
+end
+
+def cm_close_gtk_window_now(window_ref, closed_ref = nil)
+  window = window_ref.is_a?(Hash) ? window_ref[:window] : window_ref
+  name = window_ref.is_a?(Hash) ? window_ref[:name].to_s : '(direct)'
+  cm_gtk_debug("closing #{name}")
+  closed_ref[:closed] = true if closed_ref
+  cm_forget_gtk_window(name, window_ref, closed_ref) if window_ref.is_a?(Hash)
+  return unless window
+
+  if defined?(Gtk)
+    Gtk.queue do
+      begin
+        window.hide if window.respond_to?(:hide)
+        if window.respond_to?(:destroy)
+          window.destroy
+        elsif window.respond_to?(:close)
+          window.close
+        end
+      rescue => error
+        cm_gtk_debug("queued close failed: #{error.class}: #{error.message}")
+      end
+    end
+  elsif window.respond_to?(:destroy)
+    window.destroy
+  end
+rescue
+  nil
+end
+
+# Requests that active Chrism Forge work stop at the next safe point.
+#
+# Side effects: updates script-wide stop flags used by chrism making,
+# chrismarium filling, and saved-pouch cutting loops.
+#
+# @param reason [String, nil] short reason for the stop request
+# @return [Boolean] true when the request was recorded
+def cm_request_safe_stop(reason = nil)
+  $chrismforge_stop_requested = true
+  $chrismforge_close_after_stop = true
+  $chrismforge_safe_stop_reason = reason.to_s unless reason.to_s.empty?
+  true
+rescue
+  false
+end
+
+def cm_handle_gtk_delete_event(label, window_ref, closed_ref)
+  cm_gtk_debug("#{label} delete_event")
+  window = window_ref.is_a?(Hash) ? window_ref[:window] : window_ref
+  name = window_ref.is_a?(Hash) ? window_ref[:name].to_s : label.to_s
+  closed_ref[:closed] = true if closed_ref
+  cm_forget_gtk_window(name, window_ref, closed_ref) if window_ref.is_a?(Hash)
+  begin
+    window.hide if window && window.respond_to?(:hide)
+  rescue => error
+    cm_gtk_debug("#{label} delete_event hide failed: #{error.class}: #{error.message}")
+  end
+  true
+rescue => error
+  cm_gtk_debug("#{label} delete_event failed: #{error.class}: #{error.message}")
+  true
+end
+
+def cm_remember_gtk_window(name, window, window_ref = nil)
+  $chrism_maker_gtk_windows = {} unless $chrism_maker_gtk_windows.is_a?(Hash)
+  if window_ref.is_a?(Hash)
+    window_ref[:name] = name
+    window_ref[:window] = window
+  end
+  $chrism_maker_gtk_windows[name] = window
+rescue
+  nil
+end
+
+def cm_forget_gtk_window(name, window_ref = nil, closed_ref = nil)
+  closed_ref[:closed] = true if closed_ref
+  window_ref[:window] = nil if window_ref.is_a?(Hash)
+  $chrism_maker_gtk_windows = {} unless $chrism_maker_gtk_windows.is_a?(Hash)
+  $chrism_maker_gtk_windows.delete(name)
+rescue
+  nil
+end
+
+def cm_gtk_window_open?(window_ref)
+  window = window_ref.is_a?(Hash) ? window_ref[:window] : window_ref
+  !!window
+rescue
+  false
+end
+
+def cm_close_all_gtk_windows_now
+  tracked_windows = $chrism_maker_gtk_windows.is_a?(Hash) ? $chrism_maker_gtk_windows.values : []
+  tracked_windows.reverse_each { |window| cm_close_gtk_window_now(window) }
+  tracked_refs = $chrism_maker_gtk_window_refs.is_a?(Array) ? $chrism_maker_gtk_window_refs : []
+  tracked_refs.reverse_each { |ref, closed| cm_close_gtk_window_now(ref, closed) }
+  $chrism_maker_gtk_windows = {}
+  $chrism_maker_gtk_window_refs = []
+rescue
+  nil
+end
+
+def cm_register_gtk_window_cleanup(window_ref, closed_ref)
+  $chrism_maker_gtk_windows = {} unless $chrism_maker_gtk_windows.is_a?(Hash)
+  $chrism_maker_gtk_window_refs = [] unless $chrism_maker_gtk_window_refs.is_a?(Array)
+  $chrism_maker_gtk_window_refs.reject! { |ref, closed| closed[:closed] || ref[:window].nil? }
+  $chrism_maker_gtk_window_refs << [window_ref, closed_ref]
+  return if $chrism_maker_gtk_cleanup_registered
+
+  before_dying do
+    begin
+      cm_request_safe_stop('script stopped')
+      cm_close_all_gtk_windows_now
+    rescue => error
+      cm_gtk_debug("before_dying GTK cleanup failed: #{error.class}: #{error.message}")
+    end
+  end if defined?(before_dying)
+  $chrism_maker_gtk_cleanup_registered = true
+rescue
+  nil
+end
+
+def cm_entry_row(label_text, value = '', tooltip_text = nil)
+  row = Gtk::Box.new(:horizontal, 8)
+  label = Gtk::Label.new(label_text)
+  label.xalign = 1.0 if label.respond_to?(:xalign=)
+  label.set_size_request(CHRISMFORGE_SETUP_LABEL_WIDTH, -1) if label.respond_to?(:set_size_request)
+  entry = Gtk::Entry.new
+  entry.text = value.to_s if entry.respond_to?(:text=)
+  if tooltip_text && !tooltip_text.to_s.empty?
+    row.set_tooltip_text(tooltip_text) if row.respond_to?(:set_tooltip_text)
+    label.set_tooltip_text(tooltip_text) if label.respond_to?(:set_tooltip_text)
+    entry.set_tooltip_text(tooltip_text) if entry.respond_to?(:set_tooltip_text)
+  end
+  row.pack_start(label, :expand => false, :fill => false, :padding => 0)
+  row.pack_start(entry, :expand => true, :fill => true, :padding => 0)
+  [row, entry]
+end
+
+def cm_container_dropdown_row(label_text, value = '', choices = [], allow_none = false, tooltip_text = nil)
+  row = Gtk::Box.new(:horizontal, 8)
+  label = Gtk::Label.new(label_text)
+  label.xalign = 1.0 if label.respond_to?(:xalign=)
+  label.set_size_request(CHRISMFORGE_SETUP_LABEL_WIDTH, -1) if label.respond_to?(:set_size_request)
+  combo = Gtk::ComboBoxText.new
+  cm_set_container_dropdown_choices(combo, choices, value, allow_none)
+  if tooltip_text && !tooltip_text.to_s.empty?
+    row.set_tooltip_text(tooltip_text) if row.respond_to?(:set_tooltip_text)
+    label.set_tooltip_text(tooltip_text) if label.respond_to?(:set_tooltip_text)
+    combo.set_tooltip_text(tooltip_text) if combo.respond_to?(:set_tooltip_text)
+  end
+  row.pack_start(label, :expand => false, :fill => false, :padding => 0)
+  row.pack_start(combo, :expand => true, :fill => true, :padding => 0)
+  [row, combo]
+rescue
+  cm_entry_row(label_text, value, tooltip_text)
+end
+
+def cm_set_container_dropdown_choices(combo, choices, selected = nil, allow_none = false)
+  return unless combo
+
+  if combo.respond_to?(:remove_all)
+    combo.remove_all
+  elsif combo.respond_to?(:model) && combo.model
+    combo.model.clear
+  end
+
+  list = cm_unique_container_choices(choices)
+  selected = selected.to_s.strip
+  selected_index = list.index { |choice| cm_choice_matches?(choice, selected) }
+  value_map = {}
+  if allow_none
+    list.unshift(cm_container_choice(CHRISMFORGE_NONE_LABEL, ''))
+    active_index = selected_index ? selected_index + 1 : 0
+  else
+    list.unshift(cm_container_choice(selected, selected)) unless selected.empty? || selected_index
+    active_index = list.index { |choice| cm_choice_matches?(choice, selected) } || 0
+  end
+  list.each do |choice|
+    display = cm_choice_display(choice)
+    value_map[display] = cm_choice_value(choice)
+    combo.append_text(display) if combo.respond_to?(:append_text)
+  end
+  combo.instance_variable_set(:@chrismforge_choice_values, value_map)
+
+  combo.active = active_index if combo.respond_to?(:active=) && !list.empty?
+rescue
+  nil
+end
+
+def cm_control_text(control)
+  if control.respond_to?(:active_text)
+    display = control.active_text.to_s.strip
+    values = control.instance_variable_get(:@chrismforge_choice_values) rescue nil
+    value = values.is_a?(Hash) ? values.fetch(display, display) : display
+  elsif control.respond_to?(:active?)
+    value = control.active? ? 'true' : 'false'
+  elsif control.respond_to?(:text)
+    value = control.text.to_s.strip
+  else
+    value = ''
+  end
+  value == CHRISMFORGE_NONE_LABEL ? '' : value
+end
+
+def cm_save_setup_entries(entries)
+  entries.each do |key, entry|
+    value = cm_control_text(entry)
+    value = CHRISMARIUM_FULL_LABELS[value] || value if key.to_sym == :chrismariumfull
+    cm_setting_write(key, value)
+  end
+  cm_save_settings
+end
+
+def cm_gem_item_count(obj)
+  return obj.quantity.to_i if obj.respond_to?(:quantity) && obj.quantity.to_i > 0
+
+  obj.name.to_s[/\((\d+)\)\s*\z/, 1].to_i.nonzero? || 1
+end
+
+def cm_count_gems_in_container(container_name)
+  return { error: 'not set' } if container_name.to_s.strip.empty?
+
+  container = find_inventory_container(container_name)
+  return { error: 'not found' } unless container
+
+  cm_quiet_command(
+    "look in ##{container.id}",
+    5,
+    /In the |You see nothing|I could not find/i,
+    /<prompt|R>/i,
+    /In the .*?:|Total items:|You see nothing|I could not find/
+  )
+  return { error: 'contents unavailable' } if container.contents.nil?
+
+  gem_counts = Hash.new(0)
+  chrismable_counts = Hash.new(0)
+  container.contents.find_all { |obj| obj.type.to_s =~ /gem/i }.each do |gem|
+    gem_name = gem.name.to_s.sub(/\s*\(\d+\)\s*\z/, '')
+    count = cm_gem_item_count(gem)
+    gem_counts[gem_name] += count
+    chrismable_counts[gem_name] += count if chrismable_gem?(gem)
+  end
+
+  {
+    container: container.name.to_s.empty? ? container.noun.to_s : container.name.to_s,
+    total: gem_counts.values.inject(0) { |sum, count| sum + count.to_i },
+    chrismable_total: chrismable_counts.values.inject(0) { |sum, count| sum + count.to_i },
+    gems: gem_counts,
+    chrismable_gems: chrismable_counts
+  }
+end
+
+def cm_gem_count_report(container_entries)
+  lines = ['Gem Counts']
+  container_entries.each do |entry|
+    label = entry[0]
+    container_name = entry[1]
+    kind = entry[2] || :orb
+
+    result = cm_count_gems_in_container(container_name)
+    if result[:error]
+      lines << "#{label}: #{container_name.to_s.empty? ? '(unset)' : container_name} - #{result[:error]}"
+      next
+    end
+
+    item_word = kind == :chrism ? "chrism#{result[:total] == 1 ? '' : 's'}" : "gem#{result[:total] == 1 ? '' : 's'}"
+    summary = "#{label}: #{result[:container]} - #{result[:total]} #{item_word}"
+    summary += " (#{result[:chrismable_total]} on the chrismable staging list)" if kind == :orb
+    lines << summary
+
+    result[:gems].sort.each { |gem, count| lines << "  #{gem}: #{count}" }
+
+    if kind == :orb && !result[:chrismable_gems].empty?
+      lines << "  Chrismable staging list:"
+      result[:chrismable_gems].sort.each { |gem, count| lines << "    #{gem}: #{count}" }
+    end
+  end
+  lines.join("\n")
+end
+
+# Returns the saved containers shown by the count command.
+#
+# @return [Array<Array>] label, setting value, and count type rows
+def cm_saved_count_entries
+  entries = [
+    ['Gems to try', setting_value(:orbsack), :orb],
+    ['Finished chrisms', setting_value(:chrismsack), :chrism],
+    ['Non-orb gems', setting_value(:lootsack), :loot]
+  ]
+  if setting_value(:toocrudesack)
+    entries << ['Low-value orb gems', setting_value(:toocrudesack), :loot]
+  end
+  entries
+end
+
+def cm_container_contents(container, refresh: true)
+  if refresh
+    cm_quiet_command(
+      "look in ##{container.id}",
+      5,
+      /In the |You see nothing|I could not find/i,
+      /<prompt|R>/i,
+      /In the .*?:|Total items:|You see nothing|I could not find/
+    )
+  end
+  container.contents
+end
+
+# Moves likely chrism gems into the saved Gems to try pouch.
+#
+# Side effects: refreshes inventory contents and drags gem items between
+# containers. If a target pouch is full, the method stops and reports what
+# happened.
+#
+# @param source_container_name [String, nil] one source pouch, or nil for all eligible pouches
+# @param orb_container_name [String] saved Gems to try pouch
+# @param loot_container_name [String] saved Non-orb gems pouch
+# @return [String] plain-language stage report
+def cm_stage_raw_gems(source_container_name, orb_container_name, loot_container_name)
+  return 'Sort failed: Gems to try pouch is not set.' if orb_container_name.to_s.strip.empty?
+  return 'Sort failed: Non-orb gems pouch is not set.' if loot_container_name.to_s.strip.empty?
+
+  cm_silently_refresh_inventory
+  orb_target = find_inventory_container(orb_container_name)
+  loot_target = find_inventory_container(loot_container_name)
+  chrism_target = find_inventory_container(setting_value(:chrismsack)) rescue nil
+
+  return "Sort failed: could not find Gems to try pouch '#{orb_container_name}'." unless orb_target
+  return "Sort failed: could not find Non-orb gems pouch '#{loot_container_name}'." unless loot_target
+
+  source_name = source_container_name.to_s.strip
+  sources = if source_name.empty?
+              cm_inventory_gem_sources([orb_target, loot_target, chrism_target], cm_ignore_settings)
+            else
+              source = find_inventory_container(source_name)
+              return "Sort failed: could not find source container '#{source_name}'." unless source
+
+              [source]
+            end
+  return "Stage complete.\nNo outside containers with gems were found." if sources.empty?
+
+  stage_candidates = []
+  other_gems = []
+  sources.each do |source|
+    contents = cm_container_contents(source, refresh: !source_name.empty?)
+    next if contents.nil?
+
+    contents.find_all { |obj| obj.type.to_s =~ /gem/i }.each do |gem|
+      if chrismable_gem?(gem)
+        stage_candidates << [source, gem]
+      elsif !source_name.empty?
+        other_gems << [source, gem]
+      end
+    end
+  end
+
+  moved_chrismable = 0
+  moved_other = 0
+  skipped = 0
+  stopped_reason = nil
+
+  stage_candidates.each do |source, gem|
+    if source.id.to_s == orb_target.id.to_s
+      skipped += 1
+      next
+    end
+    result = dothistimeout "_drag ##{gem.id} ##{orb_target.id}", 5, /You put|You add|#{CONTAINER_FULL_MESSAGE_PATTERN}|could not|I could not/
+    if result =~ /You put|You add/i
+      moved_chrismable += cm_gem_item_count(gem)
+    elsif cm_container_full_message?(result)
+      stopped_reason = "#{orb_target.name.empty? ? orb_target.noun : orb_target.name} is full."
+      skipped += cm_gem_item_count(gem)
+      break
+    else
+      skipped += cm_gem_item_count(gem)
+    end
+  end
+
+  unless stopped_reason
+    other_gems.each do |source, gem|
+      if source.id.to_s == loot_target.id.to_s
+        skipped += 1
+        next
+      end
+      result = dothistimeout "_drag ##{gem.id} ##{loot_target.id}", 5, /You put|You add|#{CONTAINER_FULL_MESSAGE_PATTERN}|could not|I could not/
+      if result =~ /You put|You add/i
+        moved_other += cm_gem_item_count(gem)
+      elsif cm_container_full_message?(result)
+        stopped_reason = "#{loot_target.name.empty? ? loot_target.noun : loot_target.name} is full."
+        skipped += cm_gem_item_count(gem)
+        break
+      else
+        skipped += cm_gem_item_count(gem)
+      end
+    end
+  end
+
+  [
+    stopped_reason ? "Stage stopped: #{stopped_reason}" : "Stage complete.",
+    "Chrismable gems moved to #{orb_target.name.empty? ? orb_target.noun : orb_target.name}: #{moved_chrismable}",
+    source_name.empty? ? 'Other gems left where they were: automatic staging only moves chrismable gems.' : "Non-orb/other gems moved to #{loot_target.name.empty? ? loot_target.noun : loot_target.name}: #{moved_other}",
+    "Skipped or already in the right place: #{skipped}"
+  ].join("\n")
+end
+
+# Moves finished chrisms into the saved Finished chrisms pouch.
+#
+# Side effects: refreshes inventory contents, inspects gems for cobalt liquid,
+# and moves finished chrisms between containers.
+#
+# @param source_container_name [String, nil] one source pouch, or nil for all eligible pouches
+# @param gem_container_name [String] saved Gems to try pouch
+# @param chrism_container_name [String] saved Finished chrisms pouch
+# @return [String] plain-language sort report
+def cm_sort_finished_chrisms(source_container_name, gem_container_name, chrism_container_name)
+  return 'Sort failed: gem container is not set.' if gem_container_name.to_s.strip.empty?
+  return 'Sort failed: chrism container is not set.' if chrism_container_name.to_s.strip.empty?
+
+  cm_silently_refresh_inventory
+  gem_target = find_inventory_container(gem_container_name)
+  chrism_target = find_inventory_container(chrism_container_name)
+
+  return "Sort failed: could not find gem container '#{gem_container_name}'." unless gem_target
+  return "Sort failed: could not find chrism container '#{chrism_container_name}'." unless chrism_target
+
+  source_name = source_container_name.to_s.strip
+  sources = if source_name.empty?
+              cm_inventory_gem_sources([gem_target, chrism_target], cm_ignore_settings)
+            else
+              source = find_inventory_container(source_name)
+              return "Sort failed: could not find source container '#{source_name}'." unless source
+
+              [source]
+            end
+
+  gems = []
+  sources.each do |source|
+    contents = cm_container_contents(source, refresh: !source_name.empty?)
+    next if contents.nil?
+
+    contents.find_all { |obj| obj.type.to_s =~ /gem/i }.each { |gem| gems << [source, gem] }
+  end
+  return "Sort complete.\nNo outside containers with gems were found." if gems.empty?
+
+  moved_chrisms = 0
+  moved_gems = 0
+  skipped = 0
+  stopped_reason = nil
+  quality_counts = Hash.new(0)
+  fullness_counts = Hash.new(0)
+
+  gems.each do |source, gem|
+    get_result = dothistimeout "get ##{gem.id} from ##{source.id}", 3, /You (?:remove|retrieve|grab|procure)|Get what|already/
+    unless get_result =~ /You (?:remove|retrieve|grab|procure)|already/i
+      skipped += cm_gem_item_count(gem)
+      next
+    end
+
+    look_result = dothistimeout "look ##{gem.id}", 3, /cobalt liquid|You see|You carefully inspect|You glance|I could not/
+    quality = cm_chrism_quality_from_look(look_result)
+    target = look_result =~ /cobalt liquid/i ? chrism_target : gem_target
+    put_result = dothistimeout "put ##{gem.id} in ##{target.id}", 3, /You put|You add|#{CONTAINER_FULL_MESSAGE_PATTERN}|I could not/
+
+    if put_result =~ /You put|You add/i
+      if target == chrism_target
+        moved_chrisms += cm_gem_item_count(gem)
+        quality_counts[quality[:strength] || 'unknown'] += cm_gem_item_count(gem) if quality
+        fullness_counts[quality[:fullness] || 'unknown'] += cm_gem_item_count(gem) if quality
+      else
+        moved_gems += cm_gem_item_count(gem)
+      end
+    else
+      skipped += cm_gem_item_count(gem)
+      if cm_container_full_message?(put_result)
+        stopped_reason = "#{target.name.empty? ? target.noun : target.name} is full."
+        dothistimeout "put ##{gem.id} in ##{source.id}", 3, /You put|You add|#{CONTAINER_FULL_MESSAGE_PATTERN}|I could not/
+        break
+      end
+    end
+  end
+
+  lines = [
+    stopped_reason ? "Chrism sort stopped: #{stopped_reason}" : "Chrism sort complete.",
+    "Finished chrisms moved to #{chrism_target.name.empty? ? chrism_target.noun : chrism_target.name}: #{moved_chrisms}",
+    "Normal gems moved to #{gem_target.name.empty? ? gem_target.noun : gem_target.name}: #{moved_gems}",
+    "Skipped: #{skipped}"
+  ]
+  unless quality_counts.empty?
+    lines << "Death's Sting quality seen:"
+    quality_counts.sort.each { |quality, count| lines << "  #{quality}: #{count}" }
+  end
+  unless fullness_counts.empty?
+    lines << 'Retained-experience fullness seen:'
+    fullness_counts.sort.each { |fullness, count| lines << "  #{fullness}: #{count}" }
+  end
+  lines.join("\n")
+end
+
+# Checks whether a finished chrism matches the selected chrismarium filters.
+#
+# @param quality [Hash, nil] strength and fullness from LOOK output
+# @param strengths [Array<String>] allowed strength names
+# @param fullnesses [Array<String>] allowed fullness names
+# @return [Boolean] true when both strength and fullness match
+def cm_chrismarium_quality_match?(quality, strengths, fullnesses)
+  return false unless quality
+
+  strengths.include?(quality[:strength].to_s) && fullnesses.include?(quality[:fullness].to_s)
+end
+
+# Moves matching finished chrisms from the saved chrism pouch into a chrismarium.
+#
+# Side effects: sends game commands, moves chrisms into the chrismarium, may
+# stop when the chrismarium is full, and stows the chrismarium when finished.
+#
+# @param chrism_container_name [String] saved Finished chrisms pouch
+# @param chrismarium_container_name [String] saved chrismarium storage pouch
+# @param strengths [Array<String>] allowed cobalt-liquid strength names
+# @param fullnesses [Array<String>] allowed retained-experience fullness names
+# @yield [String] progress text for GTK status/report updates
+# @return [String] plain-language fill report
+def cm_fill_chrismarium_from_pouch(chrism_container_name, chrismarium_container_name, strengths, fullnesses)
+  strengths = Array(strengths).map(&:to_s) & CHRISMFORGE_CHRISM_STRENGTHS
+  fullnesses = Array(fullnesses).map(&:to_s) & CHRISMFORGE_CHRISM_FULLNESSES
+  return 'Fill failed: choose at least one strength and one fullness.' if strengths.empty? || fullnesses.empty?
+  return 'Fill failed: Finished chrisms pouch is not set.' if chrism_container_name.to_s.strip.empty?
+  return 'Fill failed: Chrismarium storage pouch is not set.' if chrismarium_container_name.to_s.strip.empty?
+
+  cm_silently_refresh_inventory
+  chrism_source = find_inventory_container(chrism_container_name)
+  chrismarium_container = find_inventory_container(chrismarium_container_name)
+  return "Fill failed: could not find Finished chrisms pouch '#{chrism_container_name}'." unless chrism_source
+  return "Fill failed: could not find chrismarium storage pouch '#{chrismarium_container_name}'." unless chrismarium_container
+
+  unless cm_clear_hands_before_run(chrism_source, chrismarium_container, chrism_source, chrism_source)
+    return 'Fill failed: could not free your hands before starting.'
+  end
+
+  chrismarium_ref = cm_container_ref(chrismarium_container)
+  fput "get my chrismarium from #{chrismarium_ref}" unless holding_chrismarium?
+  fput 'swap' if holding_chrismarium? && !chrismarium_in_left?
+  return 'Fill failed: could not get your chrismarium.' unless holding_chrismarium?
+
+  contents = cm_container_contents(chrism_source)
+  chrisms = Array(contents).select { |obj| obj.type.to_s =~ /gem/i || obj.name.to_s =~ /chrism|cobalt liquid/i }
+  return "Fill complete.\nNo gems or chrisms were found in #{cm_container_label(chrism_source)}." if chrisms.empty?
+
+  checked = 0
+  added = 0
+  skipped = 0
+  not_chrisms = 0
+  stopped_reason = nil
+  quality_counts = Hash.new(0)
+  fullness_counts = Hash.new(0)
+
+  yield "Chrismarium fill started.\n#{cm_chrismarium_fill_filter_text(strengths, fullnesses)}" if block_given?
+
+  chrisms.each_with_index do |gem, index|
+    if $chrismforge_stop_requested
+      stopped_reason = 'stopped by user'
+      break
+    end
+
+    count = cm_gem_item_count(gem)
+    checked += count
+    yield "Checking #{index + 1}/#{chrisms.length}: #{gem.name}" if block_given?
+
+    get_result = dothistimeout "get ##{gem.id} from ##{chrism_source.id}", 5, /You (?:remove|retrieve|grab|procure)|Get what|already/
+    unless get_result =~ /You (?:remove|retrieve|grab|procure)|already/i
+      skipped += count
+      next
+    end
+
+    look_result = dothistimeout "look ##{gem.id}", 5, /cobalt liquid|You see|You carefully inspect|You glance|I could not/
+    quality = cm_chrism_quality_from_look(look_result)
+    unless look_result =~ /cobalt liquid/i
+      not_chrisms += count
+      dothistimeout "put ##{gem.id} in ##{chrism_source.id}", 5, /You put|You add|#{CONTAINER_FULL_MESSAGE_PATTERN}|I could not/
+      next
+    end
+
+    unless cm_chrismarium_quality_match?(quality, strengths, fullnesses)
+      skipped += count
+      dothistimeout "put ##{gem.id} in ##{chrism_source.id}", 5, /You put|You add|#{CONTAINER_FULL_MESSAGE_PATTERN}|I could not/
+      next
+    end
+
+    fput 'swap' if holding_chrismarium? && !chrismarium_in_left?
+    push_result = dothistimeout 'push my chrismarium', 5, /full to the brim|wasteful|You move|cobalt|liquid|I could not|What were you/
+    if push_result =~ /full to the brim|wasteful/i
+      stopped_reason = 'chrismarium full'
+      dothistimeout "put ##{gem.id} in ##{chrism_source.id}", 5, /You put|You add|#{CONTAINER_FULL_MESSAGE_PATTERN}|I could not/
+      break
+    elsif push_result =~ /You move|cobalt|liquid/i
+      added += count
+      quality_counts[quality[:strength]] += count if quality && quality[:strength]
+      fullness_counts[quality[:fullness]] += count if quality && quality[:fullness]
+      yield "Added #{added}: #{gem.name}." if block_given?
+    else
+      skipped += count
+      dothistimeout "put ##{gem.id} in ##{chrism_source.id}", 5, /You put|You add|#{CONTAINER_FULL_MESSAGE_PATTERN}|I could not/
+    end
+  end
+
+  measure = cm_chrismarium_measure(chrismarium_container)
+  stow_chrismarium(chrismarium_container)
+
+  lines = [
+    stopped_reason ? "Chrismarium fill stopped: #{stopped_reason}." : 'Chrismarium fill complete.',
+    'Selected qualities:',
+    "  #{cm_chrismarium_fill_filter_text(strengths, fullnesses).gsub("\n", "\n  ")}",
+    "Checked: #{checked}",
+    "Added to chrismarium: #{added}",
+    "Skipped by quality: #{skipped}",
+    "Not chrisms: #{not_chrisms}"
+  ]
+  unless quality_counts.empty?
+    lines << "Death's Sting strength added:"
+    quality_counts.sort.each { |quality, count| lines << "  #{quality}: #{count}" }
+  end
+  unless fullness_counts.empty?
+    lines << 'Retained-experience fullness added:'
+    fullness_counts.sort.each { |fullness, count| lines << "  #{fullness}: #{count}" }
+  end
+  lines << 'Chrismarium:'
+  lines.concat(cm_chrismarium_quality_lines(measure))
+  lines.join("\n")
+ensure
+  stow_chrismarium(chrismarium_container) if defined?(chrismarium_container) && chrismarium_container
+end
+
+alias cm_sort_gems cm_stage_raw_gems
+
+def cm_set_text_view_text(text_view, text)
+  return unless text_view && text_view.respond_to?(:buffer)
+
+  if text_view.buffer.respond_to?(:text=)
+    text_view.buffer.text = text.to_s
+  else
+    text_view.buffer.set_text(text.to_s)
+  end
+rescue
+  nil
+end
+
+def cm_scroll_text_view_to_end(text_view)
+  return unless text_view && text_view.respond_to?(:buffer)
+
+  buffer = text_view.buffer
+  return unless buffer.respond_to?(:end_iter)
+
+  if text_view.respond_to?(:scroll_to_iter)
+    text_view.scroll_to_iter(buffer.end_iter, 0.0, false, 0.0, 1.0)
+  elsif text_view.respond_to?(:scroll_mark_onscreen) && buffer.respond_to?(:create_mark)
+    mark = buffer.create_mark(nil, buffer.end_iter, false)
+    text_view.scroll_mark_onscreen(mark)
+    buffer.delete_mark(mark) if buffer.respond_to?(:delete_mark)
+  end
+rescue
+  nil
+end
+
+def cm_append_text_view_text(text_view, text)
+  return unless text_view && text_view.respond_to?(:buffer)
+
+  buffer = text_view.buffer
+  current = if buffer.respond_to?(:text)
+              buffer.text.to_s
+            elsif buffer.respond_to?(:get_text)
+              buffer.get_text(buffer.start_iter, buffer.end_iter, false).to_s
+            else
+              ''
+            end
+  cm_set_text_view_text(text_view, [current, text.to_s].reject(&:empty?).join("\n"))
+  cm_scroll_text_view_to_end(text_view)
+rescue
+  nil
+end
+
+# Opens the optional progress window for a chrism-making run.
+#
+# Side effects: creates a GTK window, stores callbacks used by the run loop,
+# and updates script state when the user stops or closes the window.
+#
+# @return [Array<Hash, Hash>, Array<nil, nil>] window reference and closed-state hashes
+def show_chrism_maker_progress_window
+  return [nil, nil] unless cm_gtk_available?
+
+  window_ref = { window: nil, name: 'Chrism Forge Progress' }
+  closed_ref = { closed: false }
+  cm_register_gtk_window_cleanup(window_ref, closed_ref)
+
+  Gtk.queue do
+    begin
+      window = Gtk::Window.new
+      cm_remember_gtk_window('Chrism Forge Progress', window, window_ref)
+      callbacks = []
+
+      window.title = cm_window_title('Chrism Forge Progress')
+      window.set_default_size(760, 420) if window.respond_to?(:set_default_size)
+
+      outer = Gtk::Box.new(:vertical, 8)
+      outer.margin = 12 if outer.respond_to?(:margin=)
+
+      status = Gtk::Label.new('Starting Chrism Forge...')
+      status.xalign = 0 if status.respond_to?(:xalign=)
+      status.line_wrap = true if status.respond_to?(:line_wrap=)
+      outer.pack_start(status, :expand => false, :fill => true, :padding => 0)
+
+      progress_text = Gtk::TextView.new
+      progress_text.editable = false if progress_text.respond_to?(:editable=)
+      progress_text.cursor_visible = false if progress_text.respond_to?(:cursor_visible=)
+      progress_text.monospace = true if progress_text.respond_to?(:monospace=)
+
+      scroller = Gtk::ScrolledWindow.new
+      scroller.set_policy(Gtk::PolicyType::AUTOMATIC, Gtk::PolicyType::AUTOMATIC) if scroller.respond_to?(:set_policy)
+      scroller.add(progress_text) if scroller.respond_to?(:add)
+      outer.pack_start(scroller, :expand => true, :fill => true, :padding => 0)
+
+      stop_button = Gtk::Button.new(:label => 'Stop')
+      stop_handler = proc do
+        $chrismforge_stop_requested = true
+        stop_button.sensitive = false if stop_button.respond_to?(:sensitive=)
+        status.text = 'Stopping after the current gem. Report will stay here.' if status.respond_to?(:text=)
+      end
+      callbacks << stop_handler
+      stop_button.signal_connect('clicked', &stop_handler)
+      outer.pack_start(stop_button, :expand => false, :fill => false, :padding => 0)
+
+      close_button = Gtk::Button.new(:label => 'Close')
+      close_handler = proc do
+        if $chrismforge_run_active && !$chrismforge_run_finished
+          $chrismforge_stop_requested = true
+          $chrismforge_close_after_stop = true
+        end
+        cm_close_gtk_window_now(window_ref, closed_ref)
+      end
+      callbacks << close_handler
+      close_button.signal_connect('clicked', &close_handler)
+      outer.pack_start(close_button, :expand => false, :fill => false, :padding => 0)
+
+      delete_handler = proc do
+        cm_request_safe_stop('closed by user')
+        cm_handle_gtk_delete_event('Chrism Forge Progress', window_ref, closed_ref)
+      end
+      destroy_handler = proc { cm_forget_gtk_window(window_ref[:name], window_ref, closed_ref) }
+      callbacks << delete_handler
+      callbacks << destroy_handler
+      window.signal_connect('delete_event', &delete_handler)
+      window.signal_connect('destroy', &destroy_handler)
+      window.instance_variable_set(:@chrism_maker_callbacks, callbacks)
+
+      if defined?(GLib::Timeout)
+        callbacks << GLib::Timeout.add(1000) do
+          live_state = $chrismforge_run_state
+          if !cm_gtk_window_open?(window_ref) || $chrismforge_run_finished
+            false
+          elsif $chrismforge_run_active && live_state && !live_state[:reported]
+            cm_set_text_view_text(progress_text, cm_progress_panel_text(live_state, live_state[:activity_status].to_s))
+            true
+          else
+            true
+          end
+        end
+      end
+
+      $chrism_maker_progress_callback = proc do |line, state = nil|
+        Gtk.queue do
+          next unless cm_gtk_window_open?(window_ref)
+          clean_line = line.to_s.gsub(/\A~\s*/, '')
+          if state && state[:highlight_status]
+            wait_text = state[:highlight_status].to_s.lines.first.to_s.strip
+            if status.respond_to?(:set_markup)
+              status.set_markup(cm_status_warning_markup(wait_text))
+            elsif status.respond_to?(:text=)
+              status.text = wait_text
+            end
+          elsif status.respond_to?(:text=)
+            status_text = if clean_line =~ /\A\[\d{2}:\d{2}:\d{2}\] Processed:/
+                            'Running.'
+                          else
+                            clean_line
+                          end
+            status.text = status_text.to_s.lines.first.to_s.strip
+          end
+          if state
+            cm_set_text_view_text(progress_text, cm_progress_panel_text(state, clean_line))
+          elsif clean_line.include?("Chrism Forge Report\n") || clean_line =~ /\A\[\d{2}:\d{2}:\d{2}\] Chrism Forge Report/
+            cm_set_text_view_text(progress_text, clean_line)
+          end
+        end
+      end
+      $chrismforge_progress_state_callback = proc do |state|
+        Gtk.queue do
+          next unless cm_gtk_window_open?(window_ref)
+          if [:finished, :stopped].include?(state)
+            stop_button.sensitive = false if stop_button.respond_to?(:sensitive=)
+          elsif state == :running
+            stop_button.sensitive = true if stop_button.respond_to?(:sensitive=)
+          end
+        end
+      end
+
+      window.add(outer)
+      window.set_keep_above(true) if window.respond_to?(:set_keep_above)
+      window.show_all
+      window.present if window.respond_to?(:present)
+    rescue => error
+      message("~ GTK progress window failed: #{error.class}: #{error.message}")
+    end
+  end
+
+  [window_ref, closed_ref]
+end
+
+# Opens the setup window and waits for the user's next action.
+#
+# Side effects: creates a GTK setup window, saves settings when requested, and
+# may run count, stage, sort, or skill checks from the window.
+#
+# @return [Symbol, nil] selected follow-up action such as :run, :run_chrismarium, or :close
+def show_chrism_maker_setup
+  unless cm_gtk_available?
+    message("~ The setup window needs GTK, which is not loaded right now.")
+    message("~ Use the commands below to set up and run from the game line.")
+    message('')
+    help
+    return
+  end
+
+  action = nil
+  setup_error = nil
+  count_report = nil
+  container_choices = cm_scan_container_names
+  is_cleric = cm_is_cleric?
+  window_ref = { window: nil, name: 'Chrism Forge Setup' }
+  closed_ref = { closed: false }
+  cm_register_gtk_window_cleanup(window_ref, closed_ref)
+  setup_report_writer = nil
+  chrismarium_report_writer = nil
+  lapidary_report_writer = nil
+  lapidary_pattern_widgets = {}
+  lapidary_cut_bag_value = 'chrism'
+  lapidary_cut_state_writer = nil
+  setup_action_state_writer = nil
+
+  Gtk.queue do
+    begin
+      window = Gtk::Window.new
+      cm_remember_gtk_window('Chrism Forge Setup', window, window_ref)
+      callbacks = []
+
+      window.title = cm_window_title('Chrism Forge')
+      window.set_default_size(640, 640) if window.respond_to?(:set_default_size)
+
+      main_outer = Gtk::Box.new(:vertical, 10)
+      main_outer.margin = 12 if main_outer.respond_to?(:margin=)
+
+      header = Gtk::Label.new('Chrism Forge Setup')
+      header.xalign = 0 if header.respond_to?(:xalign=)
+      begin
+        header.set_markup('<b>Chrism Forge Setup</b>') if header.respond_to?(:set_markup)
+      rescue
+        nil
+      end
+      main_outer.pack_start(header, :expand => false, :fill => false, :padding => 0)
+
+      notebook = Gtk::Notebook.new
+      outer = Gtk::Box.new(:vertical, 10)
+      outer.margin = 8 if outer.respond_to?(:margin=)
+
+      entries = {}
+      container_entry_keys = [:orbsack, :chrismsack, :lootsack, :toocrudesack, :chrismariumsack]
+      ignore_checks = {}
+      ignore_box_widget = nil
+
+      rebuild_ignores = proc do
+        next unless ignore_box_widget
+        begin
+          if ignore_box_widget.respond_to?(:children)
+            ignore_box_widget.children.each { |c| ignore_box_widget.remove(c) }
+          end
+          ignore_checks.clear
+
+          used = container_entry_keys.map { |key| entries[key] }.compact.map { |e| cm_control_text(e).downcase }.reject(&:empty?)
+          current_ignores = cm_ignore_settings.map(&:downcase)
+          available = container_choices.reject { |choice| used.include?(cm_choice_value(choice).downcase) }
+
+          if available.empty?
+            placeholder = Gtk::Label.new('(no other pouches to ignore)')
+            placeholder.xalign = 0 if placeholder.respond_to?(:xalign=)
+            ignore_box_widget.pack_start(placeholder, :expand => false, :fill => false, :padding => 0)
+          else
+            available.each do |choice|
+              display = cm_choice_display(choice)
+              value = cm_choice_value(choice)
+              cb = Gtk::CheckButton.new(display)
+              cb.active = current_ignores.include?(value.downcase) || current_ignores.include?(display.downcase) if cb.respond_to?(:active=)
+              cb.set_tooltip_text(value) if cb.respond_to?(:set_tooltip_text) && value != display
+              cb.signal_connect('toggled') do
+                checked = ignore_checks.select { |_, check| check.respond_to?(:active?) ? check.active? : false }.keys
+                cm_save_ignore_setting(checked)
+                status.text = 'Ignore containers saved.' if defined?(status) && status.respond_to?(:text=)
+              end if cb.respond_to?(:signal_connect)
+              ignore_checks[value] = cb
+              ignore_box_widget.pack_start(cb, :expand => false, :fill => false, :padding => 0)
+            end
+          end
+          ignore_box_widget.show_all if ignore_box_widget.respond_to?(:show_all)
+        rescue
+          nil
+        end
+      end
+
+      [
+        [:orbsack, 'Gems to try', 'Raw gems Chrism Forge will try to bless into chrisms.'],
+        [:chrismsack, 'Finished chrisms go here', 'Finished chrism gems are stored here when they are not pushed into your chrismarium.'],
+        [:lootsack, 'Non-orb gems go here', 'Gems confirmed as non-orbs, plus gems that failed for another reason.'],
+        [:toocrudesack, 'Orb gems under 3000 silver go here', 'These are real orb gems, but their value is too low to accept a chrism blessing.'],
+        [:chrismariumsack, 'Chrismarium is stored in', 'Container where your chrismarium is kept.']
+      ].each do |key, label_text, tooltip_text|
+        row, entry = cm_container_dropdown_row(label_text, setting_value(key), container_choices, true, tooltip_text)
+        entries[key] = entry
+        outer.pack_start(row, :expand => false, :fill => true, :padding => 0)
+        entry.signal_connect('changed') { rebuild_ignores.call } if entry.respond_to?(:signal_connect)
+      end
+
+      ignore_header = Gtk::Label.new('Pouches to ignore (Stage and Sort skip gems inside these):')
+      ignore_header.xalign = 0 if ignore_header.respond_to?(:xalign=)
+      outer.pack_start(ignore_header, :expand => false, :fill => true, :padding => 0)
+
+      ignore_box_widget = Gtk::Box.new(:vertical, 2)
+      ignore_scroller = Gtk::ScrolledWindow.new
+      ignore_scroller.set_policy(Gtk::PolicyType::AUTOMATIC, Gtk::PolicyType::AUTOMATIC) if ignore_scroller.respond_to?(:set_policy)
+      ignore_scroller.set_size_request(-1, 110) if ignore_scroller.respond_to?(:set_size_request)
+      if ignore_scroller.respond_to?(:add_with_viewport)
+        ignore_scroller.add_with_viewport(ignore_box_widget)
+      elsif ignore_scroller.respond_to?(:add)
+        ignore_scroller.add(ignore_box_widget)
+      end
+      outer.pack_start(ignore_scroller, :expand => false, :fill => true, :padding => 0)
+
+      rebuild_ignores.call
+
+      status = Gtk::Label.new('')
+      status.xalign = 0 if status.respond_to?(:xalign=)
+      status.line_wrap = true if status.respond_to?(:line_wrap=)
+      outer.pack_start(status, :expand => false, :fill => true, :padding => 0)
+
+      count_output = Gtk::TextView.new
+      count_output.editable = false if count_output.respond_to?(:editable=)
+      count_output.cursor_visible = false if count_output.respond_to?(:cursor_visible=)
+      count_output.monospace = true if count_output.respond_to?(:monospace=)
+      count_scroller = Gtk::ScrolledWindow.new
+      count_scroller.set_policy(Gtk::PolicyType::AUTOMATIC, Gtk::PolicyType::AUTOMATIC) if count_scroller.respond_to?(:set_policy)
+      count_scroller.set_size_request(-1, 150) if count_scroller.respond_to?(:set_size_request)
+      count_scroller.add(count_output) if count_scroller.respond_to?(:add)
+      outer.pack_start(count_scroller, :expand => true, :fill => true, :padding => 0)
+
+      setup_report_writer = proc do |text|
+        Gtk.queue do
+          status.text = text.to_s.lines.first.to_s.chomp if status.respond_to?(:text=)
+          cm_set_text_view_text(count_output, text)
+        end
+      end
+
+      button_row = Gtk::Box.new(:horizontal, 8)
+      refresh_button = Gtk::Button.new(:label => 'Refresh Containers')
+      save_button = Gtk::Button.new(:label => 'Save')
+      quality_button = Gtk::Button.new(:label => 'Check Skills')
+      count_button = Gtk::Button.new(:label => 'Count Gems')
+      stage_button = Gtk::Button.new(:label => 'Stage Gems')
+      sort_button = Gtk::Button.new(:label => 'Sort Chrisms')
+      run_button = Gtk::Button.new(:label => 'Save & Run')
+      run_chrismarium_button = Gtk::Button.new(:label => 'Save & Run Chrismarium')
+      close_button = Gtk::Button.new(:label => 'Close')
+
+      unless is_cleric
+        [run_button, run_chrismarium_button].each do |btn|
+          btn.sensitive = false if btn.respond_to?(:sensitive=)
+          btn.set_tooltip_text('Making chrisms is Cleric-only.') if btn.respond_to?(:set_tooltip_text)
+        end
+        cleric_only_text = 'Making chrisms is Cleric-only. Count Gems, Stage Gems, and Sort Chrisms still work.'
+        if status.respond_to?(:set_markup)
+          status.set_markup(cm_status_warning_markup(cleric_only_text))
+        elsif status.respond_to?(:text=)
+          status.text = cleric_only_text
+        end
+      end
+
+      collect_ignores = proc do
+        ignore_checks.select { |_, cb| cb.respond_to?(:active?) ? cb.active? : false }.keys
+      end
+
+      strength_checks = {}
+      fullness_checks = {}
+      collect_strengths = proc do
+        strength_checks.select { |_, cb| cb.respond_to?(:active?) ? cb.active? : false }.keys
+      end
+      collect_fullnesses = proc do
+        fullness_checks.select { |_, cb| cb.respond_to?(:active?) ? cb.active? : false }.keys
+      end
+      save_chrismarium_filter_settings = proc do
+        cm_setting_write(:chrismariumfillstrengths, collect_strengths.call)
+        cm_setting_write(:chrismariumfillfullnesses, collect_fullnesses.call)
+        cm_save_settings
+      end
+
+      refresh_handler = proc do
+        current_values = {}
+        entries.each { |key, control| current_values[key] = cm_control_text(control) }
+        refreshed_choices = cm_scan_container_names
+        container_choices.replace(refreshed_choices) if container_choices.respond_to?(:replace)
+        container_entry_keys.each { |key| cm_set_container_dropdown_choices(entries[key], refreshed_choices, current_values[key], true) if entries[key] }
+        rebuild_ignores.call
+        status.text = "Found #{refreshed_choices.length} container#{refreshed_choices.length == 1 ? '' : 's'}." if status.respond_to?(:text=)
+      rescue => error
+        status.text = "Refresh failed: #{error.message}" if status.respond_to?(:text=)
+      end
+      callbacks << refresh_handler
+      refresh_button.signal_connect('clicked', &refresh_handler)
+
+      save_handler = proc do
+        cm_save_setup_entries(entries)
+        cm_save_ignore_setting(collect_ignores.call)
+        save_chrismarium_filter_settings.call
+        rebuild_ignores.call
+        status.text = 'Saved.' if status.respond_to?(:text=)
+      rescue => error
+        status.text = "Save failed: #{error.message}" if status.respond_to?(:text=)
+      end
+      callbacks << save_handler
+      save_button.signal_connect('clicked', &save_handler)
+
+      quality_handler = proc do
+        status.text = 'Checking skills...' if status.respond_to?(:text=)
+        action = :quality
+      rescue => error
+        status.text = "Skill check failed: #{error.message}" if status.respond_to?(:text=)
+      end
+      callbacks << quality_handler
+      quality_button.signal_connect('clicked', &quality_handler)
+
+      count_handler = proc do
+        cm_save_setup_entries(entries)
+        cm_save_ignore_setting(collect_ignores.call)
+        save_chrismarium_filter_settings.call
+        status.text = 'Counting gems...' if status.respond_to?(:text=)
+        action = :count
+      rescue => error
+        status.text = "Count failed: #{error.message}" if status.respond_to?(:text=)
+      end
+      callbacks << count_handler
+      count_button.signal_connect('clicked', &count_handler)
+
+      stage_handler = proc do
+        cm_save_setup_entries(entries)
+        cm_save_ignore_setting(collect_ignores.call)
+        save_chrismarium_filter_settings.call
+        status.text = 'Staging gems...' if status.respond_to?(:text=)
+        action = :stage
+      rescue => error
+        status.text = "Stage failed: #{error.message}" if status.respond_to?(:text=)
+      end
+      callbacks << stage_handler
+      stage_button.signal_connect('clicked', &stage_handler)
+
+      sort_handler = proc do
+        cm_save_setup_entries(entries)
+        cm_save_ignore_setting(collect_ignores.call)
+        save_chrismarium_filter_settings.call
+        status.text = 'Sorting finished chrisms...' if status.respond_to?(:text=)
+        action = :sort
+      rescue => error
+        status.text = "Sort failed: #{error.message}" if status.respond_to?(:text=)
+      end
+      callbacks << sort_handler
+      sort_button.signal_connect('clicked', &sort_handler)
+
+      run_handler = proc do
+        cm_save_setup_entries(entries)
+        cm_save_ignore_setting(collect_ignores.call)
+        save_chrismarium_filter_settings.call
+        action = :run
+        cm_close_gtk_window_now(window_ref, closed_ref)
+      rescue => error
+        status.text = "Save failed: #{error.message}" if status.respond_to?(:text=)
+      end
+      callbacks << run_handler
+      run_button.signal_connect('clicked', &run_handler)
+
+      run_chrismarium_handler = proc do
+        cm_save_setup_entries(entries)
+        cm_save_ignore_setting(collect_ignores.call)
+        save_chrismarium_filter_settings.call
+        action = :run_chrismarium
+        cm_close_gtk_window_now(window_ref, closed_ref)
+      rescue => error
+        status.text = "Save failed: #{error.message}" if status.respond_to?(:text=)
+      end
+      callbacks << run_chrismarium_handler
+      run_chrismarium_button.signal_connect('clicked', &run_chrismarium_handler)
+
+      close_handler = proc do
+        action = :close
+        cm_close_gtk_window_now(window_ref, closed_ref)
+      end
+      callbacks << close_handler
+      close_button.signal_connect('clicked', &close_handler)
+
+      button_row.pack_start(refresh_button, :expand => false, :fill => false, :padding => 0)
+      button_row.pack_start(save_button, :expand => false, :fill => false, :padding => 0)
+      button_row.pack_start(quality_button, :expand => false, :fill => false, :padding => 0)
+      button_row.pack_start(count_button, :expand => false, :fill => false, :padding => 0)
+      button_row.pack_start(stage_button, :expand => false, :fill => false, :padding => 0)
+      button_row.pack_start(sort_button, :expand => false, :fill => false, :padding => 0)
+      button_row.pack_start(run_button, :expand => false, :fill => false, :padding => 0)
+      button_row.pack_start(run_chrismarium_button, :expand => false, :fill => false, :padding => 0)
+      button_row.pack_end(close_button, :expand => false, :fill => false, :padding => 0)
+      outer.pack_start(button_row, :expand => false, :fill => true, :padding => 0)
+
+      chrismarium_tab = Gtk::Box.new(:vertical, 10)
+      chrismarium_tab.margin = 8 if chrismarium_tab.respond_to?(:margin=)
+      chrismarium_note = Gtk::Label.new('Choose which chrisms should be pushed into your chrismarium. These filters apply to Fill Chrismarium and chrismarium run mode.')
+      chrismarium_note.xalign = 0 if chrismarium_note.respond_to?(:xalign=)
+      chrismarium_note.line_wrap = true if chrismarium_note.respond_to?(:line_wrap=)
+      chrismarium_tab.pack_start(chrismarium_note, :expand => false, :fill => true, :padding => 0)
+
+      full_row, full_entry = cm_container_dropdown_row(
+        'When chrismarium is full',
+        cm_chrismarium_full_label,
+        CHRISMARIUM_FULL_CHOICES.values
+      )
+      entries[:chrismariumfull] = full_entry
+      chrismarium_tab.pack_start(full_row, :expand => false, :fill => true, :padding => 0)
+
+      strength_label = Gtk::Label.new("Death's Sting strength")
+      strength_label.xalign = 0 if strength_label.respond_to?(:xalign=)
+      chrismarium_tab.pack_start(strength_label, :expand => false, :fill => true, :padding => 0)
+      strength_box = Gtk::Box.new(:horizontal, 8)
+      saved_strengths = cm_chrismarium_fill_strengths
+      CHRISMFORGE_CHRISM_STRENGTHS.each do |strength|
+        cb = Gtk::CheckButton.new(strength)
+        cb.active = saved_strengths.include?(strength) if cb.respond_to?(:active=)
+        strength_checks[strength] = cb
+        cb.signal_connect('toggled') do
+          save_chrismarium_filter_settings.call
+          chrismarium_status.text = 'Chrismarium filters saved.' if defined?(chrismarium_status) && chrismarium_status.respond_to?(:text=)
+        end if cb.respond_to?(:signal_connect)
+        strength_box.pack_start(cb, :expand => false, :fill => false, :padding => 0)
+      end
+      chrismarium_tab.pack_start(strength_box, :expand => false, :fill => true, :padding => 0)
+
+      fullness_label = Gtk::Label.new('Retained-experience fullness')
+      fullness_label.xalign = 0 if fullness_label.respond_to?(:xalign=)
+      chrismarium_tab.pack_start(fullness_label, :expand => false, :fill => true, :padding => 0)
+      fullness_box = Gtk::Box.new(:vertical, 2)
+      saved_fullnesses = cm_chrismarium_fill_fullnesses
+      CHRISMFORGE_CHRISM_FULLNESSES.each do |fullness|
+        cb = Gtk::CheckButton.new(fullness)
+        cb.active = saved_fullnesses.include?(fullness) if cb.respond_to?(:active=)
+        fullness_checks[fullness] = cb
+        cb.signal_connect('toggled') do
+          save_chrismarium_filter_settings.call
+          chrismarium_status.text = 'Chrismarium filters saved.' if defined?(chrismarium_status) && chrismarium_status.respond_to?(:text=)
+        end if cb.respond_to?(:signal_connect)
+        fullness_box.pack_start(cb, :expand => false, :fill => false, :padding => 0)
+      end
+      chrismarium_tab.pack_start(fullness_box, :expand => false, :fill => true, :padding => 0)
+
+      chrismarium_status = Gtk::Label.new('')
+      chrismarium_status.xalign = 0 if chrismarium_status.respond_to?(:xalign=)
+      chrismarium_status.line_wrap = true if chrismarium_status.respond_to?(:line_wrap=)
+      chrismarium_tab.pack_start(chrismarium_status, :expand => false, :fill => true, :padding => 0)
+
+      chrismarium_output = Gtk::TextView.new
+      chrismarium_output.editable = false if chrismarium_output.respond_to?(:editable=)
+      chrismarium_output.cursor_visible = false if chrismarium_output.respond_to?(:cursor_visible=)
+      chrismarium_output.monospace = true if chrismarium_output.respond_to?(:monospace=)
+      cm_set_text_view_text(chrismarium_output, cm_chrismarium_status_text)
+      chrismarium_scroller = Gtk::ScrolledWindow.new
+      chrismarium_scroller.set_policy(Gtk::PolicyType::AUTOMATIC, Gtk::PolicyType::AUTOMATIC) if chrismarium_scroller.respond_to?(:set_policy)
+      chrismarium_scroller.set_size_request(-1, 150) if chrismarium_scroller.respond_to?(:set_size_request)
+      chrismarium_scroller.add(chrismarium_output) if chrismarium_scroller.respond_to?(:add)
+      chrismarium_tab.pack_start(chrismarium_scroller, :expand => true, :fill => true, :padding => 0)
+
+      fill_chrismarium_state = { running: false }
+      fill_chrismarium_button = Gtk::Button.new(:label => 'Fill Chrismarium')
+      setup_action_state_writer = proc do |running|
+        Gtk.queue do
+          fill_chrismarium_state[:running] = running
+          fill_chrismarium_button.label = running ? 'Stop' : 'Fill Chrismarium' if fill_chrismarium_button.respond_to?(:label=)
+          fill_chrismarium_button.sensitive = true if fill_chrismarium_button.respond_to?(:sensitive=)
+          chrismarium_status.text = running ? 'Filling chrismarium...' : 'Ready.' if chrismarium_status.respond_to?(:text=)
+        end
+      end
+      chrismarium_report_writer = proc do |text|
+        Gtk.queue do
+          chrismarium_status.text = text.to_s.lines.first.to_s.chomp if chrismarium_status.respond_to?(:text=)
+          cm_set_text_view_text(chrismarium_output, text)
+        end
+      end
+      fill_chrismarium_handler = proc do
+        if fill_chrismarium_state[:running]
+          $chrismforge_stop_requested = true
+          fill_chrismarium_button.sensitive = false if fill_chrismarium_button.respond_to?(:sensitive=)
+          chrismarium_status.text = 'Stopping after the current chrism.' if chrismarium_status.respond_to?(:text=)
+          next
+        end
+
+        selected_strengths = collect_strengths.call
+        selected_fullnesses = collect_fullnesses.call
+        if selected_strengths.empty? || selected_fullnesses.empty?
+          chrismarium_status.text = 'Choose at least one strength and one fullness.' if chrismarium_status.respond_to?(:text=)
+          next
+        end
+
+        cm_save_setup_entries(entries)
+        cm_save_ignore_setting(collect_ignores.call)
+        save_chrismarium_filter_settings.call
+        action = :fill_chrismarium
+      rescue => error
+        chrismarium_status.text = "Fill failed: #{error.message}" if chrismarium_status.respond_to?(:text=)
+      end
+      callbacks << fill_chrismarium_handler
+      fill_chrismarium_button.signal_connect('clicked', &fill_chrismarium_handler)
+      refresh_chrismarium_button = Gtk::Button.new(:label => 'Refresh Chrismarium Status')
+      refresh_chrismarium_handler = proc do
+        cm_save_setup_entries(entries)
+        cm_save_ignore_setting(collect_ignores.call)
+        save_chrismarium_filter_settings.call
+        chrismarium_status.text = 'Refreshing chrismarium status...' if chrismarium_status.respond_to?(:text=)
+        action = :refresh_chrismarium_status
+      rescue => error
+        chrismarium_status.text = "Refresh failed: #{error.message}" if chrismarium_status.respond_to?(:text=)
+      end
+      callbacks << refresh_chrismarium_handler
+      refresh_chrismarium_button.signal_connect('clicked', &refresh_chrismarium_handler)
+
+      chrismarium_button_row = Gtk::Box.new(:horizontal, 8)
+      chrismarium_button_row.pack_start(refresh_chrismarium_button, :expand => true, :fill => true, :padding => 0)
+      chrismarium_button_row.pack_start(fill_chrismarium_button, :expand => true, :fill => true, :padding => 0)
+      chrismarium_tab.pack_start(chrismarium_button_row, :expand => false, :fill => true, :padding => 0)
+
+      lapidary_tab = Gtk::Box.new(:vertical, 10)
+      lapidary_tab.margin = 8 if lapidary_tab.respond_to?(:margin=)
+      lapidary_note = Gtk::Label.new('Save a lapidary box and read its current design slots.')
+      lapidary_note.xalign = 0 if lapidary_note.respond_to?(:xalign=)
+      lapidary_note.line_wrap = true if lapidary_note.respond_to?(:line_wrap=)
+      lapidary_tab.pack_start(lapidary_note, :expand => false, :fill => true, :padding => 0)
+
+      lapidary_cut_toggle = Gtk::CheckButton.new('Cut gems during chrism run')
+      lapidary_cut_toggle.active = cm_lapidary_cut_during_run? if lapidary_cut_toggle.respond_to?(:active=)
+      lapidary_cut_toggle.set_tooltip_text('When checked, Chrism Forge cuts each gem after it knows whether the gem became a chrism, low-value orb, non-orb, or other failed gem.') if lapidary_cut_toggle.respond_to?(:set_tooltip_text)
+      entries[:lapidarycutduringrun] = lapidary_cut_toggle
+      lapidary_tab.pack_start(lapidary_cut_toggle, :expand => false, :fill => true, :padding => 0)
+
+      lapidary_row, lapidary_entry = cm_entry_row('Lapidary box', cm_lapidary_box_name)
+      entries[:lapidarybox] = lapidary_entry
+      lapidary_tab.pack_start(lapidary_row, :expand => false, :fill => true, :padding => 0)
+
+      saved_lapidary_designs = cm_lapidary_designs
+      pattern_choices = cm_lapidary_pattern_choices(saved_lapidary_designs)
+      [
+        [:lapidarychrismpattern, 'Pattern for finished chrisms'],
+        [:lapidaryorbpattern, 'Pattern for low-value orb gems'],
+        [:lapidarypurifiedpattern, 'Pattern for non-orb gems'],
+        [:lapidaryregularpattern, 'Pattern for other failed gems']
+      ].each do |key, label_text|
+        pattern_row, pattern_entry = cm_container_dropdown_row(label_text, setting_value(key), pattern_choices, true)
+        entries[key] = pattern_entry
+        lapidary_pattern_widgets[key] = pattern_entry
+        lapidary_tab.pack_start(pattern_row, :expand => false, :fill => true, :padding => 0)
+      end
+
+      manual_cut_row, manual_cut_combo = cm_container_dropdown_row(
+        'Cut saved pouch',
+        'chrism',
+        cm_lapidary_manual_bag_choices,
+        false,
+        'Choose which saved Chrism Forge pouch to cut now. Already-cut gems are skipped.'
+      )
+      lapidary_tab.pack_start(manual_cut_row, :expand => false, :fill => true, :padding => 0)
+
+      lapidary_status = Gtk::Label.new('')
+      lapidary_status.xalign = 0 if lapidary_status.respond_to?(:xalign=)
+      lapidary_status.line_wrap = true if lapidary_status.respond_to?(:line_wrap=)
+      lapidary_tab.pack_start(lapidary_status, :expand => false, :fill => true, :padding => 0)
+
+      lapidary_output = Gtk::TextView.new
+      lapidary_output.editable = false if lapidary_output.respond_to?(:editable=)
+      lapidary_output.cursor_visible = false if lapidary_output.respond_to?(:cursor_visible=)
+      lapidary_output.monospace = true if lapidary_output.respond_to?(:monospace=)
+      if saved_lapidary_designs.empty?
+        saved_lines = ['No gemcutting designs saved yet.', '']
+        saved_lines.concat(cm_lapidary_pattern_lines)
+        cm_set_text_view_text(lapidary_output, saved_lines.join("\n"))
+      else
+        saved_lines = ["Saved gemcutting tool: #{cm_lapidary_box_name}", "Last analyzed: #{cm_lapidary_analyzed_at}", 'Current designs:']
+        saved_lapidary_designs.each_with_index { |design, index| saved_lines << "  #{index + 1}. #{design}" }
+        saved_lines << ''
+        saved_lines.concat(cm_lapidary_pattern_lines)
+        cm_set_text_view_text(lapidary_output, saved_lines.join("\n"))
+      end
+      lapidary_scroller = Gtk::ScrolledWindow.new
+      lapidary_scroller.set_policy(Gtk::PolicyType::AUTOMATIC, Gtk::PolicyType::AUTOMATIC) if lapidary_scroller.respond_to?(:set_policy)
+      lapidary_scroller.set_size_request(-1, 210) if lapidary_scroller.respond_to?(:set_size_request)
+      lapidary_scroller.add(lapidary_output) if lapidary_scroller.respond_to?(:add)
+      lapidary_tab.pack_start(lapidary_scroller, :expand => true, :fill => true, :padding => 0)
+
+      lapidary_report_writer = proc do |text|
+        Gtk.queue do
+          lapidary_status.text = text.to_s.lines.first.to_s.chomp if lapidary_status.respond_to?(:text=)
+          cm_set_text_view_text(lapidary_output, text)
+          choices = cm_lapidary_pattern_choices
+          lapidary_pattern_widgets.each do |key, combo|
+            cm_set_container_dropdown_choices(combo, choices, setting_value(key), true)
+          end
+        end
+      end
+      lapidary_summary_text = proc do
+        current_designs = cm_lapidary_designs
+        lines = if current_designs.empty?
+                  ['No gemcutting designs saved yet.', '']
+                else
+                  ["Saved lapidary box: #{cm_lapidary_box_name}", "Last analyzed: #{cm_lapidary_analyzed_at}", 'Current designs:'].tap do |list|
+                    current_designs.each_with_index { |design, index| list << "  #{index + 1}. #{design}" }
+                    list << ''
+                  end
+                end
+        lines.concat(cm_lapidary_pattern_lines)
+        lines.join("\n")
+      end
+      lapidary_cut_toggle.signal_connect('toggled') do
+        cm_setting_write(:lapidarycutduringrun, lapidary_cut_toggle.respond_to?(:active?) && lapidary_cut_toggle.active? ? 'true' : 'false')
+        cm_save_settings
+        lapidary_status.text = "Cut during chrism run saved: #{cm_lapidary_cut_during_run? ? 'yes' : 'no'}" if lapidary_status.respond_to?(:text=)
+        cm_set_text_view_text(lapidary_output, lapidary_summary_text.call)
+      rescue => error
+        lapidary_status.text = "Save failed: #{error.message}" if lapidary_status.respond_to?(:text=)
+      end if lapidary_cut_toggle.respond_to?(:signal_connect)
+
+      analyze_lapidary_button = Gtk::Button.new(:label => 'Analyze Lapidary Box')
+      cut_lapidary_bag_button = Gtk::Button.new(:label => 'Cut Saved Pouch')
+      lapidary_cut_state = { running: false }
+      lapidary_cut_state_writer = proc do |running|
+        Gtk.queue do
+          lapidary_cut_state[:running] = running
+          cut_lapidary_bag_button.label = running ? 'Stop' : 'Cut Saved Pouch' if cut_lapidary_bag_button.respond_to?(:label=)
+          cut_lapidary_bag_button.sensitive = true if cut_lapidary_bag_button.respond_to?(:sensitive=)
+          analyze_lapidary_button.sensitive = !running if analyze_lapidary_button.respond_to?(:sensitive=)
+          manual_cut_combo.sensitive = !running if manual_cut_combo.respond_to?(:sensitive=)
+        end
+      end
+      analyze_lapidary_handler = proc do
+        cm_save_setup_entries(entries)
+        cm_save_ignore_setting(collect_ignores.call)
+        save_chrismarium_filter_settings.call
+        lapidary_status.text = 'Analyzing lapidary box...' if lapidary_status.respond_to?(:text=)
+        action = :analyze_lapidary
+      rescue => error
+        lapidary_status.text = "Analyze failed: #{error.message}" if lapidary_status.respond_to?(:text=)
+      end
+      callbacks << analyze_lapidary_handler
+      analyze_lapidary_button.signal_connect('clicked', &analyze_lapidary_handler)
+      cut_lapidary_bag_handler = proc do
+        if lapidary_cut_state[:running]
+          $chrismforge_stop_requested = true
+          cut_lapidary_bag_button.sensitive = false if cut_lapidary_bag_button.respond_to?(:sensitive=)
+          lapidary_status.text = 'Stopping after the current gem.' if lapidary_status.respond_to?(:text=)
+          next
+        end
+
+        cm_save_setup_entries(entries)
+        cm_save_ignore_setting(collect_ignores.call)
+        save_chrismarium_filter_settings.call
+        lapidary_cut_bag_value = cm_control_text(manual_cut_combo)
+        lapidary_status.text = 'Cutting saved pouch...' if lapidary_status.respond_to?(:text=)
+        action = :cut_lapidary_bag
+      rescue => error
+        lapidary_status.text = "Cut failed: #{error.message}" if lapidary_status.respond_to?(:text=)
+      end
+      callbacks << cut_lapidary_bag_handler
+      cut_lapidary_bag_button.signal_connect('clicked', &cut_lapidary_bag_handler)
+      lapidary_button_row = Gtk::Box.new(:horizontal, 8)
+      lapidary_button_row.pack_start(analyze_lapidary_button, :expand => true, :fill => true, :padding => 0)
+      lapidary_button_row.pack_start(cut_lapidary_bag_button, :expand => true, :fill => true, :padding => 0)
+      lapidary_tab.pack_start(lapidary_button_row, :expand => false, :fill => true, :padding => 0)
+
+      notebook.append_page(outer, Gtk::Label.new('Setup')) if notebook.respond_to?(:append_page)
+      notebook.append_page(chrismarium_tab, Gtk::Label.new('Chrismarium')) if notebook.respond_to?(:append_page)
+      notebook.append_page(lapidary_tab, Gtk::Label.new('Gemcutting')) if notebook.respond_to?(:append_page)
+      main_outer.pack_start(notebook, :expand => true, :fill => true, :padding => 0)
+
+      delete_handler = proc do
+        cm_request_safe_stop('closed by user')
+        action = :close
+        cm_handle_gtk_delete_event('Chrism Forge Setup', window_ref, closed_ref)
+      end
+      destroy_handler = proc do
+        action = :close
+        cm_forget_gtk_window(window_ref[:name], window_ref, closed_ref)
+      end
+      callbacks << delete_handler
+      callbacks << destroy_handler
+      window.signal_connect('delete_event', &delete_handler)
+      window.signal_connect('destroy', &destroy_handler)
+
+      window.instance_variable_set(:@chrism_maker_callbacks, callbacks)
+      window.add(main_outer)
+      window.set_keep_above(true) if window.respond_to?(:set_keep_above)
+      window.show_all
+      window.present if window.respond_to?(:present)
+    rescue => error
+      setup_error = error
+      action = :error
+    end
+  end
+
+  loop do
+    wait_until { action }
+
+    requested_action = action
+    action = nil
+
+    if requested_action == :error
+      message("~ GTK setup failed: #{setup_error.class}: #{setup_error.message}")
+      break
+    elsif requested_action == :quality
+      setup_report_writer.call(cm_chrism_skill_report) if setup_report_writer
+      next
+    elsif requested_action == :count
+      count_report = cm_gem_count_report(cm_saved_count_entries)
+      setup_report_writer.call(count_report) if setup_report_writer
+      next
+    elsif requested_action == :stage
+      sort_report = cm_stage_raw_gems(nil, setting_value(:orbsack), setting_value(:lootsack))
+      setup_report_writer.call(sort_report) if setup_report_writer
+      next
+    elsif requested_action == :sort
+      sort_report = cm_sort_finished_chrisms(nil, setting_value(:orbsack), setting_value(:chrismsack))
+      setup_report_writer.call(sort_report) if setup_report_writer
+      next
+    elsif requested_action == :fill_chrismarium
+      begin
+        $chrismforge_stop_requested = false
+        setup_action_state_writer.call(true) if setup_action_state_writer
+        report = cm_fill_chrismarium_from_pouch(
+          setting_value(:chrismsack),
+          setting_value(:chrismariumsack),
+          cm_chrismarium_fill_strengths,
+          cm_chrismarium_fill_fullnesses
+        ) do |progress|
+          chrismarium_report_writer.call(progress) if chrismarium_report_writer
+        end
+        chrismarium_report_writer.call(report) if chrismarium_report_writer
+      ensure
+        $chrismforge_stop_requested = false
+        setup_action_state_writer.call(false) if setup_action_state_writer
+      end
+      next
+    elsif requested_action == :refresh_chrismarium_status
+      report = cm_refresh_chrismarium_status(setting_value(:chrismariumsack))
+      chrismarium_report_writer.call(report) if chrismarium_report_writer
+      next
+    elsif requested_action == :analyze_lapidary
+      report = cm_analyze_lapidary_box(cm_lapidary_box_name)
+      lapidary_report_writer.call(report) if lapidary_report_writer
+      next
+    elsif requested_action == :cut_lapidary_bag
+      begin
+        $chrismforge_stop_requested = false
+        lapidary_cut_state_writer.call(true) if lapidary_cut_state_writer
+        report = cm_lapidary_cut_saved_bag(lapidary_cut_bag_value) do |progress|
+          lapidary_report_writer.call(progress) if lapidary_report_writer
+        end
+        lapidary_report_writer.call(report) if lapidary_report_writer
+      ensure
+        $chrismforge_stop_requested = false
+        lapidary_cut_state_writer.call(false) if lapidary_cut_state_writer
+      end
+      next
+    elsif requested_action == :run
+      message('~ Starting Chrism Forge.')
+      return :run
+    elsif requested_action == :run_chrismarium
+      message('~ Starting Chrism Forge in chrismarium mode.')
+      return :run_chrismarium
+    elsif requested_action == :close
+      return :close
+    end
+  end
+ensure
+  cm_close_gtk_window_now(window_ref, closed_ref) if window_ref
+end
+
+if args.any? { |arg| arg =~ /^(?:help|--help|-h|\?)$/i }
+  help
+  exit
+end
+
+if args.any? { |arg| arg =~ /^(?:changelog|changes|version)$/i }
+  changelog
+  exit
+end
+
+if args.empty? || args.any? { |arg| arg =~ /^(?:setup|config|gtk|gui)$/i }
+  setup_result = show_chrism_maker_setup
+  case setup_result
+  when :run
+    use_gtk_progress = true
+    # fall through to the main run
+  when :run_chrismarium
+    use_chrismarium = true
+    use_gtk_progress = true
+    # fall through to the main run
+  else
+    exit
+  end
+end
+
+if args[0].to_s =~ /^(?:quality|skills?|check|canmake)$/i
+  message cm_chrism_skill_report
+  exit
+end
+
+if args[0].to_s =~ /^count$/i
+  message cm_gem_count_report(cm_saved_count_entries)
+  exit
+end
+
+if args[0].to_s =~ /^(?:stage|stage-gems|rawsort)$/i
+  source_container = args[1..-1].join(' ').strip
+  source_container = nil if source_container.empty?
+  message cm_stage_raw_gems(source_container, setting_value(:orbsack), setting_value(:lootsack))
+  exit
+end
+
+if args[0].to_s =~ /^(?:sort|chrismsort|sort-chrisms)$/i
+  sort_args = args[1..-1]
+  if sort_args.length >= 3
+    source_container = sort_args[0]
+    gem_container = sort_args[1]
+    chrism_container = sort_args[2..-1].join(' ')
+  else
+    source_container = sort_args.join(' ').strip
+    source_container = nil if source_container.empty?
+    gem_container = setting_value(:orbsack)
+    chrism_container = setting_value(:chrismsack)
+  end
+  message cm_sort_finished_chrisms(source_container, gem_container, chrism_container)
+  exit
+end
+
+orbsack = require_setting(:orbsack, 'container holding gems to try')
+chrismsack = require_setting(:chrismsack, 'container where finished chrisms go')
+lootsack = require_setting(:lootsack, 'container where non-orb gems go')
+chrismariumsack = require_setting(:chrismariumsack, 'container where your chrismarium is stored') if use_chrismarium
+toocrudesack = setting_value(:toocrudesack)
+
+unless orbsack && chrismsack && lootsack && (!use_chrismarium || chrismariumsack)
+  message
+  help
+  exit
+end
+
+unless cm_can_make_chrisms?
+  message(cm_chrism_skill_report)
+  message('')
+  message('Chrism-making run stopped. Count, stage, sort, setup, and skill check are still available.')
+  exit
+end
+
+container = find_inventory_container(orbsack)
+unless container
+  message("~ Error: Can't find your gem pouch \"#{orbsack}\". Open ;chrismforge and pick it again.")
+  exit
+end
+
+chrism_container = find_inventory_container(chrismsack)
+unless chrism_container
+  message("~ Error: Can't find your finished-chrisms pouch \"#{chrismsack}\". Open ;chrismforge and pick it again.")
+  exit
+end
+
+loot_container = find_inventory_container(lootsack)
+unless loot_container
+  message("~ Error: Can't find your non-orb gems pouch \"#{lootsack}\". Open ;chrismforge and pick it again.")
+  exit
+end
+
+too_crude_container = nil
+if toocrudesack
+  too_crude_container = find_inventory_container(toocrudesack)
+  message("~ Low-value orb gems pouch not found; using non-orb gems pouch instead.") unless too_crude_container
+end
+
+chrismarium_container = nil
+if use_chrismarium
+  chrismarium_container = find_inventory_container(chrismariumsack)
+  unless chrismarium_container
+    message("~ Error: Can't find your chrismarium pouch \"#{chrismariumsack}\". Open ;chrismforge and pick it again.")
+    exit
+  end
+end
+
+chrism_ref = cm_container_ref(chrism_container)
+loot_ref = cm_container_ref(loot_container)
+too_crude_ref = cm_container_ref(too_crude_container || loot_container)
+chrismarium_ref = cm_container_ref(chrismarium_container)
+$chrismforge_stop_requested = false
+$chrismforge_close_after_stop = false
+$chrismforge_run_active = false
+$chrismforge_run_finished = false
+$chrismforge_run_state = nil
+
+before_dying do
+  cm_finish_run!($chrismforge_run_state, 'script stopped', chrismarium_container) if $chrismforge_run_state
+  if use_chrismarium
+    stow_chrismarium(chrismarium_container || chrismariumsack)
+  else
+    empty_hand_safely
+  end
+end
+
+unless cm_clear_hands_before_run(container, chrismarium_container, chrism_container, loot_container)
+  message('Could not clear your hands before starting. Please free one hand and run again.')
+  exit
+end
+
+if use_chrismarium
+  message('~ Chrism Forge: Chrismarium mode enabled')
+  fput "get my chrismarium from #{chrismarium_ref}" unless holding_chrismarium?
+  fput 'swap' if holding_chrismarium? && !chrismarium_in_left?
+end
+
+progress_window_ref = nil
+progress_closed_ref = nil
+if use_gtk_progress
+  progress_window_ref, progress_closed_ref = show_chrism_maker_progress_window
+end
+
+message('~ Refreshing list of gems to try')
+sleep 0.5
+
+cm_quiet_command(
+  "look in ##{container.id}",
+  5,
+  /In the |You see nothing|I could not find/i,
+  /<prompt|R>/i,
+  /In the .*?/
+)
+if container.contents.nil?
+  message("~ Error: Failed to find contents of container \"#{container.noun}\"")
+  exit
+end
+
+gem_list = container.contents.find_all { |obj| obj.type.to_s =~ /gem/i }
+if gem_list.empty?
+  message("~ Error: No gems found in container \"#{container.noun}\"")
+  exit
+end
+
+gem_counts = Hash.new(0)
+gem_list.each { |gem| gem_counts[gem.name] += cm_gem_item_count(gem) }
+
+message("~ Gem count in #{container.noun}:")
+gem_counts.each { |gem, count| message("~ #{gem.capitalize}: #{count}") }
+
+total_gems = gem_counts.values.sum
+message("~ Total gems to try: #{total_gems}")
+
+start_time = Time.now
+successful_count = 0
+failure_count = 0
+total_mana_used = 0
+quality_counts = Hash.new(0)
+fullness_counts = Hash.new(0)
+run_state = cm_new_run_state(total_gems, use_chrismarium, cm_chrismarium_full_setting, cm_container_label(chrism_container))
+$chrismforge_run_state = run_state
+$chrismforge_run_active = true
+$chrismforge_run_finished = false
+$chrismforge_progress_state_callback.call(:running) if $chrismforge_progress_state_callback
+learned_mana_needed = CHRISM_MINIMUM_MANA_COST
+run_state[:mana_needed] = learned_mana_needed
+note_mana_use = proc do |observed_mana_used|
+  mana_used_now = [observed_mana_used.to_i, 0].max
+  total_mana_used += mana_used_now
+  run_state[:mana_used] = total_mana_used
+  if mana_used_now > learned_mana_needed
+    learned_mana_needed = mana_used_now
+    run_state[:mana_needed] = learned_mana_needed
+    cm_progress_status("~ Learned mana needed per attempt: #{learned_mana_needed}", run_state)
+  end
+end
+lapidary_cut_enabled = cm_lapidary_cut_during_run? && !cm_lapidary_box_name.empty?
+if cm_lapidary_cut_during_run? && cm_lapidary_box_name.empty?
+  cm_progress_status('~ Gemcutting is enabled, but no lapidary box is saved; cuts will be skipped.', run_state)
+end
+cut_gem_for_outcome = proc do |held_gem, outcome|
+  next held_gem unless lapidary_cut_enabled
+
+  pattern = cm_lapidary_pattern_for_outcome(outcome)
+  next held_gem if pattern.to_s.strip.empty?
+
+  if cm_lapidary_gem_already_cut?(held_gem)
+    cm_note_lapidary_cut(run_state, :already_cut, cm_gem_item_count(held_gem))
+    next held_gem
+  end
+
+  cut_gem, cut_result, cut_message = cm_lapidary_cut_held_gem(held_gem, pattern, chrismarium_container || chrismariumsack)
+  cm_note_lapidary_cut(run_state, cut_result, cm_gem_item_count(held_gem))
+  cm_progress_status("~ #{cut_message}", run_state) if cut_result == :failed
+  cut_gem || held_gem
+end
+ensure_chrismarium_ready = proc do
+  next unless run_state[:use_chrismarium_current]
+  next if holding_chrismarium?
+
+  fput "get my chrismarium from #{chrismarium_ref}" if chrismarium_ref
+  fput 'swap' if holding_chrismarium? && !chrismarium_in_left?
+end
+cm_progress_status("~ Starting chrism run.", run_state)
+
+gem_list.each do |gem|
+  if $chrismforge_stop_requested
+    run_state[:stop_reason] = $chrismforge_close_after_stop ? 'closed by user' : 'stopped by user'
+    break
+  end
+
+  count = cm_gem_item_count(gem)
+  gemguard_skip = cm_gemguard_chrism_skip(gem)
+  if gemguard_skip
+    run_state[:processed] += count
+    waitrt?
+    waitcastrt?
+
+    get_result = dothistimeout "get ##{gem.id}", 5, /You (?:remove|take)|Get what|already/
+    unless get_result =~ /You (?:remove|take)|already/i
+      message("~ Failed to get #{gem.name}; skipping it.")
+      failure_count += 1
+      run_state[:failed] += count
+      run_state[:other_failed] += count
+      next
+    end
+
+    failed_target_ref = gemguard_skip[:target] == :not_chrismable_orb ? too_crude_ref : loot_ref
+    failed_stop_reason = gemguard_skip[:target] == :not_chrismable_orb && too_crude_container ? 'low-value orb gems pouch full' : 'non-orb gems pouch full'
+    cm_record_gemguard_skip(run_state, gem.name.to_s, count, gemguard_skip[:detail])
+    if gemguard_skip[:target] == :not_chrismable_orb
+      cm_record_not_chrismable_orb(run_state, gem.name.to_s, count, gemguard_skip[:note])
+    end
+
+    gem = cut_gem_for_outcome.call(gem, gemguard_skip[:target] == :not_chrismable_orb ? :not_chrismable_orb : :non_orb)
+    put_result = cm_put_item_in_container(gem, failed_target_ref)
+    failure_count += 1
+    unless gemguard_skip[:target] == :not_chrismable_orb
+      run_state[:failed] += count
+      run_state[:non_orb] += count
+    end
+    if cm_container_full_message?(put_result)
+      run_state[:stop_reason] = failed_stop_reason
+      cm_return_current_gem_to_source!(run_state, gem, container)
+      $chrismforge_stop_requested = true
+    end
+    cm_progress_status("~ Skipped #{gem.name}: #{gemguard_skip[:note]}.", run_state)
+
+    if $chrismforge_stop_requested
+      run_state[:stop_reason] = $chrismforge_close_after_stop ? 'closed by user' : 'stopped by user' if run_state[:stop_reason] == 'completed'
+      break
+    end
+    next
+  end
+
+  if checkmana < learned_mana_needed
+    cm_progress_status("~ Waiting for #{learned_mana_needed} mana...", run_state)
+    last_wait_update = Time.now
+    until checkmana >= learned_mana_needed
+      if $chrismforge_stop_requested
+        run_state[:stop_reason] = $chrismforge_close_after_stop ? 'closed by user' : 'stopped by user'
+        break
+      end
+      if $chrism_maker_progress_callback && Time.now - last_wait_update >= 5
+        cm_progress_status("~ Waiting for #{learned_mana_needed} mana... current mana: #{checkmana}", run_state)
+        last_wait_update = Time.now
+      end
+      sleep 1
+    end
+    break if $chrismforge_stop_requested
+  end
+
+  initial_mana = checkmana
+  run_state[:processed] += count
+
+  waitrt?
+  waitcastrt?
+
+  get_result = dothistimeout "get ##{gem.id}", 5, /You (?:remove|take)|Get what|already/
+  unless get_result =~ /You (?:remove|take)|already/i
+    message("~ Failed to get #{gem.name}; skipping it.")
+    failure_count += 1
+    run_state[:failed] += cm_gem_item_count(gem)
+    run_state[:other_failed] += cm_gem_item_count(gem)
+    next
+  end
+
+  fput 'prep 325'
+  result = dothistimeout "cast my #{gem}", 8, /spiritual bond|too crude to accept your blessing|shudders in your hand but does little else|and blows away in the form of a fine powder|Cast at what\?/
+  waitcastrt?
+
+  post_cast_mana = checkmana
+  mana_used = [initial_mana - post_cast_mana, 0].max
+
+  if result =~ /spiritual bond/
+    check = dothistimeout 'bless deity common 4', 5, /cobalt liquid|You don't seem to be able|You gesture/
+    waitrt?
+    waitcastrt?
+    post_magic_mana = checkmana
+    mana_used = [initial_mana - post_magic_mana, mana_used].max
+    note_mana_use.call(mana_used)
+
+    if check =~ /cobalt liquid/
+      successful_count += 1
+      quality_look = dothistimeout "look ##{gem.id}", 5, /cobalt liquid|You see|I could not/
+      quality = cm_chrism_quality_from_look(quality_look)
+      cm_update_gemguard_chrism_record(gem, quality, quality_look)
+      quality_counts[quality[:strength] || 'unknown'] += cm_gem_item_count(gem) if quality
+      fullness_counts[quality[:fullness] || 'unknown'] += cm_gem_item_count(gem) if quality
+      run_state[:chrismed] += cm_gem_item_count(gem)
+      cm_note_chrism_quality(run_state, quality, cm_gem_item_count(gem))
+      sleep 0.4
+      gem = cut_gem_for_outcome.call(gem, :chrism)
+
+      if run_state[:use_chrismarium_current] && !cm_chrismarium_quality_match?(quality, cm_chrismarium_fill_strengths, cm_chrismarium_fill_fullnesses)
+        put_result = cm_put_item_in_container(gem, chrism_ref)
+        if put_result =~ /You put|You add/i
+          run_state[:stored_pouch] += cm_gem_item_count(gem)
+          run_state[:chrismarium_filtered] += cm_gem_item_count(gem)
+          cm_progress_status('~ Chrism did not match chrismarium filters; storing it in the finished-chrism pouch.', run_state)
+        elsif cm_container_full_message?(put_result)
+          run_state[:stop_reason] = 'finished-chrism pouch full'
+          cm_return_current_gem_to_source!(run_state, gem, container)
+          $chrismforge_stop_requested = true
+        end
+        sleep 0.4
+      elsif run_state[:use_chrismarium_current]
+        ensure_chrismarium_ready.call
+        push_result = dothistimeout 'push my chrismarium', 5, /full to the brim|wasteful|You move|cobalt|liquid|I could not|What were you/
+        if push_result =~ /full to the brim|wasteful/i
+          run_state[:chrismarium_full] = true
+          if run_state[:chrismarium_full_action] == 'stop'
+            run_state[:chrismarium_status] = 'full - stopping as requested'
+            cm_progress_status('~ Chrismarium is full. Stopping after this chrism as requested.', run_state)
+          else
+            run_state[:chrismarium_status] = 'full - continuing with finished-chrism pouch'
+            cm_progress_status('~ Chrismarium is full. Continuing with finished-chrism pouch.', run_state)
+          end
+          stow_chrismarium(chrismarium_container || chrismariumsack)
+          run_state[:use_chrismarium_current] = false
+          use_chrismarium = false
+          put_result = cm_put_item_in_container(gem, chrism_ref)
+          if put_result =~ /You put|You add/i
+            run_state[:stored_pouch] += cm_gem_item_count(gem)
+          elsif cm_container_full_message?(put_result)
+            run_state[:stop_reason] = 'finished-chrism pouch full'
+            cm_return_current_gem_to_source!(run_state, gem, container)
+            $chrismforge_stop_requested = true
+          end
+          if run_state[:chrismarium_full_action] == 'stop' && run_state[:stop_reason] != 'finished-chrism pouch full'
+            run_state[:stop_reason] = 'chrismarium full'
+            $chrismforge_stop_requested = true
+          end
+        else
+          run_state[:stored_chrismarium] += cm_gem_item_count(gem)
+        end
+      else
+        put_result = cm_put_item_in_container(gem, chrism_ref)
+        if put_result =~ /You put|You add/i
+          run_state[:stored_pouch] += cm_gem_item_count(gem)
+        elsif cm_container_full_message?(put_result)
+          run_state[:stop_reason] = 'finished-chrism pouch full'
+          cm_return_current_gem_to_source!(run_state, gem, container)
+          $chrismforge_stop_requested = true
+        end
+        sleep 0.4
+      end
+
+      quality_short = quality && quality[:strength] ? " (#{quality[:strength]})" : ''
+      cm_progress_status("~ Processed: #{run_state[:processed]}/#{total_gems} | Chrismed: #{run_state[:chrismed]}#{quality_short} | Non-orb gems: #{run_state[:non_orb]} | Pouch: #{run_state[:stored_pouch]} | Chrismarium: #{run_state[:stored_chrismarium]} | Mana used: #{run_state[:mana_used]}", run_state)
+    else
+      gem = cut_gem_for_outcome.call(gem, :other_failed)
+      put_result = cm_put_item_in_container(gem, loot_ref)
+      failure_count += 1
+      run_state[:failed] += cm_gem_item_count(gem)
+      run_state[:other_failed] += cm_gem_item_count(gem)
+      if cm_container_full_message?(put_result)
+        run_state[:stop_reason] = 'non-orb gems pouch full'
+        cm_return_current_gem_to_source!(run_state, gem, container)
+        $chrismforge_stop_requested = true
+      end
+      cm_progress_status("~ Processed: #{run_state[:processed]}/#{total_gems} | Chrismed: #{run_state[:chrismed]} | Non-orb gems: #{run_state[:non_orb]} | Pouch: #{run_state[:stored_pouch]} | Chrismarium: #{run_state[:stored_chrismarium]} | Mana used: #{run_state[:mana_used]}", run_state)
+    end
+  else
+    note_mana_use.call(mana_used)
+    failed_target_ref = loot_ref
+    failed_stop_reason = 'non-orb gems pouch full'
+    if result =~ /too crude to accept your blessing/i
+      count = cm_gem_item_count(gem)
+      cm_record_not_chrismable_orb(run_state, gem.name.to_s, count)
+      failed_target_ref = too_crude_ref
+      failed_stop_reason = too_crude_container ? 'low-value orb gems pouch full' : 'non-orb gems pouch full'
+      cm_progress_status("~ #{gem.name.capitalize} could not become a chrism; orb value is too low.", run_state)
+    end
+    unless result =~ /and blows away in the form of a fine powder/i
+      gem = cut_gem_for_outcome.call(gem, result =~ /too crude to accept your blessing/i ? :not_chrismable_orb : :non_orb)
+    end
+    put_result = cm_put_item_in_container(gem, failed_target_ref)
+    failure_count += 1
+    unless result =~ /too crude to accept your blessing/i
+      run_state[:failed] += cm_gem_item_count(gem)
+      run_state[:non_orb] += cm_gem_item_count(gem)
+    end
+    if cm_container_full_message?(put_result)
+      run_state[:stop_reason] = failed_stop_reason
+      cm_return_current_gem_to_source!(run_state, gem, container)
+      $chrismforge_stop_requested = true
+    end
+    cm_progress_status("~ Processed: #{run_state[:processed]}/#{total_gems} | Chrismed: #{run_state[:chrismed]} | Non-orb gems: #{run_state[:non_orb]} | Pouch: #{run_state[:stored_pouch]} | Chrismarium: #{run_state[:stored_chrismarium]} | Mana used: #{run_state[:mana_used]}", run_state)
+  end
+
+  if $chrismforge_stop_requested
+    run_state[:stop_reason] = $chrismforge_close_after_stop ? 'closed by user' : 'stopped by user' if run_state[:stop_reason] == 'completed'
+    break
+  end
+end
+
+run_state[:stop_reason] = 'completed' if run_state[:stop_reason].to_s.empty?
+cm_finish_run!(run_state, run_state[:stop_reason], chrismarium_container)
+
+sleep 1
+stow_chrismarium(chrismarium_container || chrismariumsack) if run_state[:use_chrismarium_current]
+if use_gtk_progress && progress_window_ref
+  wait_until { progress_closed_ref[:closed] || !cm_gtk_window_open?(progress_window_ref) }
+end
+$chrism_maker_progress_callback = nil
+$chrismforge_progress_state_callback = nil
