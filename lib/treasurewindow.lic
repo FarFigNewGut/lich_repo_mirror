@@ -23,7 +23,7 @@
   Author: Phocosoen, ChatGPT
   Tags: wrayth, frontend, mod, window, treasures, gems, coins, loot, avalon, wizard, gtk3
   Version: 1.4.7
-  Recently changed: Run GTK main asynchronously so startup hooks/loops initialize reliably at logon.
+  Recently changed: Added At Feet inventory display.
 =end
 
 no_kill_all
@@ -35,10 +35,16 @@ module TreasureWindow
   extend self
   include Lich::Common if defined?(Lich::Common)
 
+  PANEL_FRONTENDS = /^(?:stormfront|wrayth)$/i
+
   class << self
-    attr_accessor :settings, :window_settings, :use_gtk_window, :single_column
+    attr_accessor :settings, :window_settings, :use_gtk_window, :single_column, :feet_items
   end
 end
+
+# Items "placed alongside you" (at your feet). Populated by the feet DownstreamHook
+# below and read by both the GTK window and the Wrayth panel renderers.
+TreasureWindow.feet_items = []
 
 TW_DEFAULT_WINDOW_SETTINGS = {
   "treasurewindow" => {
@@ -93,7 +99,7 @@ TreasureWindow.use_gtk_window = TreasureWindow.window_settings["use_gtk_treasure
 TreasureWindow.single_column = TreasureWindow.window_settings["single_column"] || false
 
 # if they've explicitly enabled GTK, always launch it
-if TreasureWindow.use_gtk_window || $frontend != "stormfront"
+if TreasureWindow.use_gtk_window || $frontend !~ TreasureWindow::PANEL_FRONTENDS
   respond ""
   respond " Initiating GTK window."
   respond ""
@@ -103,11 +109,12 @@ if TreasureWindow.use_gtk_window || $frontend != "stormfront"
   Thread.new { Gtk.main unless Gtk.main_level > 0 }
 end
 
-if $frontend == "stormfront"
+if $frontend =~ TreasureWindow::PANEL_FRONTENDS
   puts("<closeDialog id='TreasureWindow'/><openDialog type='dynamic' id='TreasureWindow' title='Treasure' target='TreasureWindow' scroll='manual' location='main' justify='3' height='100' resident='true'><dialogData id='TreasureWindow'></dialogData></openDialog>")
 end
 
 @tw_last_treasures = []
+@tw_last_feet = []
 
 # 1) Define your TreasureWindow::PALETTES
 TreasureWindow::PALETTES = {
@@ -300,6 +307,7 @@ class TreasureWindowGtk
     @flow.set_vexpand(true)
     @flow.valign                = Gtk::Align::START
     @flow.homogeneous           = false
+    apply_column_layout
     @scroll.add(@flow)
 
     @window.add(@scroll)
@@ -352,6 +360,18 @@ class TreasureWindowGtk
     @flow.add(lbl_right)
   end
 
+  def self.add_single_row(text = "")
+    lbl = Gtk::Label.new(text)
+    lbl.set_xalign(0)
+    @flow.add(lbl)
+  end
+
+  def self.apply_column_layout
+    return unless @flow
+
+    @flow.max_children_per_line = TreasureWindow.single_column ? 1 : 2
+  end
+
   def self.killtracker_two_columns
     lines = TreasureWindow.killtracker_summary_lines
     # For the "all gems found" case, "All Gems Found for Month!" will be at lines[2]
@@ -378,7 +398,13 @@ class TreasureWindowGtk
   def self.update_treasures(treasures, _summary_lines)
     return unless @window
     Gtk.queue do
+      apply_column_layout
       @flow.children.each { |c| @flow.remove(c) }
+
+      # At Feet: items placed alongside you (always the very first line)
+      feet = TreasureWindow.feet_items || []
+      feet_names = feet.map { |f| f[:name].to_s.sub(/^(an?|some|the)\s+/i, '') }
+      add_full_row("At Feet:#{feet_names.empty? ? '' : ' ' + feet_names.join(', ')}", "")
 
       # Always format killtracker summary in two columns
       if Script.running?("killtracker") && defined?($killtracker) && $killtracker.is_a?(Hash)
@@ -391,12 +417,16 @@ class TreasureWindowGtk
 
       end
 
-      # -- Treasures: single column --
-      add_full_row("Treasures: #{treasures.size}", "")
-      treasures.each do |t|
-        lbl = Gtk::Label.new("#{t.name}")
-        lbl.set_xalign(0)
-        @flow.add(lbl)
+      if TreasureWindow.single_column
+        add_single_row("Treasures: #{treasures.size}")
+        treasures.each do |t|
+          add_single_row(t.name.to_s)
+        end
+      else
+        add_full_row("Treasures: #{treasures.size}", "")
+        treasures.each_slice(2) do |left, right|
+          add_full_row(left&.name.to_s, right&.name.to_s)
+        end
       end
 
       @flow.show_all
@@ -462,6 +492,23 @@ end
 def TreasureWindow.push_treasures_to_window(treasures)
   output = "<dialogData id='TreasureWindow' clear='t'>"
   current_top = 0
+
+  # At Feet: items placed alongside you (always the very first line)
+  feet = TreasureWindow.feet_items || []
+  if feet.empty?
+    output += "<label id='atfeet' value='At Feet:' justify='left' left='0' top='#{current_top}' />"
+    current_top += 20
+  else
+    output += "<label id='atfeet' value='At Feet: ' justify='left' left='0' top='#{current_top}' />"
+    feet_left = 70
+    feet.each_with_index do |item, index|
+      item_name = item[:name].to_s.sub(/^(an?|some|the)\s+/i, '')
+      suffix = index < feet.size - 1 ? ',' : ''
+      output += "<link id='feet_#{index}' value='#{item_name}#{suffix}' cmd='get ##{item[:id]}' echo='get ##{item[:id]}' justify='left' left='#{feet_left}' top='#{current_top}' />"
+      feet_left += 10 + (item_name.length + suffix.length) * 8
+    end
+    current_top += 20
+  end
 
   # Column layout toggle
   #  column_value = TreasureWindow.single_column ? 'Layout: Single Column' : 'Layout: Two Columns'
@@ -560,18 +607,70 @@ def TreasureWindow.push_treasures_to_window(treasures)
   puts(output)
 end
 
+# --- Feet tracker -------------------------------------------------------------
+# Items "placed alongside you" only appear in the 'inv' stream under the
+# "Placed alongside you:" header (each with an exist id), or are cleared by
+# "You have nothing placed alongside you." We watch the server feed for both
+# and keep TreasureWindow.feet_items current with no extra game traffic.
+FEET_HOOK_ID    = "#{Script.current.name}_feet".freeze
+FEET_ITEM_RE    = /<a exist="(-?\d+)" noun="[^"]*">([^<]+)<\/a>/.freeze
+@tw_inv_active    = false   # inside a full inventory listing
+@tw_in_feet_block = false   # inside the "Placed alongside you:" section
+@tw_saw_feet      = false   # this inventory listing had a feet section
+@tw_feet_buffer   = []
+
+DownstreamHook.remove(FEET_HOOK_ID) rescue nil
+DownstreamHook.add(FEET_HOOK_ID, proc do |server_string|
+  begin
+    # Explicit empty result (e.g. INVENTORY FEET with nothing down).
+    TreasureWindow.feet_items = [] if server_string.include?("You have nothing placed alongside you")
+
+    server_string.each_line do |line|
+      if line =~ /Your worn items are:/
+        # Start of a full inventory listing reset feet tracking for it.
+        @tw_inv_active    = true
+        @tw_in_feet_block = false
+        @tw_saw_feet      = false
+        @tw_feet_buffer   = []
+      elsif line =~ /Placed alongside you:/
+        # Feet section (inside a full inventory or a standalone feet check).
+        @tw_in_feet_block = true
+        @tw_saw_feet      = true
+        @tw_feet_buffer   = []
+      elsif line =~ /<popStream/
+        # Close of the current stream. If we were reading a full inventory,
+        # commit: use collected items, or clear if there was no feet section.
+        if @tw_inv_active
+          TreasureWindow.feet_items = @tw_saw_feet ? @tw_feet_buffer.dup : []
+        elsif @tw_in_feet_block
+          TreasureWindow.feet_items = @tw_feet_buffer.dup
+        end
+        @tw_inv_active    = false
+        @tw_in_feet_block = false
+      elsif @tw_in_feet_block && (m = line.match(FEET_ITEM_RE))
+        @tw_feet_buffer << { id: m[1], name: m[2] }
+      end
+    end
+  rescue StandardError
+    # Never let a parse error break the game stream.
+  end
+  server_string
+end)
+
 UPSTREAM_HOOK_ID = "#{Script.current.name}_upstream".freeze
 UpstreamHook.remove(UPSTREAM_HOOK_ID) rescue nil
 
 UpstreamHook.add(UPSTREAM_HOOK_ID, proc do |command|
-  case command.strip.downcase
+  settings = TreasureWindow.load_window_settings
+  settings["treasurewindow"] ||= {}
+
+  case command
   when /\*click/i
     @tw_show_click_links = !@tw_show_click_links
     respond "Click-to-loot links are now #{@tw_show_click_links ? 'ENABLED' : 'DISABLED'}."
     nil
   when /\*twcol/i
     TreasureWindow.single_column = !TreasureWindow.single_column
-    settings = TreasureWindow.load_window_settings
     settings["treasurewindow"]["single_column"] = TreasureWindow.single_column
     TreasureWindow.save_window_settings(settings)
     current_treasures = GameObj.loot.select do |obj|
@@ -585,8 +684,6 @@ UpstreamHook.add(UPSTREAM_HOOK_ID, proc do |command|
     respond "GTK Treasurewindow is now #{TreasureWindow.use_gtk_window ? 'ENABLED' : 'DISABLED'}."
 
     # persist the new setting
-    settings = TreasureWindow.load_window_settings
-    settings["treasurewindow"] ||= {}
     settings["treasurewindow"]["use_gtk_treasurewindow"] = TreasureWindow.use_gtk_window
     TreasureWindow.save_window_settings(settings)
 
@@ -609,8 +706,6 @@ UpstreamHook.add(UPSTREAM_HOOK_ID, proc do |command|
     respond "GTK Treasurewindow is now #{TreasureWindow.use_gtk_window ? 'ENABLED' : 'DISABLED'}."
 
     # persist the new setting
-    settings = TreasureWindow.load_window_settings
-    settings["treasurewindow"] ||= {}
     settings["treasurewindow"]["use_gtk_treasurewindow"] = TreasureWindow.use_gtk_window
     TreasureWindow.save_window_settings(settings)
 
@@ -635,6 +730,7 @@ end)
 
 before_dying do
   UpstreamHook.remove("#{Script.current.name}_upstream")
+  DownstreamHook.remove("#{Script.current.name}_feet")
 
   if defined?(TreasureWindowGtk) && TreasureWindowGtk.instance_variable_get(:@window)
     Gtk.queue { TreasureWindowGtk.instance_variable_get(:@window).hide }
@@ -643,7 +739,7 @@ end
 
 last_push_time = Time.now
 
-echo "Treasurewindow is active." if $frontend == "stormfront"
+echo "Treasurewindow is active." if $frontend =~ TreasureWindow::PANEL_FRONTENDS
 
 loop do
   current_treasures = GameObj.loot.select do |obj|
@@ -655,11 +751,13 @@ loop do
   end
 
   now = Time.now
-  if current_treasures != @tw_last_treasures || (now - last_push_time) >= 2
+  feet_snapshot = (TreasureWindow.feet_items || []).map { |f| f[:id] }
+  if current_treasures != @tw_last_treasures || feet_snapshot != @tw_last_feet || (now - last_push_time) >= 2
     @tw_last_treasures = current_treasures
+    @tw_last_feet = feet_snapshot
 
     # update the Wrayth window
-    TreasureWindow.push_treasures_to_window(current_treasures) if $frontend == "stormfront"
+    TreasureWindow.push_treasures_to_window(current_treasures) if $frontend =~ TreasureWindow::PANEL_FRONTENDS
 
     # *and* update the GTK window
     if defined?(TreasureWindowGtk) && TreasureWindowGtk.instance_variable_get(:@window)
