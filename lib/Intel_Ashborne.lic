@@ -20,12 +20,172 @@ Internal hunting intelligence service for ;ashborne.
 silence_me
 
 require 'fileutils'
+require 'yaml'
 
 
 # OOP
 
 module Intel_ashborne_toolkit
   extend self
+
+  SPELL_SAMPLE_MINIMUM = 5
+
+  def spell_learning_enabled?
+    Settings[Char.name]['ashborne_setting_spell_learning'].to_s == "1"
+  rescue
+    false
+  end
+
+  def spell_metrics_file
+    directory = File.join($lich_dir, "data", "ashborne")
+    FileUtils.mkdir_p(directory) unless File.directory?(directory)
+    safe_name = Char.name.to_s.gsub(/[^A-Za-z0-9_\-]/, "")
+    File.join(directory, "#{safe_name}_ashborne_spell_metrics.yml")
+  end
+
+  def load_spell_metrics
+    data = File.exist?(spell_metrics_file) ? YAML.load_file(spell_metrics_file) : {}
+    @spell_metrics = data.is_a?(Hash) ? data : {}
+  rescue
+    @spell_metrics = {}
+  end
+
+  def start_spell_observation(payload)
+    finalize_spell_observation(payload[:mana_before].to_i) if @spell_observation
+    @spell_observation = {
+      "seq" => payload[:seq].to_i,
+      "spell" => payload[:spell].to_i,
+      "profession" => payload[:profession].to_s,
+      "creature" => payload[:creature].to_s.downcase,
+      "mana_before" => payload[:mana_before].to_i,
+      "started_at" => payload[:started_at].to_f,
+      "source" => payload[:source].to_s,
+      "damage" => 0,
+      "kills" => 0,
+      "control" => 0
+    }
+  end
+
+  def sync_spell_observation
+    return unless spell_learning_enabled?
+
+    payload = $ashborne_spell_observation
+    if payload.is_a?(Hash) && payload[:seq].to_i > @last_spell_observation_seq.to_i
+      @last_spell_observation_seq = payload[:seq].to_i
+      start_spell_observation(payload)
+    elsif @spell_observation && Time.now.to_f - @spell_observation["started_at"].to_f > 10.0
+      finalize_spell_observation
+    end
+  rescue
+    nil
+  end
+
+  def observe_manual_spell_command(data)
+    return data unless spell_learning_enabled?
+
+    command = data.to_s.sub(/^<c>/, '').strip
+    match = command.match(/\A(?:incant|prep(?:are)?)\s+(\d+)/i)
+    return data unless match
+
+    spell_number = match[1].to_i
+    current = $ashborne_spell_observation
+    scripted = current.is_a?(Hash) && current[:spell].to_i == spell_number &&
+      Time.now.to_f - current[:started_at].to_f < 2.0
+    unless scripted
+      $ashborne_spell_observation_seq = $ashborne_spell_observation_seq.to_i + 1
+      $ashborne_spell_observation = {
+        seq: $ashborne_spell_observation_seq,
+        spell: spell_number,
+        profession: Stats.prof.to_s,
+        creature: ($ashborne_current_target || GameObj.targets.first&.name).to_s.downcase,
+        mana_before: checkmana.to_i,
+        started_at: Time.now.to_f,
+        source: "manual"
+      }
+    end
+    data
+  rescue
+    data
+  end
+
+  def record_spell_result_line(line)
+    return unless spell_learning_enabled?
+    return unless @spell_observation
+    return if Time.now.to_f - @spell_observation["started_at"].to_f > 10.0
+
+    text = line.to_s
+    @spell_observation["damage"] += Regexp.last_match(1).to_i if
+      text =~ /\.\.\. and hit for (\d+) points? of damage/i
+    @spell_observation["kills"] += 1 if
+      text =~ /goes still|falls (?:to the ground )?motionless|collapses into dust|has been slain|is destroyed|one last time/i
+    @spell_observation["control"] += 1 if
+      text =~ /knocked .*down|falls? to the ground|stunned|unable to cast|roundtime|vulnerab|weakened|slowed/i
+  rescue
+    nil
+  end
+
+  def finalize_spell_observation(mana_after = nil)
+    observation = @spell_observation
+    @spell_observation = nil
+    return unless observation && observation["spell"].to_i > 0 && !observation["creature"].to_s.empty?
+
+    mana_after = checkmana.to_i if mana_after.nil?
+    mana_spent = [observation["mana_before"].to_i - mana_after.to_i, 0].max
+    creature = observation["creature"]
+    spell = observation["spell"].to_s
+    source = observation["source"].to_s
+    @spell_metrics ||= {}
+    entry = (((@spell_metrics[creature] ||= {})[spell] ||= {})[source] ||= {})
+    entry["samples"] = entry["samples"].to_i + 1
+    entry["damage"] = entry["damage"].to_i + observation["damage"].to_i
+    entry["mana"] = entry["mana"].to_i + mana_spent
+    entry["kills"] = entry["kills"].to_i + observation["kills"].to_i
+    entry["control"] = entry["control"].to_i + observation["control"].to_i
+    entry["damage_per_mana"] = (entry["damage"].to_f / [entry["mana"].to_i, 1].max).round(2)
+    entry["average_damage"] = (entry["damage"].to_f / entry["samples"].to_i).round(2)
+    entry["kill_rate"] = (entry["kills"].to_f / entry["samples"].to_i).round(3)
+    entry["control_rate"] = (entry["control"].to_f / entry["samples"].to_i).round(3)
+    @spell_metrics_dirty = @spell_metrics_dirty.to_i + 1
+    publish_spell_recommendations
+    flush_spell_metrics if @spell_metrics_dirty >= 10 || Time.now.to_f - @spell_metrics_flushed_at.to_f > 60.0
+  rescue
+    nil
+  end
+
+  def publish_spell_recommendations
+    recommendations = {}
+    (@spell_metrics || {}).each do |creature, spells|
+      baseline_entries = spells.values.map { |sources| sources["ashborne"] }.compact.select do |data|
+        data["samples"].to_i >= SPELL_SAMPLE_MINIMUM
+      end
+      next if baseline_entries.empty?
+      baseline = baseline_entries.max_by { |data| [data["damage_per_mana"].to_f, data["control_rate"].to_f] }
+
+      candidates = spells.each_with_object([]) do |(spell, sources), list|
+        manual = sources["manual"] || sources["forced"]
+        next unless manual && manual["samples"].to_i >= SPELL_SAMPLE_MINIMUM
+        more_efficient = manual["damage_per_mana"].to_f >= baseline["damage_per_mana"].to_f * 1.10
+        better_control = manual["control_rate"].to_f >= baseline["control_rate"].to_f + 0.50 &&
+          manual["average_damage"].to_f >= baseline["average_damage"].to_f * 0.70
+        next unless more_efficient || better_control
+        list << [spell.to_i, manual]
+      end
+      best = candidates.max_by { |_spell, data| [data["damage_per_mana"].to_f, data["control_rate"].to_f] }
+      recommendations[creature] = best[0] if best
+    end
+    $ashborne_spell_recommendations = recommendations
+  rescue
+    $ashborne_spell_recommendations ||= {}
+  end
+
+  def flush_spell_metrics
+    return unless @spell_metrics
+    File.write(spell_metrics_file, YAML.dump(@spell_metrics))
+    @spell_metrics_dirty = 0
+    @spell_metrics_flushed_at = Time.now.to_f
+  rescue
+    nil
+  end
 
   def intel_ashborne_feedback
     respond
@@ -72,6 +232,48 @@ module Intel_ashborne_toolkit
     respond "[Intel Ashborne] skipped unpausing #{script_name}: Lich script thread lookup failed (#{error.message})."
   rescue => error
     respond "[Intel Ashborne] skipped unpausing #{script_name}: #{error.message}."
+  end
+
+  def wrong_equipment_reason
+    "You aren't wearing correct equipment to fight a creature in this zone. You may need enchanted weapons, armor or ammo."
+  end
+
+  def wrong_equipment_no_effect_line?(line)
+    line.to_s =~ /but it has no effect|your attack has no effect/i
+  end
+
+  def player_attack_line?(line)
+    line.to_s =~ /^You (?:swing|thrust|lunge|slash|jab|kick|punch|grapple|attack|attempt|fire|shoot|hurl|throw|ambush|channel|cast|gesture|wave)/i
+  end
+
+  def wrong_equipment_success_line?(line)
+    text = line.to_s
+    return true if text =~ /goes still|falls to the ground motionless|falls motionless|collapses into dust|vanishes in .*mist|curls in on .*decomposes|screams .* one last time|eyes flare in a final|has been slain|is destroyed/i
+    return false unless $ashborne_last_player_attack_at.to_f > 0
+
+    Time.now.to_f - $ashborne_last_player_attack_at.to_f <= 3.0 &&
+      text =~ /\.\.\. and hit for \d+ points? of damage/i
+  end
+
+  def clear_wrong_equipment_warning
+    $ashborne_wrong_equipment_hits = 0
+    $ashborne_wrong_equipment_last_at = 0
+    if $ashborne_return_why.to_s == Intel_ashborne_toolkit.wrong_equipment_reason
+      $ashborne_return_why = nil
+      $ashborne_action = 0 if $ashborne_action == 99
+    end
+  end
+
+  def record_wrong_equipment_warning
+    now = Time.now.to_f
+    $ashborne_wrong_equipment_hits = 0 if now - $ashborne_wrong_equipment_last_at.to_f > 20.0
+    $ashborne_wrong_equipment_last_at = now
+    $ashborne_wrong_equipment_hits = $ashborne_wrong_equipment_hits.to_i + 1
+    return false if $ashborne_wrong_equipment_hits < 3
+
+    $ashborne_action = 99
+    $ashborne_return_why = Intel_ashborne_toolkit.wrong_equipment_reason
+    true
   end
 
   def post_hunt_injured?
@@ -333,12 +535,27 @@ if script.vars[1].downcase =~ /update_all/
   exit
 end
 
+spell_observer_hook = "intel_ashborne_spell_observer_#{Char.name}"
+if Intel_ashborne_toolkit.spell_learning_enabled?
+  Intel_ashborne_toolkit.load_spell_metrics
+  Intel_ashborne_toolkit.publish_spell_recommendations
+  UpstreamHook.add(spell_observer_hook, proc { |data| Intel_ashborne_toolkit.observe_manual_spell_command(data) })
+else
+  $ashborne_spell_recommendations = {}
+end
+before_dying do
+  if Intel_ashborne_toolkit.spell_learning_enabled?
+    Intel_ashborne_toolkit.finalize_spell_observation
+    Intel_ashborne_toolkit.flush_spell_metrics
+    UpstreamHook.remove(spell_observer_hook)
+  end
+end
 
 
 loop {
   Intel_ashborne_toolkit.time_zone
   # Intel_ashborne_toolkit.path_rt
-  if Script.running?("ashborne") || Script.running?("beta-ashborne")
+  if Script.running?("ashborne")
     nil
   else
     Intel_ashborne_toolkit.oop_script_kill
@@ -347,6 +564,10 @@ loop {
   end
 
   line = get
+  Intel_ashborne_toolkit.sync_spell_observation
+  Intel_ashborne_toolkit.record_spell_result_line(line)
+  $ashborne_last_player_attack_at = Time.now.to_f if Intel_ashborne_toolkit.player_attack_line?(line)
+  Intel_ashborne_toolkit.clear_wrong_equipment_warning if Intel_ashborne_toolkit.wrong_equipment_success_line?(line)
 
   # Cman Skill Watch
 
@@ -1213,9 +1434,8 @@ loop {
     end
   end
 
-  if line =~ /but it has no effect|your attack has no effect/
-    $ashborne_action = 99
-    $ashborne_return_why = "You aren't wearing correct equipment to fight a creature in this zone. You may need enchanted weapons, armor or ammo."
+  if Intel_ashborne_toolkit.wrong_equipment_no_effect_line?(line)
+    Intel_ashborne_toolkit.record_wrong_equipment_warning
   end
 
 
