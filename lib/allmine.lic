@@ -1,0 +1,447 @@
+=begin
+
+  allmine.lic - All Mine item guard
+
+  Prevents accidentally leaving a placed All Mine item (basket, bowl, etc.)
+  behind when moving rooms or logging off. Hard-blocks movement/quit while
+  the item is on the ground, with a 10-second re-send bypass. A watchdog
+  thread fires repeating alerts (no auto-return) if the item is left behind
+  anyway.
+    Documentation: https://gswiki.play.net/Lich:Script_allmine
+
+    ;allmine set <noun>     configure the item noun (e.g. bowl)
+    ;allmine arm            manually arm on an item already on the ground
+    ;allmine status         show current state
+    ;allmine ack            acknowledge/silence a left-behind alert
+    ;allmine clear          manually clear deployed state
+    ;allmine pause          disable the movement block (monitoring continues)
+    ;allmine resume         re-enable the movement block
+    ;allmine verb add <v>   add a custom movement verb to block
+    ;allmine verb remove <v>
+    ;allmine help           show help
+
+  Run with no arguments to start the monitor. Subcommands may be issued
+  while the monitor runs; they modify shared settings and exit.
+
+  Known Limitation: Script-generated movement (e.g. Bigshot, go2's fput, etc)
+  bypasses the movement block through UpstreamHook. Even though it bypasses 
+  the block, the watchdog alert still catches the left-behind item. 
+
+        author: Triex
+          game: GSIV
+          tags: utility, allmine
+       version: 0.3.1
+
+  changelog:
+    0.3.1 (2026-07-13):
+      Fix mojibake in bold alert text (replaced char with plain hyphen;
+      file is now pure ASCII). Added full GSIV movement style verb list
+      (crawl, limp, march, sashay, skip, sneak, stride, stumble, trudge,
+      prance) plus walk -- previously only compass verbs like sashay
+      passed through unblocked. Script released.
+    0.3.0 (2026-07-13):
+      Fix movement block never firing: hooks no longer touch CharSettings
+      (unavailable in hook context); state mirrored into module ivars.
+      Tolerant upstream command parsing (optional <c> prefix). Added
+      ;allmine debug to echo raw upstream lines.
+    0.2.0 (2026-07-13):
+      Arm when the item is already on the ground at monitor start, when a
+      held item transitions to ground loot (missed place message), or via
+      manual ;allmine arm.
+    0.1.0 (2026-07-13):
+      Initial release. Deploy/pickup detection, hard-block with 10s
+      re-send bypass, alert-only watchdog, crash persistence.
+
+=end
+
+module AllMine
+  UP_HOOK   = 'AllMine::upstream'
+  DOWN_HOOK = 'AllMine::downstream'
+
+  BYPASS_WINDOW  = 10   # seconds: identical re-sent command passes through
+  ALERT_INTERVAL = 15   # seconds between repeating left-behind alerts
+  POLL_INTERVAL  = 1    # watchdog poll rate
+
+  # Single-word directional commands (whole command must match).
+  DIRS = %w[n north s south e east w west
+            ne northeast nw northwest se southeast sw southwest
+            u up d down out].freeze
+
+  # Verbs that take an argument and cause movement (first word must match).
+  # Includes GSIV movement styles (confirmed via in-game MOVEMENT command:
+  # Normal, Crawl, Limp, March, Sashay, Skip, Sneak, Stride, Stumble,
+  # Trudge, Prance) plus other common movement verbs. Extend with
+  # ;allmine verb add <verb>.
+  MOVE_VERBS = %w[go climb swim jump leap dive vault enter board ride walk
+                  crawl limp march sashay skip sneak stride stumble trudge prance].freeze
+
+  # Logoff commands (whole command must match).
+  QUIT_CMDS = %w[quit exit].freeze
+
+  @last_blocked = nil
+  @pending_deploy_at = nil
+  @last_held_id = nil
+  @loot_miss_count = 0
+  @last_alert_at = Time.at(0)
+  @pending_clear_at = nil
+  @hs_noun = @hs_item_id = @hs_extra = nil
+  @hs_deployed = @hs_paused = @hs_debug = false
+
+  def self.settings
+    CharSettings['allmine'] ||= {}
+    CharSettings['allmine']
+  end
+
+  def self.bold(msg)
+    _respond Lich::Messaging.monsterbold(msg)
+  end
+
+  def self.info(msg)
+    _respond Lich::Messaging.msg_format('teal', "[AllMine] #{msg}")
+  end
+
+  def self.caution(msg)
+    _respond Lich::Messaging.msg_format('orange', "[AllMine] #{msg}")
+  end
+
+  # ---------------------------------------------------------------- state
+
+  def self.deployed?
+    settings['deployed'] == true
+  end
+
+  def self.set_deployed(item_id)
+    settings['deployed']  = true
+    settings['item_id']   = item_id
+    settings['room_id']   = (Room.current.id rescue nil)
+    settings['placed_at'] = Time.now.to_i
+    settings['acked']     = false
+    @loot_miss_count = 0
+    sync_hook_state
+    info "Your #{settings['noun']} (ID #{item_id || 'unknown'}) is now on the ground in room #{settings['room_id'] || 'unmapped'}. Movement is guarded."
+  end
+
+  def self.clear_deployed(reason)
+    settings['deployed'] = false
+    settings['item_id']  = nil
+    settings['acked']    = false
+    @loot_miss_count = 0
+    @pending_clear_at = nil
+    sync_hook_state
+    info "Your #{settings['noun']} has been recovered (#{reason}). Movement is no longer guarded."
+  end
+
+  def self.item_on_ground?
+    id = settings['item_id']
+    if id
+      GameObj.loot.to_a.any? { |o| o.id == id }
+    else
+      noun = settings['noun']
+      return false unless noun
+      GameObj.loot.to_a.any? { |o| o.noun == noun }
+    end
+  end
+
+  def self.item_in_hands?
+    id = settings['item_id']
+    return false unless id
+    [GameObj.right_hand, GameObj.left_hand].any? { |h| h && h.id == id }
+  end
+
+  # ------------------------------------------------------------ movement
+
+  def self.blocked_command?(cmd)
+    words = cmd.downcase.split
+    return false if words.empty?
+    first = words.first
+    if words.length == 1
+      return :quit if QUIT_CMDS.include?(first)
+      return :move if DIRS.include?(first)
+    end
+    return :move if MOVE_VERBS.include?(first) || (@hs_extra || []).include?(first)
+    false
+  end
+
+  # ---------------------------------------------------------------- hooks
+
+  # Hooks execute in Lich's stream context, not this script's thread, so
+  # they must never touch CharSettings (script-scoped). All state they
+  # need is mirrored into module ivars by sync_hook_state, which runs in
+  # the script thread. set_deployed/clear_deployed also update the mirror
+  # immediately.
+  def self.sync_hook_state
+    @hs_noun     = settings['noun']
+    @hs_deployed = settings['deployed'] == true
+    @hs_paused   = settings['paused'] == true
+    @hs_item_id  = settings['item_id']
+    @hs_extra    = (settings['extra_verbs'] || []).dup
+    @hs_debug    = settings['debug'] == true
+  end
+
+  def self.install_hooks
+    noun = Regexp.escape(settings['noun'])
+    place_re  = /You carefully place your [^.]*\b#{noun} on the ground\./
+    pickup_re = /You pick up [^.]*\b#{noun}\./
+
+    DownstreamHook.add(DOWN_HOOK, proc { |xml|
+      begin
+        if xml =~ place_re
+          @pending_deploy_at = Time.now
+        elsif xml =~ pickup_re && @hs_deployed
+          @pending_clear_at = Time.now # watchdog confirms and clears
+        end
+      rescue => e
+        respond "[AllMine] Downstream hook error: #{e}" rescue nil
+      end
+      xml
+    })
+
+    UpstreamHook.add(UP_HOOK, proc { |line|
+      begin
+        respond "[AllMine DEBUG] upstream: #{line.inspect}" if @hs_debug
+        next line unless @hs_deployed
+        next line if @hs_paused
+        # Client command framing is not documented; tolerate an optional
+        # <c> prefix anywhere-leading, else take the raw line.
+        cmd = line.sub(/\A\s*(?:<c>)?/, '').strip
+        next line if cmd.empty?
+        kind = AllMine.blocked_command?(cmd)
+        next line unless kind
+
+        on_ground = begin
+          if @hs_item_id
+            GameObj.loot.to_a.any? { |o| o.id == @hs_item_id }
+          else
+            GameObj.loot.to_a.any? { |o| o.noun == @hs_noun }
+          end
+        rescue
+          true # if the check itself fails, block rather than risk the item
+        end
+        next line unless on_ground
+
+        key = cmd.downcase
+        if @last_blocked && @last_blocked[:cmd] == key &&
+           (Time.now - @last_blocked[:time]) <= BYPASS_WINDOW
+          @last_blocked = nil
+          next line # intentional: identical command re-sent within window
+        end
+
+        @last_blocked = { cmd: key, time: Time.now }
+        if kind == :quit
+          AllMine.bold "*** YOUR #{@hs_noun.upcase} IS STILL ON THE GROUND - repeat #{cmd.upcase} within #{BYPASS_WINDOW} seconds to log off anyway. ***"
+        else
+          AllMine.bold "*** YOUR #{@hs_noun.upcase} IS STILL ON THE GROUND - repeat the command within #{BYPASS_WINDOW} seconds to leave anyway. ***"
+        end
+        next nil
+      rescue => e
+        respond "[AllMine] Upstream hook error: #{e}" rescue nil
+        next line
+      end
+    })
+  end
+
+  def self.remove_hooks
+    DownstreamHook.remove(DOWN_HOOK)
+    UpstreamHook.remove(UP_HOOK)
+  end
+
+  # ------------------------------------------------------------- watchdog
+
+  def self.watchdog_tick
+    sync_hook_state
+    noun = settings['noun']
+
+    # Track the id of a held item matching the noun, so a deploy can be
+    # attributed to the exact item that just left our hands.
+    [GameObj.right_hand, GameObj.left_hand].each do |h|
+      @last_held_id = h.id if h && h.id && h.noun == noun
+    end
+
+    # Pickup message seen by the downstream hook: confirm and clear.
+    if @pending_clear_at && deployed?
+      if settings['item_id'].nil? || item_in_hands?
+        clear_deployed('picked up')
+        return
+      elsif Time.now - @pending_clear_at > 3
+        @pending_clear_at = nil # pickup message was for a different item
+      end
+    end
+
+    # Complete a pending deploy: item should now appear in room loot.
+    if @pending_deploy_at
+      match = nil
+      if @last_held_id
+        match = GameObj.loot.to_a.find { |o| o.id == @last_held_id }
+      end
+      match ||= GameObj.loot.to_a.find { |o| o.noun == noun }
+      if match
+        @pending_deploy_at = nil
+        set_deployed(match.id)
+      elsif Time.now - @pending_deploy_at > 5
+        @pending_deploy_at = nil
+        set_deployed(nil) # deploy seen but id unresolved; guard by noun
+      end
+      return
+    end
+
+    unless deployed?
+      # Backup arm: an item we were holding (matching noun) is now on the
+      # ground - covers missed/unrecognized place messaging.
+      if @last_held_id && GameObj.loot.to_a.any? { |o| o.id == @last_held_id }
+        set_deployed(@last_held_id)
+      end
+      return
+    end
+
+    # Backup clear: item is back in our hands (missed pickup message).
+    if item_in_hands?
+      clear_deployed('back in your hands')
+      return
+    end
+
+    # Left-behind detection.
+    left_behind = false
+    here = (Room.current.id rescue nil)
+    if here && settings['room_id'] && here != settings['room_id']
+      left_behind = true
+      @loot_miss_count = 0
+    elsif !item_on_ground?
+      # Could be lag or an unmapped-room move; require persistence.
+      @loot_miss_count += 1
+      left_behind = true if @loot_miss_count >= 3
+    else
+      @loot_miss_count = 0
+    end
+
+    if left_behind && !settings['acked']
+      if Time.now - @last_alert_at >= ALERT_INTERVAL
+        @last_alert_at = Time.now
+        where = settings['room_id'] ? "room #{settings['room_id']} (;go2 #{settings['room_id']})" : 'an unknown room'
+        placed = settings['placed_at'] ? Time.at(settings['placed_at']).strftime('%H:%M') : '?'
+        bold "*** ALL MINE ALERT: Your #{settings['noun']} was left behind in #{where}, placed at #{placed}. Use ;allmine ack to silence this alert. ***"
+      end
+    end
+  end
+
+  # ------------------------------------------------------------- commands
+
+  def self.command(args)
+    case args
+    when /^set\s+(\w+)$/i
+      settings['noun'] = $1.downcase
+      info "Item noun set to '#{settings['noun']}'. If the monitor is already running, restart it so the message patterns rebuild."
+      info "Recommend adding the script to Lich autostart with ;autostart add allmine.lic"
+    when /^status$/i
+      info "Item noun: #{settings['noun'] || 'not set'}"
+      if deployed?
+        placed = settings['placed_at'] ? Time.at(settings['placed_at']).strftime('%Y-%m-%d %H:%M') : 'unknown'
+        info "Deployed: yes - item ID #{settings['item_id'] || 'unknown'}, room #{settings['room_id'] || 'unknown'}, placed at #{placed}"
+      else
+        info 'Deployed: no'
+      end
+      info "Movement block paused: #{settings['paused'] ? 'yes' : 'no'}"
+      info "Custom movement verbs: #{(settings['extra_verbs'] || []).empty? ? 'none' : settings['extra_verbs'].join(', ')}"
+      info "Monitor running: #{Script.list.count { |s| s.name == Script.current.name } > 1 ? 'yes' : 'no'}"
+    when /^arm$/i
+      noun = settings['noun']
+      if noun.nil?
+        caution 'No item noun configured. Use ;allmine set <noun> first.'
+      elsif (match = GameObj.loot.to_a.find { |o| o.noun == noun })
+        set_deployed(match.id)
+      else
+        caution "No #{noun} was found on the ground in this room."
+      end
+    when /^ack$/i
+      settings['acked'] = true
+      info 'Alert acknowledged. The deployed state remains until the item is recovered or cleared with ;allmine clear.'
+    when /^clear$/i
+      settings['deployed'] = false
+      settings['item_id']  = nil
+      settings['acked']    = false
+      info 'Deployed state cleared.'
+    when /^debug$/i
+      settings['debug'] = !settings['debug']
+      if settings['debug']
+        caution 'Debug mode ON - every upstream line will be echoed in raw form. Toggle off with ;allmine debug.'
+      else
+        info 'Debug mode off.'
+      end
+    when /^pause$/i
+      settings['paused'] = true
+      caution 'Movement block PAUSED. Watchdog alerts remain active.'
+    when /^resume$/i
+      settings['paused'] = false
+      info 'Movement block resumed.'
+    when /^verb\s+add\s+(\w+)$/i
+      settings['extra_verbs'] ||= []
+      v = $1.downcase
+      if settings['extra_verbs'].include?(v) || MOVE_VERBS.include?(v)
+        info "The verb '#{v}' is already blocked."
+      else
+        settings['extra_verbs'].push(v)
+        info "Added movement verb '#{v}'."
+      end
+    when /^verb\s+remove\s+(\w+)$/i
+      settings['extra_verbs'] ||= []
+      v = $1.downcase
+      if settings['extra_verbs'].delete(v)
+        info "Removed movement verb '#{v}'."
+      else
+        caution "The verb '#{v}' is not in the custom verb list."
+      end
+    else
+      info 'Usage: set <noun> | arm | status | ack | clear | pause | resume | debug | verb add <verb> | verb remove <verb>'
+      info "Blocked by default: #{DIRS.join(' ')} | #{MOVE_VERBS.join(' ')} | #{QUIT_CMDS.join(' ')}"
+    end
+  end
+
+  # ---------------------------------------------------------------- main
+
+  def self.run
+    unless settings['noun']
+      caution "No item noun configured. Use ;#{Script.current.name} set <noun> (for example, ;#{Script.current.name} set bowl)."
+      exit
+    end
+
+    if Script.list.count { |s| s.name == Script.current.name } > 1 && Script.current.vars[0].to_s.strip.empty?
+      caution 'The monitor is already running.'
+      exit
+    end
+
+    # Crash/disconnect recovery: stale deployed flag from a prior session.
+    if deployed?
+      where  = settings['room_id'] ? "room #{settings['room_id']} (;go2 #{settings['room_id']})" : 'an unknown room'
+      placed = settings['placed_at'] ? Time.at(settings['placed_at']).strftime('%Y-%m-%d %H:%M') : 'an unknown time'
+      bold "*** ALL MINE: A prior session shows your #{settings['noun']} may still be on the ground in #{where}, placed at #{placed}. Use ;allmine clear if it has been recovered. ***"
+    end
+
+    before_dying {
+      AllMine.remove_hooks
+      if AllMine.deployed?
+        AllMine.bold "*** AllMine is exiting while your #{AllMine.settings['noun']} is still on the ground! ***"
+      end
+    }
+
+    sync_hook_state
+    install_hooks
+    info "Monitoring your #{settings['noun']}. The movement block is active with a #{BYPASS_WINDOW}-second re-send bypass, and the watchdog will alert (but never auto-return) if the item is left behind."
+    
+    # Start-time arm: item matching the noun is already on the ground in
+    # this room (placed before the monitor started).
+    if !deployed? && (match = GameObj.loot.to_a.find { |o| o.noun == settings['noun'] })
+      set_deployed(match.id)
+      caution "Note: armed from a #{settings['noun']} already on the ground here. If it is not yours, use ;#{Script.current.name} clear."
+    end
+
+    loop {
+      watchdog_tick
+      sleep POLL_INTERVAL
+    }
+  end
+end
+
+if (args = Script.current.vars[0].to_s.strip) && !args.empty?
+  AllMine.command(args)
+else
+  AllMine.run
+end
