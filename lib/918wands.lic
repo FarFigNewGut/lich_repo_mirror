@@ -1,0 +1,545 @@
+=begin
+  918wands - liquidate treasure wands with Duplicate (918)
+
+  For a Wizard standing in any shop that buys wands - a pawnshop, Cendadric's
+  Collectibles, etc.  Pulls each wand from a container, casts Duplicate (918)
+  on it, and - if the copy is made - sells both the original and the copy.
+  Repeats until no more duplicatable wands remain.  A non-destructive APPRAISE
+  is used up front to confirm a buyer is present before anything is duplicated.
+
+  Default container:
+    The container you've set as your WAND stow target in-game (STOW WAND
+    <container>).  918wands reads Lich's StowList, the same source eloot uses
+    to know which sack holds which item type, so "the wand sack" is found
+    automatically.  Override with a container noun, or use "all".
+
+  Why this is safe for "keeper" wands:
+    Duplicate only works on items still "fresh" from the treasure system.  A
+    wand that ISN'T a fresh treasure wand simply fails with "not well suited
+    for duplicating" and is placed back in the container untouched and
+    UNSOLD.  We only ever sell wands that successfully duplicated.
+
+  Duplicate (918) mechanics (per wiki):
+    - Item in the RIGHT hand, LEFT hand empty; copy lands in the left hand.
+    - Each item can be duplicated only once (both become immune after).
+    - Small chance of catastrophic failure -> the wand is destroyed.
+
+  Mana recovery (Duplicate costs 18 mana):
+    Optionally use your society's mana ability while waiting - Sign of Wracking
+    (Council of Light), Symbol of Mana (Order of Voln), or Sigil of Power
+    (Guardians of Sunfist).  Enable the one for your society; only the matching
+    ability is ever used.  Modeled on ewaggle's mana handling.
+
+  Never-sell exclusions:
+    Add name phrases (like eloot's sell-exclude) so matching wands are never
+    duplicated or sold - useful for keeper wands stored in the same container.
+
+  Usage:
+    ;918wands                  - process wands in your WAND stow container
+    ;918wands all              - process wands in EVERY worn container
+    ;918wands <container>      - process wands in <container> (noun)
+    ;918wands wracking on|off  - Sign of Wracking recovery (Council of Light)
+    ;918wands mana on|off      - Symbol of Mana recovery (Order of Voln)
+    ;918wands power on|off     - Sigil of Power recovery (Guardians of Sunfist)
+    ;918wands exclude add <phrase> | remove <phrase> | list | clear
+    ;918wands info             - show this help
+
+  Author: Claude Code, RuseOfFools
+  Tags: wizard, duplicate, 918, wand, treasure, sell, utility
+=end
+
+module Wands918
+  extend self
+
+  SPELL_NUM     = 918
+  MAX_PASSES    = 200                   # safety cap on outer rescans per container
+  STOW          = Lich::Gemstone::StowList
+
+  # -- Cast / sell result patterns ---------------------------------------------
+  READY_RE           = /Your spell is ready\.|already have a spell (?:readied|prepared)/i
+  DUP_SUCCESS_RE     = /grab the copy|splits into two, and slowly separates/i
+  DUP_NOTSUITED_RE   = /not well suited for duplicating|cannot be duplicated|isn't something you can duplicate/i
+  DUP_CATASTROPHE_RE = /puff of smoke|is destroyed|disintegrat|consumed in|explodes/i
+  DUP_HANDS_RE       = /must be holding the object to be duplicated in your right hand/i
+  # Works with any wand buyer (Cendadric, a pawnbroker, a clerk, etc.).
+  SELL_OK_RE         = /hands you ([\d,]+) (?:silver|coins)/i
+  SELL_FAIL_RE       = /not interested|isn't buying|can't sell that|won't buy|no interest|no use for (?:that|it)|I have no use|not something I|I'm sorry.*but I (?:have no|can't)/i
+  SELL_NOSHOP_RE     = /can't (?:sell|do) that here|no one here (?:to|who|is)|no place to sell|nowhere to sell|not in a (?:shop|store)|isn't anyone here|no merchant|Sell to whom/i
+  LOOK_END_RE        = /<container|In the|You see|That is closed|There (?:is|are) nothing|can't look inside|not something you can look/i
+
+  # Non-destructive venue probe: APPRAISE offers a price without selling, so we
+  # can confirm a buyer is present in ANY shop before duplicating anything.
+  APPRAISE_OK_RE     = /You ask .* to appraise|(?:give|offer) you [\d,]+ (?:silver|coin)|coins? for it|turns? .* over in (?:his|her|their|its) hands|worth about|I'll give you/i
+  APPRAISE_NO_RE     = /no one here|no merchant|isn't anyone here|can't do that here|Appraise what\?|no place to|not in a (?:shop|store)|There is no one|nobody here|Appraise to whom/i
+
+  # Success line when pulling an item from any container type. Mirrors eloot's
+  # retrieval regex (concealed pockets/cloaks say "You retrieve...", others use
+  # slip/draw/grab/etc.) so we match immediately instead of waiting on timeout.
+  GET_OK_RE   = /^You (?:shield the opening of .*? from view as you |discreetly |carefully |deftly |slowly )?(?:get|pick up|remove|draw|equip|grab|reach|slip|tuck|retrieve|already have|unsheathe|detach|swap|sling|withdraw)\b/i
+  GET_FAIL_RE = /What were you referring to|I don't (?:see|know)|isn't here|can't quite|You can't|There is nothing/i
+
+  # Society mana-recovery abilities, keyed by Society.member.
+  # [spell, cooldown-or-punishment checker] mirrors ewaggle's usage.
+  SOCIETY_MANA = {
+    "Council of Light"     => { setting: "use_wracking", label: "Sign of Wracking",  spell: 9918 },
+    "Guardians of Sunfist" => { setting: "use_power",    label: "Sigil of Power",    spell: 9718 },
+    "Order of Voln"        => { setting: "use_mana",     label: "Symbol of Mana",    spell: 9813 },
+  }.freeze
+
+  def run
+    load_settings
+    tokens = Array(Array(Script.current.vars)[1..-1]).map(&:to_s)
+    sub    = tokens[0].to_s.strip.downcase
+
+    case sub
+    when "info", "help", "?"
+      usage
+      return
+    when "wracking", "mana", "power"
+      config_society(sub, tokens[1])
+      return
+    when "exclude", "exclusion", "exclusions", "keep"
+      config_exclude(tokens[1..-1])
+      return
+    end
+
+    unless Spell[SPELL_NUM].known?
+      echo "You do not know Duplicate (#{SPELL_NUM}). Aborting."
+      return
+    end
+
+    containers, label = containers_for(sub)
+    if containers.nil? || containers.empty?
+      return # containers_for already explained why
+    end
+
+    @sold_count   = 0
+    @silver_total = 0
+    @failures     = []   # [{name:, reason:}]
+    @abort        = false
+
+    # Confirm a buyer is here (works in any pawnshop / wand-buying shop) using a
+    # non-destructive appraise before we duplicate anything.
+    unless venue_sells_wands?(containers)
+      echo "No wand buyer is here. Stand in a pawnshop (or a shop that buys wands) first. Aborting."
+      return
+    end
+
+    echo "918wands: #{label}"
+    echo "Buyer confirmed. Wands that fail to duplicate are left in place, unsold."
+    if (regen = active_regen_label)
+      echo "Mana recovery: #{regen} enabled."
+    end
+    echo "Excluding (never sold): #{@sell_exclude.join('; ')}" unless @sell_exclude.empty?
+
+    containers.each do |c|
+      break if @abort
+      process_container(c)
+    end
+
+    echo "Stopped: no buyer available to complete a sale." if @abort
+    report
+  end
+
+  # -- Resolve which containers to work through --------------------------------
+  # Returns [array_of_container_GameObjs, human_label]
+  def containers_for(arg)
+    case arg
+    when "all"
+      cons = GameObj.inv.to_a   # every worn item; non-containers yield no wands
+      [cons, "scanning ALL worn containers for wands"]
+    when "", nil
+      STOW.check(silent: true, quiet: true) unless STOW.checked?
+      wand_con = STOW.wand
+      if wand_con.nil?
+        echo "No WAND stow container is set. In game: STOW WAND <container>."
+        echo "Or run:  ;918wands <container-noun>   or   ;918wands all"
+        return [nil, nil]
+      end
+      [[wand_con], "using your wand container (#{wand_con.name})"]
+    else
+      con = resolve_container(arg)
+      if con.nil?
+        echo "Could not find a worn container with noun '#{arg}'."
+        echo "Try:  ;918wands <container-noun>   |   ;918wands all   |   ;918wands info"
+        return [nil, nil]
+      end
+      [[con], "using container '#{con.name}'"]
+    end
+  end
+
+  # -- Work through one container until it holds no duplicatable wands ----------
+  def process_container(container)
+    skip_ids = []   # wands that stay put (failed/kept) - don't retry forever
+    passes = 0
+    loop do
+      passes += 1
+      break if passes > MAX_PASSES
+
+      wands = wands_in(container).reject { |w| skip_ids.include?(w.id) }
+      break if wands.empty?
+
+      wands.each do |wand|
+        break if @abort
+        outcome = process_wand(wand, container)
+        # :sold and :destroyed consume the wand; anything else leaves it in the
+        # container, so remember it to avoid an infinite rescan.
+        skip_ids << wand.id unless outcome == :sold || outcome == :destroyed
+      end
+      break if @abort
+    end
+  end
+
+  # -- Per-wand workflow -------------------------------------------------------
+  # Returns one of :sold, :not_suited, :destroyed, :error
+  def process_wand(wand, container)
+    wand_name = wand.name
+    wand_id   = wand.id
+
+    empty_right_hand if GameObj.right_hand.id
+    empty_left_hand  if GameObj.left_hand.id
+    waitrt?
+
+    unless get_into_right_hand(wand_id)
+      note_failure(wand_name, "could not retrieve from container")
+      return :error
+    end
+    held = GameObj.right_hand
+
+    ensure_prepared
+    result = dothistimeout("cast my #{held.noun}", 8,
+                           Regexp.union(DUP_SUCCESS_RE, DUP_NOTSUITED_RE,
+                                        DUP_CATASTROPHE_RE, DUP_HANDS_RE,
+                                        /You don't have a spell prepared|lose your concentration/i))
+    waitcastrt?
+    waitrt?
+
+    case result
+    when DUP_SUCCESS_RE
+      sell_held_wands(container)
+      :sold
+    when DUP_NOTSUITED_RE
+      note_failure(wand_name, "not a fresh treasure wand (not duplicatable)")
+      return_to_container(held, container)
+      :not_suited
+    when DUP_CATASTROPHE_RE
+      note_failure(wand_name, "CATASTROPHIC failure - wand destroyed")
+      :destroyed
+    when DUP_HANDS_RE
+      note_failure(wand_name, "hand check failed (left hand not empty?)")
+      return_to_container(held, container)
+      :error
+    else
+      note_failure(wand_name, "no/unknown response to cast (#{result.inspect})")
+      return_to_container(held, container)
+      :error
+    end
+  end
+
+  # After a successful duplicate we hold the original (right) and copy (left).
+  # Sell every wand currently in hand (re-reading hands each time).
+  def sell_held_wands(container)
+    2.times do
+      wand = [GameObj.right_hand, GameObj.left_hand].find { |h| h && h.id && h.noun == "wand" }
+      break unless wand
+      case try_sell(wand)
+      when :sold
+        # done
+      when :noshop
+        @abort = true
+        note_failure(wand.name, "no buyer available to complete the sale")
+        return_to_container(wand, container)
+        break
+      else # :refused
+        note_failure(wand.name, "buyer would not purchase")
+        return_to_container(wand, container)
+      end
+      waitrt?
+    end
+  end
+
+  # Sell a specific held wand. Prefer the precise #id reference, fall back to
+  # the noun form ("sell wand"). Returns :sold, :refused, or :noshop.
+  def try_sell(wand)
+    res = dothistimeout("sell ##{wand.id}", 6,
+                        Regexp.union(SELL_OK_RE, SELL_NOSHOP_RE, SELL_FAIL_RE,
+                                     /Sell what|don't (?:know|see)|isn't here/i))
+    # If the #id form wasn't understood, retry with the plain noun form.
+    if res.nil? || res =~ /Sell what|don't (?:know|see)|isn't here/i
+      res = dothistimeout("sell #{wand.noun}", 6,
+                          Regexp.union(SELL_OK_RE, SELL_NOSHOP_RE, SELL_FAIL_RE))
+    end
+
+    if res =~ SELL_OK_RE
+      @sold_count += 1; @silver_total += $1.delete(',').to_i
+      :sold
+    elsif res =~ SELL_NOSHOP_RE
+      :noshop
+    else
+      :refused
+    end
+  end
+
+  # Non-destructive check that a buyer is present. Pulls the first wand it can
+  # find, APPRAISES it (offers a price, no sale), returns it, and reads the
+  # result. Ambiguous/unknown responses default to true so the sell-time
+  # no-shop guard remains the final backstop.
+  def venue_sells_wands?(containers)
+    containers.each do |c|
+      sample = wands_in(c).first
+      next unless sample
+
+      empty_right_hand if GameObj.right_hand.id
+      empty_left_hand  if GameObj.left_hand.id
+      next unless get_into_right_hand(sample.id)
+
+      res = dothistimeout("appraise ##{GameObj.right_hand.id}", 6,
+                          Regexp.union(APPRAISE_OK_RE, APPRAISE_NO_RE))
+      waitrt?
+      return_to_container(GameObj.right_hand, c)
+      return false if res =~ APPRAISE_NO_RE
+      return true
+    end
+    true # no wands anywhere to probe; nothing to sell regardless
+  end
+
+  # -- Settings ----------------------------------------------------------------
+  def load_settings
+    @use_wracking = CharSettings["use_wracking"] || false   # Council of Light
+    @use_power    = CharSettings["use_power"]    || false   # Guardians of Sunfist
+    @use_mana     = CharSettings["use_mana"]     || false   # Order of Voln
+    @sell_exclude = Array(CharSettings["sell_exclude"])     # names never sold
+    @sell_exclude_regex = build_word_boundary_regexes(@sell_exclude)
+  end
+
+  # Word-boundary union of the exclusion list (mirrors eloot). Empty list yields
+  # /(?!)/ which matches nothing, so an empty list excludes nothing.
+  def build_word_boundary_regexes(list)
+    Regexp.union(
+      Array(list).map do |r|
+        source = r.is_a?(Regexp) ? r.source : r.to_s
+        /\b(?:#{source})\b/i
+      end
+    )
+  end
+
+  def excluded?(obj)
+    obj.name.to_s.match?(@sell_exclude_regex)
+  end
+
+  # -- Society mana recovery ---------------------------------------------------
+  # Label of the enabled recovery ability that matches the current society, or nil.
+  def active_regen_label
+    cfg = SOCIETY_MANA[Society.member]
+    return nil unless cfg
+    return nil unless regen_enabled?(cfg[:setting])
+    cfg[:label]
+  rescue StandardError
+    nil
+  end
+
+  def regen_enabled?(setting)
+    { "use_wracking" => @use_wracking, "use_power" => @use_power, "use_mana" => @use_mana }[setting]
+  end
+
+  # Cast the society-appropriate mana ability once, if enabled and usable.
+  # Returns true if it cast something (caller then rechecks mana).
+  def recover_mana_via_society
+    cfg = SOCIETY_MANA[Society.member]
+    return false unless cfg && regen_enabled?(cfg[:setting])
+
+    case Society.member
+    when "Council of Light"
+      wrack = Spell[9918]; punishment = Spell[9012]
+      return false unless wrack.affordable? && !punishment.active?
+      return false if Char.percent_health < 40                 # don't wrack while hurt
+      return false if Room.current.tags.include?("no-magic")
+      waitrt?; waitcastrt?
+      wrack.cast
+      true
+    when "Guardians of Sunfist"
+      sigil = Spell[9718]
+      return false unless sigil.affordable?
+      waitrt?; waitcastrt?
+      sigil.cast
+      true
+    when "Order of Voln"
+      return false if Effects::Cooldowns.active?("Symbol of Mana")
+      waitrt?; waitcastrt?
+      res = Spell[9813].cast
+      if res.to_s =~ /^You strain to perform the symbol/
+        echo "Out of favor - disabling Symbol of Mana for this run."
+        @use_mana = false
+        return false
+      end
+      true
+    else
+      false
+    end
+  rescue StandardError
+    false
+  end
+
+  # -- Config subcommands ------------------------------------------------------
+  def config_society(which, value)
+    key   = { "wracking" => "use_wracking", "mana" => "use_mana", "power" => "use_power" }[which]
+    label = { "wracking" => "Sign of Wracking (Council of Light)",
+              "mana"     => "Symbol of Mana (Order of Voln)",
+              "power"    => "Sigil of Power (Guardians of Sunfist)" }[which]
+
+    if value.nil? || value.strip.empty?
+      echo "#{label} mana recovery is currently #{CharSettings[key] ? 'ON' : 'OFF'}."
+      return
+    end
+
+    on = value.strip.downcase =~ /\A(on|true|yes|1|enable)\z/
+    CharSettings[key] = !!on
+    echo "#{label} mana recovery #{on ? 'ENABLED' : 'DISABLED'}."
+    echo "(Your current society is #{safe_society}.)"
+  end
+
+  def config_exclude(rest)
+    rest   = Array(rest)
+    action = rest[0].to_s.strip.downcase
+    text   = rest[1..-1].to_a.join(" ").strip
+    list   = Array(CharSettings["sell_exclude"])
+
+    case action
+    when "add"
+      if text.empty?
+        echo "Usage: ;918wands exclude add <wand name or phrase>"
+      elsif list.any? { |e| e.casecmp?(text) }
+        echo "Already excluded: #{text}"
+      else
+        list << text
+        CharSettings["sell_exclude"] = list
+        echo "Excluded (never sold): #{text}"
+      end
+    when "remove", "del", "delete", "rem"
+      before = list.size
+      list.reject! { |e| e.casecmp?(text) }
+      CharSettings["sell_exclude"] = list
+      echo list.size < before ? "Removed exclusion: #{text}" : "Not found in exclusions: #{text}"
+    when "clear"
+      CharSettings["sell_exclude"] = []
+      echo "Cleared all sell exclusions."
+    else # list / empty / anything else
+      if list.empty?
+        echo "No sell exclusions set. Add one with:  ;918wands exclude add <phrase>"
+      else
+        echo "Sell exclusions (matched wands are never duplicated or sold):"
+        list.each { |e| echo "   - #{e}" }
+      end
+    end
+  end
+
+  def safe_society
+    Society.member.to_s.empty? ? "none" : Society.member
+  rescue StandardError
+    "unknown"
+  end
+
+  # -- Helpers -----------------------------------------------------------------
+  def resolve_container(noun)
+    GameObj.inv.to_a.find { |o| o.noun == noun } ||
+      GameObj.inv.to_a.find { |o| o.name =~ /\b#{Regexp.escape(noun)}\b/i }
+  end
+
+  def wands_in(container)
+    # Silently refresh contents (also no-ops harmlessly on non-containers in
+    # "all" mode). Open it first if it's closed.
+    res = Lich::Util.issue_command("look in ##{container.id}", LOOK_END_RE,
+                                   /<prompt/, silent: true, quiet: true, timeout: 5)
+    if res.any? { |l| l =~ /That is closed/i }
+      Lich::Util.issue_command("open ##{container.id}", /You open|already open/i,
+                               /<prompt/, silent: true, quiet: true, timeout: 5)
+      Lich::Util.issue_command("look in ##{container.id}", LOOK_END_RE,
+                               /<prompt/, silent: true, quiet: true, timeout: 5)
+    end
+    Array(GameObj.containers[container.id]).select { |o| o.noun == "wand" && !excluded?(o) }
+  rescue StandardError
+    []
+  end
+
+  def get_into_right_hand(wand_id)
+    dothistimeout("get ##{wand_id}", 5, Regexp.union(GET_OK_RE, GET_FAIL_RE))
+    waitrt?
+    GameObj.right_hand && GameObj.right_hand.id.to_s == wand_id.to_s
+  end
+
+  def ensure_prepared
+    fput("release") if checkprep != "None" && checkprep !~ /Duplicate/i
+    return if checkprep =~ /Duplicate/i
+
+    last_notice = nil
+    until Spell[SPELL_NUM].affordable?
+      next if recover_mana_via_society   # cast society ability, then recheck
+      if last_notice.nil? || (Time.now - last_notice) >= 60
+        echo "Waiting for mana to prepare Duplicate (need #{Spell[SPELL_NUM].mana_cost}, have #{checkmana})..."
+        last_notice = Time.now
+      end
+      sleep 2
+    end
+    dothistimeout("prepare #{SPELL_NUM}", 5, READY_RE)
+    waitcastrt?
+  end
+
+  def return_to_container(obj, container)
+    return if obj.nil? || obj.id.nil?
+    dothistimeout("put ##{obj.id} in ##{container.id}", 5, /You put|already|You can't/i)
+    waitrt?
+  end
+
+  def note_failure(name, reason)
+    @failures << { name: name, reason: reason }
+    echo ">> NOTE: #{name} -- #{reason}"
+  end
+
+  def report
+    echo "============================================================"
+    echo " 918wands - summary"
+    echo "------------------------------------------------------------"
+    echo " Wands sold (incl. copies): #{@sold_count}"
+    echo " Silver earned:             #{@silver_total.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\1,').reverse}"
+    if @failures.empty?
+      echo " Failures:                  none"
+    else
+      echo " Failures (#{@failures.size}) - these were NOT sold:"
+      @failures.each { |f| echo "   - #{f[:name]}: #{f[:reason]}" }
+    end
+    echo "============================================================"
+  end
+
+  def usage
+    echo "918wands - liquidate treasure wands with Duplicate (918)"
+    echo ""
+    echo "Run:"
+    echo "  ;918wands              process wands in your WAND stow container"
+    echo "  ;918wands all          process wands in EVERY worn container"
+    echo "  ;918wands <container>   process wands in <container> noun"
+    echo "  ;918wands info          show this help"
+    echo ""
+    echo "Mana recovery while waiting (enable the one for YOUR society):"
+    echo "  ;918wands wracking on|off   Sign of Wracking  (Council of Light)"
+    echo "  ;918wands mana on|off       Symbol of Mana    (Order of Voln)"
+    echo "  ;918wands power on|off      Sigil of Power    (Guardians of Sunfist)"
+    echo "  (only the ability matching your current society is used)"
+    echo ""
+    echo "Never-sell exclusions (matched wands are skipped entirely):"
+    echo "  ;918wands exclude add <phrase>      e.g. exclude add lustrous beryl"
+    echo "  ;918wands exclude remove <phrase>"
+    echo "  ;918wands exclude list"
+    echo "  ;918wands exclude clear"
+    echo ""
+    echo "Stand in any shop that buys wands (a pawnshop, Cendadric's, etc.)."
+    echo "The default container is read from your in-game STOW WAND setting."
+    echo "Only wands that successfully duplicate are sold; any that fail are"
+    echo "left where they are, unsold, and reported at the end."
+  end
+end
+
+before_dying do
+  fput("release") if defined?(checkprep) && checkprep =~ /Duplicate/i
+end
+
+Wands918.run
