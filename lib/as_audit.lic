@@ -1,0 +1,2162 @@
+=begin
+  Summary:
+  Experimental attack strength audit for GemStone IV.  The script gathers a large
+  amount of character, spell, skill, ascension, gear, recall, and enhancive data,
+  then opens a separate GTK window with a compact AS summary or a more detailed
+  categorized breakdown.
+
+  Commands:
+  ;as_audit
+    Show the default compact two-column AS summary.
+
+  ;as_audit detail
+    Show the full categorized breakdown window.
+
+  ;as_audit help
+    Show command usage and current script coverage.
+
+  What it currently tries to parse:
+  - Base combat skills from SKILLS BASE
+  - Ascension combat/stat skill data from ASC INFO
+  - Active spell AS data
+  - Enhancive totals and enhancive item sources
+  - Ready weapon / shield recall data
+  - Armor recall data
+  - Some scripted / situational item bonuses
+
+  Notes:
+  - This script is very much a work in progress.  Attack strength has a large
+    number of possible contributors, and many rare items, scripts, warcries,
+    society effects, and temporary buffs still need explicit handling.
+  - Expect the script to take roughly 30 seconds to run.  It should be used
+    out of combat.
+  - Once finished, it opens a separate GTK window with the collected results.
+  - Missing or incorrect contributors are expected in the current version.
+
+  Feedback:
+  If you find a source of AS that is being missed, provide as much direct game
+  output as possible.  Raw commands and responses are best, especially:
+    - recall
+    - analyze
+    - spell active
+    - bonuses
+    - skills base
+    - asc info
+    - inventory enhancive totals details
+
+  Straight game text is more useful than paraphrased behavior when expanding the
+  parser.
+  Author: RuseofFools, Codex, ClaudeCode
+  Tags: combat, attack strength, as, audit, analysis, gtk, enhancives, spells, ascension, recall, bonuses, skills, theorycraft
+  Version: 1.0.1
+  Recently changed: Updated for katars, wspec, and paladin 1611.
+=end
+# frozen_string_literal: true
+
+require "yaml"
+
+if ::Lich::Common.const_defined?(:Lich, false)
+  ::Lich::Common.send(:remove_const, :Lich)
+end
+
+module ::Lich
+  module Common
+    module ASAudit
+      WINDOW_DEFAULTS = {
+        "asauditwindow" => {
+          "x" => 1820,
+          "y" => 200,
+          "width" => 760,
+          "height" => 900,
+          "font_size" => 14,
+          "use_gtk_asauditwindow" => true,
+          "palette" => "White on Black"
+        }
+      }.freeze
+
+      PALETTES = {
+        "Lich Dark Mode" => { bg: "#2E2E2E", fg: "#DADADA" },
+        "Lich Light Mode" => { bg: "#E6E6E6", fg: "#202020" },
+        "Middle Ground" => { bg: "#333333", fg: "#FFFFFF" },
+        "White on Black" => { bg: "#000000", fg: "#FFFFFF" },
+        "NQWhite on NQBlack" => { bg: "#111111", fg: "#f6f6f6" },
+        "Black on White" => { bg: "#FFFFFF", fg: "#000000" }
+      }.freeze
+
+      SPELL_RULES = [
+        {
+          num: 117,
+          name: "Spirit Strike (117)",
+          styles: %i[melee ranged thrown uaf],
+          shareable: true,
+          self_only: false,
+          note: "+75 AS on the next attack",
+          bonus: ->(_ctx) { 75 }
+        },
+        {
+          num: 211,
+          name: "Bravery (211)",
+          styles: %i[melee ranged thrown uaf],
+          shareable: true,
+          self_only: false,
+          note: "+15 AS",
+          bonus: ->(_ctx) { 15 }
+        },
+        {
+          num: 215,
+          name: "Heroism (215)",
+          styles: %i[melee ranged thrown uaf],
+          shareable: true,
+          self_only: false,
+          note: "base +25 AS, plus Blessings lore scaling",
+          bonus: lambda { |ctx|
+            25 + (ctx[:lore_blessings].to_i / 10)
+          }
+        },
+        {
+          num: 307,
+          name: "Benediction (307)",
+          styles: %i[melee],
+          shareable: true,
+          self_only: false,
+          note: "base +5 AS, plus Cleric spell-rank scaling",
+          bonus: lambda { |ctx|
+            ranks = ctx[:cleric_ranks].to_i
+            next 0 if ranks < 7
+
+            [5 + ((ranks - 7) / 2), 15].min
+          }
+        },
+        {
+          num: 425,
+          name: "Elemental Targeting (425)",
+          styles: %i[melee ranged thrown uaf bolt],
+          shareable: false,
+          self_only: true,
+          note: "base +25 AS, plus Minor Elemental rank scaling",
+          bonus: lambda { |ctx|
+            ranks = ctx[:minor_elemental_ranks].to_i
+            next 0 if ranks < 25
+
+            [25 + ((ranks - 25) / 2), 50].min
+          }
+        },
+        {
+          num: 509,
+          name: "Strength (509)",
+          styles: %i[melee],
+          shareable: true,
+          self_only: false,
+          note: "base +15 STR bonus, plus Earth lore seed-4 scaling",
+          bonus: lambda { |ctx|
+            base = 15
+            if ctx[:major_elemental_ranks].to_i >= 9
+              base + seed_sum(4, ctx[:lore_earth].to_i)
+            else
+              0
+            end
+          }
+        },
+        {
+          num: 606,
+          name: "Phoen's Strength (606)",
+          styles: %i[melee],
+          shareable: false,
+          self_only: true,
+          note: "+10 AS",
+          bonus: ->(ctx) { ctx[:ranger_ranks].to_i >= 6 ? 10 : 0 }
+        },
+        {
+          num: 1007,
+          name: "Kai's Triumph Song (1007)",
+          styles: %i[melee ranged thrown uaf],
+          shareable: false,
+          self_only: true,
+          note: "bard AS song with Telepathy lore scaling",
+          bonus: lambda { |ctx|
+            ranks = ctx[:bard_ranks].to_i
+            next 0 if ranks < 7
+
+            bonus = [10 + (ranks - 7), 20].min
+            bonus + [seed_sum(3, ctx[:lore_telepathy].to_i), 11].min
+          }
+        },
+        {
+          num: 1107,
+          name: "Adrenal Surge (1107)",
+          styles: %i[melee ranged thrown uaf],
+          shareable: false,
+          self_only: true,
+          note: "brief +10 AS burst",
+          bonus: ->(_ctx) { 10 }
+        },
+        {
+          num: 1109,
+          name: "Empathic Focus (1109)",
+          styles: %i[melee],
+          shareable: false,
+          self_only: true,
+          note: "+15 AS",
+          bonus: ->(ctx) { ctx[:empath_ranks].to_i >= 9 ? 15 : 0 }
+        },
+        {
+          num: 1130,
+          name: "Intensity (1130)",
+          styles: %i[melee ranged thrown uaf],
+          shareable: false,
+          self_only: true,
+          note: "base +20 AS, plus Empath rank scaling",
+          bonus: lambda { |ctx|
+            ranks = ctx[:empath_ranks].to_i
+            next 0 if ranks < 30
+
+            [20 + ((ranks - 30) / 2), 55].min
+          }
+        },
+        {
+          num: 1606,
+          name: "Dauntless (1606)",
+          styles: %i[melee ranged thrown uaf],
+          shareable: false,
+          self_only: true,
+          note: "+10 AS",
+          bonus: ->(ctx) { ctx[:paladin_ranks].to_i >= 6 ? 10 : 0 }
+        },
+        {
+          num: 1611,
+          name: "Patron's Blessing (1611)",
+          styles: %i[melee thrown uaf],
+          shareable: false,
+          self_only: true,
+          note: "Combat Maneuvers-based AS scaling",
+          bonus: lambda { |ctx|
+            ranks = ctx[:paladin_ranks].to_i
+            next 0 if ranks < 11
+
+            effective_cman = ((ranks - 11) * 0.75) + 10 + seed_sum(3, ctx[:lore_blessings].to_i)
+            divisor = ctx[:style] == :thrown ? 4.0 : 2.0
+            [(effective_cman / divisor).round, 38].min
+          }
+        },
+        {
+          num: 1617,
+          name: "Zealot (1617)",
+          styles: %i[melee],
+          shareable: false,
+          self_only: true,
+          note: "base +30 AS, plus Religion lore seed-1 scaling",
+          bonus: lambda { |ctx|
+            ranks = ctx[:paladin_ranks].to_i
+            next 0 if ranks < 17
+
+            30 + [seed_sum(1, ctx[:lore_religion].to_i), 21].min
+          }
+        }
+      ].freeze
+
+      SCRIPTED_ITEM_RULES = [
+        {
+          pattern: /zelnorn/i,
+          note: "Detected zelnorn gear. Zelnorn scripts can add offensive bonuses depending on item state; verify the item's current messaging or ANALYZE output."
+        },
+        {
+          pattern: /rusalkoren/i,
+          note: "Detected rusalkoren gear. Rusalkoren armor/weapon scripts can create temporary combat buffs; verify whether its scripted AS state is active."
+        },
+        {
+          pattern: /somnis/i,
+          note: "Detected somnis gear. Somnis scripts are offensive but their AS contribution is messaging/state dependent."
+        }
+      ].freeze
+
+      AS_CMAN_NAMES = [
+        "Berserk",
+        "Burst of Swiftness",
+        "Coup de Grace",
+        "Perfect Self",
+        "Side by Side",
+        "Weapon Specialization",
+        "Spin Attack",
+        "Surge of Strength",
+        "Seanette's Shout",
+        "Weapon Bonding"
+      ].freeze
+
+      AS_CMAN_ALIASES = {
+        "Weapon Specializatio" => "Weapon Specialization",
+        "Burst" => "Burst of Swiftness",
+        "Side By Side" => "Side by Side",
+        "Specialization" => "Weapon Specialization",
+        "Seanettes Shout" => "Seanette's Shout",
+        "Seanette's Shout" => "Seanette's Shout",
+        "Weapon Bond" => "Weapon Bonding"
+      }.freeze
+
+      module_function
+
+      def help
+        lines = []
+        lines << "as_audit commands:"
+        lines << "  ;as_audit"
+        lines << "    Show the compact two-column AS summary."
+        lines << "  ;as_audit detail"
+        lines << "    Show the full categorized breakdown window."
+        lines << "  ;as_audit help"
+        lines << "    Show this help."
+        lines << ""
+        lines << "Current MVP coverage:"
+        lines << "  - current weapon/style profile"
+        lines << "  - active spell and buff AS contributors"
+        lines << "  - enhancive totals and item sources"
+        lines << "  - ready weapon / shield recall notes"
+        lines << "  - missing major spell / society / CMAN sources"
+        lines << ""
+        lines << "Known limits:"
+        lines << "  - weapon enchant parsing is best-effort from recall text"
+        lines << "  - custom scripted item states are heuristic unless explicitly surfaced in recall/effect text"
+        ::Lich::Messaging.mono(lines.join("\n"))
+      end
+
+      def run
+        return help if requested_help?
+
+        setup_window_runtime
+        refresh_context
+
+        base_skills = capture_base_skills
+        asc_skills = capture_asc_skills
+        cman_skills = capture_cman_skills
+        context = build_context(base_skills, asc_skills, cman_skills)
+        enh_details = capture_enhancive_details
+        ready_gear = capture_ready_gear_details
+        armor_gear = capture_armor_details
+        sections = build_report_sections(context, enh_details, ready_gear, armor_gear)
+        sections = { "AS Summary" => sections["AS Summary"] } unless requested_detail?
+        report_text = render_report(sections)
+
+        if gtk_enabled?
+          show_gtk_report(report_text)
+          Thread.new { Gtk.main if Gtk.main_level.zero? }
+          wait_until_window_closes
+        else
+          ::Lich::Messaging.mono(report_text)
+        end
+      end
+
+      def refresh_context
+        echo "[as_audit: syncing character data]"
+        lean_infomon_sync
+        refresh_ready_list
+      rescue StandardError => e
+        echo "[as_audit: warning: context refresh incomplete: #{e.message}]"
+      end
+
+      # A trimmed Infomon sync: same commands the framework runs (which update the
+      # Infomon DB via its downstream parser) MINUS the ones as_audit doesn't need
+      # (citizenship, resource, profile full). Enhancive data is captured directly
+      # by capture_enhancive_details, so 'invento enh' is skipped as well.
+      def lean_infomon_sync
+        # armor/shield/weapon list all are skipped -- none of that data feeds AS.
+        request = {
+          "info full"          => /<a exist=.+#{XMLData.name}/,
+          "skill"              => /<a exist=.+#{XMLData.name}/,
+          "spell"              => %r{<output class="mono"/>},
+          "experience"         => %r{<output class="mono"/>},
+          "society"            => %r{<pushBold/>},
+          "cman list all"      => /<a exist=.+#{XMLData.name}/,
+          "feat list all"      => /<a exist=.+#{XMLData.name}/,
+          "warcry"             => /You have learned the following War Cries:|You must be an active member of the Warrior Guild/,
+          "ascension list all" => /<a exist=.+#{XMLData.name}/
+        }
+        request.each do |command, start_capture|
+          ::Lich::Util.issue_command(command, start_capture, /<prompt/, include_end: true, timeout: 5, silent: false, usexml: true, quiet: true)
+        end
+      end
+
+      def build_context(base_skills, asc_skills, cman_skills)
+        primary_item = chosen_primary_item
+        primary_armament = primary_item ? find_armament(primary_item) : nil
+        style_info = detect_style(primary_item, primary_armament)
+        society_rank = defined?(::Lich::Gemstone::Society) ? ::Lich::Gemstone::Society.rank.to_i : 0
+        society_status = defined?(::Lich::Gemstone::Society) ? ::Lich::Gemstone::Society.status.to_s : ""
+
+        {
+          style: style_info[:style],
+          style_label: style_info[:label],
+          primary_item: primary_item,
+          primary_armament: primary_armament,
+          weapon_skill_method: style_info[:weapon_skill_method],
+          weapon_skill_label: style_info[:weapon_skill_label],
+          base_skills: base_skills,
+          asc_skills: asc_skills,
+          cman_skills: cman_skills,
+          society_rank: society_rank,
+          society_status: society_status,
+          minor_elemental_ranks: ::Lich::Gemstone::Spells.minor_elemental,
+          major_elemental_ranks: ::Lich::Gemstone::Spells.major_elemental,
+          ranger_ranks: ::Lich::Gemstone::Spells.ranger,
+          bard_ranks: ::Lich::Gemstone::Spells.bard,
+          empath_ranks: ::Lich::Gemstone::Spells.empath,
+          paladin_ranks: ::Lich::Gemstone::Spells.paladin,
+          cleric_ranks: ::Lich::Gemstone::Spells.cleric,
+          lore_earth: ::Lich::Gemstone::Skills.elemental_lore_earth,
+          lore_blessings: ::Lich::Gemstone::Skills.spiritual_lore_blessings,
+          lore_telepathy: ::Lich::Gemstone::Skills.mental_lore_telepathy,
+          lore_religion: ::Lich::Gemstone::Skills.spiritual_lore_religion
+        }
+      end
+
+      def live_item(item)
+        return nil if item.nil?
+        return nil if item.respond_to?(:name) && item.name.to_s == "Empty"
+
+        item
+      end
+
+      def display_hand(item)
+        item = live_item(item)
+        item ? item.name.to_s : "(empty)"
+      end
+
+      KATAR_NAMES = /(?:katar|gauntlet-sword|kunai|manople|paiscush|pata|slasher|tvekre)/i
+
+      # Armaments.find requires exact noun match in all_names (e.g. "pata").
+      # Real items have material/adjective prefixes ("leaf-bladed enruned golvern pata"),
+      # so try full name first, then fall back to the bare noun.
+      def find_armament(item)
+        return nil unless item
+        noun = item.respond_to?(:noun) ? item.noun.to_s.downcase.strip : ""
+        ::Lich::Gemstone::Armaments.find(item.name.to_s) ||
+          (noun.empty? ? nil : ::Lich::Gemstone::Armaments.find(noun))
+      end
+
+      def chosen_primary_item
+        ready_item = safe_ready_item(:weapon)
+        ready_armament = ready_item ? find_armament(ready_item) : nil
+        return ready_item if ready_armament
+
+        hand_item = live_item(GameObj.right_hand)
+        hand_armament = hand_item ? find_armament(hand_item) : nil
+        return hand_item if hand_armament && hand_armament.dig(:data, :category) != :shield
+
+        hand_item
+      end
+
+      def detect_style(item, armament)
+        return { style: :bolt, label: "Bolt / Spell Aiming", weapon_skill_method: :spell_aiming, weapon_skill_label: "Spell Aiming" } if item.nil? && ::Lich::Gemstone::Skills.spell_aiming.positive?
+        return { style: :unknown, label: "Unknown", weapon_skill_method: nil, weapon_skill_label: nil } if armament.nil?
+        return { style: :katar, label: "Melee (Katar Hybrid)", weapon_skill_method: nil, weapon_skill_label: "Katar Hybrid" } if katar_weapon?(item, armament)
+
+        category = armament.dig(:data, :category)
+        case category
+        when :missile
+          { style: :ranged, label: "Ranged", weapon_skill_method: :ranged_weapons, weapon_skill_label: "Ranged Weapons" }
+        when :thrown
+          { style: :thrown, label: "Thrown", weapon_skill_method: :thrown_weapons, weapon_skill_label: "Thrown Weapons" }
+        when :polearm
+          { style: :melee, label: "Melee (Polearm)", weapon_skill_method: :polearm_weapons, weapon_skill_label: "Polearm Weapons" }
+        when :two_handed
+          { style: :melee, label: "Melee (Two-Handed)", weapon_skill_method: :two_handed_weapons, weapon_skill_label: "Two-Handed Weapons" }
+        when :blunt
+          { style: :melee, label: "Melee (Blunt)", weapon_skill_method: :blunt_weapons, weapon_skill_label: "Blunt Weapons" }
+        when :edged
+          { style: :melee, label: "Melee (Edged)", weapon_skill_method: :edged_weapons, weapon_skill_label: "Edged Weapons" }
+        when :brawling, :unarmed
+          { style: :uaf, label: "UAF / Brawling", weapon_skill_method: :brawling, weapon_skill_label: "Brawling" }
+        when :runestave
+          { style: :bolt, label: "Bolt / Runestaff", weapon_skill_method: :spell_aiming, weapon_skill_label: "Spell Aiming" }
+        when :hybrid
+          { style: :katar, label: "Melee (Katar Hybrid)", weapon_skill_method: nil, weapon_skill_label: "Katar Hybrid" }
+        else
+          { style: :unknown, label: "Unknown", weapon_skill_method: nil, weapon_skill_label: nil }
+        end
+      end
+
+      def katar_weapon?(item, armament)
+        return true if item_name_parts(item).any? { |part| part =~ KATAR_NAMES }
+        return true if armament&.dig(:data, :base_name).to_s =~ /^katar$/i
+
+        Array(armament&.dig(:data, :all_names)).any? { |name| name.to_s =~ KATAR_NAMES }
+      end
+
+      def item_name_parts(item)
+        return [] unless item
+
+        methods = %i[name noun before after desc long_name]
+        methods.filter_map do |method_name|
+          next unless item.respond_to?(method_name)
+
+          item.public_send(method_name).to_s
+        rescue StandardError
+          nil
+        end
+      end
+
+      def current_formula_sources(context)
+        sources = []
+        style = context[:style]
+        health_penalty = current_health_penalty
+        spirit_penalty = current_spirit_penalty
+        base_skills = context[:base_skills] || {}
+        asc_skills = context[:asc_skills] || {}
+        weapon_label = context[:weapon_skill_label]
+        # Weapon-skill AS comes from the "skills base" Actual BONUS column, not ranks
+        # (Blunt 101 ranks = 201 bonus). CMAN stays ranks/2. Enhancives are added
+        # separately and are not baked into the base bonus.
+        weapon_base_ranks = base_skills.dig(weapon_label, :ranks).to_i
+        weapon_base_bonus = base_skills.dig(weapon_label, :bonus).to_i
+        weapon_asc_ranks = asc_skills.dig(weapon_label, :ranks).to_i
+        cman_base_ranks = base_skills.dig("Combat Maneuvers", :ranks).to_i
+        cman_asc_ranks = asc_skills.dig("Combat Maneuvers", :ranks).to_i
+        wspec_ranks = as_cman_rank(context, "Weapon Specialization")
+
+        case style
+        when :melee
+          sources << source_entry(weapon_base_bonus, "#{weapon_label} base skill") if weapon_base_bonus.positive?
+          sources << source_entry((cman_base_ranks / 2.0).truncate, "Combat Maneuvers base") if cman_base_ranks.positive?
+          sources << source_entry(wspec_ranks * 2, "Weapon Specialization", "#{wspec_ranks} ranks") if wspec_ranks.positive?
+          sources << source_entry(weapon_asc_ranks, "#{weapon_label} ascension") if weapon_asc_ranks.positive?
+          sources << source_entry((cman_asc_ranks / 2.0).truncate, "Combat Maneuvers ascension") if cman_asc_ranks.positive?
+        when :ranged
+          sources << source_entry(weapon_base_bonus, "#{weapon_label} base skill") if weapon_base_bonus.positive?
+          sources << source_entry(wspec_ranks * 2, "Weapon Specialization", "#{wspec_ranks} ranks") if wspec_ranks.positive?
+          sources << source_entry(weapon_asc_ranks, "#{weapon_label} ascension") if weapon_asc_ranks.positive?
+          perception_ranks = base_skills.dig("Perception", :ranks).to_i
+          ambush_ranks = base_skills.dig("Ambush", :ranks).to_i
+          perception_bonus = [(perception_ranks - 40) / 4, 0].max
+          ambush_bonus = [(ambush_ranks - 40) / 4, 0].max
+          sources << source_entry(perception_bonus, "Perception base") if perception_bonus.positive?
+          sources << source_entry(ambush_bonus, "Ambush base") if ambush_bonus.positive?
+        when :thrown
+          sources << source_entry(weapon_base_bonus, "#{weapon_label} base skill") if weapon_base_bonus.positive?
+          sources << source_entry(wspec_ranks * 2, "Weapon Specialization", "#{wspec_ranks} ranks") if wspec_ranks.positive?
+          sources << source_entry(weapon_asc_ranks, "#{weapon_label} ascension") if weapon_asc_ranks.positive?
+          perception_ranks = base_skills.dig("Perception", :ranks).to_i
+          perception_cman = ((perception_ranks + cman_base_ranks) / 4.0).truncate
+          asc_throw_cman = (cman_asc_ranks / 4.0).truncate
+          sources << source_entry(perception_cman, "Perception + Combat Maneuvers base") if perception_cman.positive?
+          sources << source_entry(asc_throw_cman, "Combat Maneuvers ascension") if asc_throw_cman.positive?
+        when :uaf
+          sources << source_entry(weapon_base_ranks * 2, "Brawling base skill") if weapon_base_ranks.positive?
+          sources << source_entry((cman_base_ranks / 2.0).truncate, "Combat Maneuvers base") if cman_base_ranks.positive?
+          sources << source_entry(wspec_ranks * 2, "Weapon Specialization", "#{wspec_ranks} ranks") if wspec_ranks.positive?
+          sources << source_entry(weapon_asc_ranks * 2, "Brawling ascension") if weapon_asc_ranks.positive?
+          sources << source_entry((cman_asc_ranks / 2.0).truncate, "Combat Maneuvers ascension") if cman_asc_ranks.positive?
+        when :katar
+          edged_base_bonus = base_skills.dig("Edged Weapons", :bonus).to_i
+          brawling_base_bonus = base_skills.dig("Brawling", :bonus).to_i
+          edged_asc_ranks = asc_skills.dig("Edged Weapons", :ranks).to_i
+          brawling_asc_ranks = asc_skills.dig("Brawling", :ranks).to_i
+          hybrid_base = ((edged_base_bonus + brawling_base_bonus) / 2.0).truncate
+          hybrid_asc = ((edged_asc_ranks + brawling_asc_ranks) / 2.0).truncate
+          sources << source_entry(hybrid_base, "Katar Edged/Brawling base", "Edged #{edged_base_bonus}, Brawling #{brawling_base_bonus}") if hybrid_base.positive?
+          sources << source_entry((cman_base_ranks / 2.0).truncate, "Combat Maneuvers base") if cman_base_ranks.positive?
+          sources << source_entry(wspec_ranks * 2, "Weapon Specialization", "#{wspec_ranks} ranks") if wspec_ranks.positive?
+          sources << source_entry(hybrid_asc, "Katar Edged/Brawling ascension", "Edged #{edged_asc_ranks}, Brawling #{brawling_asc_ranks}") if hybrid_asc.positive?
+          sources << source_entry((cman_asc_ranks / 2.0).truncate, "Combat Maneuvers ascension") if cman_asc_ranks.positive?
+        when :bolt
+          spell_aim_bonus = base_skills.dig("Spell Aiming", :bonus).to_i
+          sources << source_entry(spell_aim_bonus, "Spell Aiming base skill") if spell_aim_bonus.positive?
+        end
+
+        sources << source_entry(-health_penalty.round, "Health penalty") if health_penalty.positive?
+        sources << source_entry(-spirit_penalty, "Spirit penalty estimate") if spirit_penalty.positive?
+        sources
+      end
+
+      # Unrealized AS from AS-granting ascension skills that aren't at max rank yet.
+      # Reported as headroom only (NOT added to the current AS total). Weapon skill
+      # ascension is 1:1 AS; Combat Maneuvers and Strength/Dexterity are ranks/2.
+      def ascension_headroom_sources(context)
+        asc = context[:asc_skills] || {}
+        physical = %i[melee ranged thrown uaf katar].include?(context[:style])
+        one_to_one = ->(ranks) { ranks }
+        half = ->(ranks) { (ranks / 2.0).truncate }
+
+        specs = if context[:style] == :katar
+                  [["Edged Weapons ascension", "Edged Weapons", ->(ranks) { (ranks / 2.0).truncate }],
+                   ["Brawling ascension", "Brawling", ->(ranks) { (ranks / 2.0).truncate }],
+                   ["Combat Maneuvers ascension", "Combat Maneuvers", half],
+                   ["Strength ascension", "Strength", half]]
+                elsif physical
+                  [["#{context[:weapon_skill_label]} ascension", context[:weapon_skill_label], one_to_one],
+                   ["Combat Maneuvers ascension", "Combat Maneuvers", half],
+                   ["Strength ascension", "Strength", half]]
+                else
+                  [["Spell Aiming ascension", "Spell Aiming", one_to_one],
+                   ["Dexterity ascension", "Dexterity", half]]
+                end
+
+        specs.each_with_object([]) do |(label, key, convert), entries|
+          # If the skill doesn't appear in asc info at all, the character has spent
+          # no ascension ranks on it -- treat as 0/50 (full headroom available).
+          data = asc[key] || { ranks: 0, max: 50 }
+
+          cur = data[:ranks].to_i
+          max = data[:max].to_i
+          gain = convert.call(max) - convert.call(cur)
+          next unless gain.positive?
+
+          entries << source_entry(gain, label, "#{cur}/#{max} ranks -> +#{gain} AS if maxed")
+        end
+      end
+
+      def active_spell_sources(context)
+        sources = []
+
+        Spell.active.sort_by { |spell| spell.num.to_i }.each do |spell|
+          amount = context[:style] == :bolt ? spell.bolt_as.to_i : spell.physical_as.to_i
+          detail = nil
+
+          # Spell#physical_as/bolt_as (same data as ;bonuses) is wrong for 425.
+          # Per GSWiki it is +25 to BOTH pAS and bAS, then +1 per 2 Minor Elemental
+          # ranks over 25 (cap 50); item-granted casting still gets the +25 floor.
+          if spell.num.to_i == 425
+            mne = minor_elemental_ranks(context)
+            amount = elemental_targeting_as(context)
+            detail = "base +25, +1 per 2 MnE ranks over 25 (cap 50); MnE ranks=#{mne}"
+          # 513 (Elemental Focus) no longer lowers AS -- it only adds to bolt AS.
+          elsif spell.num.to_i == 513
+            amount = context[:style] == :bolt ? [spell.bolt_as.to_i, 0].max : 0
+            detail = "adds to bolt AS only (does not lower melee AS)"
+          elsif spell.num.to_i == 1611 && spell.combatmaneuvers.to_i.positive?
+            cm_bonus = spell.combatmaneuvers.to_i
+            amount = as_from_cman_bonus(context, cm_bonus)
+            detail = "#{signed(cm_bonus)} CM bonus from Patron's Blessing"
+          end
+
+          next if amount.zero?
+
+          sources << source_entry(amount, "#{spell.name} (#{spell.num})", detail)
+        end
+
+        sources
+      end
+
+      def physical_style?(context)
+        %i[melee ranged thrown uaf katar].include?(context[:style])
+      end
+
+      def melee_style?(context)
+        %i[melee uaf katar].include?(context[:style])
+      end
+
+      def as_cman_rank(context, name)
+        normalized = normalize_cman_skill_name(name)
+        rank = (context[:cman_skills] || {}).dig(normalized, :ranks).to_i
+        return rank if rank.positive?
+
+        case normalized
+        when "Perfect Self"
+          return ::Lich::Gemstone::Feat["perfectself"].to_i if defined?(::Lich::Gemstone::Feat)
+        when "Weapon Bonding"
+          return ::Lich::Gemstone::Feat["weaponbonding"].to_i if defined?(::Lich::Gemstone::Feat)
+        when "Seanette's Shout"
+          return ::Lich::Gemstone::Warcry["shout"].to_i if defined?(::Lich::Gemstone::Warcry)
+        end
+
+        return 0 unless defined?(::Lich::Gemstone::CMan)
+        return 0 unless ::Lich::Gemstone::CMan.known?(normalized)
+
+        ::Lich::Gemstone::CMan[normalized].to_i
+      rescue StandardError
+        0
+      end
+
+      # Character's Minor Elemental circle ranks (with a live fallback).
+      def minor_elemental_ranks(context)
+        ranks = context[:minor_elemental_ranks].to_i
+        ranks = ::Lich::Gemstone::Spells.minor_elemental.to_i if ranks.zero?
+        ranks
+      end
+
+      # Elemental Targeting (425) AS to bolt and aimed/physical attacks.
+      # AS = 25 + trunc[(MnE ranks - 25) / 2], floored at the +25 base, capped at 50.
+      def elemental_targeting_as(context)
+        ranks = minor_elemental_ranks(context)
+        [25 + [(ranks - 25) / 2, 0].max, 50].min
+      end
+
+      # Max AS available from the character's society's offensive powers, per GSWiki.
+      # Applies to every attack pool. Rank-scaled powers use the member's rank. The
+      # Council signs (Striking/Smiting/Swords) DO stack; Sign of Madness is a
+      # high-risk slot reported separately (society_situational_sources), not summed.
+      def society_power_sources(context)
+        rank = context[:society_rank].to_i
+        case context[:society_status].to_s
+        when "Order of Voln"
+          return [] if rank < 5
+
+          [source_entry([rank, 26].min, "Symbol of Courage (Voln)",
+                        "+1 AS per Voln rank, max +26 (Supremacy adds +#{[rank / 2, 13].min} vs undead only)")]
+        when "Council of Light"
+          entries = []
+          entries << source_entry(5, "Sign of Striking (CoL)", "+5 AS") if rank >= 4
+          entries << source_entry(10, "Sign of Smiting (CoL)", "+10 AS") if rank >= 8
+          entries << source_entry(20, "Sign of Swords (CoL)", "+20 AS") if rank >= 12
+          entries
+        when "Guardians of Sunfist"
+          entries = []
+          entries << source_entry([rank, 20].min, "Sigil of Offense (Sunfist)", "+1 AS per GoS rank, max +20") if rank >= 8
+          # Major and Minor Bane can't be active together -- Major supersedes Minor.
+          if rank >= 15
+            entries << source_entry(10, "Sigil of Major Bane (Sunfist)", "+10 AS vs any enemy (supersedes Minor Bane)")
+          elsif rank >= 5
+            entries << source_entry(5, "Sigil of Minor Bane (Sunfist)", "+5 AS vs any enemy")
+          end
+          entries
+        else
+          []
+        end
+      end
+
+      # High-risk society powers shown for reference but NOT added to the total.
+      # Sign of Madness lives in a separate slot and carries a -50 DS penalty.
+      def society_situational_sources(context)
+        return [] unless context[:society_status].to_s == "Council of Light"
+        return [] unless context[:society_rank].to_i >= 16
+
+        [source_entry(50, "Sign of Madness (CoL)", "+50 AS / -50 DS, 15s -- high-risk slot, not counted in total")]
+      end
+
+      def active_buff_sources(context)
+        sources = []
+
+        # Society AS is reported in its own group (society_power_sources); here we
+        # only handle Enhance Strength effects so they aren't double-counted.
+        surge_active = false
+        Effects::Buffs.to_h.keys.each do |name|
+          text = name.to_s
+          next unless (match = text.match(/^Enh\. Strength \(\+(?<amount>\d+)\)$/))
+
+          amount = match[:amount].to_i
+          as_amount = case context[:style]
+                      when :melee then amount
+                      when :thrown then (amount / 2.0).truncate
+                      else 0
+                      end
+          surge_active ||= as_cman_rank(context, "Surge of Strength").positive?
+          label = surge_active ? "Surge of Strength" : text
+          detail = surge_active ? "active via #{text}; #{signed(amount)} STR bonus" : "#{signed(amount)} STR bonus"
+          sources << source_entry(as_amount, label, detail) if as_amount.positive?
+        end
+
+        Effects::Buffs.to_h.keys.each do |name|
+          text = name.to_s
+          next unless (match = text.match(/^Empowered \(\+(?<amount>\d+)\)$/))
+
+          amount = match[:amount].to_i
+          sources << source_entry(amount, "Empowered", "#{signed(amount)} AS from Coup de Grace or Seanette's Shout") if amount.positive?
+        end
+
+        sources
+      end
+
+      def enhancive_sources(context, enh_details)
+        totals = []
+        item_sources = []
+
+        str_total = fetch_total(enh_details, "Stats", "Strength (STR)")
+        dex_total = fetch_total(enh_details, "Stats", "Dexterity (DEX)")
+        weapon_skill_total = context[:weapon_skill_label] ? fetch_total(enh_details, "Skills", "#{context[:weapon_skill_label]} Bonus") : 0
+        cman_bonus_total = fetch_total(enh_details, "Skills", "Combat Maneuvers Bonus")
+
+        if str_total.positive?
+          as_amount = as_from_stat_bonus(context, :strength, str_total)
+          totals << source_entry(as_amount, "Strength enhancives total", "#{signed(str_total)} STR bonus") if as_amount.positive?
+        end
+
+        if dex_total.positive?
+          as_amount = as_from_stat_bonus(context, :dexterity, dex_total)
+          totals << source_entry(as_amount, "Dexterity enhancives total", "#{signed(dex_total)} DEX bonus") if as_amount.positive?
+        end
+
+        if weapon_skill_total.positive?
+          totals << source_entry(weapon_skill_total, "#{context[:weapon_skill_label]} enhancives total")
+        end
+
+        if cman_bonus_total.positive?
+          derived_as = as_from_cman_bonus(context, cman_bonus_total)
+          totals << source_entry(derived_as, "Combat Maneuvers enhancives total", "#{signed(cman_bonus_total)} CM bonus") if derived_as.positive?
+        end
+
+        item_map = relevant_enhancive_item_sources(enh_details, context)
+        item_map.each do |item_name, entry|
+          next if entry[:amount].zero?
+
+          item_sources << source_entry(entry[:amount], item_name, entry[:details].join(", "))
+        end
+
+        { totals: totals, items: item_sources.sort_by { |entry| [-entry[:amount], entry[:label]] } }
+      end
+
+      def scripted_item_section
+        lines = ["Detected scripted item families:"]
+        names = scan_candidate_items.map { |item| item.name.to_s }.reject(&:empty?).uniq
+        found = false
+
+        SCRIPTED_ITEM_RULES.each do |rule|
+          next unless names.any? { |name| name.match?(rule[:pattern]) }
+
+          lines << "  #{rule[:note]}"
+          found = true
+        end
+
+        lines << "  (none matched known scripted-item heuristics)" unless found
+        lines
+      end
+
+      def build_report_sections(context, enh_details, ready_gear, armor_gear)
+        base_sources = current_formula_sources(context)
+        spell_sources = active_spell_sources(context)
+        buff_sources = active_buff_sources(context)
+        enh_sources = enhancive_sources(context, enh_details)
+        weapon_lines = build_slot_section(:weapon, ready_gear, base_sources)
+        shield_lines = build_slot_section(:shield, ready_gear, [])
+        armor_lines = armor_section(armor_gear)
+        raw_total = sum_sources(base_sources) + sum_slot_sources(ready_gear[:weapon]) + sum_slot_sources(ready_gear[:shield]) + sum_slot_sources(armor_gear) + sum_sources(spell_sources) + sum_sources(buff_sources) + sum_sources(enh_sources[:items])
+
+        sections = {}
+        physical_ctx = physical_pool_context(context)
+        spell_ctx = spell_pool_context(context)
+        # Gear (readied weapon/shield + worn armor) belongs to whichever pool the
+        # in-hand item drives. If the in-hand style resolved to bolt, the enchant is
+        # spell-aim gear; otherwise it counts toward the physical (melee) pool.
+        phys_gear, phys_armor = context[:style] == :bolt ? [nil, nil] : [ready_gear, armor_gear]
+        spell_gear, spell_armor = context[:style] == :bolt ? [ready_gear, armor_gear] : [nil, nil]
+
+        # Zelnorn gear applies to every attack pool (incl. spell aim); the supercharger
+        # is physical-only. Tactician gemstones are universal and grouped separately.
+        zelnorn = zelnorn_as_sources
+        gems = tactician_gemstone_sources
+        supercharger = supercharger_sources(ready_gear)
+        # Situational item/script buffs detected once (some require ANALYZE).
+        item_buffs = detect_item_buffs
+
+        columns = []
+        columns << build_summary_column(physical_ctx, enh_details, phys_gear, phys_armor, gear_extras: zelnorn + supercharger, gem_sources: gems, item_buffs: item_buffs) if physical_ctx
+        columns << build_summary_column(spell_ctx, enh_details, spell_gear, spell_armor, gear_extras: zelnorn, gem_sources: gems, item_buffs: item_buffs) if spell_ctx
+        sections["AS Summary"] = build_summary_lines(columns[0], columns[1])
+        sections["Overview"] = [
+          "Character: #{XMLData.name}",
+          "Profession: #{::Lich::Gemstone::Stats.profession}",
+          "Level: #{::Lich::Gemstone::Stats.level}",
+          "Primary profile: #{context[:style_label]}",
+          "Right hand: #{display_hand(GameObj.right_hand)}",
+          "Left hand: #{display_hand(GameObj.left_hand)}",
+          "Estimated measurable AS total: #{raw_total}"
+        ]
+
+        sections["Weapon"] = weapon_lines
+        sections["Shield"] = shield_lines
+        sections["Armor"] = armor_lines
+        sections["Enhancives"] = format_source_section("Enhancive totals", enh_sources[:totals]) +
+          ["", "Enhancive item contributions:"] +
+          format_source_section(nil, enh_sources[:items], empty_message: "(none parsed)")
+        sections["Spells"] = format_source_section("Active spells", spell_sources)
+        sections["Society / Buffs / CMAN"] = format_source_section("Active buffs", buff_sources)
+        sections["Scripted Items"] = scripted_item_section
+        sections["Potential Sources"] = opportunity_section(context)
+        sections["Notes"] = [
+          "- The displayed AS total is an estimate from measurable sources, not a direct live-game AS readout.",
+          "- Weapon enchant parsing is currently best-effort from recall text.",
+          "- Scripted gear bonuses are only quantified when recall/effects provide a usable direct AS line.",
+          "- Enhancive stat lines from INVENTORY ENHANCIVE TOTALS are treated as bonus-space values because the game caps them in bonus space."
+        ]
+        sections
+      end
+
+      # Renders the AS Summary as a single vertical list: the physical (melee) pool
+      # first, then the spell-aim (bolt) pool. Each pool is broken into groups
+      # (Skills / Gear / Gemstones / Enhancives / Spells / Buffs) and every line
+      # shows what is granting the AS (enchant, stat, skill bonus, per-spell, etc.).
+      def build_summary_lines(primary_col, secondary_col)
+        lines = render_summary_column(primary_col)
+        if secondary_col
+          lines << ""
+          lines.concat(render_summary_column(secondary_col))
+        end
+        lines
+      end
+
+      # Left column is a running cumulative AS (each real line adds to it, building
+      # to the pool total). Middle column is that line's own AS. Informational
+      # groups (ascension headroom) show no cumulative -- they aren't in the total.
+      def render_summary_column(col)
+        lines = ["#{col[:title]} -- #{col[:total].to_i} AS", format("    %6s | %5s  %s", "cumul", "each", "source")]
+        running = 0
+        col[:groups].each do |group|
+          lines << "  #{group[:name]}"
+          group[:entries].each do |entry|
+            label = entry[:label].to_s
+            label += " -- #{entry[:detail]}" if entry[:detail] && !entry[:detail].to_s.empty?
+            if group[:informational]
+              cumulative = ""
+            else
+              running += entry[:amount].to_i
+              cumulative = running.to_s
+            end
+            lines << format("    %6s | %5s  %s", cumulative, concise_amount(entry[:amount]), label)
+          end
+        end
+        lines << "  #{'-' * 28}"
+        lines << format("    %6s | %5s  %s", col[:total].to_i.to_s, "", col[:total_label])
+        lines
+      end
+
+      # Build the grouped AS breakdown for one attack pool. gear_extras (zelnorn,
+      # supercharger) and gem_sources (Tactician gemstones) are AS the base helpers
+      # don't model. Every entry keeps its :detail so the render shows the source.
+      def build_summary_column(ctx, enh_details, ready_gear = nil, armor_gear = nil, gear_extras: [], gem_sources: [], item_buffs: nil)
+        groups = []
+
+        groups << { name: "Skills", entries: current_formula_sources(ctx).reject { |e| e[:amount].to_i.zero? } }
+
+        gear = []
+        if ready_gear
+          weapon_sum = sum_slot_sources(ready_gear[:weapon])
+          if weapon_sum.positive?
+            enchant = weapon_enchant_bonus(ready_gear)
+            detail = if enchant.positive? && weapon_sum > enchant
+                       "+#{enchant} enchant, +#{weapon_sum - enchant} other"
+                     elsif enchant.positive?
+                       "+#{enchant} enchant"
+                     end
+            gear << source_entry(weapon_sum, "Weapon", detail)
+          end
+          shield_sum = sum_slot_sources(ready_gear[:shield])
+          gear << source_entry(shield_sum, "Shield") if shield_sum.positive?
+        end
+        if armor_gear
+          armor_sum = sum_slot_sources(armor_gear)
+          gear << source_entry(armor_sum, "Armor") if armor_sum.positive?
+        end
+        gear.concat(Array(gear_extras).reject { |e| e[:amount].to_i.zero? })
+        groups << { name: "Gear", entries: gear }
+
+        groups << { name: "Gemstones", entries: Array(gem_sources).reject { |e| e[:amount].to_i.zero? } }
+
+        enh_items = enhancive_sources(ctx, enh_details)[:items].reject { |e| e[:amount].to_i.zero? }
+                    .map { |e| source_entry(e[:amount], short_item_label(e[:label]), e[:detail]) }
+        groups << { name: "Enhancives", entries: enh_items }
+
+        groups << { name: "Spells", entries: active_spell_sources(ctx).reject { |e| e[:amount].to_i.zero? } }
+        groups << { name: "Society (max available)", entries: society_power_sources(ctx) }
+        groups << { name: "Society high-risk (not in total)", entries: society_situational_sources(ctx), informational: true }
+        groups << { name: "Buffs", entries: active_buff_sources(ctx).reject { |e| e[:amount].to_i.zero? } }
+        groups << { name: "Item / Script Buffs (situational)", entries: item_buff_entries(ctx, item_buffs) }
+        # Informational only -- headroom, excluded from the AS total below.
+        groups << { name: "Ascension headroom (potential, not in total)", entries: ascension_headroom_sources(ctx), informational: true }
+
+        groups.reject! { |g| g[:entries].empty? }
+        groups.each { |g| g[:entries] = g[:entries].sort_by { |e| -e[:amount].to_i } }
+
+        {
+          title: ctx[:style_label].to_s,
+          total_label: "#{summary_pool_name(ctx)} AS",
+          total: groups.reject { |g| g[:informational] }.sum { |g| g[:entries].sum { |e| e[:amount].to_i } },
+          groups: groups
+        }
+      end
+
+      # Trim long item descriptions to their head noun-phrase for readable rows.
+      def short_item_label(label)
+        summarize_item_label(label)
+          .sub(/\s+(suffused|dangling|embroidered|emblazoned|dotted|cradling|studded|adorned|inset|etched|carved|set)\b.*/i, "")
+          .sub(/\s+with\s+.*/i, "")
+          .strip
+      end
+
+      # Zelnorn items grant half of their attack bonus as AS to ALL weapon pools
+      # (including spell aim), so they can't be modeled as per-slot gear. Scan held
+      # and worn items for zelnorn, recall each, and half its attack bonus.
+      def zelnorn_as_sources
+        candidates = scan_candidate_items
+        candidates = candidates.select { |item| item.name.to_s =~ /zelnorn/i }.uniq { |item| item.id }
+
+        sources = []
+        candidates.each do |item|
+          bonus = item_attack_bonus(item)
+          next unless bonus.positive?
+
+          sources << source_entry((bonus / 2.0).truncate, "zelnorn #{item.noun}", "half of +#{bonus} enchant")
+        end
+        sources
+      rescue StandardError => e
+        echo "[as_audit: warning: could not scan zelnorn items: #{e.message}]"
+        []
+      end
+
+      # Equipped Tactician gemstones grant flat AS to all attack sources (incl. spell
+      # aim). Journeyman Tactician gives its rank (1..5); Master Tactician gives
+      # rank+5 (6..10). Parsed from GEMSTONE LIST ALL, equipped stones only.
+      TACTICIAN_GEMS = {
+        /Journeyman Tactician \(Rank (\d+) of \d+\)/i => ->(rank) { rank },
+        /Master Tactician \(Rank (\d+) of \d+\)/i => ->(rank) { rank + 5 }
+      }.freeze
+
+      def tactician_gemstone_sources
+        lines = ::Lich::Util.issue_command(
+          "gemstone list all",
+          /Gemstone \d+:|you have no gemstones/i,
+          /GEM SLOTS ALL|<prompt/i,
+          include_end: false,
+          timeout: 8,
+          quiet: true,
+          usexml: false
+        )
+
+        sources = []
+        equipped = false
+        Array(lines).each do |line|
+          text = strip_xml(line).strip
+          next if text.empty?
+
+          if (header = text.match(/^Gemstone \d+:/i))
+            equipped = text =~ /\(equipped\)/i ? true : false
+            next
+          end
+          next unless equipped
+
+          TACTICIAN_GEMS.each do |pattern, as_for|
+            next unless (match = text.match(pattern))
+
+            amount = as_for.call(match[1].to_i)
+            label = text.sub(/^\*\s*/, "").sub(/\s*\(Rank.*/i, "")
+            sources << source_entry(amount, "#{label} gem") if amount.positive?
+          end
+        end
+        sources
+      rescue StandardError => e
+        echo "[as_audit: warning: could not read gemstones: #{e.message}]"
+        []
+      end
+
+      # The "increase the efficiency of attacks ... with a bonus of N" line from an
+      # item's recall -- the AS-granting property on zelnorn (and similar) gear.
+      def item_attack_bonus(item)
+        Array(capture_item_recall(item)).each do |line|
+          text = strip_xml(line)
+          if (match = text.match(/increase the efficiency of attacks made by the wearer with a bonus of (\d+)/i))
+            return match[1].to_i
+          end
+        end
+        0
+      end
+
+      # An item supercharger (topaz crown periapt) grants half the equipped weapon's
+      # enchant bonus as extra AS for that weapon type. Returns a melee-only source.
+      def supercharger_sources(ready_gear)
+        return [] unless supercharger_worn?
+
+        enchant = weapon_enchant_bonus(ready_gear)
+        return [] unless enchant.positive?
+
+        [source_entry((enchant / 2.0).truncate, "item supercharger (half of +#{enchant} weapon enchant)")]
+      rescue StandardError => e
+        echo "[as_audit: warning: could not evaluate supercharger: #{e.message}]"
+        []
+      end
+
+      def supercharger_worn?
+        items = scan_candidate_items
+        items.any? { |item| item.name.to_s =~ /crown periapt|supercharger/i }
+      end
+
+      # The weapon's raw enchant ("imparts a bonus of +N more than usual"), captured
+      # by parse_recall_notes as "weapon bonus from recall".
+      def weapon_enchant_bonus(ready_gear)
+        weapon = ready_gear && ready_gear[:weapon]
+        return 0 unless weapon
+
+        note = Array(weapon[:notes]).find { |entry| entry[:text].to_s =~ /weapon bonus from recall/i }
+        note ? note[:amount].to_i : 0
+      end
+
+      # --- Situational item/script buffs -------------------------------------
+      # These grant AS only when the item procs/is triggered, so they're reported
+      # in their own group (not part of the always-on baseline). Detected once.
+      RUSALKAN_MATERIALS = /rusalkoren|rusalkysk|rusalkita|rusylka/i
+
+      # Recognized item scripts that can add AS. Detected from an item's recall or
+      # analyze text so the audit flags them for anyone, even without the script.
+      # :as is a fixed max value or :capture (regex group 1). :pools -> :all or
+      # :physical. Sources: https://gswiki.play.net/Category:Mechanical_item_scripts
+      ITEM_SCRIPT_BUFFS = [
+        { name: "Blessings lore flare", source: :recall, pattern: /Lore Flares[^\n]*Blessings/i,
+          as: 10, pools: :all, note: "+10 AS/+6 CS per flare, up to 3 concurrent (+30 AS), 10s" },
+        { name: "Cursed Armor (tier 4)", source: :analyze, pattern: /chance of \+(\d+) Attack Strength/i,
+          as: :capture, pools: :all, note: "chance of +N AS/+CS on attack or cast (cursed armor tier 4)" },
+        { name: "Briar flare weapon", source: :analyze, pattern: /briar flare weapon/i,
+          as: 25, pools: :physical, note: "up to +25 AS at tier 3 (blood pts/4 + briar items wielded), 120s" },
+        { name: "Ethereal string", source: :recall, pattern: /ethereal string/i,
+          as: 55, pools: :physical, note: "builds +5 AS per enchant over 10x, up to +200 AS at 40x (per-swing)" }
+      ].freeze
+
+      # Any other unrecognized "+N AS" boost text on gear, so novel scripts still surface.
+      GENERIC_AS_SCRIPT = /(?:Boost|chance|buff)[^\n]*?\+(\d+)\s*(?:AS|Attack Strength)/i
+
+      def detect_item_buffs
+        {
+          rusalkan: rusalkan_worn?,
+          mana_tap: mana_tap_as,
+          soul_harvester: soul_harvester_sources,
+          script_buffs: item_script_buff_sources
+        }
+      rescue StandardError => e
+        echo "[as_audit: warning: item-buff scan failed: #{e.message}]"
+        { rusalkan: false, mana_tap: 0, soul_harvester: [], script_buffs: [] }
+      end
+
+      # Scan the character's weapon, shield, and body armor recall/analyze text for
+      # known (and generic) AS-granting item scripts.
+      def item_script_buff_sources
+        items = (ready_combat_items + [current_armor_item]).compact.uniq { |item| item.id }
+
+        sources = []
+        items.each do |item|
+          recall_text = nil
+          analyze_text = nil
+          matched = []
+
+          ITEM_SCRIPT_BUFFS.each do |buff|
+            if buff[:source] == :analyze
+              analyze_text ||= Array(capture_item_analyze(item)).map { |line| strip_xml(line) }.join("\n")
+              text = analyze_text
+            else
+              recall_text ||= Array(capture_item_recall(item)).map { |line| strip_xml(line) }.join("\n")
+              text = "#{recall_text}\n#{item.name}"
+            end
+            match = text.match(buff[:pattern])
+            next unless match
+
+            amount = buff[:as] == :capture ? match[1].to_i : buff[:as].to_i
+            next unless amount.positive?
+
+            matched << buff[:name]
+            sources << source_entry(amount, "#{buff[:name]} (#{item.noun})", buff[:note]).merge(pools: buff[:pools])
+          end
+
+          # Generic catch-all for AS scripts we don't model yet.
+          recall_text ||= Array(capture_item_recall(item)).map { |line| strip_xml(line) }.join("\n")
+          [recall_text, analyze_text].compact.join("\n").scan(GENERIC_AS_SCRIPT).flatten.each do |amt|
+            next if amt.to_i.zero?
+            next if matched.any? # already recognized on this item
+
+            sources << source_entry(amt.to_i, "unrecognized AS script (#{item.noun})", "detected +#{amt} AS boost text -- verify").merge(pools: :all)
+          end
+        end
+        sources.uniq { |entry| [entry[:label], entry[:amount]] }
+      rescue StandardError => e
+        echo "[as_audit: warning: item-script scan failed: #{e.message}]"
+        []
+      end
+
+      # Assemble the situational-buff group for one pool. Brine (rusalkan) and Mana
+      # Tap boost both physical and spell-aim AS; Soul Harvester's Spirit Strike is
+      # physical-only.
+      def item_buff_entries(ctx, item_buffs)
+        return [] unless item_buffs
+
+        physical = %i[melee ranged thrown uaf katar].include?(ctx[:style])
+        entries = []
+        if item_buffs[:rusalkan]
+          entries << source_entry(10, "Brine of the Rusalka", "+10 AS per target knocked down, up to 3 (rusalkan flare, 10s)")
+        end
+        if item_buffs[:mana_tap].to_i.positive?
+          entries << source_entry(item_buffs[:mana_tap].to_i, "Mana Tap", "+#{item_buffs[:mana_tap].to_i} AS/+15 CS for 3 min when TAPped (mana-infused armor)")
+        end
+        item_buffs[:soul_harvester].each { |entry| entries << entry } if physical
+        Array(item_buffs[:script_buffs]).each do |entry|
+          next if entry[:pools] == :physical && !physical
+
+          entries << entry
+        end
+        entries.reject { |entry| entry[:amount].to_i.zero? }
+      end
+
+      def rusalkan_worn?
+        items = scan_candidate_items
+        items.any? { |item| item.name.to_s =~ RUSALKAN_MATERIALS }
+      rescue StandardError
+        false
+      end
+
+      # Mana-Infused Armor tier 4+ unlocks Mana Tap: +25 AS (physical + spell aim)
+      # for 3 minutes when TAPped. Confirmed by ANALYZE on the worn armor.
+      def mana_tap_as
+        item = current_armor_item
+        return 0 unless item
+
+        text = Array(capture_item_analyze(item)).map { |line| strip_xml(line) }.join("\n")
+        tier = text[/This is tier (\d+) Mana-Infused Armor/i, 1].to_i
+        return 0 unless tier >= 4
+
+        (text[/grant \+(\d+) AS/i, 1] || text[/\+(\d+) AS\/\+\d+ CS/i, 1] || 25).to_i
+      rescue StandardError => e
+        echo "[as_audit: warning: armor analyze failed: #{e.message}]"
+        0
+      end
+
+      # Soul Harvester vissi (aversaris arcarium) surges Spirit Strike (117): a
+      # tier-based +N AS buff plus the +75 AS from Spirit Strike itself. Only the
+      # AS-granting arcaria count (the vangaris variant gives DS, so it's skipped).
+      def soul_harvester_sources
+        arcaria = scan_candidate_items.select { |item| item.name.to_s =~ /arcarium/i }
+
+        sources = []
+        arcaria.each do |item|
+          text = Array(capture_item_analyze(item)).map { |line| strip_xml(line) }.join("\n")
+          next unless text =~ /Soul Harvester/i
+
+          match = text.match(/Soul Harvester.*?\+(\d+)\s*AS/im)
+          next unless match
+
+          bonus = match[1].to_i
+          sources << source_entry(bonus, "Soul Harvester", "+#{bonus} AS tier bonus + Spirit Strike (117) +75 AS after kills")
+        end
+        sources
+      rescue StandardError => e
+        echo "[as_audit: warning: arcarium analyze failed: #{e.message}]"
+        []
+      end
+
+      def capture_item_analyze(item)
+        item_id = item.respond_to?(:id) ? item.id : nil
+        return [] unless item_id
+
+        Array(::Lich::Util.issue_command(
+                 "analyze ##{item_id}",
+                 /You analyze|sense that the (?:creator|item)/i,
+                 /<prompt/,
+                 include_end: false,
+                 timeout: 8,
+                 quiet: true,
+                 usexml: false
+               ))
+      rescue StandardError => e
+        echo "[as_audit: warning: analyze failed: #{e.message}]"
+        []
+      end
+
+      # The character's physical (melee/ranged/thrown/uaf) attack pool. When the
+      # in-hand item resolves to one of those styles we reuse that context (it has
+      # the right weapon skill + gear); otherwise -- including the :unknown case
+      # where the readied item couldn't be categorized -- we fall back to the
+      # best-trained melee weapon skill so the melee column still populates fully.
+      def physical_pool_context(context)
+        case context[:style]
+        when :melee, :ranged, :thrown, :uaf, :katar
+          context
+        else
+          label, ranks = best_melee_skill(context[:base_skills] || {})
+          return nil unless label && ranks.positive?
+
+          context.merge(style: :melee,
+                        style_label: "Melee (#{label.sub(/ Weapons\z/, '')})",
+                        weapon_skill_label: label,
+                        weapon_skill_method: nil)
+        end
+      end
+
+      # The character's spell-aim (bolt) attack pool, or nil if untrained.
+      def spell_pool_context(context)
+        return context if context[:style] == :bolt
+        return nil unless (context[:base_skills] || {}).dig("Spell Aiming", :ranks).to_i.positive?
+
+        context.merge(style: :bolt,
+                      style_label: "Bolt / Spell Aiming",
+                      weapon_skill_label: "Spell Aiming",
+                      weapon_skill_method: :spell_aiming)
+      end
+
+      def best_melee_skill(base_skills)
+        %w[Blunt Edged Two-Handed Polearm].map { |group| "#{group} Weapons" }
+          .map { |label| [label, base_skills.dig(label, :ranks).to_i] }
+          .select { |(_, ranks)| ranks.positive? }
+          .max_by { |(_, ranks)| ranks } || [nil, 0]
+      end
+
+      def summary_pool_name(ctx)
+        { melee: "MELEE", bolt: "BOLT", ranged: "RANGED", thrown: "THROWN", uaf: "UAF", katar: "KATAR" }
+          .fetch(ctx[:style], "TOTAL")
+      end
+
+      def build_slot_section(slot, ready_gear, formula_sources)
+        details = ready_gear[slot]
+        lines = []
+        if details
+          lines << details[:item_name].to_s
+          lines.concat(format_source_section(nil, details[:sources], empty_message: "(no direct AS contribution parsed)"))
+          passive_notes = details[:notes].reject { |note| note[:amount].to_i != 0 }
+          unless passive_notes.empty?
+            lines << ""
+            lines << "Other notes:"
+            passive_notes.each { |note| lines << "  - #{note[:text]}" }
+          end
+        else
+          lines << "(none parsed)"
+        end
+        if slot == :weapon
+          lines << ""
+          lines << "Base formula contributors:"
+          lines.concat(format_source_section(nil, formula_sources, empty_message: "(none)"))
+        end
+        lines
+      end
+
+      def armor_section(armor_gear)
+        lines = []
+        if armor_gear[:item_name]
+          lines << armor_gear[:item_name]
+          lines.concat(format_source_section(nil, armor_gear[:sources], empty_message: "(no direct AS contribution parsed)"))
+          passive_notes = armor_gear[:notes].reject { |note| note[:amount].to_i != 0 }
+          unless passive_notes.empty?
+            lines << ""
+            lines << "Other notes:"
+            passive_notes.each { |note| lines << "  - #{note[:text]}" }
+          end
+        else
+          lines << "(no armor item parsed)"
+        end
+        lines
+      end
+
+      def ready_gear_section(ready_gear)
+        lines = ["Ready gear recall notes:"]
+        if ready_gear.empty?
+          lines << "  (no ready-list gear parsed)"
+          return lines
+        end
+
+        ready_gear.each do |slot, details|
+          lines << "  #{slot.to_s.tr('_', ' ')}: #{details[:item_name]}"
+          if details[:notes].empty?
+            lines << "    (no AS-relevant recall lines found)"
+          else
+            details[:notes].each { |note| lines << "    #{note}" }
+          end
+        end
+
+        lines
+      end
+
+      def capture_armor_details
+        item = current_armor_item
+        return {} unless item
+
+        recall_lines = capture_item_recall(item)
+        parsed_notes = parse_recall_notes(:armor, item.name.to_s, Array(recall_lines))
+        {
+          item_name: item.name.to_s,
+          notes: parsed_notes,
+          sources: parsed_notes.select { |note| note[:amount].to_i != 0 }.map { |note| source_entry(note[:amount], note[:text]) }
+        }
+      rescue StandardError => e
+        echo "[as_audit: warning: could not parse armor recall data: #{e.message}]"
+        {}
+      end
+
+      def opportunity_section(context)
+        lines = ["Potential missing AS sources:"]
+        found = false
+
+        SPELL_RULES.each do |rule|
+          next unless rule[:styles].include?(context[:style]) || rule[:styles].include?(:all)
+          spell = Spell[rule[:num]]
+          next if spell.active?
+
+          bonus = rule[:bonus].call(context).to_i
+          next if bonus <= 0
+
+          if spell.known?
+            lines << "  self-cast: #{rule[:name]} -> #{rule[:note]} (current estimate #{signed(bonus)})"
+            found = true
+          elsif rule[:shareable]
+            lines << "  external: #{rule[:name]} -> #{rule[:note]} (current estimate #{signed(bonus)})"
+            found = true
+          end
+        end
+
+        if (rank = as_cman_rank(context, "Surge of Strength")).positive? && !Effects::Buffs.to_h.keys.grep(/Enh\. Strength/).any?
+          bonus = surge_bonus(rank, context[:style])
+          lines << "  cman: Surge of Strength -> #{signed(bonus)} estimated AS"
+          found = true
+        end
+
+        if (rank = as_cman_rank(context, "Berserk")).positive? && physical_style?(context)
+          lines << "  cman: Berserk -> #{signed(rank * 5)} AS while berserking"
+          found = true
+        end
+
+        if (rank = as_cman_rank(context, "Spin Attack")).positive? && melee_style?(context)
+          lines << "  cman: Spin Attack -> #{signed(rank * 3)} melee AS for the spin attack"
+          found = true
+        end
+
+        if as_cman_rank(context, "Side by Side").positive? && melee_style?(context)
+          lines << "  cman: Side by Side -> variable melee AS while grouped with Side by Side users"
+          found = true
+        end
+
+        if as_cman_rank(context, "Coup de Grace").positive?
+          lines << "  cman: Coup de Grace -> variable Empowered AS after a successful coup, max +40"
+          found = true
+        end
+
+        if as_cman_rank(context, "Burst of Swiftness").positive?
+          lines << "  cman: Burst of Swiftness -> AGI/DEX stat boost; AS impact is captured through active stat effects when visible"
+          found = true
+        end
+
+        if as_cman_rank(context, "Perfect Self").positive?
+          lines << "  feat: Perfect Self -> passive stat boost; AS impact is captured through current stats/enhancive totals"
+          found = true
+        end
+
+        if as_cman_rank(context, "Seanette's Shout").positive?
+          lines << "  warcry: Seanette's Shout -> +20 AS while Empowered"
+          found = true
+        end
+
+        if as_cman_rank(context, "Weapon Bonding").positive?
+          lines << "  feat: Weapon Bonding -> +2 AS per bonded rank with the bonded weapon; verify with FEAT WEAPONBOND INFO"
+          found = true
+        end
+
+        if defined?(::Lich::Gemstone::Societies::CouncilOfLight) && ::Lich::Gemstone::Societies::CouncilOfLight.known?("Sign of Swords") && !Effects::Buffs.active?("Sign of Swords")
+          lines << "  society: Sign of Swords -> +20 AS"
+          found = true
+        end
+
+        if defined?(::Lich::Gemstone::Societies::GuardiansOfSunfist) && ::Lich::Gemstone::Societies::GuardiansOfSunfist.known?("Sigil of Offense") && !Effects::Buffs.active?("Sigil of Offense")
+          lines << "  society: Sigil of Offense -> #{signed(context[:society_rank])} AS"
+          found = true
+        end
+
+        if defined?(::Lich::Gemstone::Societies::OrderOfVoln) && ::Lich::Gemstone::Societies::OrderOfVoln.known?("Symbol of Courage") && !Effects::Buffs.active?("Symbol of Courage")
+          lines << "  society: Symbol of Courage -> #{signed(context[:society_rank])} AS"
+          found = true
+        end
+
+        lines << "  (no missing high-confidence sources detected)" unless found
+        lines
+      end
+
+      def capture_ready_gear_details
+        gear = {}
+
+        ready_weapon = safe_ready_item(:weapon)
+        ready_shield = safe_ready_item(:shield)
+
+        { weapon: ready_weapon, shield: ready_shield }.each do |slot, item|
+          next unless item
+
+          recall_lines = capture_item_recall(item)
+          notes = parse_recall_notes(slot, item.name.to_s, Array(recall_lines))
+          gear[slot] = {
+            item_name: item.name.to_s,
+            notes: notes,
+            sources: notes.select { |note| note[:amount].to_i != 0 }.map { |note| source_entry(note[:amount], note[:text]) }
+          }
+        end
+
+        gear
+      rescue StandardError => e
+        echo "[as_audit: warning: could not parse ready gear recall data: #{e.message}]"
+        {}
+      end
+
+      def capture_enhancive_details
+        lines = ::Lich::Util.issue_command(
+          "inventory enhancive totals details",
+          /^Stats:|^<pushBold\/>Stats:/,
+          /For fewer details, see|For more details, see|<prompt/,
+          include_end: false,
+          timeout: 8,
+          quiet: true,
+          usexml: false
+        )
+        parse_enhancive_details(Array(lines))
+      rescue StandardError => e
+        echo "[as_audit: warning: could not capture enhancive details: #{e.message}]"
+        {}
+      end
+
+      def capture_base_skills
+        lines = ::Lich::Util.issue_command(
+          "skills base",
+          /your base skill bonuses, ranks and goals are:/i,
+          /Training Points:|<prompt/,
+          include_end: false,
+          timeout: 8,
+          quiet: true,
+          usexml: false
+        )
+        parse_base_skills(Array(lines))
+      rescue StandardError => e
+        echo "[as_audit: warning: could not capture skills base: #{e.message}]"
+        {}
+      end
+
+      def parse_base_skills(lines)
+        parsed = {}
+        current_section = :skills
+
+        lines.each do |line|
+          text = strip_xml(line).rstrip
+          next if text.empty?
+
+          if text =~ /^Spell Lists$/i
+            current_section = :spells
+            next
+          end
+
+          next unless text.include?("|")
+          next if text =~ /Skill Name|Actual|Goals|In-Game Time to Goal/i
+
+          if current_section == :skills
+            if (match = text.match(/^\s*(?<name>.+?)\.{2,}\|\s*(?<bonus>\d+)\s+(?<ranks>\d+)/))
+              parsed[match[:name].strip] = { bonus: match[:bonus].to_i, ranks: match[:ranks].to_i }
+            end
+          elsif (match = text.match(/^\s*(?<name>.+?)\.{2,}\|\s*(?<ranks>\d+)/))
+            parsed[match[:name].strip] = { bonus: nil, ranks: match[:ranks].to_i }
+          end
+        end
+
+        parsed
+      end
+
+      def capture_asc_skills
+        lines = ::Lich::Util.issue_command(
+          "asc info",
+          /your Ascension Abilities are as follows:/i,
+          /Available Ascension Abilities Points:|<prompt/,
+          include_end: false,
+          timeout: 8,
+          quiet: true,
+          usexml: false
+        )
+        parse_asc_skills(Array(lines))
+      rescue StandardError => e
+        echo "[as_audit: warning: could not capture asc info: #{e.message}]"
+        {}
+      end
+
+      def parse_asc_skills(lines)
+        parsed = {}
+        lines.each do |line|
+          text = strip_xml(line).rstrip
+          next if text.empty?
+          next if text =~ /^Skill\s+Mnemonic/i
+          next if text =~ /^-+$/
+
+          if (match = text.match(/^\s*(?<skill>.+?)\s{2,}\S+\s+(?<ranks>\d+)\/(?<max>\d+)\s+Passive/i))
+            parsed[match[:skill].strip] = { ranks: match[:ranks].to_i, max: match[:max].to_i }
+          end
+        end
+        parsed
+      end
+
+      def capture_cman_skills
+        lines = ::Lich::Util.issue_command(
+          "cman list",
+          /following Combat Maneuvers are available:/i,
+          /The output listed above was generated|<prompt/,
+          include_end: false,
+          timeout: 8,
+          quiet: true,
+          usexml: false
+        )
+        parse_cman_skills(Array(lines))
+      rescue StandardError => e
+        echo "[as_audit: warning: could not capture cman list: #{e.message}]"
+        {}
+      end
+
+      def parse_cman_skills(lines)
+        parsed = {}
+        lines.each do |line|
+          text = strip_xml(line).rstrip
+          next if text.empty?
+          next if text =~ /^Skill\s+Mnemonic/i
+          next if text =~ /^-+$/
+
+          if (match = text.match(/^\s*(?<skill>.+?)\s+\S+\s+(?<ranks>\d+)\/(?<max>\d+)\s+/))
+            skill = normalize_cman_skill_name(match[:skill])
+            next unless AS_CMAN_NAMES.include?(skill)
+
+            parsed[skill] = { ranks: match[:ranks].to_i, max: match[:max].to_i }
+          end
+        end
+        parsed
+      end
+
+      def normalize_cman_skill_name(name)
+        text = name.to_s.strip
+        text = text.gsub(/[[:space:]]+/, " ")
+        text = text.gsub("\u{2019}", "'")
+        return AS_CMAN_ALIASES[text] if AS_CMAN_ALIASES.key?(text)
+        return "Weapon Specialization" if text =~ /^Weapon Specializatio\b/i
+
+        text
+      end
+
+      def parse_enhancive_details(lines)
+        parsed = {}
+        section = nil
+        current_key = nil
+
+        lines.each do |line|
+          text = strip_xml(line).strip
+          next if text.empty?
+
+          if text =~ /^(Stats|Skills|Resources|Martial Knowledge Skills):$/
+            section = Regexp.last_match(1)
+            parsed[section] ||= {}
+            current_key = nil
+            next
+          end
+
+          next unless section
+
+          if (match = text.match(/^(?<label>.+?):\s+(?<total>\d+)\/\d+$/))
+            current_key = match[:label]
+            parsed[section][current_key] = { total: match[:total].to_i, items: [] }
+            next
+          end
+
+          if (match = text.match(/^\+(?<amount>\d+):\s+(?<item>.+)$/))
+            next unless current_key && parsed.dig(section, current_key)
+
+            parsed[section][current_key][:items] << { amount: match[:amount].to_i, item: match[:item] }
+          end
+        end
+
+        parsed
+      end
+
+      def refresh_ready_list
+        return unless defined?(::Lich::Gemstone::ReadyList)
+        return if ::Lich::Gemstone::ReadyList.valid?
+
+        ::Lich::Gemstone::ReadyList.check(silent: true, quiet: true)
+      end
+
+      BODY_ARMOR_NOUNS = /platemail|full plate|fullplate|breastplate|cuirass|hauberk|brigandine|chainmail|scale mail|scalemail|greatplate|\bplate\b|\bmail\b|leathers?|robes?|cloak|coat|doublet|armor/i
+
+      # Prefer the character's main body armor (the mana-infused piece will be here),
+      # falling back to any armor-typed worn item.
+      def current_armor_item
+        worn = GameObj.inv.to_a.compact
+        worn.find { |item| item.name.to_s =~ BODY_ARMOR_NOUNS } ||
+          worn.find { |item| item.type.to_s =~ /armor/i }
+      end
+
+      def safe_ready_item(slot)
+        return nil unless defined?(::Lich::Gemstone::ReadyList)
+
+        item = ::Lich::Gemstone::ReadyList.ready_list[slot]
+        return nil unless item
+        return nil if item.respond_to?(:name) && item.name.to_s.empty?
+
+        item
+      end
+
+      # Weapons/shield are taken from the READY LIST (not the character's hands), so
+      # audits work without holding them. Worn items come from GameObj.inv.
+      def ready_combat_items
+        %i[weapon secondary_weapon ranged_weapon shield].map { |slot| safe_ready_item(slot) }
+      end
+
+      def scan_candidate_items
+        (ready_combat_items + Array(GameObj.inv)).compact.uniq { |item| item.respond_to?(:id) ? item.id : item.object_id }
+      end
+
+      def capture_item_recall(item)
+        item_id = item.respond_to?(:id) ? item.id : nil
+        return [] unless item_id
+
+        lines = ::Lich::Util.issue_command(
+          "recall ##{item_id}",
+          /As you recall|That is not something you can recall|You don't seem to recall/i,
+          /It has the following restrictions:|It has a permanently unlocked loresong by a bard\.|It has been unlocked by a bard\.|This item has not yet been unlocked by a bard\.|The item has no more song to sing\.|<prompt/,
+          include_end: true,
+          timeout: 8,
+          quiet: true,
+          usexml: false
+        )
+
+        Array(lines)
+      end
+
+      def parse_recall_notes(slot, item_name, lines)
+        notes = []
+        saw_imparts_bonus = false
+
+        lines.each do |line|
+          text = strip_xml(line).strip
+          next if text.empty?
+
+          if (match = text.match(/It imparts a bonus of \+(\d+) more than usual\./i))
+            amount = match[1].to_i
+            if item_name =~ /zelnorn/i
+              # Zelnorn AS applies to ALL weapon pools (incl. spell aim), so it is
+              # counted globally in zelnorn_as_sources -- not as slot gear here.
+              notes << { amount: 0, text: "zelnorn item (+#{amount}) -- AS counted globally" }
+            elsif slot == :weapon
+              notes << { amount: amount, text: "weapon bonus from recall" }
+            end
+            saw_imparts_bonus = true
+            next
+          end
+
+          if slot == :armor && item_name =~ /rusalkoren/i
+            if text =~ /It has been infused with the power of a strange anti-magical substance/i
+              notes << { amount: 0, text: "anti-magic infused" }
+              next
+            end
+          end
+
+          if (match = text.match(/It helps to increase the efficiency of attacks made by the wearer with a bonus of (\d+)\./i))
+            unless saw_imparts_bonus
+              notes << { amount: match[1].to_i, text: "AS from item script" }
+            end
+            next
+          end
+
+          if (match = text.match(/It is forged by a member of the Artisan's Guild and has increased \(\+(\d+)\) effectiveness in combat\./i))
+            notes << { amount: match[1].to_i, text: "combat effectiveness" }
+            next
+          end
+
+          if (match = text.match(/It may be enchanted up to a bonus of (\d+) by a wizard/i))
+            notes << { amount: 0, text: "wizard enchant limit/observed bonus text: +#{match[1]}" }
+            next
+          end
+
+          if (match = text.match(/It has been sanctified \d+ times\..*It provides an additional \+(\d+) AS bonus against the undead\./i))
+            notes << { amount: 0, text: "+#{match[1]} AS vs undead" }
+            next
+          end
+
+          if text =~ /It is weighted to inflict more critical wounds/i
+            notes << { amount: 0, text: "critical weighting" }
+            next
+          end
+
+          if text =~ /It is a holy item\./i
+            notes << { amount: 0, text: "holy item" }
+            next
+          end
+
+          if text =~ /It has permanent Holy Fire flares\./i
+            notes << { amount: 0, text: "permanent Holy Fire flares" }
+            next
+          end
+
+          if text =~ /This .+ flares with a grappling force when employed against bandits\./i
+            notes << { amount: 0, text: "bandit-specific grappling flare" }
+            next
+          end
+
+          if text =~ /It is a Blink Weapon\./i
+            notes << { amount: 0, text: "blink weapon script" }
+            next
+          end
+
+          if (match = text.match(/It is currently infused with the (.+) spell\./i))
+            notes << { amount: 0, text: "currently infused with #{match[1]}" }
+            next
+          end
+        end
+
+        notes.uniq { |note| [note[:amount], note[:text]] }
+      end
+
+      def relevant_enhancive_item_sources(enh_details, context)
+        interesting_labels = ["Strength (STR)", "Dexterity (DEX)", "Combat Maneuvers Bonus"]
+        if context[:weapon_skill_label]
+          interesting_labels << "#{context[:weapon_skill_label]} Bonus"
+        end
+
+        item_map = Hash.new { |hash, key| hash[key] = { amount: 0, details: [] } }
+
+        enh_details.each_value do |section_hash|
+          section_hash.each do |label, entry|
+            next unless interesting_labels.include?(label)
+
+            entry[:items].each do |item|
+              amount = enhancive_item_as_amount(context, label, item[:amount].to_i)
+              next if amount.zero?
+
+              item_map[item[:item]][:amount] += amount
+              item_map[item[:item]][:details] << "#{signed(item[:amount])} #{label}"
+            end
+          end
+        end
+
+        item_map.each_value { |entry| entry[:details] = entry[:details].uniq.sort }
+        item_map
+      end
+
+      def fetch_total(enh_details, section, label)
+        enh_details.dig(section, label, :total).to_i
+      end
+
+      def enhancive_item_as_amount(context, label, amount)
+        case label
+        when "Strength (STR)"
+          as_from_stat_bonus(context, :strength, amount)
+        when "Dexterity (DEX)"
+          as_from_stat_bonus(context, :dexterity, amount)
+        when "Combat Maneuvers Bonus"
+          as_from_cman_bonus(context, amount)
+        else
+          if context[:weapon_skill_label] && label == "#{context[:weapon_skill_label]} Bonus"
+            amount
+          else
+            0
+          end
+        end
+      end
+
+      def as_from_stat_bonus(context, stat, amount)
+        # INVENTORY ENHANCIVE TOTALS DETAIL reports stat enhancives as BASE points,
+        # and each base point is worth only +0.5 AS (a direct stat-BONUS enhancive
+        # would be +1, but this source is always base). So halve the reported total.
+        base_as = (amount / 2.0).truncate
+        case context[:style]
+        when :melee, :katar
+          stat == :strength ? base_as : 0
+        when :ranged, :bolt
+          stat == :dexterity ? base_as : 0
+        when :thrown
+          (base_as / 2.0).truncate
+        else
+          0
+        end
+      end
+
+      def as_from_cman_bonus(context, cman_bonus)
+        case context[:style]
+        when :melee, :uaf, :katar then (cman_bonus.to_i / 2.0).truncate
+        when :thrown then (cman_bonus.to_i / 4.0).truncate
+        else 0
+        end
+      end
+
+      def source_entry(amount, label, detail = nil)
+        { amount: amount.to_i, label: label.to_s, detail: detail.to_s.empty? ? nil : detail.to_s }
+      end
+
+      def sum_sources(sources)
+        Array(sources).sum { |entry| entry[:amount].to_i }
+      end
+
+      def sum_slot_sources(details)
+        return 0 unless details
+
+        sum_sources(details[:sources])
+      end
+
+      def format_source_section(header, sources, empty_message: "(none detected)")
+        lines = []
+        lines << header if header
+        if Array(sources).empty?
+          lines << empty_message
+          return lines
+        end
+
+        sources.each do |entry|
+          amount = entry[:amount].to_i
+          left = concise_amount(amount).rjust(4)
+          right = entry[:label].to_s
+          right += " -- #{entry[:detail]}" if entry[:detail] && !entry[:detail].empty?
+          lines << "#{left} | #{right}"
+        end
+        lines
+      end
+
+      def concise_amount(amount)
+        amount.to_i.to_s
+      end
+
+      def summarize_item_label(label)
+        plain = label.to_s.strip
+        plain = plain.sub(/\Aa /i, "")
+        plain = plain.sub(/\Aan /i, "")
+        plain = plain.sub(/\Asome /i, "")
+        plain
+      end
+
+      def weapon_skill_bonus(context)
+        return 0 unless context[:weapon_skill_method]
+
+        ranks = ::Lich::Gemstone::Skills.send(context[:weapon_skill_method]).to_i
+        ::Lich::Gemstone::Skills.to_bonus(ranks).to_i
+      end
+
+      def current_health_penalty
+        return 0 if Char.max_health.to_i <= 0
+
+        pct = (Char.health.to_f / Char.max_health.to_f) * 100.0
+        return 0 if pct >= 75.0
+        return 10 if pct >= 50.0
+        return 20 if pct >= 25.0
+
+        30
+      end
+
+      def current_spirit_penalty
+        max_spirit = effective_max_spirit
+        return 0 if max_spirit <= 0
+
+        pct = (Char.spirit.to_f / max_spirit.to_f) * 100.0
+        return 0 if pct >= 75.0
+        return 20 if pct >= 50.0
+        return 35 if pct >= 25.0
+
+        50
+      end
+
+      def effective_max_spirit
+        base = begin
+          Char.max_spirit.to_i
+        rescue StandardError
+          0
+        end
+        return base if base.positive?
+
+        10
+      end
+
+      def stance_factor(stance)
+        case stance.to_s.downcase
+        when "offensive" then 1.0
+        when "advance", "advanced" then 0.9
+        when "forward" then 0.8
+        when "neutral" then 0.7
+        when "guarded" then 0.6
+        when "defensive" then 0.5
+        else 0.7
+        end
+      end
+
+      def signed(value)
+        value = value.to_i
+        value.positive? ? "+#{value}" : value.to_s
+      end
+
+      def equivalent_ranks_for_skill_bonus(bonus)
+        return 0 if bonus.to_i <= 0
+
+        ranks = 0
+        while ranks < 250
+          return ranks if ::Lich::Gemstone::Skills.to_bonus(ranks) >= bonus.to_i
+
+          ranks += 1
+        end
+        ranks
+      end
+
+      def surge_bonus(rank, style)
+        return 0 if rank.to_i <= 0
+
+        if %i[thrown uaf].include?(style)
+          3 + rank.to_i
+        else
+          6 + (rank.to_i * 2)
+        end
+      end
+
+      def seed_sum(seed_value, skill_value)
+        seed_current = seed_value
+        seed_increment = seed_value + 1
+        seed_rank = 0
+
+        while skill_value.to_i >= seed_current
+          seed_rank += 1
+          seed_current += seed_increment
+          seed_increment += 1
+        end
+
+        seed_rank
+      end
+
+      def strip_xml(text)
+        text.to_s.gsub(/<[^>]+>/, "")
+      end
+
+      def requested_help?
+        args = Array(Script.current.vars).map(&:to_s)
+        return false if args.length <= 1
+
+        args[1].strip.casecmp("help").zero?
+      end
+
+      def requested_detail?
+        args = Array(Script.current.vars).map(&:to_s)
+        return false if args.length <= 1
+
+        %w[detail details verbose full].include?(args[1].strip.downcase)
+      end
+
+      def setup_window_runtime
+        @settings ||= load_window_settings
+        @window_settings ||= @settings["asauditwindow"] ||= {}
+        @use_gtk_window = @window_settings.fetch("use_gtk_asauditwindow", true)
+        @gtk_available = begin
+          require "gtk3"
+          true
+        rescue LoadError
+          false
+        end
+      end
+
+      def gtk_enabled?
+        @gtk_available && @use_gtk_window
+      end
+
+      def show_gtk_report(text)
+        Gtk.queue do
+          create_window unless @window
+          @textbuffer.text = text
+          @window.show_all
+          @window.present
+        end
+      end
+
+      def create_window
+        settings = load_window_settings
+        aw = settings["asauditwindow"] ||= {}
+        palette = PALETTES[aw["palette"]] || PALETTES["White on Black"]
+
+        @window = Gtk::Window.new(:toplevel)
+        @window.title = "AS Audit"
+        @window.set_default_size(aw["width"], aw["height"])
+        @window.move(aw["x"], aw["y"]) if aw["x"] && aw["y"]
+
+        outer = Gtk::Box.new(:vertical, 6)
+
+        header = Gtk::Box.new(:horizontal, 6)
+        title = Gtk::Label.new("AS Audit - #{XMLData.name}")
+        title.set_xalign(0.0)
+        header.pack_start(title, expand: true, fill: true, padding: 0)
+        clear_btn = Gtk::Button.new(label: "Clear")
+        clear_btn.signal_connect("clicked") { @textbuffer.text = "" if @textbuffer }
+        header.pack_start(clear_btn, expand: false, fill: false, padding: 0)
+        outer.pack_start(header, expand: false, fill: true, padding: 6)
+
+        scroll = Gtk::ScrolledWindow.new
+        scroll.set_policy(Gtk::PolicyType::AUTOMATIC, Gtk::PolicyType::AUTOMATIC)
+        @textview = Gtk::TextView.new
+        @textview.editable = false
+        @textview.cursor_visible = false
+        @textview.wrap_mode = :word
+        @textview.monospace = true if @textview.respond_to?(:monospace=)
+        @textbuffer = @textview.buffer
+        scroll.add(@textview)
+        outer.pack_start(scroll, expand: true, fill: true, padding: 0)
+
+        @window.add(outer)
+
+        css = Gtk::CssProvider.new
+        css.load(data: <<~CSS)
+          textview, textview text {
+            background-color: #{palette[:bg]};
+            color: #{palette[:fg]};
+            font-size: #{aw["font_size"]}pt;
+            font-family: Consolas, Menlo, monospace;
+          }
+          window {
+            background-color: #{palette[:bg]};
+            color: #{palette[:fg]};
+          }
+        CSS
+        @window.style_context.add_provider(css, Gtk::StyleProvider::PRIORITY_APPLICATION)
+        @textview.style_context.add_provider(css, Gtk::StyleProvider::PRIORITY_APPLICATION)
+
+        @window.signal_connect("delete-event") do
+          persist_window_geometry
+          false
+        end
+
+        default_quit_id = @window.signal_connect("destroy") { Gtk.main_quit }
+        @window.signal_handler_disconnect(default_quit_id)
+
+        @window.signal_connect("destroy") do
+          @window = nil
+          @textview = nil
+          @textbuffer = nil
+        end
+
+        @window.signal_connect("configure-event") do
+          persist_window_geometry
+          false
+        end
+      end
+
+      def persist_window_geometry
+        return unless @window
+
+        x, y = @window.position
+        w, h = @window.size
+        settings = load_window_settings
+        settings["asauditwindow"] ||= {}
+        settings["asauditwindow"].merge!("x" => x, "y" => y, "width" => w, "height" => h)
+        save_window_settings(settings)
+      rescue StandardError
+        nil
+      end
+
+      def render_report(sections)
+        sections.map do |title, lines|
+          block = ["#{title}:"]
+          Array(lines).each { |line| block << "  #{line}" }
+          block.join("\n")
+        end.join("\n\n")
+      end
+
+      def wait_until_window_closes
+        sleep 0.1 while @window
+      end
+
+      def window_settings_path(name: Char.name)
+        base_dir = "#{$data_dir}#{XMLData.game}/#{name}"
+        Dir.mkdir("#{$data_dir}#{XMLData.game}") unless File.exist?("#{$data_dir}#{XMLData.game}")
+        Dir.mkdir(base_dir) unless File.exist?(base_dir)
+        File.join(base_dir, "lichwindows.yaml")
+      end
+
+      def load_window_settings(name: Char.name)
+        filename = window_settings_path(name: name)
+        settings_hash =
+          if File.exist?(filename)
+            YAML.safe_load(File.read(filename), permitted_classes: [Hash, Array, String, Integer, Float, TrueClass, FalseClass, NilClass], aliases: false)
+          else
+            {}
+          end
+        deep_merge_hash(WINDOW_DEFAULTS, settings_hash || {})
+      rescue StandardError
+        deep_merge_hash(WINDOW_DEFAULTS, {})
+      end
+
+      def save_window_settings(settings, name: Char.name)
+        File.write(window_settings_path(name: name), deep_merge_hash(WINDOW_DEFAULTS, settings).to_yaml)
+      end
+
+      def deep_merge_hash(base, override)
+        base.merge(override) do |_k, left, right|
+          if left.is_a?(Hash) && right.is_a?(Hash)
+            deep_merge_hash(left, right)
+          else
+            right
+          end
+        end
+      end
+    end
+  end
+end
+
+::Lich::Common::ASAudit.run
