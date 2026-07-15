@@ -48,8 +48,8 @@
   parser.
   Author: RuseofFools, Codex, ClaudeCode
   Tags: combat, attack strength, as, audit, analysis, gtk, enhancives, spells, ascension, recall, bonuses, skills, theorycraft
-  Version: 1.0.1
-  Recently changed: Updated for katars, wspec, and paladin 1611.
+  Version: 1.0.2
+  Recently changed: Updated for UAF, TWC, splitters, katars, wspec, and paladin 1611.
 =end
 # frozen_string_literal: true
 
@@ -402,7 +402,9 @@ module ::Lich
           lore_earth: ::Lich::Gemstone::Skills.elemental_lore_earth,
           lore_blessings: ::Lich::Gemstone::Skills.spiritual_lore_blessings,
           lore_telepathy: ::Lich::Gemstone::Skills.mental_lore_telepathy,
-          lore_religion: ::Lich::Gemstone::Skills.spiritual_lore_religion
+          lore_religion: ::Lich::Gemstone::Skills.spiritual_lore_religion,
+          str_base_bonus: (::Lich::Gemstone::Stats.strength.base.bonus rescue 0).to_i,
+          agi_base_bonus: (::Lich::Gemstone::Stats.agility.base.bonus rescue 0).to_i
         }
       end
 
@@ -542,6 +544,12 @@ module ::Lich
           sources << source_entry(wspec_ranks * 2, "Weapon Specialization", "#{wspec_ranks} ranks") if wspec_ranks.positive?
           sources << source_entry(weapon_asc_ranks * 2, "Brawling ascension") if weapon_asc_ranks.positive?
           sources << source_entry((cman_asc_ranks / 2.0).truncate, "Combat Maneuvers ascension") if cman_asc_ranks.positive?
+          # UAF formula explicitly adds trunc(STR bonus / 2) and trunc(AGI bonus / 2).
+          # Base bonuses only -- enhancive portions are handled in enhancive_sources.
+          str_bonus = context[:str_base_bonus].to_i
+          agi_bonus = context[:agi_base_bonus].to_i
+          sources << source_entry((str_bonus / 2.0).truncate, "Strength base bonus") if str_bonus.positive?
+          sources << source_entry((agi_bonus / 2.0).truncate, "Agility base bonus") if agi_bonus.positive?
         when :katar
           edged_base_bonus = base_skills.dig("Edged Weapons", :bonus).to_i
           brawling_base_bonus = base_skills.dig("Brawling", :bonus).to_i
@@ -605,6 +613,10 @@ module ::Lich
         sources = []
 
         Spell.active.sort_by { |spell| spell.num.to_i }.each do |spell|
+          # Society sigils/signs/symbols are in the 9600-9799 range; they're
+          # already accounted for in the Society group, so skip them here.
+          next if spell.num.to_i >= 9600 && spell.num.to_i <= 9799
+
           amount = context[:style] == :bolt ? spell.bolt_as.to_i : spell.physical_as.to_i
           detail = nil
 
@@ -752,14 +764,71 @@ module ::Lich
         sources
       end
 
+      # Parse weapon recall text for enhancive boosts that inventory enhancive totals
+      # won't show -- specifically depleted-but-persisted enhancives (charges = 0,
+      # "will persist after last charge"). Skips any skill already captured by the
+      # inventory command to prevent double-counting.
+      def recall_weapon_enhancive_sources(context, enh_details)
+        sources = []
+        [:weapon, :secondary_weapon].each do |slot|
+          item = safe_ready_item(slot)
+          next unless item
+
+          recall_lines = Array(capture_item_recall(item))
+          text = recall_lines.map { |l| strip_xml(l).strip }.join("\n")
+          next unless text =~ /It is an enhancive item:/i
+
+          depleted  = text =~ /It seems to be out of enhancive charges/i
+          persists  = text =~ /It will persist after its last enhancive charge has been expended/i
+
+          text.scan(/It provides a boost of (\d+) to (.+?) (Ranks|Bonus)\./i) do |cnt_s, skill_name, skill_type|
+            count = cnt_s.to_i
+            skill_name = skill_name.strip
+            totals_key = "#{skill_name} #{skill_type}"
+
+            # If the inventory command already captured this, the total will be > 0.
+            next if fetch_total(enh_details, "Skills", totals_key).positive?
+
+            as_contrib = weapon_recall_enhancive_as(context, skill_name, skill_type, count)
+            next unless as_contrib.positive?
+
+            note = (depleted && persists) ? "depleted, persists -- excluded from inv. enhancive totals" : "from recall"
+            sources << source_entry(as_contrib, "#{item.noun} +#{count} #{skill_name} #{skill_type}", note)
+          end
+        end
+        sources
+      rescue StandardError => e
+        echo "[as_audit: warning: recall_weapon_enhancive_sources: #{e.message}]"
+        []
+      end
+
+      def weapon_recall_enhancive_as(context, skill_name, skill_type, count)
+        wl = context[:weapon_skill_label]
+        # Both Ranks and Bonus enhancives contribute the stated number 1:1 to AS.
+        case skill_type
+        when "Ranks", "Bonus"
+          if wl && skill_name == wl
+            count
+          elsif skill_name == "Combat Maneuvers"
+            as_from_cman_bonus(context, count)
+          else
+            0
+          end
+        else
+          0
+        end
+      end
+
       def enhancive_sources(context, enh_details)
         totals = []
         item_sources = []
 
         str_total = fetch_total(enh_details, "Stats", "Strength (STR)")
         dex_total = fetch_total(enh_details, "Stats", "Dexterity (DEX)")
-        weapon_skill_total = context[:weapon_skill_label] ? fetch_total(enh_details, "Skills", "#{context[:weapon_skill_label]} Bonus") : 0
+        weapon_skill_bonus_total = context[:weapon_skill_label] ? fetch_total(enh_details, "Skills", "#{context[:weapon_skill_label]} Bonus") : 0
+        weapon_skill_ranks_total = context[:weapon_skill_label] ? fetch_total(enh_details, "Skills", "#{context[:weapon_skill_label]} Ranks") : 0
         cman_bonus_total = fetch_total(enh_details, "Skills", "Combat Maneuvers Bonus")
+        cman_ranks_total = fetch_total(enh_details, "Skills", "Combat Maneuvers Ranks")
 
         if str_total.positive?
           as_amount = as_from_stat_bonus(context, :strength, str_total)
@@ -771,13 +840,31 @@ module ::Lich
           totals << source_entry(as_amount, "Dexterity enhancives total", "#{signed(dex_total)} DEX bonus") if as_amount.positive?
         end
 
-        if weapon_skill_total.positive?
-          totals << source_entry(weapon_skill_total, "#{context[:weapon_skill_label]} enhancives total")
+        # AGI contributes to UAF (trunc(AGI bonus / 2)) -- irrelevant to other pools.
+        if context[:style] == :uaf
+          agi_total = fetch_total(enh_details, "Stats", "Agility (AGI)")
+          if agi_total.positive?
+            as_amount = as_from_stat_bonus(context, :agility, agi_total)
+            totals << source_entry(as_amount, "Agility enhancives total", "#{signed(agi_total)} AGI bonus") if as_amount.positive?
+          end
+        end
+
+        if weapon_skill_bonus_total.positive?
+          totals << source_entry(weapon_skill_bonus_total, "#{context[:weapon_skill_label]} enhancives total", "#{signed(weapon_skill_bonus_total)} bonus")
+        end
+
+        if weapon_skill_ranks_total.positive?
+          totals << source_entry(weapon_skill_ranks_total, "#{context[:weapon_skill_label]} enhancive ranks", "#{signed(weapon_skill_ranks_total)} ranks")
         end
 
         if cman_bonus_total.positive?
           derived_as = as_from_cman_bonus(context, cman_bonus_total)
           totals << source_entry(derived_as, "Combat Maneuvers enhancives total", "#{signed(cman_bonus_total)} CM bonus") if derived_as.positive?
+        end
+
+        if cman_ranks_total.positive?
+          derived_as = as_from_cman_bonus(context, cman_ranks_total)
+          totals << source_entry(derived_as, "Combat Maneuvers enhancive ranks", "#{signed(cman_ranks_total)} ranks") if derived_as.positive?
         end
 
         item_map = relevant_enhancive_item_sources(enh_details, context)
@@ -786,6 +873,9 @@ module ::Lich
 
           item_sources << source_entry(entry[:amount], item_name, entry[:details].join(", "))
         end
+
+        # Add weapon enhancives that inventory totals misses (depleted/persisted).
+        item_sources.concat(recall_weapon_enhancive_sources(context, enh_details))
 
         { totals: totals, items: item_sources.sort_by { |entry| [-entry[:amount], entry[:label]] } }
       end
@@ -833,10 +923,19 @@ module ::Lich
         # Situational item/script buffs detected once (some require ANALYZE).
         item_buffs = detect_item_buffs
 
+        # UAF column: always built when brawling is trained. Gear section uses
+        # gloves/boots (full enchant) and held weapon enchant / 2 instead of the
+        # standard ready_gear weapon/shield/armor sources.
+        uaf_ctx = uaf_pool_context(context)
+        # Avoid a duplicate UAF column when the primary style is already :uaf.
+        uaf_ctx = nil if physical_ctx && physical_ctx[:style] == :uaf
+        uaf_gear = uaf_ctx ? uaf_gear_sources : []
+
         columns = []
         columns << build_summary_column(physical_ctx, enh_details, phys_gear, phys_armor, gear_extras: zelnorn + supercharger, gem_sources: gems, item_buffs: item_buffs) if physical_ctx
+        columns << build_summary_column(uaf_ctx, enh_details, nil, nil, gear_extras: zelnorn + uaf_gear, gem_sources: gems, item_buffs: item_buffs, total_unit: "UAF") if uaf_ctx
         columns << build_summary_column(spell_ctx, enh_details, spell_gear, spell_armor, gear_extras: zelnorn, gem_sources: gems, item_buffs: item_buffs) if spell_ctx
-        sections["AS Summary"] = build_summary_lines(columns[0], columns[1])
+        sections["AS Summary"] = build_summary_lines(*columns)
         sections["Overview"] = [
           "Character: #{XMLData.name}",
           "Profession: #{::Lich::Gemstone::Stats.profession}",
@@ -866,15 +965,12 @@ module ::Lich
         sections
       end
 
-      # Renders the AS Summary as a single vertical list: the physical (melee) pool
-      # first, then the spell-aim (bolt) pool. Each pool is broken into groups
-      # (Skills / Gear / Gemstones / Enhancives / Spells / Buffs) and every line
-      # shows what is granting the AS (enchant, stat, skill bonus, per-spell, etc.).
-      def build_summary_lines(primary_col, secondary_col)
-        lines = render_summary_column(primary_col)
-        if secondary_col
-          lines << ""
-          lines.concat(render_summary_column(secondary_col))
+      # Renders the AS Summary: physical pool, UAF pool (if brawling trained), bolt pool.
+      def build_summary_lines(*cols)
+        lines = []
+        cols.compact.each_with_index do |col, i|
+          lines << "" if i.positive?
+          lines.concat(render_summary_column(col))
         end
         lines
       end
@@ -883,7 +979,8 @@ module ::Lich
       # to the pool total). Middle column is that line's own AS. Informational
       # groups (ascension headroom) show no cumulative -- they aren't in the total.
       def render_summary_column(col)
-        lines = ["#{col[:title]} -- #{col[:total].to_i} AS", format("    %6s | %5s  %s", "cumul", "each", "source")]
+        unit = col[:total_unit] || "AS"
+        lines = ["#{col[:title]} -- #{col[:total].to_i} #{unit}", format("    %6s | %5s  %s", "cumul", "each", "source")]
         running = 0
         col[:groups].each do |group|
           lines << "  #{group[:name]}"
@@ -907,7 +1004,7 @@ module ::Lich
       # Build the grouped AS breakdown for one attack pool. gear_extras (zelnorn,
       # supercharger) and gem_sources (Tactician gemstones) are AS the base helpers
       # don't model. Every entry keeps its :detail so the render shows the source.
-      def build_summary_column(ctx, enh_details, ready_gear = nil, armor_gear = nil, gear_extras: [], gem_sources: [], item_buffs: nil)
+      def build_summary_column(ctx, enh_details, ready_gear = nil, armor_gear = nil, gear_extras: [], gem_sources: [], item_buffs: nil, total_unit: "AS")
         groups = []
 
         groups << { name: "Skills", entries: current_formula_sources(ctx).reject { |e| e[:amount].to_i.zero? } }
@@ -953,7 +1050,8 @@ module ::Lich
 
         {
           title: ctx[:style_label].to_s,
-          total_label: "#{summary_pool_name(ctx)} AS",
+          total_label: "#{summary_pool_name(ctx)} #{total_unit}",
+          total_unit: total_unit,
           total: groups.reject { |g| g[:informational] }.sum { |g| g[:entries].sum { |e| e[:amount].to_i } },
           groups: groups
         }
@@ -1268,6 +1366,74 @@ module ::Lich
                       style_label: "Bolt / Spell Aiming",
                       weapon_skill_label: "Spell Aiming",
                       weapon_skill_method: :spell_aiming)
+      end
+
+      # UAF pool -- shown whenever brawling is trained, regardless of primary weapon.
+      # Placed after melee but before bolt so brawlers can compare all three pools.
+      def uaf_pool_context(context)
+        return nil unless (context[:base_skills] || {}).dig("Brawling", :ranks).to_i.positive?
+
+        context.merge(style: :uaf,
+                      style_label: "UAF / Brawling",
+                      weapon_skill_label: "Brawling",
+                      weapon_skill_method: :brawling)
+      end
+
+      # Item names matching gloves, gauntlets, or UCS-style hand/foot weapons
+      # for UAF gear enchant (full value, unlike held weapons which are halved).
+      GLOVE_NOUNS = /\A(?:gloves?|gauntlets?|handwraps?|mittens?|glove)\z/i
+      BOOT_NOUNS  = /\A(?:boots?|footwraps?|shoes?|sandals?|greaves?)\z/i
+
+      # Recall a single item and extract its enchant bonus line.
+      def single_item_enchant(item)
+        return 0 unless item&.respond_to?(:id)
+
+        Array(capture_item_recall(item)).each do |line|
+          text = strip_xml(line).strip
+          if (m = text.match(/It imparts a bonus of \+(\d+) more than usual\./i))
+            return m[1].to_i
+          end
+        end
+        0
+      rescue StandardError
+        0
+      end
+
+      # UAF-specific gear contributions:
+      #   gloves or boots  -> full enchant bonus
+      #   held weapons     -> trunc(avg enchant / 2)
+      # Zelnorn is already included universally; this covers the UCS-specific slots.
+      def uaf_gear_sources
+        sources = []
+        worn = Array(GameObj.inv).compact
+
+        # Gloves or boots -- full enchant
+        [GLOVE_NOUNS, BOOT_NOUNS].each do |pattern|
+          item = worn.find { |i| i.noun.to_s =~ pattern }
+          next unless item
+
+          enchant = single_item_enchant(item)
+          next unless enchant.positive?
+
+          sources << source_entry(enchant, "#{item.noun} enchant", "+#{enchant} worn #{item.noun}")
+        end
+
+        # Held weapons -- trunc(avg enchant / 2)
+        weapon_items = [safe_ready_item(:weapon), safe_ready_item(:secondary_weapon)].compact
+        if weapon_items.any?
+          enchants = weapon_items.map { |i| single_item_enchant(i) }
+          avg = (enchants.sum.to_f / enchants.size).truncate
+          half = (avg / 2.0).truncate
+          if half.positive?
+            label = weapon_items.map(&:noun).join(" + ")
+            sources << source_entry(half, "Held weapon enchant", "avg +#{avg} / 2 from #{label}")
+          end
+        end
+
+        sources
+      rescue StandardError => e
+        echo "[as_audit: warning: uaf_gear_sources: #{e.message}]"
+        []
       end
 
       def best_melee_skill(base_skills)
@@ -1775,9 +1941,11 @@ module ::Lich
       end
 
       def relevant_enhancive_item_sources(enh_details, context)
-        interesting_labels = ["Strength (STR)", "Dexterity (DEX)", "Combat Maneuvers Bonus"]
+        interesting_labels = ["Strength (STR)", "Dexterity (DEX)", "Agility (AGI)",
+                               "Combat Maneuvers Bonus", "Combat Maneuvers Ranks"]
         if context[:weapon_skill_label]
           interesting_labels << "#{context[:weapon_skill_label]} Bonus"
+          interesting_labels << "#{context[:weapon_skill_label]} Ranks"
         end
 
         item_map = Hash.new { |hash, key| hash[key] = { amount: 0, details: [] } }
@@ -1810,11 +1978,20 @@ module ::Lich
           as_from_stat_bonus(context, :strength, amount)
         when "Dexterity (DEX)"
           as_from_stat_bonus(context, :dexterity, amount)
+        when "Agility (AGI)"
+          as_from_stat_bonus(context, :agility, amount)
         when "Combat Maneuvers Bonus"
           as_from_cman_bonus(context, amount)
+        when "Combat Maneuvers Ranks"
+          as_from_cman_bonus(context, amount)
         else
-          if context[:weapon_skill_label] && label == "#{context[:weapon_skill_label]} Bonus"
+          wl = context[:weapon_skill_label]
+          if wl && label == "#{wl} Bonus"
             amount
+          elsif wl && label == "#{wl} Ranks"
+            # Weapon skill ranks enhancive: 1 rank ~= 2 AS at standard 2x training.
+            # skills base is unenhanced so these ranks are not in the base bonus total.
+            amount * 2
           else
             0
           end
@@ -1829,6 +2006,10 @@ module ::Lich
         case context[:style]
         when :melee, :katar
           stat == :strength ? base_as : 0
+        when :uaf
+          # UAF: trunc(stat_bonus / 2). Enhancive gives base pts -> bonus ~= base/2 -> UAF ~= bonus/2.
+          # So enhancive base pts -> UAF = base_as / 2 (a second halving).
+          (stat == :strength || stat == :agility) ? (base_as / 2.0).truncate : 0
         when :ranged, :bolt
           stat == :dexterity ? base_as : 0
         when :thrown

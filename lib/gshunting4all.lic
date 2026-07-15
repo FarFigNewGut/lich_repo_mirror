@@ -6,7 +6,7 @@
   game: Gemstone
   tags: hunting, combat, automate, society, arcarium, trinkets, gemstones, paladin, warrior, rogue, ranger, bard, cleric, empath, wizard, sorcerer
   required: Lich >= 5.9.0
-  version: 1.9.9
+  version: 2.0.1
 
   Usage:
     ;gshunting4all setup  -- open setup wizard
@@ -25,6 +25,40 @@
 
 =begin
   changelog:
+    2.0.1:
+      Fixed hostile_npcs using stale GameObj.targets across room transitions.
+      Creatures that only attack via AOE/MDR (like boss captains) never get a
+      <target> XML element set, so they never appeared in GameObj.targets and
+      the combat loop had nothing to attack. New logic: game-confirmed targets
+      (cross-referenced to current room to drop stale entries) PLUS any
+      boss-listed creature present in the room via GameObj.npcs. Non-hostile
+      town NPCs not on the boss list are never pulled in by either path.
+    2.0.0:
+      Grouped hunting overhaul: all retreat suppression (health, mana, overexerted,
+      dread, encumbrance, navigation) now keys off actual group membership rather than
+      the Grouped Mode master toggle. Eloot gating likewise uses real group detection.
+      Fixed hidden-player hold blocking attacks when grouped rogues are hiding -- now
+      uses named-player cross-check instead of unreliable pc.status inspection.
+      Fixed group member cache storing "hidden" for hiding members ("who is hidden"
+      suffix now stripped alongside "who is hiding" and "who is leading").
+      Fixed eloot running with solo settings while grouped with toggle OFF.
+      Fixed holy weapon double-beseech on per_attack mode. Fixed wound retreat while
+      bound failing to fire Symbol of Return. Added "when" option legends to Scripts
+      and CMANs tabs. Added Wound Retreat note clarifying per-part vs combo scoring.
+      Replaced "Grouped mode: ON/OFF" startup line with actual group member list.
+    1.9.11:
+      Fixed hidden_player_present? still blocking attacks when a group member is hiding.
+      The 1.9.6 fix subtracted hiding group members via pc.status =~ /hiding/ but Lich 5
+      may return nil/blank status for hiding players, making grouped_hiders always 0.
+      New approach: if all named players in GameObj.pcs are group members (or self), any
+      anonymous "signs of hiding" must belong to those same group members -- no unknown
+      hider is present regardless of sign count.
+    1.9.10:
+      Fixed all retreat suppression checks (health, mana, overexerted, dread,
+      encumbrance, combat-start-room navigation) using effectively_grouped? (the
+      Grouped Mode master toggle) instead of actual group membership. All now check
+      group_members_cache / XMLData.group_members directly. The toggle now only affects
+      wound retreat (where it remains a deliberate opt-in via retreat_when_grouped).
     1.9.9:
       Replaced "Grouped mode: ON/OFF" in the ready message with actual group membership:
       shows "Grouped with: Name, Name, ..." when in a group, "Solo" when not. The old
@@ -819,7 +853,7 @@ require 'set'
 # All script internals live inside this module -- no global namespace pollution.
 module GSH4A
 
-SCRIPT_VERSION = "1.9.9".freeze
+SCRIPT_VERSION = "2.0.1".freeze
 PROFILE_DIR = File.join(File.dirname(__FILE__), "gsh4a_profiles")
 FileUtils.mkdir_p(PROFILE_DIR)
 
@@ -7866,14 +7900,22 @@ module Engine
   def self.hostile_npcs
     safe    = safe_npc_patterns
     avoid_g = pref("avoid_gigas")
-    # GameObj.targets contains only creatures the game has flagged as hostile --
-    # avoids attacking non-hostile NPCs (couriers, invasion bystanders, etc.)
-    # without relying solely on the manual blocklist.
-    (GameObj.targets || []).select do |n|
+    filter = ->(n) {
       n.status !~ /dead|gone|decaying/i &&
         safe.none? { |pat| n.noun =~ pat || n.name =~ pat } &&
         !(avoid_g && (n.noun =~ GIGAS_PATTERN || n.name =~ GIGAS_PATTERN))
-    end
+    }
+    # Game-confirmed hostile targets, cross-referenced to current-room NPCs to
+    # drop stale entries from previous rooms (targets list doesn't clear
+    # instantly on room transitions).
+    room_npc_ids = (GameObj.npcs || []).map(&:id).to_set
+    from_targets = (GameObj.targets || []).select { |n| room_npc_ids.include?(n.id) && filter.call(n) }
+    # Boss-listed creatures present in the room are always included, regardless
+    # of GameObj.targets state -- bosses that open with AOE/MDR never get a
+    # <target> XML tag and would otherwise be invisible to the combat loop.
+    # Town NPCs not on the boss list are never pulled in by this path.
+    from_boss = (GameObj.npcs || []).select { |n| filter.call(n) && boss_target?(n.id) }
+    (from_targets + from_boss).uniq(&:id)
   end
 
   def self.npc_count = hostile_npcs.length
@@ -8014,17 +8056,17 @@ module Engine
   end
 
   # Returns true when an UNKNOWN hidden player is in the room.
-  # GS4 renders each hiding player as a loot-category object ("obvious signs of someone hiding")
-  # but also shows named group members who are hiding in GameObj.pcs with status "hiding".
-  # Subtract known hiding group members from the sign count -- if all signs are accounted for
-  # by group members, no unidentified hiders are present.
+  # GS4 renders hiding players as loot-category objects ("obvious signs of someone hiding").
+  # If all named players visible in GameObj.pcs are group members (or self), any hider must
+  # also be a group member -- no unknown hider is present regardless of sign count.
   def self.hidden_player_present?
     signs = (GameObj.loot || []).count { |obj| obj.name.to_s =~ /\bsigns?\b.*\bhiding\b/i }
     return false if signs == 0
-    grouped_hiders = (GameObj.pcs || []).count { |pc|
-      (pc.status.to_s =~ /hiding/i rescue false) && in_my_group?(pc.name)
+    my_name = (checkname rescue "").downcase
+    all_named_are_group = (GameObj.pcs || []).all? { |pc|
+      pc.name.to_s.downcase =~ /\b#{Regexp.escape(my_name)}\b/ || in_my_group?(pc.name)
     }
-    signs > grouped_hiders
+    !all_named_are_group
   rescue
     false
   end
@@ -10663,7 +10705,7 @@ module Engine
 
     # Overexerted: stamina fully depleted -- escape to saferoom immediately (solo only)
     # In grouped mode, stay and fight through it -- the group keeps you alive.
-    if overexerted? && !effectively_grouped?
+    if overexerted? && !(@group_members_cache&.any? || (XMLData.group_members rescue []).any?)
       unless @overexerted_responded
         log "Overexerted -- stopping combat and retreating to safe room"
         attempt_escape("Overexerted")
@@ -10707,7 +10749,7 @@ module Engine
         100
       end
       if mana_pct < mana_ret_pct
-        if effectively_grouped?
+        if @group_members_cache&.any? || (XMLData.group_members rescue []).any?
           log "Mana at #{mana_pct}% -- threshold reached but grouped; skipping retreat"
         else
           do_retreat("Mana at #{mana_pct}% (below #{mana_ret_pct}% threshold)")
@@ -10722,7 +10764,7 @@ module Engine
       crush_thresh = dread_cfg.fetch("crushing_threshold", 15).to_i
       creep = @creeping_dread.to_i
       crush = @crushing_dread.to_i
-      if (creep >= creep_thresh || crush >= crush_thresh) && !effectively_grouped?
+      if (creep >= creep_thresh || crush >= crush_thresh) && !(@group_members_cache&.any? || (XMLData.group_members rescue []).any?)
         unless @dread_retreat_responded
           @dread_retreat_responded = true
           attempt_dread_escape
@@ -10764,7 +10806,7 @@ module Engine
   end
 
   def self.handle_health_retreat(pct)
-    if effectively_grouped?
+    if @group_members_cache&.any? || (XMLData.group_members rescue []).any?
       log "Health at #{pct}% -- threshold reached but grouped; skipping retreat"
       return
     end
@@ -10867,8 +10909,9 @@ module Engine
           # Game outputs something like: "Encumbrance: Heavy (35%)"
           if enc_line =~ /(\d+)%/
             pct = $1.to_i
+            actually_grouped = (@group_members_cache&.any? || (XMLData.group_members rescue []).any?)
             if pct >= threshold
-              if effectively_grouped?
+              if actually_grouped
                 log "Encumbrance at #{pct}% -- threshold reached but grouped; skipping retreat"
               else
                 warn "Encumbrance at #{pct}% -- exceeds threshold of #{threshold}%"
@@ -11547,7 +11590,7 @@ module Engine
     unless csr.empty?
       current = [(XMLData.room_id rescue nil).to_s, @detected_room_num.to_s]
       unless current.include?(csr)
-        if effectively_grouped?
+        if @group_members_cache&.any? || (XMLData.group_members rescue []).any?
           # In a group, follow the leader -- don't navigate independently.
           # Combat stays locked until the group arrives at the CSR naturally.
           log "Grouped -- waiting for group leader to reach combat start room #{csr} before entering combat loop"
