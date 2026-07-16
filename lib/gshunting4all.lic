@@ -6,7 +6,7 @@
   game: Gemstone
   tags: hunting, combat, automate, society, arcarium, trinkets, gemstones, paladin, warrior, rogue, ranger, bard, cleric, empath, wizard, sorcerer
   required: Lich >= 5.9.0
-  version: 2.0.2
+  version: 2.0.9
 
   Usage:
     ;gshunting4all setup  -- open setup wizard
@@ -25,6 +25,45 @@
 
 =begin
   changelog:
+    2.0.9:
+      Fixed CMAN saved state being silently wiped when cman info detection
+      returns empty or partial output (server lag / timeout). Orphaned
+      saved entries (e.g. Surge of Strength) are now merged back at save
+      time so detection hiccups cannot erase the user's enabled choices.
+    2.0.8:
+      Removed beseech from hunt start. Infusion still runs at start to fill
+      charges, but the weapon is only armed (beseech) when the first hostile
+      is present -- the combat loop already handles this before each engagement.
+    2.0.7:
+      When sanctuary is detected ("Be at peace"), society symbols, spell maintenance,
+      sonic songs, and maintenance abilities are all suppressed in addition to attacks.
+      Applies to both the between-fight maintenance block and the paused loop.
+    2.0.6:
+      Reverted 2.0.5 -- GameObj.targets already returns only hostile creatures,
+      not all NPCs. Using GameObj.npcs was wrong and unsafe. Restored GameObj.targets
+      as the primary source with room cross-reference for stale entry filtering.
+      Boss-list path retained for bosses that only use AOE/MDR and never appear
+      in GameObj.targets.
+    2.0.5:
+      Changed hostile_npcs to use GameObj.npcs as the primary source so the script
+      attacks proactively rather than waiting to be hit first. Added type =~ /familiar/
+      filter to exclude companion animals (ranger bears, wizard familiars, etc.).
+      safe_npc_patterns remains the user-configurable exclusion list. The sanctuary
+      watcher (2.0.4) stops attack loops in town areas the moment "Be at peace" fires.
+    2.0.4:
+      Reverted 2.0.3 grouped NPC detection change -- it caused attacks on town NPCs
+      and group members' companions (ranger bears, etc.) because GameObj.npcs includes
+      all non-player objects, not just hostile creatures. The grouped boss detection
+      problem remains; use the boss_list field in setup to add specific boss names.
+      Added sanctuary watcher: DownstreamHook detects "Be at peace my child, there is
+      no need to fight here" and sets @in_sanctuary flag, halting all attack attempts
+      until the next room transition. Prevents runaway attack loops in town areas.
+    2.0.3:
+      Fixed script not attacking boss NPCs in grouped fights. GameObj.targets only
+      contains NPCs targeting the local character -- a boss that opens by attacking
+      other group members never appears in targets and was invisible to hostile_npcs,
+      causing the script to sit idle. When grouped, hostile_npcs now includes all
+      non-safe room NPCs regardless of targets state.
     2.0.2:
       Fixed holy weapon sense returning -1 (failure) when weapon is empty. Game
       response "nothing happens" was not in the dothistimeout pattern, so the call
@@ -168,7 +207,7 @@ require 'set'
 # All script internals live inside this module -- no global namespace pollution.
 module GSH4A
 
-SCRIPT_VERSION = "2.0.8".freeze
+SCRIPT_VERSION = "2.0.9".freeze
 PROFILE_DIR = File.join(File.dirname(__FILE__), "gsh4a_profiles")
 FileUtils.mkdir_p(PROFILE_DIR)
 
@@ -6604,6 +6643,15 @@ module SetupWizard
         "grip"        => iter[8].to_s,
       }
     end
+    # Preserve saved CMANs that detection didn't return this session (e.g. server lag
+    # caused cman info to time out or return partial output).  Without this, an empty
+    # store silently wipes all previously-saved enabled states on next save.
+    saved_cmans = (@saved_config || {}).fetch("cmans", [])
+    unless saved_cmans.empty?
+      seen = cmans.map { |c| c["name"].to_s.downcase }.to_set
+      orphans = saved_cmans.select { |c| c.is_a?(Hash) && !seen.include?(c["name"].to_s.downcase) }
+      cmans = cmans + orphans unless orphans.empty?
+    end
     p["cmans"] = cmans
     p["techniques"]   = collect_enabled_store(@tech_store, %w[name verb tech_type trigger stamina min_creatures min_rank grip mnemonic ranks category])
                           .each { |r| r["stamina"] = r["stamina"].to_i; r["min_creatures"] = r["min_creatures"].to_i }
@@ -7436,15 +7484,13 @@ module Engine
         safe.none? { |pat| n.noun =~ pat || n.name =~ pat } &&
         !(avoid_g && (n.noun =~ GIGAS_PATTERN || n.name =~ GIGAS_PATTERN))
     }
-    # Game-confirmed hostile targets, cross-referenced to current-room NPCs to
-    # drop stale entries from previous rooms (targets list doesn't clear
-    # instantly on room transitions).
+    # GameObj.targets returns only hostile creatures in the room (not all NPCs).
+    # Cross-reference against current room NPCs to drop stale entries from the
+    # previous room (the targets list doesn't clear instantly on room transitions).
     room_npc_ids = (GameObj.npcs || []).map(&:id).to_set
     from_targets = (GameObj.targets || []).select { |n| room_npc_ids.include?(n.id) && filter.call(n) }
-    # Boss-listed creatures present in the room are always included, regardless
-    # of GameObj.targets state -- bosses that open with AOE/MDR never get a
-    # <target> XML tag and would otherwise be invisible to the combat loop.
-    # Town NPCs not on the boss list are never pulled in by this path.
+    # Boss-list path covers bosses that only use AOE/MDR attacks and never get
+    # a single-target <target> XML tag, so they don't appear in GameObj.targets.
     from_boss = (GameObj.npcs || []).select { |n| filter.call(n) && boss_target?(n.id) }
     (from_targets + from_boss).uniq(&:id)
   end
@@ -10294,6 +10340,26 @@ module Engine
     })
   end
 
+  def self.start_sanctuary_watcher
+    @in_sanctuary = false
+    DownstreamHook.remove("gsh4a_sanctuary_watcher") rescue nil
+    DownstreamHook.add("gsh4a_sanctuary_watcher", proc { |line|
+      stripped = line.gsub(/<[^>]+>/, "")
+      if stripped =~ /be at peace.*no need to fight|this is a holy place|you cannot attack here/i
+        unless @in_sanctuary
+          @in_sanctuary = true
+          respond "[gsh4a] Sanctuary detected -- halting attacks"
+        end
+      end
+      line
+    })
+  end
+
+  def self.stop_sanctuary_watcher
+    @in_sanctuary = false
+    DownstreamHook.remove("gsh4a_sanctuary_watcher") rescue nil
+  end
+
   def self.start_prone_watcher
     Thread.new do
       loop do
@@ -10739,8 +10805,10 @@ module Engine
 
       if GSH4AState.paused
         monitor_emergencies
-        check_holy_weapon_charges
-        check_society_maintain
+        unless @in_sanctuary
+          check_holy_weapon_charges
+          check_society_maintain
+        end
         pause 1
         next
       end
@@ -10994,7 +11062,6 @@ module Engine
     if holy_weapon_enabled?
       @hw_depleted = false
       infuse_holy_weapon
-      beseech_holy_weapon unless holy_weapon_cfg.fetch("mode", "per_target") == "per_attack"
     end
 
     start_reaction_watcher
@@ -11006,6 +11073,7 @@ module Engine
     start_holy_weapon_watcher
     start_mount_watcher
     start_movement_debuff_watcher
+    start_sanctuary_watcher
     start_prone_watcher
     start_death_watcher
     start_encumbrance_watcher
@@ -11134,6 +11202,7 @@ module Engine
         @last_room_id        = current_room_id
         @holding_for_player  = false
         @combat_engaged      = false
+        @in_sanctuary        = false
         # Wait for room description XML to finish streaming so GameObj.pcs is
         # populated before we decide whether a stranger was here first.
         pause 0.5
@@ -11181,6 +11250,11 @@ module Engine
         next
       end
 
+      if @in_sanctuary
+        pause 2
+        next
+      end
+
       if npcs.empty?
         @combat_engaged = false
         ensure_mounted
@@ -11208,12 +11282,14 @@ module Engine
       # Only do maintenance when the room is clear -- skip if a new hostile
       # has already arrived so we loop back to attack immediately.
       if hostile_npcs.empty?
-        check_holy_weapon_charges
-        check_society_maintain
-        check_society_mana
-        maintain_sonic_songs
-        cast_maintain_spells
-        run_abilities_when("maintenance")
+        unless @in_sanctuary
+          check_holy_weapon_charges
+          check_society_maintain
+          check_society_mana
+          maintain_sonic_songs
+          cast_maintain_spells
+          run_abilities_when("maintenance")
+        end
       end
 
       pause 0.5
@@ -11230,6 +11306,7 @@ module Engine
       log "Ecleanse stopped."
     end
     UpstreamHook.remove("gsh4a_pause") rescue nil
+    stop_sanctuary_watcher
     stop_reaction_watcher
     stop_uac_watcher
     stop_stun_watcher
@@ -11270,6 +11347,7 @@ end # module GSH4A
 before_dying do
   GSH4A::GSH4AState.save_state                         rescue nil
   UpstreamHook.remove("gsh4a_pause")                   rescue nil
+  GSH4A::Engine.stop_sanctuary_watcher                 rescue nil
   GSH4A::Engine.stop_reaction_watcher                  rescue nil
   GSH4A::Engine.stop_uac_watcher                       rescue nil
   GSH4A::Engine.stop_stun_watcher                      rescue nil
