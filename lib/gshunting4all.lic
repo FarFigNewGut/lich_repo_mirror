@@ -6,7 +6,7 @@
   game: Gemstone
   tags: hunting, combat, automate, society, arcarium, trinkets, gemstones, paladin, warrior, rogue, ranger, bard, cleric, empath, wizard, sorcerer
   required: Lich >= 5.9.0
-  version: 2.0.4
+  version: 2.0.2
 
   Usage:
     ;gshunting4all setup  -- open setup wizard
@@ -25,37 +25,30 @@
 
 =begin
   changelog:
-    2.0.4:
-      Fixed low_health healing firing before wound-triggered retreat. Root cause:
-      run_low_health_priorities (Fated Fruit, etc.) ran before wound_retreat_triggered?
-      was checked. Moved wound retreat to the top of monitor_emergencies so that
-      attempt_escape sets hunting=false first, and the guard after it skips all
-      healing logic. Escape now always takes priority over healing.
-    2.0.3:
-      Fixed BESEECH (1635 Divine Intervention) not firing when CC'd during low-mana
-      fights. mana_cost was incorrectly set to 35 -- BESEECH costs no mana in GS4,
-      so ability_ready? was silently skipping it whenever mana dipped below the
-      reserve. Set mana_cost to 0.
-      Fixed script sending "prepare 1650" (Incarnate Armor path) instead of BESEECH
-      when horror/fear stun + high RT triggered check_incarnate_armor_emergency.
-      That check now only fires when run_abilities_when("emergency_status") didn't
-      already handle the CC -- if BESEECH fired, Incarnate Armor is skipped entirely.
     2.0.2:
-      Fixed holy weapon beseech falsely triggering 30s backoff mid-combat. Root cause:
-      "Nothing happens." from a warded spell (CS/TD roll) bled into the dothistimeout
-      capture window for the next beseech call and matched the failure pattern. Fix:
-      removed "nothing happens" from the dothistimeout pattern entirely -- warded-spell
-      output is indistinguishable from a real beseech failure by content alone.
-      Depletion is already handled by the watcher; timeout (nil result) now silently
-      skips rather than backing off. Added a "fired" event to the watcher: when the
-      weapon discharges holy fire, @hw_activated resets to false so per_attack mode
-      re-arms correctly before the next swing. Made the @hw_activated skip universal
-      across all modes (was previously only "once") -- beseech is now a no-op when
-      already armed, preventing double-beseech on any mode.
+      Fixed holy weapon sense returning -1 (failure) when weapon is empty. Game
+      response "nothing happens" was not in the dothistimeout pattern, so the call
+      timed out and infuse_holy_weapon broke early (charges < 0 exit) before sending
+      any PREP/INFUSE commands. Added "nothing happens" to the sense pattern and
+      mapped it to return 0.
+      Fixed encumbrance watcher sending "encumbrance" command while grouped. Check
+      now skips entirely (no command, no hook) when group membership is detected.
+      Simplified holy weapon management: refill only at hunt start, not mid-combat.
+      On depletion the watcher sets @hw_depleted = true; beseech_holy_weapon returns
+      early if set. Cleared at hunt start before infuse + beseech. Removed
+      @hw_refilling and mid-combat Thread refill.
+      Fixed BESEECH (1635) not firing when CC'd: mana_cost was 35, set to 0.
+      Fixed script sending "prepare 1650" instead of BESEECH when incarnate armor
+      path ran unconditionally alongside emergency_status abilities.
+      Fixed low_health healing firing before wound retreat. Moved wound check to top
+      of monitor_emergencies so escape always takes priority over healing.
+      Fixed Energy Wings TURN missing target: verb now includes "at #TARGET".
+      Fixed holy weapon beseech falsely triggering 30s backoff from warded-spell
+      "nothing happens" bleeding into the beseech dothistimeout window.
     2.0.1:
-      Fixed holy weapon watcher missing the "You try to draw on the power of <noun>,
-      but nothing happens." depletion message. Added pattern to depletion_pattern so
-      the mid-combat refill fires correctly when that message appears.
+      Fixed MG_ABILITIES uninitialized constant in pg_spell_rotation. Removed four
+      non-existent trinket constants; kept only the five valid SCRIPT_TEMPLATES
+      entries. Fixed gemstone/script sections using @saved_config instead of @profile.
     2.0.0:
       See git history for changes prior to 2.0.0.
       Grouped hunting overhaul: all retreat suppression (health, mana, overexerted,
@@ -175,7 +168,7 @@ require 'set'
 # All script internals live inside this module -- no global namespace pollution.
 module GSH4A
 
-SCRIPT_VERSION = "2.0.4".freeze
+SCRIPT_VERSION = "2.0.8".freeze
 PROFILE_DIR = File.join(File.dirname(__FILE__), "gsh4a_profiles")
 FileUtils.mkdir_p(PROFILE_DIR)
 
@@ -339,7 +332,7 @@ SCRIPT_TEMPLATES = {
     weapon: [
       # Tier 1
       { key: "tap",   verb: "tap my #NOUN",   cd: 90,   when: "maintenance",  min_tier: 1, type: :both,  desc: "[T1 Light: Luminous Flight +5% evade/tier 30s] [T1 Dark: Shadow Mantle +5 S&H ranks/tier 90s]" },
-      { key: "turn",  verb: "turn my #NOUN",  cd: 60,   when: "per_attack",   min_tier: 1, type: :both,  desc: "[T1 Light: Radiant Pulse -- plasma SMR stun] [T1 Dark: Shadow Barb -- disruption+poison SMR]" },
+      { key: "turn",  verb: "turn my #NOUN at #TARGET",  cd: 60,   when: "per_attack",   min_tier: 1, type: :both,  desc: "[T1 Light: Radiant Pulse -- plasma SMR stun] [T1 Dark: Shadow Barb -- disruption+poison SMR]" },
       # Tier 2
       { key: "pull",  verb: "pull my #NOUN",  cd: 180,  when: "aoe",   min_tier: 2, type: :both,  desc: "[T2 Light: Prismatic Aegis -- evasiveness 10s] [T2 Dark: Crawling Shadow -- evasiveness + counter-attack disease 10s]" },
       { key: "knock", verb: "knock my #NOUN", cd: 180,  when: "aoe",   min_tier: 2, min_creatures: 2, type: :both,  desc: "[T2 Light: Blast of Brilliance -- steam+blind AoE 5 targets] [T2 Dark: Barbed Sweep -- disruption+poison AoE 5 targets]" },
@@ -10020,14 +10013,8 @@ module Engine
   # are zero. Called in the maintenance loop BEFORE society symbols so the weapon
   # is ready before the next fight starts.
   def self.check_holy_weapon_charges
-    return unless holy_weapon_enabled?
-    return unless holy_weapon_cfg.fetch("autorefill", true)
-    charges = sense_holy_weapon_charges
-    return if charges > 0 || charges < 0  # < 0 = sense failed, skip silently
-    log "Holy weapon charges depleted -- refilling"
-    GSH4AState.instance_variable_set(:@hw_activated, false)
-    infuse_holy_weapon
-    beseech_holy_weapon if holy_weapon_enabled?
+    # No-op: refill only happens at hunt start now. Mid-combat depletion sets
+    # @hw_depleted and the weapon stays disarmed until the next hunt.
   end
 
   # Query charges via BESEECH SENSE. Returns integer charge count or -1 on failure.
@@ -10035,8 +10022,8 @@ module Engine
     noun ||= holy_weapon_noun
     return -1 unless noun && !noun.empty?
     line = dothistimeout("beseech my #{noun} sense", 5,
-      /holding\s+(\d+)|no charges|not infused|not blessed/i)
-    return 0 if line =~ /no charges|not infused/i
+      /holding\s+(\d+)|no charges|not infused|not blessed|nothing happens/i)
+    return 0 if line =~ /no charges|not infused|nothing happens/i
     return -1 if line.nil?
     line =~ /(\d+)/ ? $1.to_i : -1
   end
@@ -10048,6 +10035,7 @@ module Engine
   # "per_attack" -- before every single swing (called in inner combat loop)
   def self.beseech_holy_weapon
     return unless holy_weapon_enabled?
+    return if @hw_depleted
     cfg  = holy_weapon_cfg
     noun = holy_weapon_noun
     return unless noun && !noun.empty?
@@ -10090,18 +10078,10 @@ module Engine
     DownstreamHook.add("gsh4a_holy_weapon_watcher", proc { |line|
       stripped = line.gsub(/<[^>]+>/, "")
       if stripped =~ depletion_pattern
-        respond "[gsh4a] Holy weapon depleted"
         GSH4AState.instance_variable_set(:@hw_activated, false)
-        if holy_weapon_cfg.fetch("autorefill", true)
-          Thread.new {
-            begin
-              pause 1
-              infuse_holy_weapon
-              beseech_holy_weapon if holy_weapon_enabled?
-            rescue => e
-              respond "[gsh4a] Holy weapon refill error: #{e.message}"
-            end
-          }
+        unless @hw_depleted
+          @hw_depleted = true
+          respond "[gsh4a] Holy weapon depleted -- will refill at next hunt start"
         end
       elsif stripped =~ fired_pattern
         # Weapon fired -- needs re-arming before next swing (per_attack mode).
@@ -10384,24 +10364,20 @@ module Engine
       loop do
         break unless GSH4AState.hunting
         begin
-          enc_line = ""
-          DownstreamHook.remove("gsh4a_enc_tmp") rescue nil
-          DownstreamHook.add("gsh4a_enc_tmp", proc { |line|
-            enc_line += line.gsub(/<[^>]+>/, "")
-            line
-          })
-          fput "encumbrance"
-          sleep 1.5
-          DownstreamHook.remove("gsh4a_enc_tmp") rescue nil
-          # Parse encumbrance percentage from game output
-          # Game outputs something like: "Encumbrance: Heavy (35%)"
-          if enc_line =~ /(\d+)%/
-            pct = $1.to_i
-            actually_grouped = (@group_members_cache&.any? || (XMLData.group_members rescue []).any?)
-            if pct >= threshold
-              if actually_grouped
-                log "Encumbrance at #{pct}% -- threshold reached but grouped; skipping retreat"
-              else
+          actually_grouped = (@group_members_cache&.any? || (XMLData.group_members rescue []).any?)
+          unless actually_grouped
+            enc_line = ""
+            DownstreamHook.remove("gsh4a_enc_tmp") rescue nil
+            DownstreamHook.add("gsh4a_enc_tmp", proc { |line|
+              enc_line += line.gsub(/<[^>]+>/, "")
+              line
+            })
+            fput "encumbrance"
+            sleep 1.5
+            DownstreamHook.remove("gsh4a_enc_tmp") rescue nil
+            if enc_line =~ /(\d+)%/
+              pct = $1.to_i
+              if pct >= threshold
                 warn "Encumbrance at #{pct}% -- exceeds threshold of #{threshold}%"
                 attempt_escape("Encumbrance too high (#{pct}%)")
                 break
@@ -11014,6 +10990,12 @@ module Engine
 
     apply_society_maintain_startup
     warn_missing_spells
+
+    if holy_weapon_enabled?
+      @hw_depleted = false
+      infuse_holy_weapon
+      beseech_holy_weapon unless holy_weapon_cfg.fetch("mode", "per_target") == "per_attack"
+    end
 
     start_reaction_watcher
     start_technique_cd_watcher
