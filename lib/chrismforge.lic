@@ -41,8 +41,8 @@ Important notes:
        author: Mystienne
   contributor: Timbalt, Aethor, Leafiara, Tatterclaws
          game: gs
-      version: 0.12.4
-        build: 07052026.7
+      version: 0.12.5
+        build: 07132026.1
          tags: cleric, chrism, utility, gtk
      required: Lich >= 5.11.0
         email: Mystienne@mystienne.com
@@ -50,7 +50,7 @@ Important notes:
 
 =end
 
-VERSION = '0.12.4'
+VERSION = '0.12.5'
 AUTHOR = 'Mystienne'
 SCRIPT_COMMAND = 'chrismforge'
 CHRISMFORGE_NONE_LABEL = '(none)'
@@ -90,7 +90,9 @@ CHRISMFORGE_SETTINGS_DEFAULTS = {
   },
   'lapidary' => {
     'box' => '',
+    'design_slots' => '0',
     'designs' => [],
+    'supports_whisper_design' => 'false',
     'cut_during_run' => 'false',
     'patterns' => {
       'orb' => '',
@@ -118,7 +120,9 @@ CHRISMFORGE_SETTING_PATHS = {
   chrismariumfillfullnesses: ['chrismarium', 'fill_fullnesses'],
   chrismariumstatus: ['chrismarium', 'status'],
   lapidarybox: ['lapidary', 'box'],
+  lapidarydesignslots: ['lapidary', 'design_slots'],
   lapidarydesigns: ['lapidary', 'designs'],
+  lapidarysupportswhisperdesign: ['lapidary', 'supports_whisper_design'],
   lapidarycutduringrun: ['lapidary', 'cut_during_run'],
   lapidaryorbpattern: ['lapidary', 'patterns', 'orb'],
   lapidarychrismpattern: ['lapidary', 'patterns', 'chrism'],
@@ -474,6 +478,8 @@ end
 def changelog
   output = "\n"
   output.concat "#{cm_inline_preset('thought', 'chrismforge changelog:')}\n\n"
+  output.concat "07-13-2026\n"
+  output.concat "   0.12.5 - fix(gemcutting): Ported GemGuard's faster visible Analyze Box capture and saved lapidary whisper support.\n\n"
   output.concat "07-05-2026\n"
   output.concat "   0.12.4 - fix(gemcutting): Recognized grab and hand-swap messages while preparing the saved lapidary box.\n"
   output.concat "   0.12.3 - fix(setup): Made closing a Chrism Forge window request a safe stop after the current action.\n"
@@ -706,7 +712,13 @@ end
 #
 # @return [Array<String>] plain display lines for saved pattern choices
 def cm_lapidary_pattern_lines
-  lines = ["Cut during chrism run: #{cm_lapidary_cut_during_run? ? 'yes' : 'no'}", 'Saved pattern choices:']
+  lines = ["Cut during chrism run: #{cm_lapidary_cut_during_run? ? 'yes' : 'no'}"]
+  if !cm_lapidary_box_name.empty?
+    slots = cm_lapidary_design_slots
+    lines << "Saved design slots: #{slots.positive? ? slots : 'unknown'}"
+    lines << "Whisper design support: #{cm_lapidary_supports_whisper_design? ? 'yes' : 'no'}"
+  end
+  lines << 'Saved pattern choices:'
   %w[chrism orb purified regular].each do |kind|
     value = cm_lapidary_pattern_value(kind)
     lines << "  #{cm_lapidary_outcome_label(kind)}: #{value.empty? ? CHRISMFORGE_NONE_LABEL : value}"
@@ -716,6 +728,18 @@ end
 
 def cm_lapidary_analyzed_at
   setting_value(:lapidaryanalyzedat).to_s
+end
+
+def cm_lapidary_design_slots
+  setting_value(:lapidarydesignslots).to_s.gsub(/[^\d]/, '').to_i
+rescue
+  0
+end
+
+def cm_lapidary_supports_whisper_design?
+  setting_value(:lapidarysupportswhisperdesign).to_s =~ /\A(?:true|yes|on|1)\z/i ? true : false
+rescue
+  false
 end
 
 def require_setting(name, description)
@@ -809,6 +833,21 @@ rescue
   nil
 end
 
+# Builds the best ANALYZE target for a saved gem-shaping tool.
+#
+# @param setting [String] box name, noun, or item id
+# @return [String] game command target
+def cm_lapidary_command_target(setting)
+  setting = setting.to_s.strip
+  container = find_inventory_container(setting)
+  return "##{container.id}" if container && !container.id.to_s.empty?
+  return "##{Regexp.last_match(1)}" if setting =~ /\A#?(\d+)\z/
+
+  setting
+rescue
+  setting.to_s.strip
+end
+
 # Parses gem-shaping tool ANALYZE output for saved design names.
 #
 # @param text [String] output from ANALYZE
@@ -826,44 +865,71 @@ def cm_parse_lapidary_analysis(text)
   {
     lapidary: source =~ /lapidary box|gem\s*cutter|gemcutter|Current Designs:|currently has\s+\d+\s+unlocked design slots|WHISPER DESIGN/i ? true : false,
     slots: source[/currently has\s+(\d+)\s+unlocked design slots/i, 1].to_i,
-    designs: designs
+    designs: designs,
+    whisper_design: source =~ /WHISPER DESIGN/i ? true : false
   }
+end
+
+# Sends a visible command and captures downstream lines without hiding the
+# result from the player.
+#
+# Side effects: sends a game command and briefly installs a downstream hook.
+#
+# @param command [String] game command to send
+# @param timeout [Numeric] seconds to wait for the ending pattern
+# @param end_pattern [Regexp] pattern that marks command completion
+# @return [Array<String>] captured downstream lines
+def cm_capture_visible_command(command, timeout, end_pattern)
+  lines = []
+  hook_name = nil
+  if defined?(DownstreamHook)
+    hook_name = "#{SCRIPT_COMMAND}_capture_#{Time.now.to_f}_#{rand(1000)}"
+    DownstreamHook.add(hook_name, proc do |xml|
+      lines << xml.to_s.rstrip
+      xml
+    end)
+  end
+  result = dothistimeout(command, timeout, end_pattern).to_s
+  lines << result.rstrip if lines.empty? && !result.empty?
+  lines.reject(&:empty?)
+ensure
+  begin
+    DownstreamHook.remove(hook_name) if hook_name && defined?(DownstreamHook)
+  rescue
+    nil
+  end
 end
 
 # Sends ANALYZE and captures the full gemcutting-tool output for parsing.
 #
 # Side effects: sends ANALYZE to the game.
 #
-# @param command [String] ANALYZE command to send
+# @param target [String] ANALYZE target
 # @return [String] captured game output
-def cm_lapidary_analyze_output(command)
-  lines = []
-  fput command
-  Timeout.timeout(10) do
-    while (line = get)
-      text = line.to_s.rstrip
-      lines << text
-      break if text =~ /Try as you might|as light as it can get|could get any deeper|What were you|I could not/i
-    end
-  end
-  lines.join("\n")
-rescue Timeout::Error
-  lines.join("\n")
+def cm_lapidary_analyze_output(target)
+  cm_capture_visible_command(
+    "analyze #{target}",
+    5,
+    /Try as you might|as light as it can get|could get any deeper|What were you referring to|I could not find|You do not|You can't|must be holding/i
+  ).join("\n")
 rescue
-  lines.join("\n")
+  ''
 end
 
-# Builds safe ANALYZE commands for a gemcutting tool.
+# Builds safe ANALYZE targets for a gemcutting tool.
 #
 # @param box_name [String] typed item name, noun, or id
 # @param box [Object, nil] matched GameObj item when available
-# @return [Array<String>] ANALYZE command attempts, most precise first
-def cm_lapidary_analyze_commands(box_name, box = nil)
-  commands = []
+# @return [Array<String>] ANALYZE targets, most precise first
+def cm_lapidary_analyze_targets(box_name, box = nil)
+  targets = []
   if box && box.respond_to?(:id) && !box.id.to_s.empty?
-    commands << "analyze ##{box.id}"
-    commands << "analyze my #{box.noun}" unless box.noun.to_s.empty?
+    targets << "##{box.id}"
+    targets << "my #{box.noun}" unless box.noun.to_s.empty?
   end
+
+  primary = cm_lapidary_command_target(box_name)
+  targets << primary unless primary.to_s.strip.empty?
 
   typed = box_name.to_s.strip
   core = cm_item_lookup_core(typed)
@@ -873,9 +939,18 @@ def cm_lapidary_analyze_commands(box_name, box = nil)
     next if name.empty? || name =~ /\A#?\d+\z/
 
     name = name.sub(/\A(?:my|your)\s+/i, '')
-    commands << "analyze my #{name}"
+    targets << "my #{name}"
   end
-  commands.map(&:strip).reject(&:empty?).uniq
+  targets.map(&:strip).reject(&:empty?).uniq
+end
+
+# Builds safe ANALYZE commands for a gemcutting tool.
+#
+# @param box_name [String] typed item name, noun, or id
+# @param box [Object, nil] matched GameObj item when available
+# @return [Array<String>] ANALYZE command attempts, most precise first
+def cm_lapidary_analyze_commands(box_name, box = nil)
+  cm_lapidary_analyze_targets(box_name, box).map { |target| "analyze #{target}" }
 end
 
 # Analyzes a saved gem-shaping tool and saves its current designs.
@@ -890,13 +965,13 @@ def cm_analyze_lapidary_box(box_name)
 
   cm_silently_refresh_inventory
   box = find_inventory_container(box_name)
-  commands = cm_lapidary_analyze_commands(box_name, box)
-  return "Could not build an analyze command for lapidary box '#{box_name}'." if commands.empty?
+  targets = cm_lapidary_analyze_targets(box_name, box)
+  return "Could not build an analyze command for lapidary box '#{box_name}'." if targets.empty?
 
   output = nil
   parsed = nil
-  commands.each do |command|
-    output = cm_lapidary_analyze_output(command)
+  targets.each do |target|
+    output = cm_lapidary_analyze_output(target)
     parsed = cm_parse_lapidary_analysis(output)
     break if parsed[:lapidary]
   end
@@ -907,13 +982,16 @@ def cm_analyze_lapidary_box(box_name)
 
   saved_label = box ? cm_container_label(box) : box_name
   cm_setting_write(:lapidarybox, saved_label)
+  cm_setting_write(:lapidarydesignslots, parsed[:slots].to_s)
   cm_setting_write(:lapidarydesigns, parsed[:designs])
+  cm_setting_write(:lapidarysupportswhisperdesign, parsed[:whisper_design] ? 'true' : 'false')
   cm_setting_write(:lapidaryanalyzedat, Time.now.strftime('%m/%d/%Y %H:%M:%S %z'))
   cm_save_settings
 
   lines = [
     "Lapidary box saved: #{saved_label}",
-    "Unlocked design slots: #{parsed[:slots].positive? ? parsed[:slots] : 'unknown'}"
+    "Unlocked design slots: #{parsed[:slots].positive? ? parsed[:slots] : 'unknown'}",
+    "Whisper design support: #{parsed[:whisper_design] ? 'yes' : 'no'}"
   ]
   if parsed[:designs].empty?
     lines << 'No designs were found in ANALYZE output.'
