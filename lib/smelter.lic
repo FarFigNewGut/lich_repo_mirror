@@ -1,35 +1,359 @@
+# smelter.lic
 =begin
+    BIG WIP. For Premium accounts only. Scans locker surfaces for specific or ALL metals by leveraging native Lich GameObj data.
+    Strictly segregates Ora variants. Optimizes batches using a Target-Sum Knapsack algorithm
+    to minimize wasted metal overfill.
+    Usage: ;smelter all  -OR-  ;smelter <metal_name>
 
-    author: Gwrawr
+    Author: Lobsterman
+    Tags: locker, inventory, smelting, forging, crucible
 
 =end
 
-sortSlab = proc {
-    result = dothis "glance", /^You glance down at your empty hands\.$|^.*left hand\.$/
-    case result
-        when /(?<material>iron|invar)/
-            fput "put my #{$~[:material]} slab in waste"
-        when /(?<material>mithril|imflass|ora)/
-            fput "drop my #{$~[:material]} slab"
-        else
-            fput "stow my #{$~[:material]} slab"
+# Establish compilation-safe explicit data structures to completely eliminate brace parsing errors
+ItemStruct = Struct.new(:id, :name, :surface, :metal, :weight_str, :lbs)
+BatchStruct = Struct.new(:items, :total_weight, :functional)
+
+# Define master list of standard and rare metals supported by Tier 3 crucibles
+KNOWN_METALS = [
+  "black ora", "white ora", "bronze", "copper", "imflass", "invar", "iron", "mithril", "ora", "steel", "vultite", 
+  "drakar", "gornar", "mithglin", "rhimar", "zorchar", "eahnor", "eonake", 
+  "faenor", "golvern", "kelyn", "razern", "rolaren", "vaalorn", "veil iron"
+]
+
+# Helper function to read the weight text from game output (handles weigh and loresong variations)
+def determine_weight_from_lines(lines)
+  lines.each { |line|
+    if line =~ /looks like it weighs about (\d+ pounds?|\d+ ounces?|less than \d+ pounds?)/i ||
+       line =~ /determine that the weight is about (\d+ pounds?|\d+ ounces?|less than \d+ pounds?)/i
+      return $1
+    elsif line =~ /under a pound/i
+      return "under a pound"
+    elsif line =~ /appears to weigh about (\d+)\s+pounds?/i || line =~ /weighing about (\d+)\s+pounds?/i
+      return "#{$1} pounds"
     end
+  }
+  return "Unknown"
+end
+
+# Helper function to convert game weight strings into numeric floats for grouping calculation
+def convert_to_numeric_pounds(weight_str)
+  case weight_str
+  when /under a\s+pound/i, /less than 2\s+pounds?/i, /less than a\s+pound/i
+    return 1.0
+  when /(\d+)\s+ounces?/i
+    return ($1.to_f / 16.0).round(2)
+  when /(\d+)\s+pounds?/i
+    return $1.to_f
+  else
+    return 0.0
+  end
+end
+
+# Helper logic to precisely identify the metal type of an item string
+def identify_exact_metal(item_name_down)
+  return nil if item_name_down.include?("orase")
+
+  if item_name_down.include?("black ora")
+    return "black ora"
+  elsif item_name_down.include?("white ora")
+    return "white ora"
+  elsif item_name_down =~ /\bora\b/ 
+    return "ora"
+  end
+
+  KNOWN_METALS.each { |metal|
+    next if ["ora", "black ora", "white ora"].include?(metal) 
+    return metal if item_name_down.include?(metal)
+  }
+  return nil
+end
+
+# Isolated network stream reader - returns compilation-safe Array
+def fetch_recall_stream
+  recall_lines = []
+  recall_failed = false
+  
+  loop do
+    line = get?
+    if line
+      recall_lines << line
+      if line =~ /unable to recall/i || line =~ /must be holding/i
+        recall_failed = true
+      end
+      break if line =~ /unlocked loresong/i || line =~ /unlock its lorig/i || line =~ /unlock its loresong/i
+    else
+      sleep 0.05
+      line_retry = get?
+      if line_retry
+        recall_lines << line_retry
+      else
+        break 
+      end
+    end
+  end
+  return [recall_lines, recall_failed]
+end
+
+# Isolated output block for rendering the complete dashboard report
+def print_all_metals_dashboard(metal_inventories)
+  echo ""
+  echo "=========================================================="
+  echo "         CRUSH MASTER INVENTORY DASHBOARD                "
+  echo "=========================================================="
+  echo "Analyzing all metals that can yield at least 1 Slab (25 lbs):"
+  echo ""
+  
+  has_yield = false
+  
+  metal_inventories.keys.sort.each { |metal_type|
+    sorted_items = metal_inventories[metal_type].sort_by { |item| -item.lbs }
+    slabs_count = 0
+    current_weight = 0.0
+    
+    sorted_items.each { |item|
+      current_weight += item.lbs
+      if current_weight >= 25.0
+        slabs_count += 1
+        current_weight = 0.0
+      end
+    }
+    
+    if slabs_count > 0
+      has_yield = true
+      echo " *  #{metal_type.upcase.ljust(15)} : Ready to yield [ #{slabs_count} ] Slab(s)!"
+    end
+  }
+  
+  unless has_yield
+    echo "[-] No metals currently have enough stockpiled weight to create a 25 lb slab."
+  end
+  echo "=========================================================="
+  echo "[i] Run ';smelter <metal_name>' to view the exact batch item blueprints."
+end
+
+# Isolated output block for rendering single metal detailed batches with target optimization
+def print_single_metal_report(target_mode, metal_inventories)
+  if metal_inventories[target_mode].nil? || metal_inventories[target_mode].empty?
+    echo "[-] Found 0 parsed weight records for metal target: #{target_mode.upcase}"
+    return nil
+  end
+
+  pool = metal_inventories[target_mode].dup
+  batches = []
+
+  # Target-Sum Loop: Keep finding the absolute best waste-minimizing batch until no more can be made
+  loop do
+    best_combo = nil
+    best_weight = 9999.0
+
+    # Handle explicit single overweight items (>25 lbs) immediately so they don't break the combo matrix
+    overweight_item = pool.find { |item| item.lbs >= 25.0 }
+    if overweight_item
+      batches << BatchStruct.new([overweight_item], overweight_item.lbs, true)
+      pool.delete(overweight_item)
+      next
+    end
+
+    # Mathematical combination search to find the subset that overshoots 25 lbs by the absolute smallest margin
+    (1..pool.length).each { |size|
+      pool.combination(size).each { |combo|
+        total = combo.map(&:lbs).sum
+        if total >= 25.0 && total < best_weight
+          best_combo = combo
+          best_weight = total
+        end
+      }
+    }
+
+    # If a valid combo >= 25 lbs was found, lock it in and remove those items from the pool
+    if best_combo
+      batches << BatchStruct.new(best_combo, best_weight, true)
+      best_combo.each { |item| pool.delete(item) }
+    else
+      break # No more combinations can mathematically clear the 25 lb minimum barrier
+    end
+  end
+
+  # Any remaining items left in the pool after optimization are labeled as leftovers
+  if !pool.empty?
+    leftover_weight = pool.map(&:lbs).sum
+    batches << BatchStruct.new(pool, leftover_weight, false)
+  end
+
+  echo ""
+  echo "=========================================================="
+  echo "    STRICT SMELTER REPORT: MINIMUM 25 lbs REQUIREMENT    "
+  echo "=========================================================="
+  
+  functional_count = batches.count { |b| b.functional }
+  leftover_batch = batches.find { |b| !b.functional }
+
+  batches.each_with_index { |batch, b_idx|
+    next unless batch.functional
+    waste = batch.total_weight - 25.0
+    echo "--- [ VALID BATCH ##{b_idx + 1} ] (Total Weight: #{batch.total_weight.round(2)} lbs) ---"
+    echo "    Target Yield: 1 Forging Slab (#{waste.round(2)} lbs excess will be lost)"
+    
+    batch.items.each { |item| 
+      echo "  * [##{item.id}] #{item.name} #{item.lbs.to_i}lbs #{item.surface.capitalize}"
+    }
+    echo ""
+  }
+
+  if leftover_batch
+    needed = 25.0 - leftover_batch.total_weight
+    echo "--- [ STRANDED LEFTOVERS: CANNOT SMELT YET ] ---"
+    echo "  STATUS: Total weight is only #{leftover_batch.total_weight.round(2)} lbs. (Short by #{needed.round(2)} lbs!)"
+    
+    leftover_batch.items.each { |item| 
+      echo "  ! [##{item.id}] #{item.name} #{item.lbs.to_i}lbs #{item.surface.capitalize}"
+    }
+    echo ""
+  end
+
+  echo "=========================================================="
+  echo " SUMMARY: You can immediately yield [ #{functional_count} ] Slab(s) of #{target_mode.upcase}."
+  echo "=========================================================="
+end
+# --- Main Script Execution Pipeline ---
+
+if variable.nil? || variable.empty?
+  echo "[-] Error: You must specify a metal name or use 'all'!"
+  echo "    Usage: ;smelter all  -OR-  ;smelter <metal_name>"
+  exit
+end
+
+# Check if variable is an array container, extract index 0 cleanly to fix the duplication bug
+if variable.is_a?(Array)
+  target_mode = variable[0].to_s.downcase.strip
+else
+  target_mode = variable.to_s.downcase.strip
+end
+
+if target_mode == "all"
+  echo "[+] Mode: Scanning locker surfaces for ALL valid crucible metals..."
+else
+  unless KNOWN_METALS.include?(target_mode)
+    echo "[!] Warning: '#{target_mode}' isn't explicitly on the crucible master list, but scanning anyway."
+  end
+  echo "[+] Mode: Scanning locker surfaces strictly for metal type: #{target_mode.upcase}"
+end
+
+surfaces = GameObj.loot.select { |obj| obj.noun =~ /rack|stand/i }
+
+if surfaces.empty?
+  echo "[-] ERROR: Can't see a weapon rack or armor stand in this room!"
+  echo "    Make sure you are standing in your locker interior."
+  exit
+end
+
+items_to_check = []
+
+surfaces.each { |surface|
+  waitrt?
+  fput "look on ##{surface.id}"
+  sleep 0.4 
+  
+  if surface.contents.nil? || surface.contents.empty?
+    echo "[!] Surface '#{surface.name}' appears empty or wasn't loaded in time."
+    next
+  end
+  
+  surface.contents.each { |item|
+    item_name_down = item.name.to_s.downcase
+    detected_metal = identify_exact_metal(item_name_down)
+    next if detected_metal.nil? 
+
+    if target_mode == "all"
+      items_to_check << ItemStruct.new(item.id, item.name, surface.noun, detected_metal, nil, nil)
+    else
+      if detected_metal == target_mode
+        items_to_check << ItemStruct.new(item.id, item.name, surface.noun, detected_metal, nil, nil)
+      end
+    end
+  }
 }
 
+if items_to_check.empty?
+  echo "[-] Found 0 items matching your strict criteria on your locker surfaces."
+  exit
+else
+  echo "[+] Found #{items_to_check.length} matching items via GameObj memory map. Starting weight verification..."
+end
 
-loop do
+metal_inventories = Hash.new { |h, k| h[k] = [] }
 
-    2.times{fput "ask miner about ore"}
-    fput "put ore in crucible"
-    pause 36
+items_to_check.each_with_index { |item_info, index|
+  item_id = item_info.id
+  item_name = item_info.name
+  surface_noun = item_info.surface
+  item_metal = item_info.metal
+  
+  waitrt?
+  clear
+  
+  fput "recall ##{item_id}"
+  
+  stream_data = fetch_recall_stream
+  recall_lines = stream_data[0]
+  recall_failed = stream_data[1]
+  
+  weight = "Unknown"
+  
+  if recall_failed
+    echo "[!] Recall failed for #{item_name}. Pulling to weigh..."
     waitrt?
-    waitrt?
-
-    sortSlab.call()
-    sortSlab.call() if not (checkleft == nil and checkright == nil)
-    if not (checkleft == nil or checkright == nil)
-        echo "\nFull\n"
-        exit
+    fput "get ##{item_id}"
+    
+    if checkright != nil || checkleft != nil
+      clear
+      fput "weigh my #{item_info.name.split[-1]}"
+      
+      weigh_lines = []
+      loop do
+        line = get?
+        if line
+          weigh_lines << line
+        else
+          sleep 0.05
+          line_retry = get?
+          if line_retry
+            weigh_lines << line_retry
+          else
+            break
+          end
+        end
+      end
+      
+      weight = determine_weight_from_lines(weigh_lines)
+      echo "[!] Item #{index + 1}: #{item_name} -> #{weight} (via Weigh)"
+      
+      waitrt?
+      fput "put ##{item_id} on #{surface_noun}"
+    else
+      echo "[-] Failed to grab: #{item_name}. Skipping."
+      next
     end
+  else
+    weight = determine_weight_from_lines(recall_lines)
+    echo "[!] Item #{index + 1}: #{item_name} -> #{weight} (via Recall)"
+  end
+  
+  numeric_lbs = convert_to_numeric_pounds(weight)
+  if numeric_lbs > 0
+    item_info.weight_str = weight
+    item_info.lbs = numeric_lbs
+    metal_inventories[item_metal] << item_info
+  else
+    echo "[-] Warning: Could not process weight for #{item_name}. Excluded."
+  end
+}
 
+# --- Execution of Isolated Reports ---
+
+if target_mode == "all"
+  print_all_metals_dashboard(metal_inventories)
+else
+  print_single_metal_report(target_mode, metal_inventories)
 end
