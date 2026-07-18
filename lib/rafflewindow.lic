@@ -3,19 +3,34 @@
 
   Type the command RAFFLE LIST in game after starting the script to populate the raffle window.
 
+  Supports both the Wrayth/Stormfront panel window and a GTK window for
+  Avalon and Wizard front ends (or anyone who prefers it). The GTK window
+  shows the full detail for every raffle -- cost, location, draw time and
+  countdown, online/presence requirement, and purchased status -- and gives
+  each raffle its own Show and Guide buttons.
+
+  In-game Commands (while running):
+    *rwgtk    - Toggle the GTK raffle window on/off
+    *rwrefresh - Re-request RAFFLE LIST from the game
+
   Changelog:
+   1.1.0 (2026-07-18)
+     Added a GTK window with full per-raffle detail and clickable
+     Show/Guide buttons (send RAFFLE SHOW #/RAFFLE GUIDE # to the main
+     game window). Wrayth panel window unchanged.
    1.0.1 (2025-04-26)
      Corrections for output.
    1.0.0 (2025-04-05)
      Initial release.
 
 author: Phocosoen, ChatGPT
-tags: wrayth, frontend, mod, window, raffle, raffles, track
+tags: wrayth, frontend, mod, window, raffle, raffles, track, gtk3, avalon, wizard
 =end
 
 require 'tzinfo'
 require 'time'
 require 'timeout'
+require 'yaml'
 
 hide_me
 no_kill_all
@@ -53,6 +68,131 @@ def time_diff_in_words(future_time)
 
   parts.join(" ")
 end
+
+module RaffleWindow
+  extend self
+
+  PANEL_FRONTENDS = /^(?:stormfront|wrayth)$/i
+
+  PALETTES = {
+    "Lich Dark Mode"     => { bg: "#2E2E2E", fg: "#DADADA" },
+    "Lich Light Mode"    => { bg: "#E6E6E6", fg: "#202020" },
+    "Middle Ground"      => { bg: "#333333", fg: "#FFFFFF" },
+    "White on Black"     => { bg: "#000000", fg: "#FFFFFF" },
+    "NQWhite on NQBlack" => { bg: "#111111", fg: "#f6f6f6" },
+    "Black on White"     => { bg: "#FFFFFF", fg: "#000000" },
+  }
+
+  DEFAULT_SETTINGS = {
+    "rafflewindow" => {
+      "use_gtk_rafflewindow" => true,
+      "font_size"            => 17,
+      "x"                    => 2280,
+      "y"                    => 1600,
+      "width"                => 560,
+      "height"               => 520,
+      "palette"              => "White on Black"
+    }
+  }
+
+  CMD_QUEUE = Queue.new
+
+  class << self
+    attr_accessor :settings, :window_settings, :use_gtk_window, :gtk_available
+  end
+
+  def coerce_integer(value, min: nil, max: nil, allow_nil: false)
+    return nil if value.nil? && allow_nil
+    n = Integer(value.to_s)
+    n = min if min && n < min
+    n = max if max && n > max
+    n
+  rescue StandardError
+    allow_nil ? nil : min
+  end
+
+  def deep_merge_hash(base, overrides)
+    merged = base.dup
+    overrides.each do |key, val|
+      merged[key] = if merged[key].is_a?(Hash) && val.is_a?(Hash)
+                       deep_merge_hash(merged[key], val)
+                     else
+                       val
+                     end
+    end
+    merged
+  end
+
+  def sanitize_window_settings(settings)
+    sanitized = deep_merge_hash(DEFAULT_SETTINGS, settings.is_a?(Hash) ? settings : {})
+    rw = sanitized["rafflewindow"] ||= {}
+    defaults = DEFAULT_SETTINGS["rafflewindow"]
+
+    rw["use_gtk_rafflewindow"] = !!rw["use_gtk_rafflewindow"]
+    rw["font_size"] = coerce_integer(rw["font_size"], min: 8, max: 30) || defaults["font_size"]
+    rw["width"]  = coerce_integer(rw["width"],  min: 260, max: 2400, allow_nil: true)
+    rw["height"] = coerce_integer(rw["height"], min: 160, max: 1800, allow_nil: true)
+    rw["x"] = coerce_integer(rw["x"], min: -10_000, max: 10_000, allow_nil: true)
+    rw["y"] = coerce_integer(rw["y"], min: -10_000, max: 10_000, allow_nil: true)
+    rw["palette"] = defaults["palette"] unless PALETTES.keys.include?(rw["palette"])
+
+    sanitized
+  rescue StandardError
+    deep_merge_hash(DEFAULT_SETTINGS, {})
+  end
+
+  def window_settings_path(name: Char.name)
+    base_dir = "#{$data_dir}#{XMLData.game}/#{name}"
+    Dir.mkdir("#{$data_dir}#{XMLData.game}") unless File.exist?("#{$data_dir}#{XMLData.game}")
+    Dir.mkdir(base_dir) unless File.exist?(base_dir)
+    File.join(base_dir, "lichwindows.yaml")
+  end
+
+  def load_window_settings(name: Char.name)
+    filename = window_settings_path(name: name)
+    settings_hash = nil
+
+    if File.exist?(filename) && name == Char.name
+      begin
+        raw = File.read(filename)
+        parsed = YAML.safe_load(raw, permitted_classes: [Hash, Array, String, Integer, Float, TrueClass, FalseClass, NilClass], aliases: false)
+        settings_hash = sanitize_window_settings(parsed)
+        File.write(filename, settings_hash.to_yaml) if parsed != settings_hash
+      rescue => e
+        echo "Rafflewindow settings: Corrupt settings file detected (#{e.message}). Rebuilding defaults..."
+        settings_hash = sanitize_window_settings({})
+        File.write(filename, settings_hash.to_yaml)
+      end
+    elsif !File.exist?(filename) && name != Char.name
+      echo "Rafflewindow settings: Attempt to load a profile (#{name}) that does not exist."
+      settings_hash = nil
+    elsif !File.exist?(filename) && name == Char.name
+      settings_hash = sanitize_window_settings({})
+      File.write(filename, settings_hash.to_yaml)
+    else
+      echo "Rafflewindow settings: Unknown error loading profile (#{name})"
+      settings_hash = nil
+    end
+
+    settings_hash
+  end
+
+  def save_window_settings(settings, name: Char.name)
+    File.write(window_settings_path(name: name), sanitize_window_settings(settings).to_yaml)
+  end
+end
+
+RaffleWindow.gtk_available = begin
+  require 'gtk3'
+  true
+rescue LoadError => e
+  echo "Rafflewindow: GTK unavailable (#{e.message})."
+  false
+end
+
+RaffleWindow.settings = RaffleWindow.load_window_settings
+RaffleWindow.window_settings = RaffleWindow.settings["rafflewindow"] ||= {}
+RaffleWindow.use_gtk_window = RaffleWindow.window_settings.fetch("use_gtk_rafflewindow", true)
 
 # --- Global Variables ---
 @raffle_lines = []    # Captured lines from the raffle list output
@@ -116,6 +256,17 @@ def parse_raffle_lines
   finalize_current_raffle
 end
 
+def raffle_requirement_text(raffle)
+  raffle[:online] ? 'Must be logged in.' : (raffle[:logout_ok] ? 'Can be logged out.' : 'Must be present.')
+end
+
+def raffle_time_text(raffle)
+  return nil unless raffle[:draw_time]
+  time_string = raffle[:draw_time].strftime('%a %b %e %I:%M:%S %p %Z')
+  diff_string = time_diff_in_words(raffle[:draw_time])
+  diff_string ? "#{time_string} (#{diff_string})" : "#{time_string} (Draw time has passed.)"
+end
+
 def format_raffle_info
   # Since we now discard any raffle with a "Drew at:" line, we can simply output the raffles.
   output = "Info - RAFFLE SHOW #\nTravel - RAFFLE GUIDE #\nAn asterisk ( * ) denotes a ticket has been purchased for this raffle.\n\n"
@@ -124,16 +275,11 @@ def format_raffle_info
     raffle_output = ""
     raffle_output += "Raffle ##{raffle[:id]} for \"#{raffle[:item]}\"\n"
     raffle_output += "#{raffle[:cost]} silver\n"
-    if raffle[:draw_time]
-      time_string = raffle[:draw_time].strftime('%a %b %e %I:%M:%S %p %Z')
-      diff_string = time_diff_in_words(raffle[:draw_time])
-      if diff_string
-        raffle_output += "#{time_string} (#{diff_string})\n"
-      else
-        raffle_output += "  Draw time has passed.\n"
-      end
+    time_text = raffle_time_text(raffle)
+    if time_text
+      raffle_output += "#{time_text}\n"
     end
-    raffle_output += "#{raffle[:online] ? 'Must be logged in.' : (raffle[:logout_ok] ? 'Can be logged out.' : 'Must be present.')}\n"
+    raffle_output += "#{raffle_requirement_text(raffle)}\n"
 
     raffle_output += "\n"
 
@@ -153,16 +299,356 @@ def Raffle_Window(message)
   puts "<clearStream id=\"rafflewindow\"/>" +
        "<pushStream id=\"rafflewindow\"/>" +
        "<style fontFamily='monospace'/>" +
-       "<pushStream id=\"rafflewindow\"/>#{message}<popStream/>"
+       "#{message}<popStream/>"
 end
 
-# --- Create the Raffle Window ---
+# --- GTK Window ---
+class RaffleWindowGtk
+  @window       = nil
+  @css_provider = nil
+  @font_size    = nil
+
+  def self.reload_css
+    settings = RaffleWindow.load_window_settings
+    rw       = settings["rafflewindow"] ||= {}
+    pal_name = rw["palette"] || "White on Black"
+    colors   = RaffleWindow::PALETTES[pal_name]
+
+    css = <<~CSS
+      window#rafflewindow {
+        background-color: #{colors[:bg]};
+        color:            #{colors[:fg]};
+        border:           0px solid #888888;
+        border-radius:    4px;
+      }
+
+      window#rafflewindow .palette-btn,
+      window#rafflewindow popover .palette-btn,
+      window#rafflewindow GtkPopover .palette-btn {
+        background: #{colors[:bg]};
+        color: #{colors[:fg]};
+      }
+
+      window#rafflewindow .palette-btn:checked {
+        background: #{colors[:bg]};
+        color: #{colors[:fg]};
+      }
+
+      window#rafflewindow headerbar {
+        background-color: #{colors[:bg]};
+        color:            #{colors[:fg]};
+      }
+
+      window#rafflewindow headerbar .header-toggle {
+        margin:      0 2px;
+        padding:     2px 4px;
+        background-image: none;
+        background-color: transparent;
+        color:            #{colors[:fg]};
+        border:           none;
+        box-shadow:       none;
+      }
+
+      window#rafflewindow headerbar .header-toggle:checked {
+        background-color: #0a84ff;
+        color:            #FFFFFF;
+      }
+
+      window#rafflewindow label {
+        font-size: #{@font_size}px;
+        color:     #{colors[:fg]};
+      }
+
+      window#rafflewindow .raffle-title label {
+        font-weight: bold;
+      }
+
+      window#rafflewindow .raffle-btn,
+      window#rafflewindow button.raffle-btn {
+        background: #{colors[:bg]};
+        color: #{colors[:fg]};
+        border-radius: 6px;
+        border-width: 1px;
+        border-style: solid;
+        border-color: #888888;
+        margin: 0 2px;
+        padding: 5px;
+        font-weight: normal;
+        transition: background 0.2s;
+      }
+
+      window#rafflewindow .raffle-btn:active,
+      window#rafflewindow button.raffle-btn:active {
+        background: #{colors[:bg]};
+        color: #{colors[:fg]};
+      }
+
+      window#rafflewindow GtkScrolledWindow,
+      window#rafflewindow GtkBox {
+        background-color: #{colors[:bg]};
+      }
+
+      window#rafflewindow separator {
+        background-color: #{colors[:fg]};
+        opacity: 0.25;
+      }
+    CSS
+
+    @css_provider.load(data: css)
+  end
+
+  def self.create_main_window
+    return if @window
+
+    settings = RaffleWindow.load_window_settings
+    rw       = settings["rafflewindow"] ||= {}
+    @font_size = rw["font_size"] || 14
+
+    @window = Gtk::Window.new(:toplevel)
+    @window.set_name("rafflewindow")
+    @window.set_border_width(6)
+    @window.set_type_hint(Gdk::WindowTypeHint::UTILITY)
+    @window.set_keep_above(true)
+
+    header = Gtk::HeaderBar.new
+    header.show_close_button = true
+    header.title = "Raffles"
+
+    refresh_btn = Gtk::Button.new(label: "Refresh")
+    refresh_btn.style_context.add_class("header-toggle")
+    refresh_btn.signal_connect("clicked") { RaffleWindow::CMD_QUEUE.push("raffle list") }
+    header.pack_start(refresh_btn)
+
+    dec_btn = Gtk::Button.new(label: "A-")
+    inc_btn = Gtk::Button.new(label: "A+")
+    [dec_btn, inc_btn].each do |b|
+      b.style_context.add_class("header-toggle")
+      header.pack_start(b)
+    end
+    dec_btn.signal_connect("clicked") do
+      @font_size = [@font_size - 1, 8].max
+      rw["font_size"] = @font_size; RaffleWindow.save_window_settings(settings)
+      reload_css
+    end
+    inc_btn.signal_connect("clicked") do
+      @font_size = [@font_size + 1, 30].min
+      rw["font_size"] = @font_size; RaffleWindow.save_window_settings(settings)
+      reload_css
+    end
+
+    palette_btn = Gtk::MenuButton.new
+    palette_btn.style_context.add_class("header-toggle")
+    img = Gtk::Image.new(
+      icon_name: "preferences-desktop-color-symbolic",
+      icon_size: Gtk::IconSize::SMALL_TOOLBAR
+    )
+    palette_btn.set_image(img)
+    palette_btn.set_always_show_image(true)
+
+    popover = Gtk::Popover.new(palette_btn)
+    popover.set_position(Gtk::PositionType::TOP)
+
+    listbox = Gtk::Box.new(:vertical, 0)
+    RaffleWindow::PALETTES.each_key do |name|
+      btn = Gtk::ToggleButton.new(label: name)
+      btn.style_context.add_class("header-toggle")
+      btn.style_context.add_class("palette-btn")
+      btn.active = (name == rw["palette"])
+      btn.signal_connect("clicked") do
+        s = RaffleWindow.load_window_settings
+        s["rafflewindow"] ||= {}
+        s["rafflewindow"]["palette"] = name
+        RaffleWindow.save_window_settings(s)
+        reload_css
+      end
+      listbox.add(btn)
+    end
+    popover.add(listbox)
+    listbox.show_all
+    palette_btn.set_popover(popover)
+    header.pack_end(palette_btn)
+
+    @window.set_titlebar(header)
+
+    @css_provider = Gtk::CssProvider.new
+    reload_css
+    screen = Gdk::Screen.default
+    Gtk::StyleContext.add_provider_for_screen(
+      screen,
+      @css_provider,
+      Gtk::StyleProvider::PRIORITY_APPLICATION
+    )
+
+    @window.resize(rw["width"], rw["height"]) if rw["width"] && rw["height"]
+    @window.move(rw["x"], rw["y"]) if rw["x"] && rw["y"]
+
+    @scroll = Gtk::ScrolledWindow.new
+    @scroll.set_policy(Gtk::PolicyType::AUTOMATIC, Gtk::PolicyType::AUTOMATIC)
+    @scroll.set_hexpand(true)
+    @scroll.set_vexpand(true)
+
+    @list_box = Gtk::Box.new(:vertical, 6)
+    @list_box.set_hexpand(true)
+    @scroll.add(@list_box)
+
+    @window.add(@scroll)
+
+    @ignore_next_configure = true
+    @window.signal_connect("configure_event") do |_w, _ev|
+      if @ignore_next_configure
+        @ignore_next_configure = false
+      else
+        x, y = @window.position
+        w, h = @window.size
+        s = RaffleWindow.load_window_settings
+        s["rafflewindow"] ||= {}
+        s["rafflewindow"].merge!("x" => x, "y" => y, "width" => w, "height" => h)
+        RaffleWindow.save_window_settings(s)
+      end
+      false
+    end
+
+    default_quit_id = @window.signal_connect("destroy") do
+      Gtk.main_quit
+    end
+    @window.signal_handler_disconnect(default_quit_id)
+
+    @window.signal_connect("destroy") do
+      @window = nil
+    end
+
+    @window.show_all
+  end
+
+  def self.build_raffle_row(raffle)
+    row = Gtk::Box.new(:vertical, 2)
+
+    title_box = Gtk::Box.new(:horizontal, 6)
+    title_box.style_context.add_class("raffle-title")
+
+    show_btn = Gtk::Button.new(label: (raffle[:purchased] ? "* Raffle ##{raffle[:id]}" : "Raffle ##{raffle[:id]}"))
+    show_btn.style_context.add_class("raffle-btn")
+    show_btn.signal_connect("clicked") { RaffleWindow::CMD_QUEUE.push("raffle show #{raffle[:id]}") }
+    title_box.pack_start(show_btn, expand: false, fill: false, padding: 0)
+
+    item_lbl = Gtk::Label.new("for \"#{raffle[:item]}\" -- #{raffle[:cost]} silver")
+    item_lbl.set_xalign(0)
+    title_box.pack_start(item_lbl, expand: true, fill: true, padding: 0)
+
+    row.add(title_box)
+
+    loc_lbl = Gtk::Label.new("Location: #{raffle[:object]} at [#{raffle[:location]}]")
+    loc_lbl.set_xalign(0)
+    loc_lbl.set_line_wrap(true)
+    row.add(loc_lbl)
+
+    time_text = raffle_time_text(raffle)
+    if time_text
+      time_lbl = Gtk::Label.new(time_text)
+      time_lbl.set_xalign(0)
+      row.add(time_lbl)
+    end
+
+    req_lbl = Gtk::Label.new(raffle_requirement_text(raffle))
+    req_lbl.set_xalign(0)
+    row.add(req_lbl)
+
+    btn_box = Gtk::Box.new(:horizontal, 6)
+    info_btn = Gtk::Button.new(label: "Show")
+    info_btn.style_context.add_class("raffle-btn")
+    info_btn.signal_connect("clicked") { RaffleWindow::CMD_QUEUE.push("raffle show #{raffle[:id]}") }
+    guide_btn = Gtk::Button.new(label: "Guide")
+    guide_btn.style_context.add_class("raffle-btn")
+    guide_btn.signal_connect("clicked") { RaffleWindow::CMD_QUEUE.push("raffle guide #{raffle[:id]}") }
+    btn_box.pack_start(info_btn, expand: false, fill: false, padding: 0)
+    btn_box.pack_start(guide_btn, expand: false, fill: false, padding: 0)
+    row.add(btn_box)
+
+    row
+  end
+
+  def self.update_raffles(raffles)
+    return unless @window
+    Gtk.queue do
+      @list_box.children.each { |c| @list_box.remove(c) }
+
+      header_lbl = Gtk::Label.new("#{raffles.size} active raffle#{raffles.size == 1 ? '' : 's'}. Click a raffle number for Show, or use the Guide button to travel there.")
+      header_lbl.set_xalign(0)
+      header_lbl.set_line_wrap(true)
+      @list_box.add(header_lbl)
+      @list_box.add(Gtk::Separator.new(:horizontal))
+
+      raffles.each_with_index do |raffle, idx|
+        @list_box.add(build_raffle_row(raffle))
+        @list_box.add(Gtk::Separator.new(:horizontal)) unless idx == raffles.size - 1
+      end
+
+      @list_box.show_all
+    end
+  end
+end
+
+# --- Create the Wrayth Window ---
 puts "<closeDialog id='rafflewindow'/><streamWindow id='rafflewindow' title='Raffles' location='left' resident='true' dynamic='true'></streamWindow>"
+
+# --- Launch GTK window if enabled or on a non-panel frontend ---
+if RaffleWindow.gtk_available && (RaffleWindow.use_gtk_window || $frontend !~ RaffleWindow::PANEL_FRONTENDS)
+  respond ""
+  respond " GTK Rafflewindow is active."
+  respond ""
+  Gtk.queue { RaffleWindowGtk.create_main_window }
+  Thread.new { Gtk.main unless Gtk.main_level > 0 }
+end
 
 # --- before_dying Hook ---
 before_dying {
   Raffle_Window("Raffle script is not running :(")
+  UpstreamHook.remove("#{Script.current.name}_upstream") rescue nil
+  if RaffleWindow.gtk_available && defined?(RaffleWindowGtk) && RaffleWindowGtk.instance_variable_get(:@window)
+    Gtk.queue { RaffleWindowGtk.instance_variable_get(:@window).hide }
+  end
 }
+
+# --- Commands: *rwgtk toggles the GTK window, *rwrefresh re-requests the list ---
+UPSTREAM_HOOK_ID = "#{Script.current.name}_upstream".freeze
+UpstreamHook.remove(UPSTREAM_HOOK_ID) rescue nil
+UpstreamHook.add(UPSTREAM_HOOK_ID, proc do |command|
+  case command
+  when /\*rwgtk\b/i
+    RaffleWindow.use_gtk_window = !RaffleWindow.use_gtk_window
+    respond "GTK Rafflewindow is now #{RaffleWindow.use_gtk_window ? 'ENABLED' : 'DISABLED'}."
+
+    settings = RaffleWindow.load_window_settings
+    settings["rafflewindow"]["use_gtk_rafflewindow"] = RaffleWindow.use_gtk_window
+    RaffleWindow.save_window_settings(settings)
+
+    if RaffleWindow.use_gtk_window && RaffleWindow.gtk_available
+      Gtk.queue { RaffleWindowGtk.create_main_window }
+      Thread.new { Gtk.main unless Gtk.main_level > 0 }
+      RaffleWindowGtk.update_raffles(@raffles)
+    elsif defined?(RaffleWindowGtk) && RaffleWindowGtk.instance_variable_get(:@window)
+      Gtk.queue { RaffleWindowGtk.instance_variable_get(:@window).close }
+    end
+    nil
+  when /\*rwrefresh\b/i
+    RaffleWindow::CMD_QUEUE.push("raffle list")
+    nil
+  else
+    command
+  end
+end)
+
+# --- Dedicated thread to send queued commands (Show/Guide/Refresh clicks) ---
+Thread.new do
+  loop do
+    cmd = RaffleWindow::CMD_QUEUE.pop
+    begin
+      put cmd
+    rescue => e
+      echo "Rafflewindow command error: #{e.message}"
+    end
+  end
+end
 
 fput "raffle list"
 
@@ -194,5 +680,6 @@ while (line = get)
     parse_raffle_lines
     formatted = format_raffle_info
     Raffle_Window(formatted)
+    RaffleWindowGtk.update_raffles(@raffles) if RaffleWindow.gtk_available && defined?(RaffleWindowGtk) && RaffleWindowGtk.instance_variable_get(:@window)
   end
 end
