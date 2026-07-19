@@ -39,6 +39,12 @@ version: 1.7.2
 
 =end
 
+# This file is loaded by several scripts; remove old top-level constants before
+# redefining so Ruby 4 does not warn on repeated loads.
+Object.send(:remove_const, :NODMGFLARE_PATTERNS) if Object.const_defined?(:NODMGFLARE_PATTERNS, false)
+Object.send(:remove_const, :DMGFLARE_PATTERNS) if Object.const_defined?(:DMGFLARE_PATTERNS, false)
+Object.send(:remove_const, :ATTACK_PATTERNS) if Object.const_defined?(:ATTACK_PATTERNS, false)
+
 # Define FLARE_PATTERNS as a constant to be used globally
 NODMGFLARE_PATTERNS = {
   # Non-damaging flares
@@ -287,7 +293,7 @@ DMGFLARE_PATTERNS = {
   ShadowDeathWeapon: /Ravenous tendrils of shadow burst forth from .*?, draining the very life from .*?/,
   Greater_SD_Darkrasp: /\*\* Ravenous tendrils of tangible shadow rip free from .*?\, rasping hungrily at .*?\!/,
   Greater_SD_Apex: /placeholder for greater SD/,
-  SigilStaff_Dispel: /Tendrils of .*?? energy lash out from your .*?? toward .*?? and cage/,
+  SigilStaff_Dispel: /Tendrils of .*? energy lash out from your .*? toward .*? and cage/,
   Smite302_Infusion: /With a sudden burst of divine insight, you're able to amplify the power of your/,
   Smite302_InstantDeath: /A minuscule blue-white star slowly ascends from the floor directly under the|A triad of ebony orbs conjoined by crackling ribbons of violet energy suddenly appear out of nowhere/,
   SolarWeapon: /Searing hot, the golden power of the sun is channeled through your/,
@@ -345,6 +351,7 @@ DMGFLARE_PATTERNS = {
   ThornsDisruption_GS: /\*\* Light and shadow flicker erratically around you as a wave of pure disruptive force rolls toward .*?\! \*\*/,
   ThornsFrost_GS: /\*\* Frost crystallizes beneath .*? as a howling arctic wind buffets it\! \*\*/,
   ThornsImpact_GS: /\*\* The air around .*? pulses rapidly with violent oscillations\! \*\*/,
+	ThornsLightning_GS: /\*\* The air around you crackles with electricity/,
   ThornsPlasma_GS: /\*\* Plasmatic tendrils of blinding light radiate from your vicinity\, lashing toward .*?\! \*\*/,
   Trueshot_GS: /place holder/,
   Arcane_Sidearm: /^You .*? with a vapor\-haloed .*? at/,
