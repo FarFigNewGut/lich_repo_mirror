@@ -98,7 +98,35 @@ module RaffleWindow
   CMD_QUEUE = Queue.new
 
   class << self
-    attr_accessor :settings, :window_settings, :use_gtk_window, :gtk_available
+    attr_accessor :settings, :window_settings, :use_gtk_window, :gtk_available,
+                  :last_guide_location, :last_guide_id, :last_guide_room_ids
+  end
+
+  # Remember which raffle we last asked the urchins to guide us to, so that if
+  # the game replies "no access to urchin guides" we know which room(s) to
+  # fall back to go2 for.
+  def request_guide(raffle)
+    self.last_guide_location = raffle[:location]
+    self.last_guide_id = raffle[:id]
+    self.last_guide_room_ids = Array(raffle[:room_ids]).empty? ? room_ids_for_location(raffle[:location]) : Array(raffle[:room_ids])
+    CMD_QUEUE.push("raffle guide #{raffle[:id]}")
+  end
+
+  # Called when the game refuses to guide us (no urchin access). Falls back
+  # to go2'ing the mapped Lich room number(s) for the last-requested raffle.
+  def fallback_to_go2
+    room_ids = Array(last_guide_room_ids)
+    if room_ids.empty?
+      respond "Rafflewindow: no urchin access, and no matching Lich map room found for '#{last_guide_location}' to fall back to go2."
+      return
+    end
+
+    if room_ids.size > 1
+      respond "Rafflewindow: no urchin access. Multiple rooms match '#{last_guide_location}' (#{room_ids.join(', ')}) -- using go2 on the first: #{room_ids.first}."
+    else
+      respond "Rafflewindow: no urchin access -- using go2 to room #{room_ids.first} instead."
+    end
+    start_script("go2", [room_ids.first.to_s])
   end
 
   def coerce_integer(value, min: nil, max: nil, allow_nil: false)
@@ -180,6 +208,37 @@ module RaffleWindow
   def save_window_settings(settings, name: Char.name)
     File.write(window_settings_path(name: name), sanitize_window_settings(settings).to_yaml)
   end
+
+  def normalize_room_title(title)
+    title.to_s.strip.sub(/\A\[/, '').sub(/\]\z/, '').squeeze(' ')
+  end
+
+  def room_ids_for_location(location)
+    @room_location_cache ||= {}
+    normalized_location = normalize_room_title(location)
+    return @room_location_cache[normalized_location] if @room_location_cache.key?(normalized_location)
+    return @room_location_cache[normalized_location] = [] if normalized_location.empty?
+    return @room_location_cache[normalized_location] = [] unless defined?(Map) && Map.respond_to?(:list)
+
+    room_ids = Map.list.each_with_object([]) do |room, ids|
+      titles = room.respond_to?(:title) ? Array(room.title) : []
+      ids << room.id if titles.any? { |title| normalize_room_title(title).casecmp?(normalized_location) }
+    end
+
+    @room_location_cache[normalized_location] = room_ids.compact.uniq.sort
+  rescue StandardError
+    @room_location_cache[normalized_location] = []
+  end
+
+  def location_text(raffle)
+    text = "Location: #{raffle[:object]} at [#{raffle[:location]}]"
+    room_ids = Array(raffle[:room_ids])
+    room_ids = room_ids_for_location(raffle[:location]) if room_ids.empty?
+    return text if room_ids.empty?
+
+    label = room_ids.size == 1 ? "Lich room" : "Lich rooms"
+    "#{text} (#{label}: #{room_ids.join(', ')})"
+  end
 end
 
 RaffleWindow.gtk_available = begin
@@ -226,13 +285,15 @@ def parse_raffle_lines
         draw_time: nil,
         discard: false,
         object: "",
-        location: ""
+        location: "",
+        room_ids: []
       }
 
     when /^\s*Location: (.+) at \[(.+)\]/
       if @current_raffle
         @current_raffle[:object] = $1
         @current_raffle[:location] = $2
+        @current_raffle[:room_ids] = RaffleWindow.room_ids_for_location($2)
       end
     when /^\s*Draws at: (.+) \(in .+\)/
       @current_raffle[:draw_time] = parse_et_to_local($1) if @current_raffle
@@ -392,6 +453,27 @@ class RaffleWindowGtk
         background-color: #{colors[:fg]};
         opacity: 0.25;
       }
+
+      window#rafflewindow .raffle-purchased {
+        background-color: #C6F6C6;
+        border-radius: 4px;
+      }
+
+      window#rafflewindow .raffle-purchased label {
+        color: #1B3B1B;
+      }
+
+      window#rafflewindow .raffle-purchased-label {
+        font-weight: bold;
+        color: #1B5E20;
+      }
+
+      window#rafflewindow .raffle-purchased .raffle-btn,
+      window#rafflewindow .raffle-purchased button.raffle-btn {
+        background: #EAFFEA;
+        color: #1B3B1B;
+        border-color: #4CAF50;
+      }
     CSS
 
     @css_provider.load(data: css)
@@ -521,7 +603,12 @@ class RaffleWindowGtk
   end
 
   def self.build_raffle_row(raffle)
+    container = Gtk::EventBox.new
+    container.style_context.add_class("raffle-purchased") if raffle[:purchased]
+
     row = Gtk::Box.new(:vertical, 2)
+    row.set_border_width(4)
+    container.add(row)
 
     title_box = Gtk::Box.new(:horizontal, 6)
     title_box.style_context.add_class("raffle-title")
@@ -535,9 +622,15 @@ class RaffleWindowGtk
     item_lbl.set_xalign(0)
     title_box.pack_start(item_lbl, expand: true, fill: true, padding: 0)
 
+    if raffle[:purchased]
+      purchased_lbl = Gtk::Label.new("TICKET PURCHASED")
+      purchased_lbl.style_context.add_class("raffle-purchased-label")
+      title_box.pack_end(purchased_lbl, expand: false, fill: false, padding: 0)
+    end
+
     row.add(title_box)
 
-    loc_lbl = Gtk::Label.new("Location: #{raffle[:object]} at [#{raffle[:location]}]")
+    loc_lbl = Gtk::Label.new(RaffleWindow.location_text(raffle))
     loc_lbl.set_xalign(0)
     loc_lbl.set_line_wrap(true)
     row.add(loc_lbl)
@@ -559,12 +652,12 @@ class RaffleWindowGtk
     info_btn.signal_connect("clicked") { RaffleWindow::CMD_QUEUE.push("raffle show #{raffle[:id]}") }
     guide_btn = Gtk::Button.new(label: "Guide")
     guide_btn.style_context.add_class("raffle-btn")
-    guide_btn.signal_connect("clicked") { RaffleWindow::CMD_QUEUE.push("raffle guide #{raffle[:id]}") }
+    guide_btn.signal_connect("clicked") { RaffleWindow.request_guide(raffle) }
     btn_box.pack_start(info_btn, expand: false, fill: false, padding: 0)
     btn_box.pack_start(guide_btn, expand: false, fill: false, padding: 0)
     row.add(btn_box)
 
-    row
+    container
   end
 
   def self.update_raffles(raffles)
@@ -633,6 +726,19 @@ UpstreamHook.add(UPSTREAM_HOOK_ID, proc do |command|
   when /\*rwrefresh\b/i
     RaffleWindow::CMD_QUEUE.push("raffle list")
     nil
+  when /raffle guide (\d+)/i
+    # Track which raffle this is for -- including when the player types the
+    # command manually -- so a "no urchin access" reply can fall back to go2.
+    raffle_id = $1
+    found = @raffles.find { |r| r[:id] == raffle_id }
+    RaffleWindow.last_guide_id = raffle_id
+    RaffleWindow.last_guide_location = found ? found[:location] : nil
+    RaffleWindow.last_guide_room_ids = if found
+                                          Array(found[:room_ids]).empty? ? RaffleWindow.room_ids_for_location(found[:location]) : Array(found[:room_ids])
+                                        else
+                                          []
+                                        end
+    command
   else
     command
   end
@@ -654,6 +760,10 @@ fput "raffle list"
 
 # --- Main Loop ---
 while (line = get)
+  if line =~ /You currently have no access to the urchin guides/i
+    RaffleWindow.fallback_to_go2
+  end
+
   if line =~ /raffles are currently active/i
     @raffle_lines = []
     Raffle_Window("Capturing raffle list...\n")
