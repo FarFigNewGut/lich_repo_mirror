@@ -9,6 +9,16 @@
   Optionally tracks kill metrics (Avg TTK, Last TTK, KPM) and displays
   bounty task information.
 
+  Target-next mode (*cwtargetnext) has three states, cycled in order (or set
+  directly, e.g. "*cwtargetnext off"):
+    off        - original behavior: current target floats to its own row at the top
+    numbers    - target stays in arrival-order sequence, tagged with its number, asterisked
+    no_numbers - target stays in arrival-order sequence (asterisked), numbers hidden
+  Numbers are based on when each creature first appeared in the room, tracked
+  by its unique game ID, e.g. "1creature **2creature** 3creature 4creature" /
+  "5creature". A creature's number sticks with its ID even after it dies and
+  moves to the dead-creature list, and resets when you change rooms.
+
   References:
     Wrayth FE Window: https://discordapp.com/channels/226045346399256576/1339018254517145681
     GTK Window:       https://discordapp.com/channels/226045346399256576/1386507836191670342
@@ -23,13 +33,19 @@
     *cwcol3                      - Use a 3-column layout
     *cwcol4                      - Use a 4-column layout
     *cwclaim                     - Hide/show claim status
+    *cwtargetnext                - Cycle target-next mode: off -> numbers -> no_numbers
+    *cwtargetnext off            - Jump directly to a specific mode (off/numbers/no_numbers)
     *cwgtk                       - Enable GTK window
 
   Author: Phocosoen, ChatGPT
   Tags: wrayth, frontend, mod, window, target, creature, mob, bounty, advguild, avalon, wizard, gtk3
-  Version: 1.6.2
+  Version: 1.7.1
   Recently changed:
-	  - Added support for 3 and 4 column layouts.
+    - *cwtargetnext is now a 3-way mode (off/numbers/no_numbers) instead of a
+      simple toggle, so you can keep the current target in sequence without
+      showing arrival numbers. Cycle with a bare *cwtargetnext, or jump to a
+      mode directly (e.g. "*cwtargetnext no_numbers").
+    - Added support for 3 and 4 column layouts.
     - Added optional CLAIM status display with *cwclaim toggle.
     - Added bounty action buttons for workflow automation (guild, guard, furrier, gem, herb, skin).
     - Added gem bounty automation with inventory-aware handling and gemshop routing controls.
@@ -58,10 +74,16 @@ module CreatureWindow
   BOUNTY_POLL_SECONDS = 1
   BOUNTY_WORKFLOW_STOP_SCRIPTS = %w[bigshot go2 eloot hunt3_v2].freeze
 
+  # *cwtargetnext cycles through these modes in order:
+  #   off        - original behavior: current target floats to its own row at the top
+  #   numbers    - target stays in arrival-order sequence, tagged with its number, asterisked
+  #   no_numbers - target stays in arrival-order sequence (asterisked), but numbers are hidden
+  TARGET_NEXT_MODES = %w[off numbers no_numbers].freeze
+
   class << self
     attr_accessor :settings, :window_settings, :use_gtk_window,
                   :display_bounty, :display_avg_ttk, :display_last_ttk, :display_kpm,
-                  :display_claim,
+                  :display_claim, :target_next_mode,
                   :gtk_available, :single_column, :columns
   end
 end
@@ -110,6 +132,7 @@ CW_DEFAULT_WINDOW_SETTINGS = {
     "display_kpm"            => false,
     "display_bounty"         => true,
     "display_claim"          => true,
+    "target_next_mode"       => "off",
     "x"                      => 1440,
     "y"                      => 1600,
     "width"                  => 420,
@@ -136,6 +159,16 @@ def CreatureWindow.sanitize_window_settings(settings)
   ].each do |key|
     cw[key] = !!cw[key]
   end
+
+  # Target-next mode: migrate the old boolean (true/false) to the new
+  # three-way string, then make sure whatever's left is a known mode.
+  case cw["target_next_mode"]
+  when true
+    cw["target_next_mode"] = "numbers"
+  when false, nil
+    cw["target_next_mode"] = "off"
+  end
+  cw["target_next_mode"] = "off" unless CreatureWindow::TARGET_NEXT_MODES.include?(cw["target_next_mode"])
 
   # Column count (1-4). Fall back to the legacy single_column boolean, then keep
   # the two in sync so old configs migrate cleanly.
@@ -233,6 +266,7 @@ CreatureWindow.display_avg_ttk  = CreatureWindow.window_settings.fetch("display_
 CreatureWindow.display_last_ttk = CreatureWindow.window_settings.fetch("display_last_ttk", false)
 CreatureWindow.display_kpm      = CreatureWindow.window_settings.fetch("display_kpm",      false)
 CreatureWindow.display_claim    = CreatureWindow.window_settings.fetch("display_claim",    true)
+CreatureWindow.target_next_mode = CreatureWindow.window_settings.fetch("target_next_mode", "off")
 CreatureWindow.columns          = CreatureWindow.window_settings.fetch("columns", CreatureWindow.window_settings.fetch("single_column", false) ? 1 : 2)
 CreatureWindow.single_column    = (CreatureWindow.columns == 1)
 
@@ -271,6 +305,55 @@ def CreatureWindow.ensure_runtime_state!
   @cw_guard_workflow_running ||= false
   @cw_furrier_workflow_running ||= false
   @cw_skin_workflow_running ||= false
+  @cw_creature_sequence ||= {}
+  @cw_creature_sequence_next ||= 1
+  @cw_sequence_room_id ||= nil
+end
+
+# Assign a persistent arrival-order number to every creature ID we haven't
+# seen yet in the current room (living or dead). Numbers are keyed by the
+# creature's unique ID, so they survive the creature dying and moving to the
+# dead-creature list. Numbering resets when the room changes.
+def CreatureWindow.assign_sequence_numbers!(npcs)
+  ensure_runtime_state!
+
+  room_id = Room.current.id
+  if @cw_sequence_room_id != room_id
+    @cw_sequence_room_id = room_id
+    @cw_creature_sequence = {}
+    @cw_creature_sequence_next = 1
+  end
+
+  npcs.each do |npc|
+    next if @cw_creature_sequence.key?(npc.id)
+    @cw_creature_sequence[npc.id] = @cw_creature_sequence_next
+    @cw_creature_sequence_next += 1
+  end
+end
+
+def CreatureWindow.sequence_number_for(id)
+  ensure_runtime_state!
+  @cw_creature_sequence[id]
+end
+
+# True for either inline mode ("numbers" or "no_numbers") -- i.e. whenever the
+# current target should stay in its sequence slot instead of floating to top.
+def CreatureWindow.target_next_inline?
+  CreatureWindow.target_next_mode != "off"
+end
+
+# True only when arrival-order numbers should actually be displayed.
+def CreatureWindow.target_next_numbers?
+  CreatureWindow.target_next_mode == "numbers"
+end
+
+# Prefix a creature's display label with its arrival-order number, if known
+# and if numbers are currently enabled. No-op (returns label unchanged)
+# otherwise, so callers don't need to branch.
+def CreatureWindow.with_sequence_number(label, id)
+  return label unless CreatureWindow.target_next_numbers?
+  seq = CreatureWindow.sequence_number_for(id)
+  seq ? "#{seq}#{label}" : label
 end
 
 def CreatureWindow.push_recent_line(line)
@@ -297,6 +380,9 @@ end
 @cw_last_kill_activity_at = nil
 @cw_creature_targeted = {}
 @cw_custom_status_cache = {}
+@cw_creature_sequence = {}
+@cw_creature_sequence_next = 1
+@cw_sequence_room_id = nil
 @cw_bounty_origin_room_id = Room.current.id
 @cw_bounty_origin_npc_id = nil
 @cw_bounty_origin_npc_noun = nil
@@ -646,23 +732,42 @@ class CreatureWindowGtk
         add_full_row("Kills/Min: #{kpm}")
       end
 
-      # 5) Current target
-      if (curr = targets.find { |t| t.id == XMLData.current_target_id })
-        st   = CreatureWindow.creature_status_fix(curr.status, curr.name, curr.id)
-        txt  = st ? "#{curr.noun} (#{st})" : curr.noun.to_s
-        add_full_row("**#{txt}**")
-      end
-
-      # Other living creatures as buttons
-      (targets - [curr]).each do |t|
-        st = CreatureWindow.creature_status_fix(t.status, t.name, t.id)
-        btn_label = st ? "#{t.noun} (#{st})" : t.noun.to_s
-        btn = Gtk::Button.new(label: btn_label)
-        btn.style_context.add_class("creature-btn")
-        btn.signal_connect("clicked") do
-          CreatureWindow::TARGET_CMD_QUEUE << "target ##{t.id}"
+      if CreatureWindow.target_next_inline?
+        # Keep the current target inline with the others, in arrival order,
+        # tagged with its sequence number and wrapped in asterisks -- instead
+        # of floating it to its own row at the top.
+        ordered_creatures = targets.sort_by { |t| CreatureWindow.sequence_number_for(t.id) || Float::INFINITY }
+        ordered_creatures.each do |t|
+          st = CreatureWindow.creature_status_fix(t.status, t.name, t.id)
+          base_label = st ? "#{t.noun} (#{st})" : t.noun.to_s
+          btn_label = CreatureWindow.with_sequence_number(base_label, t.id)
+          btn_label = "**#{btn_label}**" if t.id == XMLData.current_target_id
+          btn = Gtk::Button.new(label: btn_label)
+          btn.style_context.add_class("creature-btn")
+          btn.signal_connect("clicked") do
+            CreatureWindow::TARGET_CMD_QUEUE << "target ##{t.id}"
+          end
+          @flow.add(btn)
         end
-        @flow.add(btn)
+      else
+        # 5) Current target
+        if (curr = targets.find { |t| t.id == XMLData.current_target_id })
+          st   = CreatureWindow.creature_status_fix(curr.status, curr.name, curr.id)
+          txt  = st ? "#{curr.noun} (#{st})" : curr.noun.to_s
+          add_full_row("**#{txt}**")
+        end
+
+        # Other living creatures as buttons
+        (targets - [curr]).each do |t|
+          st = CreatureWindow.creature_status_fix(t.status, t.name, t.id)
+          btn_label = st ? "#{t.noun} (#{st})" : t.noun.to_s
+          btn = Gtk::Button.new(label: btn_label)
+          btn.style_context.add_class("creature-btn")
+          btn.signal_connect("clicked") do
+            CreatureWindow::TARGET_CMD_QUEUE << "target ##{t.id}"
+          end
+          @flow.add(btn)
+        end
       end
 
       # -- pad the current partial row so the dead header starts fresh --
@@ -671,11 +776,12 @@ class CreatureWindowGtk
       pad.times { @flow.add(Gtk::Label.new("")) }
 
       # 7) Dead creatures - force a full row for the count, then list
-      dead = GameObj.npcs.select { |n| n.status.to_s.downcase == "dead" }
+      # GameObj.npcs returns nil (not []) when the room's registry is empty.
+      dead = (GameObj.npcs || []).select { |n| n.status.to_s.downcase == "dead" }
       add_full_row("")
       add_full_row("Dead Creatures: #{dead.size}")
       dead.each do |t|
-        lbl = Gtk::Label.new(t.noun.to_s)
+        lbl = Gtk::Label.new(CreatureWindow.with_sequence_number(t.noun.to_s, t.id))
         lbl.set_xalign(0)
         @flow.add(lbl)
       end
@@ -1999,49 +2105,85 @@ def CreatureWindow.push_creatures_to_window(targets)
   output += "<label id='total' value='Creatures: #{targets.size}#{CreatureWindow.claim_status_text}' justify='left' left='0' top='#{current_top}' />"
   current_top += 20
 
-  # Separate and render current target first
-  target_creature = targets.find { |t| t.id == curr_target_id }
-  other_creatures = targets.reject { |t| t.id == curr_target_id }
-
-  if target_creature
-    status = CreatureWindow.creature_status_fix(target_creature.status, target_creature.name, target_creature.id)
-    label_value = status ? "#{target_creature.noun} (#{status})" : target_creature.noun.to_s
-    label_value = "**#{label_value}**"
-
-    unless @cw_creature_targeted[target_creature.id]
-      @cw_creature_timestamps[target_creature.id] = Time.now
-      @cw_creature_targeted[target_creature.id] = true
-    end
-
-    cmd = "target ##{target_creature.id}"
-    output += "<link id='target_creature' value='#{CreatureWindow.sanitize_xml(label_value)}' cmd='#{cmd}' echo='Targeting #{CreatureWindow.sanitize_xml(target_creature.name)}' justify='left' left='0' top='#{current_top}' />"
-    current_top += 20 # Add a little extra space after target for clarity
-  end
-
-  # Creature grid
   row_height = 20
   cols = [CreatureWindow.columns, 1].max
   col_width = 180
-  top_offset = current_top / row_height
 
-  other_creatures.each_slice(cols).with_index do |group, row|
-    group.each_with_index do |creature, col|
-      noun = creature.noun.to_s
-      status = CreatureWindow.creature_status_fix(creature.status, creature.name, creature.id)
-
-      label_value = status ? "#{noun} (#{status})" : noun
-      label_id = "creature_#{row}_#{col}"
-
-      left = col * col_width
-      top = row_height * (row + top_offset)
-
-      cmd = "target ##{creature.id}"
-      output += "<link id='#{label_id}' value='#{CreatureWindow.sanitize_xml(label_value)}' cmd='#{cmd}' echo='Targeting #{CreatureWindow.sanitize_xml(creature.name)}' justify='left' left='#{left}' top='#{top}' />"
+  if CreatureWindow.target_next_inline?
+    # Keep the current target inline with the others, in arrival order,
+    # tagged with its sequence number and wrapped in asterisks -- instead of
+    # floating it to a separate row at the top.
+    if (target_creature = targets.find { |t| t.id == curr_target_id })
+      unless @cw_creature_targeted[target_creature.id]
+        @cw_creature_timestamps[target_creature.id] = Time.now
+        @cw_creature_targeted[target_creature.id] = true
+      end
     end
+
+    ordered_creatures = targets.sort_by { |t| CreatureWindow.sequence_number_for(t.id) || Float::INFINITY }
+    top_offset = current_top / row_height
+
+    ordered_creatures.each_slice(cols).with_index do |group, row|
+      group.each_with_index do |creature, col|
+        status = CreatureWindow.creature_status_fix(creature.status, creature.name, creature.id)
+        base_label = status ? "#{creature.noun} (#{status})" : creature.noun.to_s
+        label_value = CreatureWindow.with_sequence_number(base_label, creature.id)
+        label_value = "**#{label_value}**" if creature.id == curr_target_id
+        label_id = "creature_#{row}_#{col}"
+
+        left = col * col_width
+        top = row_height * (row + top_offset)
+
+        cmd = "target ##{creature.id}"
+        output += "<link id='#{label_id}' value='#{CreatureWindow.sanitize_xml(label_value)}' cmd='#{cmd}' echo='Targeting #{CreatureWindow.sanitize_xml(creature.name)}' justify='left' left='#{left}' top='#{top}' />"
+      end
+    end
+
+    grid_rows = (ordered_creatures.size.to_f / cols).ceil
+    current_top = row_height * (grid_rows + top_offset) + 20
+  else
+    # Separate and render current target first
+    target_creature = targets.find { |t| t.id == curr_target_id }
+    other_creatures = targets.reject { |t| t.id == curr_target_id }
+
+    if target_creature
+      status = CreatureWindow.creature_status_fix(target_creature.status, target_creature.name, target_creature.id)
+      label_value = status ? "#{target_creature.noun} (#{status})" : target_creature.noun.to_s
+      label_value = "**#{label_value}**"
+
+      unless @cw_creature_targeted[target_creature.id]
+        @cw_creature_timestamps[target_creature.id] = Time.now
+        @cw_creature_targeted[target_creature.id] = true
+      end
+
+      cmd = "target ##{target_creature.id}"
+      output += "<link id='target_creature' value='#{CreatureWindow.sanitize_xml(label_value)}' cmd='#{cmd}' echo='Targeting #{CreatureWindow.sanitize_xml(target_creature.name)}' justify='left' left='0' top='#{current_top}' />"
+      current_top += 20 # Add a little extra space after target for clarity
+    end
+
+    # Creature grid
+    top_offset = current_top / row_height
+
+    other_creatures.each_slice(cols).with_index do |group, row|
+      group.each_with_index do |creature, col|
+        noun = creature.noun.to_s
+        status = CreatureWindow.creature_status_fix(creature.status, creature.name, creature.id)
+
+        label_value = status ? "#{noun} (#{status})" : noun
+        label_id = "creature_#{row}_#{col}"
+
+        left = col * col_width
+        top = row_height * (row + top_offset)
+
+        cmd = "target ##{creature.id}"
+        output += "<link id='#{label_id}' value='#{CreatureWindow.sanitize_xml(label_value)}' cmd='#{cmd}' echo='Targeting #{CreatureWindow.sanitize_xml(creature.name)}' justify='left' left='#{left}' top='#{top}' />"
+      end
+    end
+    # After rendering all creatures, bump spacing by 20px before starting dead creature block
+    grid_rows = (other_creatures.size.to_f / cols).ceil
+    current_top = row_height * (grid_rows + top_offset) + 20
   end
-  # After rendering all creatures, bump spacing by 20px before starting dead creature block
-  grid_rows = (other_creatures.size.to_f / cols).ceil
-  current_top = row_height * (grid_rows + top_offset) + 20
+
   # Track creatures for killed/removed creatures
   current_ids = targets.map(&:id)
   (@cw_creature_timestamps.keys - current_ids).each do |missing_id|
@@ -2050,19 +2192,17 @@ def CreatureWindow.push_creatures_to_window(targets)
   end
 
   # Dead creature listing
-  dead_creatures = GameObj.npcs.select { |t| t.status.to_s.downcase == 'dead' }
+  # GameObj.npcs returns nil (not []) when the room's registry is empty.
+  dead_creatures = (GameObj.npcs || []).select { |t| t.status.to_s.downcase == 'dead' }
 
   output += "<label id='deadcount' value='Dead Creatures: #{dead_creatures.size}' left='0' top='#{current_top}' />"
   current_top += 20
 
-  row_height = 20
-  cols = [CreatureWindow.columns, 1].max
-  col_width = 180
   dead_creatures.each_slice(cols).with_index do |group, row|
     group.each_with_index do |t, col|
       left = col * col_width
       top = current_top + row * row_height
-      noun = t.noun.to_s
+      noun = CreatureWindow.with_sequence_number(t.noun.to_s, t.id)
       output += "<link id='dead_#{row}_#{col}' value='#{noun}' cmd='loot ##{t.id}' echo='loot ##{t.id}' justify='bottom' left='#{left}' top='#{top}' />"
     end
   end
@@ -2083,7 +2223,9 @@ def CreatureWindow.targets_snapshot(targets)
 end
 
 def CreatureWindow.refresh_creature_windows(targets)
-  dead_creatures = GameObj.npcs.select { |t| t.status.to_s.downcase == 'dead' }
+  # GameObj.npcs returns nil (not []) when the room's registry is empty.
+  dead_creatures = (GameObj.npcs || []).select { |t| t.status.to_s.downcase == 'dead' }
+  CreatureWindow.assign_sequence_numbers!((targets || []) + dead_creatures)
   CreatureWindow.reset_kill_metrics_if_inactive(dead_creatures)
   CreatureWindow.track_owned_room_kills(dead_creatures)
   kpm_display = CreatureWindow.calculate_owned_room_kpm
@@ -2172,6 +2314,30 @@ UpstreamHook.add(upstream_hook_id, proc do |command|
     CreatureWindow.save_window_settings(window_settings)
     CreatureWindow::CMD_QUEUE.push("update_window")
     respond "Creaturewindow claim status: #{CreatureWindow.display_claim ? 'SHOWN' : 'HIDDEN'}"
+    nil
+
+  when /\*cwtargetnext\s*(\S+)?/i
+    modes = CreatureWindow::TARGET_NEXT_MODES
+    requested = $1&.downcase&.gsub(/[\s_-]+/, '_')
+    requested = "no_numbers" if requested =~ /^no.?numbers?$/
+    requested = "numbers" if requested =~ /^numbers?$/
+    requested = "off" if requested =~ /^off$/
+
+    next_mode = if modes.include?(requested)
+                  requested
+                else
+                  modes[(modes.index(CreatureWindow.target_next_mode).to_i + 1) % modes.size]
+                end
+
+    CreatureWindow.target_next_mode = next_mode
+    window_settings["creaturewindow"]["target_next_mode"] = next_mode
+    CreatureWindow.save_window_settings(window_settings)
+    CreatureWindow::CMD_QUEUE.push("update_window")
+
+    label = { "off" => "OFF (current target floats to top)",
+              "numbers" => "NUMBERS (target stays in sequence, numbers shown)",
+              "no_numbers" => "NO NUMBERS (target stays in sequence, numbers hidden)" }[next_mode]
+    respond "Creaturewindow target-next mode: #{label}"
     nil
 
   when /\*cwherb/i
