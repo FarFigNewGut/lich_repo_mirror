@@ -1,0 +1,664 @@
+=begin
+  csv_enhancive - Export worn enhancive properties to CSV.
+
+  Uses INVENTORY ENHANCIVE TOTAL DETAIL to collect each contributing item and
+  modifier, INVENTORY ENHANCIVE LIST to identify held enhancive items,
+  INVENTORY LOCATION USAGE to collect every functional worn item and its live
+  slot usage, and INVENTORY USAGE AVAILABLE to cross-check slot limits without
+  relying on account type.  One row is written per functional worn item, held
+  enhancive item, empty functional slot, and otherwise-unmatched enhancive
+  source, with one dynamically generated column per enhancive property.
+
+  Run: ;csv_enhancive
+
+  Output: scripts/enhancive_inventory.csv
+
+  Tags: utility, inventory, enhancive, csv
+  Requires: Ruby >= 2.6, Lich >= 5.7.0
+  Version: 1.2.1
+=end
+
+require 'cgi'
+require 'csv'
+
+module EnhanciveCSV
+  extend self
+
+  OUTPUT_PATH = File.join(SCRIPT_DIR, 'custom', 'enhancive_inventory.csv')
+  ENHANCIVE_COMMAND = 'inventory enhancive total detail'
+  ENHANCIVE_LIST_COMMAND = 'inventory enhancive list'
+  LOCATION_COMMAND = 'inventory location usage'
+  USAGE_COMMAND = 'inventory usage available'
+  USAGE_HEADER_PLAIN_RX = /^Your\s+AVAILABLE\s+worn\s+location\s+usage\s+is\s+as\s+follows:$/i
+  USAGE_HEADER_XML_RX = /worn(?:\s|<[^>]+>)*location(?:\s|<[^>]+>)*usage(?:\s|<[^>]+>)*is(?:\s|<[^>]+>)*as(?:\s|<[^>]+>)*follows:/i
+
+  # Canonical names and codes from:
+  # https://gswiki.play.net/Inventory#Inventory_slots_and_item_limits
+  SLOT_NAMES = {
+    1 => 'General (Pin)',
+    2 => 'Back',
+    3 => 'Waist',
+    4 => 'Head',
+    5 => 'Shoulder (Slung Over)',
+    6 => 'Shoulders (Draped From)',
+    7 => 'Legs (Pulled Over)',
+    8 => 'Torso',
+    9 => 'Wrist',
+    10 => 'Finger',
+    11 => 'Feet (Put On)',
+    12 => 'Neck',
+    13 => 'Belt',
+    14 => 'Arms',
+    15 => 'Legs (Attached To)',
+    16 => 'Earlobe',
+    17 => 'Earlobes',
+    18 => 'Ankle',
+    19 => 'Front',
+    20 => 'Hands',
+    21 => 'Feet (Slip On)',
+    22 => 'Hair',
+    23 => 'Undershirt',
+    24 => 'Leggings',
+    25 => 'Special'
+  }.freeze
+
+  SLOT_CODES_BY_LOCATION = {
+    'As a pin' => 1,
+    'On your back' => 2,
+    'Around your waist' => 3,
+    'On your head' => 4,
+    'Slung over your shoulder' => 5,
+    'Draped over your shoulders' => 6,
+    'Pulled over your legs' => 7,
+    'Over your chest' => 8,
+    'Attached to your wrist' => 9,
+    'On your fingers' => 10,
+    'On your feet' => 11,
+    'Hung around your neck' => 12,
+    'Attached to your belt' => 13,
+    'Attached to your arms' => 14,
+    'Attached to your legs' => 15,
+    'Hung from a single ear' => 16,
+    'Hung from both ears' => 17,
+    'Attached to your ankle' => 18,
+    'Put over your front' => 19,
+    'Slipped over your hands' => 20,
+    'Slipped on your feet' => 21,
+    'Placed in your hair' => 22,
+    'Slipped into, on your chest' => 23,
+    'Slipped into, on your legs' => 24,
+    'Additionally equipped' => 25
+  }.freeze
+
+  SECTION_HEADERS = {
+    'Stats:' => :stats,
+    'Skills:' => :skills,
+    'Resources:' => :resources,
+    'Martial Knowledge Skills:' => :martial,
+    'Self Knowledge Spells:' => :spells,
+    'Statistics:' => :statistics
+  }.freeze
+
+  def clean_lines(raw_lines)
+    raw_lines.flat_map do |raw_line|
+      without_comments = raw_line.to_s.gsub(/<!--.*?-->/m, '')
+      without_tags = without_comments.gsub(/<[^>]+>/, '')
+      CGI.unescapeHTML(without_tags).tr("\u00A0", ' ').split(/\r?\n/, -1).map(&:rstrip)
+    end
+  end
+
+  def item_key(name, remove_article: false)
+    key = name.to_s.downcase.gsub(/\s+/, ' ').strip
+    key = key.sub(/\A(?:a|an|some)\s+/, '') if remove_article
+    key
+  end
+
+  def capture(command, start_pattern)
+    raw_lines = Lich::Util.issue_command(
+      command,
+      start_pattern,
+      /<prompt\b/i,
+      include_end: true,
+      timeout: 10,
+      silent: true,
+      usexml: true,
+      quiet: true
+    )
+    clean_lines(raw_lines)
+  end
+
+  def capture_enhancives
+    capture(
+      ENHANCIVE_COMMAND,
+      /Stats:|No enhancive item bonuses found\.|which conceals your face\./i
+    )
+  end
+
+  def capture_enhancive_list
+    capture(
+      ENHANCIVE_LIST_COMMAND,
+      /You are (?:holding|not holding|wearing|not wearing).*enhancive|which conceals your face\./i
+    )
+  end
+
+  def capture_locations
+    capture(
+      LOCATION_COMMAND,
+      /You are currently wearing:|You are not currently wearing|which conceals your face\./i
+    )
+  end
+
+  def capture_usage
+    capture(
+      USAGE_COMMAND,
+      Regexp.union(USAGE_HEADER_XML_RX, /which conceals your face\./i)
+    )
+  end
+
+  def property_name(section, line)
+    case section
+    when :stats
+      match = line.match(/^\s{2}(.+?)\s+\([A-Z]{3}\):\s*\d+\/\d+\s*$/)
+      "#{match[1]} (Stat)" if match
+    when :skills
+      match = line.match(/^\s{2}(.+?)\s+(Ranks|Bonus):\s*\d+\/\d+\s*$/)
+      "#{match[1]} (#{match[2]})" if match
+    when :resources
+      match = line.match(/^\s{2}(.+?):\s*\d+\/\d+\s*$/)
+      return unless match
+
+      display_name = match[1]
+      if (maximum = display_name.match(/^Max\s+(.+)$/i))
+        "#{maximum[1]} (Maximum)"
+      elsif (recovery = display_name.match(/^(.+?)\s+Recovery$/i))
+        "#{recovery[1]} (Recovery)"
+      else
+        "#{display_name} (Resource)"
+      end
+    when :martial
+      match = line.match(/^\s{2}(.+?):\s*[+-]\d+\s+ranks?\s*$/i)
+      "#{match[1]} (Ranks)" if match
+    when :spells
+      # The game may present self-knowledge spell details differently from the
+      # numeric summary.  Retain a named property if it supplies item detail.
+      match = line.match(/^\s{2}(.+?):\s*.*$/)
+      "#{match[1]} (Self Knowledge)" if match
+    end
+  end
+
+  def parse_enhancives(lines)
+    properties = []
+    items = {}
+    statistics = {}
+    section = nil
+    current_property = nil
+    contribution_count = 0
+
+    lines.each do |line|
+      if SECTION_HEADERS.key?(line)
+        section = SECTION_HEADERS[line]
+        current_property = nil
+        next
+      end
+
+      if section == :statistics
+        if (match = line.match(/^\s+(Enhancive Items|Enhancive Properties|Total Enhancive Amount):\s*(\d+)\s*$/))
+          statistics[match[1]] = match[2].to_i
+        end
+        next
+      end
+
+      if (match = line.match(/^\s{4}([+-]\d+):\s+(.+?)\s*$/))
+        next unless current_property
+
+        modifier = match[1]
+        item_name = match[2]
+        key = item_key(item_name)
+        item = (items[key] ||= {
+          enhancive_name: item_name,
+          properties: {},
+          first_seen: items.length
+        })
+        item[:properties][current_property] ||= []
+        item[:properties][current_property] << modifier
+        contribution_count += 1
+        next
+      end
+
+      parsed_property = property_name(section, line)
+      if parsed_property
+        current_property = parsed_property
+        properties << parsed_property unless properties.include?(parsed_property)
+      elsif !line.strip.empty?
+        current_property = nil if line !~ /^\s{4}/
+      end
+    end
+
+    {
+      items: items.values,
+      properties: properties,
+      statistics: statistics,
+      contribution_count: contribution_count,
+      no_enhancives: lines.any? { |line| line == 'No enhancive item bonuses found.' }
+    }
+  end
+
+  def parse_enhancive_list(lines)
+    held = []
+    section = nil
+
+    lines.each do |line|
+      case line
+      when /^You are holding the following enhancive items?:/i
+        section = :held
+        next
+      when /^You are wearing the following enhancive items?:/i
+        section = :worn
+        next
+      when /^You are not (?:holding|wearing)/i, /^\(Items?:\s*\d+\)/i, /^For more information/i
+        section = nil
+        next
+      end
+
+      next unless section == :held
+      match = line.match(/^\s{2}(.+?)\s*$/)
+      next unless match
+
+      item_name = match[1]
+      item_name = item_name.sub(/\s+\(\d+\/\d+ charges\)\s*$/i, '')
+      item_name = item_name.sub(/\s+\(charged until .+\)\s*$/i, '')
+      held << item_name.strip unless item_name.strip.empty?
+    end
+
+    { held: held.uniq }
+  end
+
+  def parse_locations(lines)
+    exact = Hash.new { |hash, key| hash[key] = [] }
+    relaxed = Hash.new { |hash, key| hash[key] = [] }
+    usage_by_location = {}
+    entries = []
+    current_location = nil
+    current_usage = nil
+    location_index = -1
+    item_index = 0
+    parsed_count = 0
+    displayed_count = nil
+
+    lines.each do |line|
+      if (count_match = line.match(/^\((\d+) items? displayed\)\s*$/i))
+        displayed_count = count_match[1].to_i
+        next
+      end
+
+      location_match = line.match(/^([^\s].*?):(?:\s+\((\d+)\/(\d+) F\)\s+\((\d+)\/(\d+) T\))?\s*$/i)
+      if location_match && line != 'You are currently wearing:'
+        current_location = location_match[1]
+        current_usage = if location_match[2]
+                          {
+                            functional_used: location_match[2].to_i,
+                            functional_limit: location_match[3].to_i,
+                            total_used: location_match[4].to_i,
+                            total_limit: location_match[5].to_i
+                          }
+                        end
+        usage_by_location[item_key(current_location)] = current_usage if current_usage
+        location_index += 1
+        item_index = 0
+        next
+      end
+
+      next unless current_location
+      match = line.match(/^\s{4}(.+?)\s+\((functional|nonfunctional)\)(?:\s+\(hidden\))?\s*$/i)
+      next unless match
+
+      full_name = match[1].strip
+      entry = {
+        item: full_name,
+        location: current_location,
+        functional: match[2].casecmp('functional').zero?,
+        location_usage: current_usage,
+        sort_key: [location_index, item_index]
+      }
+      entries << entry
+      exact[item_key(full_name)] << entry
+      relaxed[item_key(full_name, remove_article: true)] << entry
+      item_index += 1
+      parsed_count += 1
+    end
+
+    {
+      exact: exact,
+      relaxed: relaxed,
+      usage_by_location: usage_by_location,
+      entries: entries,
+      parsed_count: parsed_count,
+      displayed_count: displayed_count,
+      response_found: lines.any? { |line| line == 'You are currently wearing:' || line.match?(/^You are not currently wearing/i) }
+    }
+  end
+
+  def parse_usage(lines)
+    slots = []
+
+    lines.each do |line|
+      match = line.match(/^\s+(\d+)\/(\d+)\s+(\d+)\/(\d+)\s+(.+?)\s+(\d+)\s*$/)
+      next unless match
+
+      slots << {
+        functional_used: match[1].to_i,
+        functional_limit: match[2].to_i,
+        total_used: match[3].to_i,
+        total_limit: match[4].to_i,
+        location: match[5].strip,
+        code: match[6].to_i
+      }
+    end
+
+    by_location = slots.each_with_object({}) do |slot, lookup|
+      lookup[item_key(slot[:location])] = slot
+    end
+    {
+      slots: slots,
+      by_location: by_location,
+      response_found: lines.any? { |line| line.strip.match?(USAGE_HEADER_PLAIN_RX) }
+    }
+  end
+
+  def find_location(item_name, locations)
+    matches = locations[:exact][item_key(item_name)]
+    if matches.empty?
+      relaxed_matches = locations[:relaxed][item_key(item_name, remove_article: true)]
+      matches = relaxed_matches if relaxed_matches.map { |entry| item_key(entry[:item]) }.uniq.length == 1
+    end
+    return nil if matches.empty?
+
+    {
+      item: matches.first[:item],
+      location: matches.map { |entry| entry[:location] }.uniq.join('; '),
+      functional: matches.all? { |entry| entry[:functional] },
+      location_usage: matches.first[:location_usage],
+      sort_key: matches.map { |entry| entry[:sort_key] }.min
+    }
+  end
+
+  def slot_metadata(location, usage, location_usage = nil)
+    available_slot = usage[:by_location][item_key(location)]
+    code = SLOT_CODES_BY_LOCATION[location] || available_slot&.dig(:code)
+    unknown = location.match?(/\A(?:Unknown|Not listed by INV LOC)/i)
+
+    if location == 'Held'
+      return {
+        slot_code: nil,
+        functional_slot: 'Held (not a worn slot)',
+        functional_slots_remaining: nil
+      }
+    end
+
+    if unknown
+      return {
+        slot_code: nil,
+        functional_slot: 'Unknown',
+        functional_slots_remaining: nil
+      }
+    end
+
+    if code == 25 || code.nil?
+      return {
+        slot_code: code,
+        functional_slot: code == 25 ? 'Special' : 'Special / unmetered',
+        functional_slots_remaining: 'Special Usage'
+      }
+    end
+
+    functional_limit = location_usage&.dig(:functional_limit) || available_slot&.dig(:functional_limit)
+    functional_used = location_usage&.dig(:functional_used)
+    functional_used ||= available_slot&.dig(:functional_used)
+
+    {
+      slot_code: code,
+      functional_slot: SLOT_NAMES.fetch(code, location),
+      functional_slots_remaining: functional_limit && functional_used ? functional_limit - functional_used : nil
+    }
+  end
+
+  def ordinary_slot_usage(locations, usage)
+    results = []
+    SLOT_CODES_BY_LOCATION.each do |location, code|
+      next unless code.between?(1, 24)
+
+      slot_usage = locations[:usage_by_location][item_key(location)]
+      slot_usage ||= usage[:by_location][item_key(location)]
+      next unless slot_usage
+
+      results << {
+        code: code,
+        location: location,
+        functional_used: slot_usage[:functional_used],
+        functional_limit: slot_usage[:functional_limit]
+      }
+    end
+    results
+  end
+
+  def empty_slot_rows(locations, usage)
+    ordinary_slot_usage(locations, usage).flat_map do |slot|
+      remaining = slot[:functional_limit] - slot[:functional_used]
+      Array.new(remaining) do
+        {
+          item: 'empty',
+          location: slot[:location],
+          properties: {},
+          functional_status: 'Empty',
+          enhancive_status: 'No',
+          slot_code: slot[:code],
+          functional_slot: SLOT_NAMES.fetch(slot[:code], slot[:location]),
+          functional_slots_remaining: remaining,
+          empty_slot: true
+        }
+      end
+    end
+  end
+
+  def correlate(enhancives, enhancive_list, locations, usage)
+    enhancive_exact = {}
+    enhancive_relaxed = {}
+    enhancives[:items].each do |item|
+      enhancive_exact[item_key(item[:enhancive_name])] = item
+      enhancive_relaxed[item_key(item[:enhancive_name], remove_article: true)] = item
+    end
+
+    matched_enhancives = {}
+    rows = locations[:entries].select { |entry| entry[:functional] }.map do |entry|
+      enhancive = enhancive_exact[item_key(entry[:item])]
+      enhancive ||= enhancive_relaxed[item_key(entry[:item], remove_article: true)]
+      matched_enhancives[enhancive.object_id] = true if enhancive
+
+      entry.merge(
+        properties: enhancive ? enhancive[:properties] : {},
+        functional_status: 'Yes',
+        enhancive_status: enhancive ? 'Yes' : 'No'
+      ).merge(slot_metadata(entry[:location], usage, entry[:location_usage]))
+    end
+
+    enhancive_list[:held].each_with_index do |held_name, index|
+      enhancive = enhancive_exact[item_key(held_name)]
+      enhancive ||= enhancive_relaxed[item_key(held_name, remove_article: true)]
+      matched_enhancives[enhancive.object_id] = true if enhancive
+
+      rows << {
+        item: held_name,
+        location: 'Held',
+        properties: enhancive ? enhancive[:properties] : {},
+        functional_status: 'Held',
+        enhancive_status: 'Yes',
+        sort_key: [10_000, index]
+      }.merge(slot_metadata('Held', usage))
+    end
+
+    enhancives[:items].each do |item|
+      next if matched_enhancives[item.object_id]
+
+      match = find_location(item[:enhancive_name], locations)
+      unknown = item[:enhancive_name].match?(/\A(?:an?\s+)?unknown source\b/i)
+      location = if match
+                   match[:location]
+                 elsif unknown
+                   'Unknown (needs loresong)'
+                 else
+                   'Not listed by INV LOC'
+                 end
+      rows << item.merge(
+        item: match ? match[:item] : item[:enhancive_name],
+        location: location,
+        functional_status: match ? (match[:functional] ? 'Yes' : 'No') : 'Unknown',
+        enhancive_status: 'Yes',
+        sort_key: match ? match[:sort_key] : [Float::INFINITY, item[:first_seen]]
+      ).merge(slot_metadata(location, usage, match&.dig(:location_usage)))
+    end
+
+    rows.sort_by! { |item| item[:sort_key] }
+    rows.concat(empty_slot_rows(locations, usage))
+  end
+
+  def calculate_totals(rows, properties, locations, usage)
+    slot_totals = ordinary_slot_usage(locations, usage)
+
+    property_totals = properties.each_with_object({}) do |property, totals|
+      totals[property] = rows.sum do |row|
+        Array(row[:properties][property]).sum(&:to_i)
+      end
+    end
+
+    {
+      functional_items: locations[:entries].count { |entry| entry[:functional] },
+      enhancive_sources: rows.count { |row| row[:enhancive_status] == 'Yes' },
+      functional_slots_remaining: slot_totals.sum { |slot| slot[:functional_limit] - slot[:functional_used] },
+      property_totals: property_totals
+    }
+  end
+
+  def write_csv(rows, properties, locations, usage, path = OUTPUT_PATH)
+    fixed_headers = [
+      'Functional Slot',
+      'Worn Location',
+      'Item',
+      'Enhancive',
+      'Functional Slot Remaining'
+    ]
+    totals = calculate_totals(rows, properties, locations, usage)
+
+    CSV.open(path, 'wb', force_quotes: true) do |csv|
+      csv << [*fixed_headers, *properties]
+      rows.each do |row|
+        values = properties.map do |property|
+          Array(row[:properties][property]).join('; ')
+        end
+        csv << [
+          row[:functional_slot],
+          row[:location],
+          row[:item],
+          row[:enhancive_status],
+          row[:functional_slots_remaining],
+          *values
+        ]
+      end
+
+      total_values = properties.map do |property|
+        value = totals[:property_totals][property]
+        value.positive? ? "+#{value}" : value.to_s
+      end
+      csv << [
+        'TOTALS',
+        '',
+        "#{totals[:functional_items]} functional items",
+        totals[:enhancive_sources],
+        totals[:functional_slots_remaining],
+        *total_values
+      ]
+    end
+  end
+
+  def validation_warnings(enhancives, locations, usage)
+    warnings = []
+    expected_properties = enhancives[:statistics]['Enhancive Properties']
+    expected_items = enhancives[:statistics]['Enhancive Items']
+
+    if expected_properties && expected_properties != enhancives[:contribution_count]
+      warnings << "parsed #{enhancives[:contribution_count]} of #{expected_properties} reported property contributions"
+    end
+    if expected_items && expected_items != enhancives[:items].length
+      warnings << "grouped #{enhancives[:items].length} distinct source names for #{expected_items} reported enhancive items"
+    end
+    # INV LOC's displayed count can exclude supplemental sections such as
+    # "Additionally equipped" even though those entries appear in the output.
+    # More parsed entries are therefore valid; fewer indicates truncation.
+    if locations[:displayed_count] && locations[:parsed_count] < locations[:displayed_count]
+      warnings << "parsed #{locations[:parsed_count]} of #{locations[:displayed_count]} reported INV LOC items"
+    end
+
+    usage[:slots].select { |slot| slot[:code].between?(1, 24) }.each do |slot|
+      parsed_used = locations[:entries].count do |entry|
+        entry[:functional] && item_key(entry[:location]) == item_key(slot[:location])
+      end
+      if parsed_used != slot[:functional_used]
+        warnings << "parsed #{parsed_used} functional items in #{slot[:location]} but INV USAGE AVAILABLE reports #{slot[:functional_used]} used"
+      end
+    end
+    warnings
+  end
+
+  def rows_label(count)
+    count == 1 ? 'row' : 'rows'
+  end
+
+  def items_label(count)
+    count == 1 ? 'item' : 'items'
+  end
+
+  def run
+    respond "--- csv_enhancive: scanning #{ENHANCIVE_COMMAND.upcase}..."
+    enhancive_lines = capture_enhancives
+    unless enhancive_lines.include?('Stats:') || enhancive_lines.include?('No enhancive item bonuses found.')
+      raise 'the enhancive command response was incomplete'
+    end
+    enhancives = parse_enhancives(enhancive_lines)
+
+    respond "--- csv_enhancive: scanning #{ENHANCIVE_LIST_COMMAND.upcase}..."
+    enhancive_list_lines = capture_enhancive_list
+    unless enhancive_list_lines.any? { |line| line.match?(/^You are (?:holding|not holding|wearing|not wearing).*enhancive/i) }
+      raise 'the enhancive list response was incomplete'
+    end
+    enhancive_list = parse_enhancive_list(enhancive_list_lines)
+
+    respond "--- csv_enhancive: scanning #{LOCATION_COMMAND.upcase}..."
+    locations = parse_locations(capture_locations)
+    raise 'the inventory location response was incomplete' unless locations[:response_found]
+
+    respond "--- csv_enhancive: scanning #{USAGE_COMMAND.upcase}..."
+    usage_lines = capture_usage
+    usage = parse_usage(usage_lines)
+    unless usage[:response_found] && !usage[:slots].empty?
+      raise "the inventory usage response was incomplete (captured #{usage_lines.length} lines; parsed #{usage[:slots].length} slot rows)"
+    end
+
+    rows = correlate(enhancives, enhancive_list, locations, usage)
+    write_csv(rows, enhancives[:properties], locations, usage)
+
+    functional_count = locations[:entries].count { |entry| entry[:functional] }
+    empty_count = rows.count { |row| row[:empty_slot] }
+    respond "--- csv_enhancive: wrote #{rows.length} inventory/slot #{rows_label(rows.length)} and #{enhancives[:properties].length} property columns to #{OUTPUT_PATH}"
+    held_count = enhancive_list[:held].length
+    respond "--- csv_enhancive: found #{functional_count} functional worn/equipped items, #{held_count} held enhancive #{items_label(held_count)}, and added #{empty_count} empty functional-slot rows; slot limits checked with #{USAGE_COMMAND.upcase}."
+    validation_warnings(enhancives, locations, usage).each do |warning|
+      respond "--- csv_enhancive warning: #{warning}."
+    end
+  rescue StandardError => error
+    respond "--- csv_enhancive error: #{error.class}: #{error.message}"
+    lich_version = defined?(LICH_VERSION) ? LICH_VERSION : 'unknown'
+    respond "--- csv_enhancive environment: Ruby #{RUBY_VERSION}; Lich #{lich_version}"
+    respond "--- csv_enhancive: no CSV was written."
+  end
+end
+
+EnhanciveCSV.run
