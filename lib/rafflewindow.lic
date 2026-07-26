@@ -112,19 +112,19 @@ module RaffleWindow
     CMD_QUEUE.push("raffle guide #{raffle[:id]}")
   end
 
-  # Called when the game refuses to guide us (no urchin access). Falls back
+  # Called when the game refuses to guide us. Falls back
   # to go2'ing the mapped Lich room number(s) for the last-requested raffle.
   def fallback_to_go2
     room_ids = Array(last_guide_room_ids)
     if room_ids.empty?
-      respond "Rafflewindow: no urchin access, and no matching Lich map room found for '#{last_guide_location}' to fall back to go2."
+      respond "Rafflewindow: urchin guide travel failed, and no matching Lich map room found for '#{last_guide_location}' to fall back to go2."
       return
     end
 
     if room_ids.size > 1
-      respond "Rafflewindow: no urchin access. Multiple rooms match '#{last_guide_location}' (#{room_ids.join(', ')}) -- using go2 on the first: #{room_ids.first}."
+      respond "Rafflewindow: urchin guide travel failed. Multiple rooms match '#{last_guide_location}' (#{room_ids.join(', ')}) -- using go2 on the first: #{room_ids.first}."
     else
-      respond "Rafflewindow: no urchin access -- using go2 to room #{room_ids.first} instead."
+      respond "Rafflewindow: urchin guide travel failed -- using go2 to room #{room_ids.first} instead."
     end
     start_script("go2", [room_ids.first.to_s])
   end
@@ -257,37 +257,73 @@ RaffleWindow.use_gtk_window = RaffleWindow.window_settings.fetch("use_gtk_raffle
 @raffle_lines = []    # Captured lines from the raffle list output
 @current_raffle = nil # Temporary storage for a raffle block being parsed
 @raffles = []         # Array of parsed raffle objects
+@show_raffle_lines = []
+@expired_winner_requests = {}
+@batch_pending = 0
+
+def normalize_winner_name(name)
+  name.to_s.strip.sub(/\Aand\s+/i, '').sub(/[[:punct:]]+\z/, '')
+end
+
+def parse_winner_names(text)
+  text.to_s.gsub(/\band\b/i, ',').split(',').map { |name| normalize_winner_name(name) }.reject(&:empty?)
+end
+
+def current_character_winner?(names)
+  names.any? { |name| name.casecmp?(Char.name.to_s) }
+end
+
+def new_raffle(id)
+  {
+    id: id,
+    item: "",
+    cost: nil,
+    online: false,
+    logout_ok: true,
+    purchased: false,
+    winner: nil,
+    winners: [],
+    won: false,
+    draw_time: nil,
+    expired: false,
+    object: "",
+    location: "",
+    room_ids: []
+  }
+end
 
 # --- Parsing Helpers ---
 def finalize_current_raffle
-  # Only add the current raffle if it exists, has an ID, and is not marked for discard.
-  if @current_raffle && @current_raffle[:id] && !@current_raffle[:discard]
-    @raffles << @current_raffle
+  if @current_raffle && @current_raffle[:id]
+    @current_raffle[:won] = current_character_winner?(@current_raffle[:winners])
+    existing_index = @raffles.index { |raffle| raffle[:id] == @current_raffle[:id] }
+    if existing_index
+      existing = @raffles[existing_index]
+      merged = existing.merge(@current_raffle)
+      if @current_raffle[:winners].empty? && !existing[:winners].empty?
+        merged[:winners] = existing[:winners]
+        merged[:won] = existing[:won]
+      end
+      @raffles[existing_index] = merged
+    else
+      @raffles << @current_raffle
+    end
   end
   @current_raffle = nil
+  @capturing_winners = false
 end
 
-def parse_raffle_lines
-  @raffles = []
+def parse_raffle_lines(reset: true)
+  @raffles = @raffles.select { |raffle| raffle[:expired] } if reset
   @current_raffle = nil
   @raffle_lines.each do |line|
     case line
     when /^Raffle \#(.+) for \"(.+)\"\, Cost\: ([\d,]+) silver/
       finalize_current_raffle
-      @current_raffle = {
-        id: $1,
-        item: $2,
-        cost: $3.gsub(",", ""),
-        online: false,
-        logout_ok: true, # default assumption unless overridden
-        purchased: false,
-        winner: nil,
-        draw_time: nil,
-        discard: false,
-        object: "",
-        location: "",
-        room_ids: []
-      }
+      @current_raffle = new_raffle($1).merge(item: $2, cost: $3.gsub(",", ""))
+    when /^Raffle \#(\d+)\b/
+      finalize_current_raffle
+      @current_raffle = new_raffle($1)
 
     when /^\s*Location: (.+) at \[(.+)\]/
       if @current_raffle
@@ -295,11 +331,28 @@ def parse_raffle_lines
         @current_raffle[:location] = $2
         @current_raffle[:room_ids] = RaffleWindow.room_ids_for_location($2)
       end
+    when /^Some raffle tickets for raffle \#\d+ can be found on (.+) at \[(.+)\] \((\d+)\)/
+      if @current_raffle
+        @current_raffle[:object] = $1
+        @current_raffle[:location] = $2
+        @current_raffle[:room_ids] = [$3]
+      end
+    when /^\s*This raffle was for \"(.+)\"/
+      @current_raffle[:item] = $1 if @current_raffle
+    when /^\s*The tickets sold for ([\d,]+) silver each/
+      @current_raffle[:cost] = $1.gsub(",", "") if @current_raffle
     when /^\s*Draws at: (.+) \(in .+\)/
       @current_raffle[:draw_time] = parse_et_to_local($1) if @current_raffle
     when /^\s*Drew at: (.+) \(.+\)/
-      # Mark the raffle for discard if it has a "Drew at:" line.
-      @current_raffle[:discard] = true if @current_raffle
+      if @current_raffle
+        @current_raffle[:draw_time] = parse_et_to_local($1)
+        @current_raffle[:expired] = true
+      end
+    when /^\s*It drew \d+ winners?.+\(at (.+)\)/
+      if @current_raffle
+        @current_raffle[:draw_time] = parse_et_to_local($1)
+        @current_raffle[:expired] = true
+      end
     when /^\s*Characters (must|had to) be (online|present)(?: in the room)? in order to win/
       if $2 == "online"
         @current_raffle[:online] = true
@@ -310,11 +363,116 @@ def parse_raffle_lines
 
     when /^\s*You have purchased a ticket to this raffle/
       @current_raffle[:purchased] = true if @current_raffle
+    when /^\s*You have already purchased a ticket to this raffle/
+      @current_raffle[:purchased] = true if @current_raffle
     when /\*\*\* You are the (.+) winner of this raffle! \*\*\*/
-      @current_raffle[:winner] = $1 if @current_raffle
+      if @current_raffle
+        @current_raffle[:winner] = $1
+        @current_raffle[:winners] = [Char.name.to_s]
+        @current_raffle[:won] = true
+      end
+    when /^\s*Winners?:\s*$/
+      @capturing_winners = true if @current_raffle
+    when /^\s*(.+)\.\s*$/
+      if @current_raffle && @capturing_winners
+        winners = parse_winner_names($1)
+        unless winners.empty?
+          @current_raffle[:winners] = winners
+          @current_raffle[:won] = current_character_winner?(winners)
+          @capturing_winners = false
+        end
+      end
     end
   end
   finalize_current_raffle
+end
+
+def display_raffles
+  formatted = format_raffle_info
+  Raffle_Window(formatted)
+  RaffleWindowGtk.update_raffles(@raffles) if RaffleWindow.gtk_available && defined?(RaffleWindowGtk) && RaffleWindowGtk.instance_variable_get(:@window)
+end
+
+def request_missing_expired_winners
+  missing = @raffles.select { |raffle| raffle[:expired] && Array(raffle[:winners]).empty? }
+                    .reject { |raffle| @expired_winner_requests[raffle[:id]] }
+  return if missing.empty?
+
+  missing.each { |raffle| @expired_winner_requests[raffle[:id]] = true }
+  echo "Rafflewindow: requesting winner details for #{missing.size} expired raffle#{missing.size == 1 ? '' : 's'}..."
+
+  # Batch these auto-fetched shows: display_raffles pushes a full redraw of
+  # the whole raffle list to the panel window, so firing it once per show
+  # (8 shows -> 8 redraws) is what was spamming the main window. Track how
+  # many responses we're still waiting on so capture_raffle_show_line can
+  # hold off and redraw only once, after the last one comes back.
+  @batch_pending = (@batch_pending || 0) + missing.size
+
+  Thread.new do
+    missing.each do |raffle|
+      RaffleWindow::CMD_QUEUE.push("raffle show #{raffle[:id]}")
+      sleep 0.5
+    end
+  end
+end
+
+def note_batch_response_done
+  return unless @batch_pending && @batch_pending > 0
+  @batch_pending -= 1
+  display_raffles if @batch_pending <= 0
+end
+
+def capture_raffle_show_line(line)
+  if line =~ /^Some raffle tickets for raffle \#(\d+)/
+    # This is the actual start of a "raffle show N" response. Reset the
+    # buffer here (with a synthetic "Raffle #N" header so parsing picks up
+    # the right id) instead of on a bare "Raffle #\d+" line -- that pattern
+    # only ever matches lines from "raffle list" output, never from
+    # "raffle show" output, which let a stale buffer from the last raffle
+    # in the list bleed into (and corrupt) every subsequent show response.
+    @show_raffle_lines = ["Raffle ##{$1}", line]
+    return
+  end
+
+  if line =~ /^Raffle \#(\d+) is not a valid raffle \#\.?/
+    # The game rejected this id -- usually because the raffle's board/crate
+    # object is momentarily untracked ("last seen as exist #..." in the
+    # list). That resolves itself once the object is seen again, so clear
+    # the "already requested" flag rather than giving up on this raffle
+    # forever -- the next "raffle list" refresh will retry it.
+    @expired_winner_requests.delete($1)
+    note_batch_response_done
+    return
+  end
+
+  return if @show_raffle_lines.empty?
+
+  if line =~ /^\d+ tickets have been sold for this raffle/ ||
+     line =~ /^This raffle was for / ||
+     line =~ /^The tickets sold for / ||
+     line =~ /^It drew / ||
+     line =~ /^Winners?:\s*$/ ||
+     line =~ /^[A-Z][A-Za-z'\-]+(?:,\s+[A-Z][A-Za-z'\-]+)*(?:,\s+and\s+[A-Z][A-Za-z'\-]+| and [A-Z][A-Za-z'\-]+)?\.$/ ||
+     line =~ /^You have already purchased a ticket to this raffle/
+    @show_raffle_lines << line
+    @raffle_lines = @show_raffle_lines.dup
+    parse_raffle_lines(reset: false)
+
+    # Only refresh the display once per "raffle show" -- right when the
+    # winner name line itself is captured -- instead of on every matching
+    # line afterward (which is what produced the repeated spam blocks).
+    # If this response is part of an auto-fetch batch, hold the redraw
+    # until the whole batch is done instead of pushing one per raffle.
+    winner_name_line = line =~ /^[A-Z][A-Za-z'\-]+(?:,\s+[A-Z][A-Za-z'\-]+)*(?:,\s+and\s+[A-Z][A-Za-z'\-]+| and [A-Z][A-Za-z'\-]+)?\.$/
+    saw_winners_header = @show_raffle_lines.any? { |captured| captured =~ /^Winners?:\s*$/ }
+    if winner_name_line && saw_winners_header
+      if @batch_pending && @batch_pending > 0
+        note_batch_response_done
+      else
+        display_raffles
+      end
+    end
+  end
 end
 
 def raffle_requirement_text(raffle)
@@ -329,13 +487,15 @@ def raffle_time_text(raffle)
 end
 
 def format_raffle_info
-  # Since we now discard any raffle with a "Drew at:" line, we can simply output the raffles.
   output = "Info - RAFFLE SHOW #\nTravel - RAFFLE GUIDE #\nAn asterisk ( * ) denotes a ticket has been purchased for this raffle.\n\n"
 
-  @raffles.each do |raffle|
+  active_raffles = @raffles.reject { |raffle| raffle[:expired] }
+  expired_raffles = @raffles.select { |raffle| raffle[:expired] }
+
+  active_raffles.each do |raffle|
     raffle_output = ""
     raffle_output += "Raffle ##{raffle[:id]} for \"#{raffle[:item]}\"\n"
-    raffle_output += "#{raffle[:cost]} silver\n"
+    raffle_output += "#{raffle[:cost]} silver\n" if raffle[:cost]
     time_text = raffle_time_text(raffle)
     if time_text
       raffle_output += "#{time_text}\n"
@@ -351,6 +511,22 @@ def format_raffle_info
     end
 
     output += raffle_output
+  end
+
+  unless expired_raffles.empty?
+    output += "\nExpired raffles:\n\n"
+    expired_raffles.each do |raffle|
+      output += "Raffle ##{raffle[:id]} for \"#{raffle[:item]}\""
+      output += " -- YOU WON" if raffle[:won]
+      output += "\n"
+      winners = Array(raffle[:winners])
+      output += "Winners: #{winners.empty? ? 'Unknown' : winners.join(', ')}\n"
+      # Some raffles reject "raffle show" as "not a valid raffle #" unless
+      # their object has recently been seen -- surface the location so it's
+      # clear where to go (via RAFFLE GUIDE #) to retry.
+      output += "#{RaffleWindow.location_text(raffle)}\n" if winners.empty?
+      output += "\n"
+    end
   end
   output
 end
@@ -473,6 +649,27 @@ class RaffleWindowGtk
         background: #EAFFEA;
         color: #1B3B1B;
         border-color: #4CAF50;
+      }
+
+      window#rafflewindow .raffle-expired {
+        background-color: #FFD6D6;
+        border-radius: 4px;
+      }
+
+      window#rafflewindow .raffle-expired label {
+        color: #4A1717;
+      }
+
+      window#rafflewindow .raffle-expired .raffle-btn,
+      window#rafflewindow .raffle-expired button.raffle-btn {
+        background: #FFECEC;
+        color: #4A1717;
+        border-color: #CC7777;
+      }
+
+      window#rafflewindow .raffle-won-label {
+        font-weight: bold;
+        color: #8B0000;
       }
     CSS
 
@@ -604,7 +801,7 @@ class RaffleWindowGtk
 
   def self.build_raffle_row(raffle)
     container = Gtk::EventBox.new
-    container.style_context.add_class("raffle-purchased") if raffle[:purchased]
+    container.style_context.add_class(raffle[:expired] ? "raffle-expired" : "raffle-purchased") if raffle[:expired] || raffle[:purchased]
 
     row = Gtk::Box.new(:vertical, 2)
     row.set_border_width(4)
@@ -613,16 +810,22 @@ class RaffleWindowGtk
     title_box = Gtk::Box.new(:horizontal, 6)
     title_box.style_context.add_class("raffle-title")
 
-    show_btn = Gtk::Button.new(label: (raffle[:purchased] ? "* Raffle ##{raffle[:id]}" : "Raffle ##{raffle[:id]}"))
+    show_btn = Gtk::Button.new(label: (raffle[:purchased] && !raffle[:expired] ? "* Raffle ##{raffle[:id]}" : "Raffle ##{raffle[:id]}"))
     show_btn.style_context.add_class("raffle-btn")
     show_btn.signal_connect("clicked") { RaffleWindow::CMD_QUEUE.push("raffle show #{raffle[:id]}") }
     title_box.pack_start(show_btn, expand: false, fill: false, padding: 0)
 
-    item_lbl = Gtk::Label.new("for \"#{raffle[:item]}\" -- #{raffle[:cost]} silver")
+    item_text = "for \"#{raffle[:item]}\""
+    item_text += " -- #{raffle[:cost]} silver" if raffle[:cost] && !raffle[:expired]
+    item_lbl = Gtk::Label.new(item_text)
     item_lbl.set_xalign(0)
     title_box.pack_start(item_lbl, expand: true, fill: true, padding: 0)
 
-    if raffle[:purchased]
+    if raffle[:won]
+      won_lbl = Gtk::Label.new("YOU WON")
+      won_lbl.style_context.add_class("raffle-won-label")
+      title_box.pack_end(won_lbl, expand: false, fill: false, padding: 0)
+    elsif raffle[:purchased] && !raffle[:expired]
       purchased_lbl = Gtk::Label.new("TICKET PURCHASED")
       purchased_lbl.style_context.add_class("raffle-purchased-label")
       title_box.pack_end(purchased_lbl, expand: false, fill: false, padding: 0)
@@ -630,31 +833,51 @@ class RaffleWindowGtk
 
     row.add(title_box)
 
-    loc_lbl = Gtk::Label.new(RaffleWindow.location_text(raffle))
-    loc_lbl.set_xalign(0)
-    loc_lbl.set_line_wrap(true)
-    row.add(loc_lbl)
+    if raffle[:expired]
+      winners = Array(raffle[:winners])
+      winners_lbl = Gtk::Label.new("Winners: #{winners.empty? ? 'Unknown' : winners.join(', ')}")
+      winners_lbl.set_xalign(0)
+      winners_lbl.set_line_wrap(true)
+      row.add(winners_lbl)
 
-    time_text = raffle_time_text(raffle)
-    if time_text
-      time_lbl = Gtk::Label.new(time_text)
-      time_lbl.set_xalign(0)
-      row.add(time_lbl)
+      if winners.empty?
+        # Some raffles (e.g. crate-based ones) reject "raffle show" as "not
+        # a valid raffle #" unless their object has recently been seen --
+        # give a way to travel there and retry instead of being stuck.
+        loc_lbl = Gtk::Label.new(RaffleWindow.location_text(raffle))
+        loc_lbl.set_xalign(0)
+        loc_lbl.set_line_wrap(true)
+        row.add(loc_lbl)
+      end
+    else
+      loc_lbl = Gtk::Label.new(RaffleWindow.location_text(raffle))
+      loc_lbl.set_xalign(0)
+      loc_lbl.set_line_wrap(true)
+      row.add(loc_lbl)
+
+      time_text = raffle_time_text(raffle)
+      if time_text
+        time_lbl = Gtk::Label.new(time_text)
+        time_lbl.set_xalign(0)
+        row.add(time_lbl)
+      end
+
+      req_lbl = Gtk::Label.new(raffle_requirement_text(raffle))
+      req_lbl.set_xalign(0)
+      row.add(req_lbl)
     end
-
-    req_lbl = Gtk::Label.new(raffle_requirement_text(raffle))
-    req_lbl.set_xalign(0)
-    row.add(req_lbl)
 
     btn_box = Gtk::Box.new(:horizontal, 6)
     info_btn = Gtk::Button.new(label: "Show")
     info_btn.style_context.add_class("raffle-btn")
     info_btn.signal_connect("clicked") { RaffleWindow::CMD_QUEUE.push("raffle show #{raffle[:id]}") }
-    guide_btn = Gtk::Button.new(label: "Guide")
-    guide_btn.style_context.add_class("raffle-btn")
-    guide_btn.signal_connect("clicked") { RaffleWindow.request_guide(raffle) }
     btn_box.pack_start(info_btn, expand: false, fill: false, padding: 0)
-    btn_box.pack_start(guide_btn, expand: false, fill: false, padding: 0)
+    if !raffle[:expired] || Array(raffle[:winners]).empty?
+      guide_btn = Gtk::Button.new(label: "Guide")
+      guide_btn.style_context.add_class("raffle-btn")
+      guide_btn.signal_connect("clicked") { RaffleWindow.request_guide(raffle) }
+      btn_box.pack_start(guide_btn, expand: false, fill: false, padding: 0)
+    end
     row.add(btn_box)
 
     container
@@ -665,15 +888,32 @@ class RaffleWindowGtk
     Gtk.queue do
       @list_box.children.each { |c| @list_box.remove(c) }
 
-      header_lbl = Gtk::Label.new("#{raffles.size} active raffle#{raffles.size == 1 ? '' : 's'}. Click a raffle number for Show, or use the Guide button to travel there.")
+      active_raffles = raffles.reject { |raffle| raffle[:expired] }
+      expired_raffles = raffles.select { |raffle| raffle[:expired] }
+
+      header_lbl = Gtk::Label.new("#{active_raffles.size} active raffle#{active_raffles.size == 1 ? '' : 's'}. Click a raffle number for Show, or use the Guide button to travel there.")
       header_lbl.set_xalign(0)
       header_lbl.set_line_wrap(true)
       @list_box.add(header_lbl)
       @list_box.add(Gtk::Separator.new(:horizontal))
 
-      raffles.each_with_index do |raffle, idx|
+      active_raffles.each_with_index do |raffle, idx|
         @list_box.add(build_raffle_row(raffle))
-        @list_box.add(Gtk::Separator.new(:horizontal)) unless idx == raffles.size - 1
+        @list_box.add(Gtk::Separator.new(:horizontal)) unless idx == active_raffles.size - 1
+      end
+
+      unless expired_raffles.empty?
+        @list_box.add(Gtk::Separator.new(:horizontal)) unless active_raffles.empty?
+        expired_lbl = Gtk::Label.new("#{expired_raffles.size} expired raffle#{expired_raffles.size == 1 ? '' : 's'}.")
+        expired_lbl.set_xalign(0)
+        expired_lbl.set_line_wrap(true)
+        @list_box.add(expired_lbl)
+        @list_box.add(Gtk::Separator.new(:horizontal))
+
+        expired_raffles.each_with_index do |raffle, idx|
+          @list_box.add(build_raffle_row(raffle))
+          @list_box.add(Gtk::Separator.new(:horizontal)) unless idx == expired_raffles.size - 1
+        end
       end
 
       @list_box.show_all
@@ -760,7 +1000,9 @@ fput "raffle list"
 
 # --- Main Loop ---
 while (line = get)
-  if line =~ /You currently have no access to the urchin guides/i
+  capture_raffle_show_line(line)
+
+  if line =~ /You currently have no access to the urchin guides|You cannot travel to this raffle via an urchin guide/i
     RaffleWindow.fallback_to_go2
   end
 
@@ -788,8 +1030,7 @@ while (line = get)
     end
 
     parse_raffle_lines
-    formatted = format_raffle_info
-    Raffle_Window(formatted)
-    RaffleWindowGtk.update_raffles(@raffles) if RaffleWindow.gtk_available && defined?(RaffleWindowGtk) && RaffleWindowGtk.instance_variable_get(:@window)
+    display_raffles
+    request_missing_expired_winners
   end
 end
