@@ -194,6 +194,34 @@
         to the same hidden-1650-cast overextend risk while stunned/in RT. Added a hard 50-mana
         floor (intentionally lower than the configurable reserve -- worth the smaller cushion
         to get emergency armor up while stunned rather than defer to the full reserve).
+    3.0.7:
+      - Added Beacon of Courage tank mode (Paladin only) to the Group tab. Recasts 1608
+        every 61 seconds while grouped to keep the 60-second Beacon of Courage redirect
+        effect active. Two modes: condition-gated (creature count >= threshold OR boss
+        present) and always-on (recast every 61s regardless). Cast is verified via
+        dothistimeout watching for deity-specific success messaging; one immediate retry
+        on failure before resetting the 61s timer. Requires 1608 in Maintain Spells for
+        the initial cast. Profile keys: paladin_spells.beacon_enabled, beacon_always,
+        beacon_min_creatures.
+    3.0.6:
+      - Fixed Glorious Momentum "Attack to use" dropdown only showing Shield Trample and
+        Shield Throw: the AOE technique list now merges auto-detected techniques with the
+        saved profile's technique list, so configured AOE techniques (e.g. Whirlwind)
+        appear immediately without requiring a fresh detection scan.
+    3.0.5:
+      - Fixed emergency_stand firing while paused: monitor_emergencies now skips the
+        stand attempt when GSH4AState.paused is true, so intentional sleep/rest
+        (Symbol of Dreams, etc.) is never interrupted by the script.
+    3.0.4:
+      - Added "Enable High DS Detected rotation" checkbox to the Group tab. When unchecked,
+        fire_high_ds_step is never called regardless of @high_ds_detected. Default: enabled.
+        Profile key: weapons.high_ds_rotation_enabled (false = disabled). Falvicar profile
+        ships with this disabled.
+    3.0.3:
+      - Fixed eloot skipping your own kill when a non-group player walks in after combat
+        was already engaged. The stranger check is now bypassed when @combat_engaged is
+        true (you were in the room first). Grouped behavior is unaffected -- the grouped
+        eloot branch runs independently of this check.
     3.0.2:
       - Fixed DownstreamHook leak: gsh4a_gm_watcher (Glorious Momentum) had no stop_gm_watcher
         counterpart and was never removed on script exit, triggering Lich's unregistered-hook-on-exit
@@ -3747,14 +3775,23 @@ module SetupWizard
       @w[:pal_gm_enabled].active = saved_pal.fetch("gm_enabled", false)
       gm_pb.pack_start(@w[:pal_gm_enabled], false, false, 2)
 
-      # Build option list: fixed shield options + detected AOE weapon techniques
+      # Build option list: fixed shield options + AOE weapon techniques.
+      # Merge detected techniques with saved profile techniques so the list
+      # is populated even when auto-detection hasn't run this session.
       gm_options = [
         ["Shield Trample", "trample"],
         ["Shield Throw",   "throw shield"],
       ]
-      Array(d[:techniques]).select { |t| t[:tech_type] == "aoe" }.each do |t|
-        mn   = t[:mnemonic].to_s.downcase
-        name = t[:name].to_s
+      seen_mnemonics = Set.new
+      aoe_sources = Array(d[:techniques]) +
+                    Array((@saved_config || {})["techniques"]).map { |t|
+                      { tech_type: t["tech_type"], mnemonic: t["mnemonic"], name: t["name"] }
+                    }
+      aoe_sources.select { |t| t[:tech_type].to_s == "aoe" || t["tech_type"].to_s == "aoe" }.each do |t|
+        mn   = (t[:mnemonic] || t["mnemonic"]).to_s.downcase
+        name = (t[:name]     || t["name"]).to_s
+        next if mn.empty? || seen_mnemonics.include?(mn)
+        seen_mnemonics << mn
         gm_options << ["#{name} (weapon #{mn})", "weapon #{mn}"]
       end
 
@@ -5348,7 +5385,12 @@ module SetupWizard
     vb.pack_start(_rot_hsep,       false, false, 4)
     vb.pack_start(_rot_st_frame,   false, false, 5)
     vb.pack_start(_rot_aoe_frame,  false, false, 5)
+    hds_group_note = Gtk::Label.new("Whether this rotation fires at all is controlled by the \"Enable High DS Detected rotation\" checkbox on the Group tab.")
+    hds_group_note.xalign = 0.0; hds_group_note.set_line_wrap(true)
+    hds_group_note.override_color(:normal, Gdk::RGBA.new(0.5, 0.5, 0.5, 1.0))
+
     vb.pack_start(hds_thresh_row,  false, false, 4)
+    vb.pack_start(hds_group_note,  false, false, 2)
     vb.pack_start(_rot_hds_frame,  false, false, 5)
 
     scrolled(vb)
@@ -5371,7 +5413,8 @@ module SetupWizard
       "<b>Setup checklist:</b>  Fill out your <b>Single Target Rotation</b>, " \
       "<b>AoE Rotation</b>, and your <b>High DS Rotation</b> (on the Weapon Attack Rotation tab).  " \
       "Even pure casters can face high-DS creatures -- configure the High DS Rotation with " \
-      "DS-lowering abilities so the script can respond when spells miss."
+      "DS-lowering abilities so the script can respond when spells miss.  " \
+      "Whether the High DS rotation fires at all is toggled on the <b>Group tab</b>."
     sr_reminder.xalign = 0.0
     sr_reminder.set_line_wrap(true)
     vb.pack_start(sr_reminder, false, false, 4)
@@ -6748,6 +6791,58 @@ module SetupWizard
     eloot_gb.pack_start(@w[:eloot_grouped_run],  false, false, 2)
     eloot_gb.pack_start(@w[:eloot_grouped_skip], false, false, 2)
     vb.pack_start(eloot_gf, false, false, 4)
+    vb.pack_start(mk_hsep, false, false, 4)
+
+    boc_f, boc_b = frame_vbox("Beacon of Courage -- 1608 Tank Mode (Paladin only)")
+    boc_note = Gtk::Label.new(
+      "Recasting Defense of the Faithful (1608) while the buff is already active grants a " \
+      "60-second Beacon of Courage effect: hidden warding rolls redirect attacks from your " \
+      "group members to you for the duration. The script recasts every 61 seconds while " \
+      "grouped and the trigger conditions below are met. The initial cast (to get the buff " \
+      "active) is handled by the Maintain Spells list on the Spells tab -- add 1608 there."
+    )
+    boc_note.xalign = 0.0; boc_note.set_line_wrap(true)
+    boc_note.override_color(:normal, Gdk::RGBA.new(0.5, 0.5, 0.5, 1.0))
+    boc_b.pack_start(boc_note, false, false, 2)
+    saved_beacon_enabled = (@saved_config || {}).dig("paladin_spells", "beacon_enabled") || false
+    saved_beacon_always  = (@saved_config || {}).dig("paladin_spells", "beacon_always")  || false
+    saved_beacon_min     = (@saved_config || {}).dig("paladin_spells", "beacon_min_creatures") || 3
+    boc_b.pack_start(w_check(:beacon_enabled, "Enable Beacon of Courage tanking while grouped", saved_beacon_enabled), false, false, 3)
+
+    boc_always_cb = w_check(:beacon_always, "Always keep Beacon active (recast every 61 seconds regardless of creature count)", saved_beacon_always)
+    boc_b.pack_start(boc_always_cb, false, false, 2)
+
+    boc_cond_box = mk_vbox(2)
+    boc_cond_box.pack_start(lrow("Recast when creatures in room >=", w_spin(:beacon_min_creatures, saved_beacon_min, 1, 20)), false, false, 2)
+    boc_boss_note = Gtk::Label.new("Also recasts when a boss (from your Boss List on Hunting Preferences 2) is in the room, regardless of creature count.")
+    boc_boss_note.xalign = 0.0; boc_boss_note.set_line_wrap(true)
+    boc_boss_note.override_color(:normal, Gdk::RGBA.new(0.5, 0.5, 0.5, 1.0))
+    boc_cond_box.pack_start(boc_boss_note, false, false, 2)
+    boc_b.pack_start(boc_cond_box, false, false, 0)
+
+    # Grey out the creature/boss conditions when "always on" is checked
+    boc_always_cb.signal_connect("toggled") { |btn| boc_cond_box.sensitive = !btn.active? }
+    boc_cond_box.sensitive = !saved_beacon_always
+    vb.pack_start(boc_f, false, false, 4)
+    vb.pack_start(mk_hsep, false, false, 4)
+
+    hds_f, hds_b = frame_vbox("High DS Detected Rotation")
+    hds_note = Gtk::Label.new(
+      "When enabled, the script fires a separate rotation slot whenever the previous weapon " \
+      "attack needed a high d100 roll to hit (enemy DS is very high). Disable this if you " \
+      "prefer to handle high-DS targets manually or via your normal rotation."
+    )
+    hds_note.xalign = 0.0; hds_note.set_line_wrap(true)
+    hds_note.override_color(:normal, Gdk::RGBA.new(0.5, 0.5, 0.5, 1.0))
+    hds_b.pack_start(hds_note, false, false, 2)
+    saved_hds_enabled = (@saved_config || {}).dig("weapons", "high_ds_rotation_enabled")
+    saved_hds_enabled = true if saved_hds_enabled.nil?
+    hds_b.pack_start(w_check(:high_ds_rotation_enabled, "Enable High DS Detected rotation", saved_hds_enabled), false, false, 3)
+    hds_xref = Gtk::Label.new("The rotation slots themselves are configured on the Weapon Attack Rotation tab (and Spell Attack Rotation tab for runestaff users).")
+    hds_xref.xalign = 0.0; hds_xref.set_line_wrap(true)
+    hds_xref.override_color(:normal, Gdk::RGBA.new(0.5, 0.5, 0.5, 1.0))
+    hds_b.pack_start(hds_xref, false, false, 2)
+    vb.pack_start(hds_f, false, false, 4)
 
     scrolled(vb)
   end
@@ -7364,6 +7459,9 @@ module SetupWizard
       "incarn_onslaught_swarm"     => @w[:pal_incarn_onslaught_swarm]&.active? || false,
       "gm_enabled"                 => @w[:pal_gm_enabled]&.active? || false,
       "gm_cmd"                     => ((@w[:pal_gm_cmd_list] || [])[(@w[:pal_gm_cmd]&.active).to_i] || [nil, "trample"]).last.to_s,
+      "beacon_enabled"             => @w[:beacon_enabled]&.active? || false,
+      "beacon_always"              => @w[:beacon_always]&.active?  || false,
+      "beacon_min_creatures"       => @w[:beacon_min_creatures]&.value&.to_i || 3,
     }
     p["bard_sonic"]          = collect_bard_sonic
     p["ranger_companion"]    = collect_ranger_companion
@@ -7671,8 +7769,9 @@ module SetupWizard
       "holy_weapon"         => collect_holy_weapon,
       "weapon_rotation"     => collect_weapon_rot.call(@weapon_rot_combos_st  || []),
       "weapon_aoe_rotation" => collect_weapon_rot.call(@weapon_rot_combos_aoe || []),
-      "high_ds_rotation"    => collect_weapon_rot.call(@weapon_rot_combos_hds || []),
-      "high_ds_threshold"   => [[@w[:hds_threshold]&.value&.to_i || 50, 2].max, 99].min,
+      "high_ds_rotation"         => collect_weapon_rot.call(@weapon_rot_combos_hds || []),
+      "high_ds_threshold"        => [[@w[:hds_threshold]&.value&.to_i || 50, 2].max, 99].min,
+      "high_ds_rotation_enabled" => @w[:high_ds_rotation_enabled]&.active? != false,
       "recovery"            => {
         "use_119"      => @w[:wr_use_119]&.active?     || false,
         "use_recover"  => @w[:wr_use_recover]&.active?  || false,
@@ -10360,7 +10459,7 @@ module Engine
   def self.execute_weapon_rotation_step(target_id)
     # High DS rotation fires first when the previous attack missed -- grouped hunts
     # skip it entirely (the group's own support covers what this is meant to backstop).
-    fire_high_ds_step(target_id) if @high_ds_detected && !grouped_now?
+    fire_high_ds_step(target_id) if @high_ds_detected && !grouped_now? && pref("high_ds_rotation_enabled") != false
     # Assault techniques fire before the rotation slot -- they're opportunity-based
     # and should not be gated behind weapon_rotation_active? being false.
     fire_assault_techniques
@@ -11298,8 +11397,10 @@ module Engine
   #
   # @return [void]
   def self.monitor_emergencies
-    # Stand up immediately -- no RT wait; re-fires next cycle if still rejected
-    emergency_stand unless standing?
+    # Stand up immediately -- no RT wait; re-fires next cycle if still rejected.
+    # Skip when paused: the player may have intentionally lain down (Symbol of Dreams,
+    # rest commands, etc.) and the script must not interrupt that.
+    emergency_stand unless standing? || GSH4AState.paused
 
     stunned  = stunned?
     webbed   = webbed?
@@ -11907,6 +12008,49 @@ module Engine
     true
   end
 
+  # ---------------------------------------------------------------------------
+  # Beacon of Courage -- 1608 tank mode
+  # ---------------------------------------------------------------------------
+  def self.cast_beacon_of_courage
+    return unless grouped_now?
+    pal = @profile["paladin_spells"] || {}
+    return unless pal["beacon_enabled"]
+    return if @beacon_last_cast && Time.now.to_f - @beacon_last_cast < 61
+
+    # Condition gate: always-on bypasses the creature/boss check
+    unless pal["beacon_always"]
+      threshold    = (pal["beacon_min_creatures"] || 3).to_i
+      hostiles     = hostile_npcs
+      boss_present = hostiles.any? { |n| boss_target?(n.id) }
+      return unless boss_present || hostiles.length >= threshold
+    end
+
+    return unless (checkmana rescue 0) >= 15
+
+    hostiles     ||= hostile_npcs
+    boss_present ||= hostiles.any? { |n| boss_target?(n.id) }
+    log "Beacon of Courage -- recasting 1608 (#{hostiles.length} creature(s)#{boss_present ? ', boss present' : ''}#{pal['beacon_always'] ? ', always-on' : ''})"
+
+    # Success pattern shared by all deity variants: "<element> appear and begin to ... coalescing into"
+    # Failure patterns: out of mana, stunned, can't cast, fizzle
+    success_pat = /coalescing into/i
+    failure_pat = /don't have enough mana|stunned|cannot cast|no spell|fizzle/i
+    combined    = Regexp.union(success_pat, failure_pat)
+
+    2.times do |attempt|
+      waitrt?
+      result = dothistimeout("incant 1608", 6, combined) rescue nil
+      if result =~ success_pat
+        @beacon_last_cast = Time.now.to_f
+        return
+      end
+      log "Beacon of Courage -- cast attempt #{attempt + 1} failed (#{result.to_s.strip.slice(0, 60)}), #{attempt == 0 ? 'retrying' : 'giving up'}"
+      pause 0.5
+    end
+    # Both attempts failed -- set timer anyway to avoid rapid retry spam
+    @beacon_last_cast = Time.now.to_f
+  rescue; end
+
   def self.attempt_dread_escape
     return if dead?
     creep = @creeping_dread.to_i
@@ -12398,7 +12542,7 @@ module Engine
         if weapon_rotation_active?
           execute_weapon_rotation_step(id)
         else
-          fire_high_ds_step(id) if @high_ds_detected && !grouped_now?
+          fire_high_ds_step(id) if @high_ds_detected && !grouped_now? && pref("high_ds_rotation_enabled") != false
           stance_offensive
           unless fire_assault_techniques
             spell_fired = walk_rotation(id)
@@ -12449,10 +12593,14 @@ module Engine
     else
       return unless pref("use_eloot")
     end
-    strangers = (GameObj.pcs || []).reject { |pc| in_my_group?(pc_first_name(pc.name)) rescue false }
-    if strangers.any?
-      log "Skipping eloot -- non-group player(s) in room: #{strangers.map(&:name).join(', ')}"
-      return
+    # If we engaged combat before any stranger arrived we were here first --
+    # loot our own kill regardless of who walked in after.
+    unless @combat_engaged
+      strangers = (GameObj.pcs || []).reject { |pc| in_my_group?(pc_first_name(pc.name)) rescue false }
+      if strangers.any?
+        log "Skipping eloot -- non-group player(s) in room: #{strangers.map(&:name).join(', ')}"
+        return
+      end
     end
     start_script "eloot"
     pause 0.1 while Script.running?("eloot") rescue nil
@@ -12801,6 +12949,7 @@ module Engine
       target    = select_target
       target_id = target&.id
 
+      cast_beacon_of_courage
       cmans_of_type("maintenance").each  { |c| fire_cman(c) }
 
       run_aoe_phase(target_id) if target_id
