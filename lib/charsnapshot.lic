@@ -1,0 +1,135 @@
+=begin
+  charsnapshot.lic
+
+  Grabs a text snapshot of INFO, SKILLS, and COMBAT OFFENSE/DEFENSE (readied
+  weapon, both stances) and writes it to a timestamped file.
+
+  ;charsnapshot           take a snapshot for the current character
+  ;charsnapshot help      show this text
+
+       author: Mara
+         game: Gemstone
+         tags: info, skills, combat, snapshot, logging
+      contact: mara.lilly on Discord, @Lillymara on GitHub
+    co-author: Claude (Anthropic) - claude.ai/code
+      version: 1.0.0
+
+  Changelog:
+    1.0.0 (2026-07-29) - Initial release.
+=end
+
+def csnap_help
+  respond ''
+  respond 'charsnapshot.lic'
+  respond '  ;charsnapshot        capture info/skills/combat to a text file'
+  respond '  ;charsnapshot help   show this text'
+  respond ''
+end
+
+if Script.current.vars[1] =~ /^help$/i
+  csnap_help
+  exit
+end
+
+def csnap_dir
+  scripts_dir = ($script_dir rescue nil) || (SCRIPT_DIR rescue nil) || Dir.pwd
+  File.join(scripts_dir, "charsnapshot")
+end
+
+# Sends +command+ and captures every line of the response (as it would
+# appear on screen), without hiding anything from the live game window.
+# Guarded against the DownstreamHook registry being process-wide (see
+# [[project-downstreamhook-audit]]): a hook registered here still fires for
+# every character's downstream text in a multiboxed Lich process, so it must
+# check whose line it's looking at before collecting it.
+#
+# Some commands (COMBAT OFFENSE/DEFENSE observed so far) send an initial
+# <prompt> before the real multi-line stat block trickles in as a delayed
+# follow-up, so a single "stop at the first prompt" rule truncates them to
+# nothing. Instead this waits for +quiet_gap+ seconds of silence *after* at
+# least one prompt has been seen, so trailing content still has time to
+# arrive; the overall +timeout+ is still an upper bound.
+def csnap_capture(command, timeout: 10, quiet_gap: 0.6)
+  my_name = checkname
+  lines = []
+  seen_prompt = false
+  last_activity = Time.now
+  hook_name = "charsnapshot_#{my_name.downcase}_#{Time.now.to_f}_#{rand(1_000_000)}"
+
+  begin
+    DownstreamHook.add(hook_name, proc { |line|
+      next line unless checkname.casecmp(my_name) == 0
+      if line =~ /<prompt/
+        seen_prompt = true
+      else
+        text = strip_xml(line)
+        lines << text if text
+      end
+      last_activity = Time.now
+      line
+    }, persist: false)
+    fput(command)
+    ttl = Time.now + timeout
+    loop do
+      break if Time.now > ttl
+      break if seen_prompt && (Time.now - last_activity) > quiet_gap
+      sleep 0.05
+    end
+    lines << "[charsnapshot: timed out waiting for a response to '#{command}']" if Time.now > ttl && !seen_prompt
+  ensure
+    DownstreamHook.remove(hook_name)
+  end
+
+  lines.join("\n")
+end
+
+def csnap_set_stance(target)
+  return if Char.stance.to_s =~ /^#{target}/i
+  csnap_capture("stance #{target}")
+  ttl = Time.now + 3
+  sleep 0.1 until Char.stance.to_s =~ /^#{target}/i || Time.now > ttl
+end
+
+char_name  = checkname
+started_at = Time.now
+orig_stance = Char.stance.to_s
+
+respond "charsnapshot: capturing info/skills/combat for #{char_name}..."
+
+sections = []
+sections << ["INFO", csnap_capture("info")]
+sections << ["SKILLS", csnap_capture("skills")]
+
+csnap_set_stance("offensive")
+gird_off = csnap_capture("gird")
+sections << ["GIRD (stance: offensive)", gird_off]
+sections << ["COMBAT OFFENSE (stance: offensive)", csnap_capture("combat offense")]
+sections << ["COMBAT DEFENSE (stance: offensive)", csnap_capture("combat defense")]
+
+csnap_set_stance("defensive")
+gird_def = csnap_capture("gird")
+sections << ["GIRD (stance: defensive)", gird_def]
+sections << ["COMBAT OFFENSE (stance: defensive)", csnap_capture("combat offense")]
+sections << ["COMBAT DEFENSE (stance: defensive)", csnap_capture("combat defense")]
+
+# best-effort restore; not worth blocking on confirmation
+if orig_stance =~ /\S/ && Char.stance.to_s !~ /^#{orig_stance}/i
+  fput("stance #{orig_stance}")
+end
+
+FileUtils.mkdir_p(csnap_dir)
+safe_name = char_name.gsub(/[^A-Za-z0-9_-]/, '_')
+file_path = File.join(csnap_dir, "#{safe_name}_#{started_at.strftime('%Y%m%d_%H%M%S')}.txt")
+
+File.open(file_path, 'w') do |f|
+  f.puts "Character: #{char_name}"
+  f.puts "Date:      #{started_at.strftime('%Y-%m-%d')}"
+  f.puts "Time:      #{started_at.strftime('%H:%M:%S')}"
+  sections.each do |title, text|
+    f.puts ''
+    f.puts "===== #{title} ====="
+    f.puts text
+  end
+end
+
+respond "charsnapshot: wrote #{file_path}"
