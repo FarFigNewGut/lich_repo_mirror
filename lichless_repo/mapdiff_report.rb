@@ -223,11 +223,11 @@ checklist.each do |i|
     end
     # echo i if old.paths.class != Array or new.paths.class != Array
     if !new.paths.is_a?(Array)
-      dif << "TYPE ERROR: NEW PATH IS A #{new.paths.class}"
+      diff << "TYPE ERROR: NEW PATH IS A #{new.paths.class}"
       new.paths = [new.paths].compact
     end
     if !old.paths.is_a?(Array)
-        dif << "TYPE ERROR: OLD PATH IS A #{old.paths.class}"
+        diff << "TYPE ERROR: OLD PATH IS A #{old.paths.class}"
         old.paths = [old.paths].compact
     end
     if old.paths.to_s != new.paths.to_s
