@@ -37,13 +37,23 @@ require 'tmpdir'
 
 class Hash
   # super hacky to make work with map object constructs in script
-  def method_missing(method_name, *_args)
-    if ['tags', 'wayto', 'timeto', 'uid'].any?(method_name.to_s)
-      default_val = []
-    else
-      default_val = nil
+  def method_missing(method_name, *args)
+    name = method_name.to_s
+
+    # writer form (room.paths = [...]) must actually store, otherwise callers
+    # silently no-op and later comparisons still see the un-coerced value
+    return store(name.chomp('='), args.first) if name.end_with?('=')
+
+    value = fetch(name, nil)
+    return value unless value.nil?
+
+    # fetch defaults do not cover keys serialized as explicit null, so the
+    # default is applied to a nil value as well as to a missing key
+    if ['title', 'description', 'paths', 'tags', 'uid', 'unique_loot'].include?(name)
+      []
+    elsif ['wayto', 'timeto'].include?(name)
+      {}
     end
-    fetch(method_name.to_s, default_val)
   end
 
 end
@@ -64,8 +74,14 @@ class MapHash
     end
   end
 
-  def find
-    @map.find
+  def find(&block)
+    @map.values.find(&block)
+  end
+
+  # title of the room a wayto / timeto key points at; blank when that id is not
+  # in this map at all (dangling exits should not abort the whole report)
+  def title_at(key)
+    (self[key.to_i] || {}).title[0]
   end
 
   def compact
@@ -227,8 +243,8 @@ checklist.each do |i|
       new.paths = [new.paths].compact
     end
     if !old.paths.is_a?(Array)
-        diff << "TYPE ERROR: OLD PATH IS A #{old.paths.class}"
-        old.paths = [old.paths].compact
+      diff << "TYPE ERROR: OLD PATH IS A #{old.paths.class}"
+      old.paths = [old.paths].compact
     end
     if old.paths.to_s != new.paths.to_s
       if ((old.paths.size == new.paths.size) && (old.paths.size == 1)) || (old.paths.nil? && !new.paths.nil?) || (!old.paths.nil? && new.paths.nil?)
@@ -248,7 +264,7 @@ checklist.each do |i|
       end
     end
     if old.unique_loot.to_s != new.unique_loot.to_s
-      diff << "  unique_loot changed from '#{old.terrain}' to '#{new.terrain}'"
+      diff << "  unique_loot changed from '#{old.unique_loot}' to '#{new.unique_loot}'"
       if (new_map[i].unique_loot - (old_map[i].unique_loot.nil? ? [] : old_map[i].unique_loot)).size.positive?
         diff << "    added loot:   #{new_map[i].unique_loot - (old_map[i].unique_loot.nil? ? [] : old_map[i].unique_loot)}"
       end
@@ -261,7 +277,7 @@ checklist.each do |i|
       # diff << "wayto: #{old_map[i].wayto.inspect} is now #{new_map[i].wayto.inspect}"
       if (new_map[i].wayto.keys - old_map[i].wayto.keys).size.positive?
         diff << "  added wayto:\n    #{(new_map[i].wayto.keys - old_map[i].wayto.keys).each_with_object([]) do |k, a|
-                                         a << "#{k}: #{new_map[k.to_i].title[0]} => #{new_map[i].wayto[k].inspect}"
+                                         a << "#{k}: #{new_map.title_at(k)} => #{new_map[i].wayto[k].inspect}"
                                        end.join("\n    ")}"
         if diff[-1] =~ /;e/ || diff[-2] =~ /;e/
           diff << stringproc_callout
@@ -289,7 +305,7 @@ checklist.each do |i|
       oldtime = {} if oldtime.nil?
       if (newtime.keys - oldtime.keys).size.positive?
         diff << "  added timeto:\n    #{(newtime.keys - oldtime.keys).each_with_object([]) do |k, a|
-                                          a << "#{k}: #{new_map[k.to_i].title[0]} => #{newtime[k].inspect}"
+                                          a << "#{k}: #{new_map.title_at(k)} => #{newtime[k].inspect}"
                                         end.join("\n    ")}"
       end
       if diff[-1] =~ /;e/ || diff[-2] =~ /;e/
@@ -297,7 +313,7 @@ checklist.each do |i|
       end
       if (oldtime.keys - newtime.keys).size.positive?
         diff << "  removed timeto:\n    #{(oldtime.keys - newtime.keys).each_with_object([]) do |k, a|
-                                            a << "#{k}: #{old_map[k.to_i].title[0]} => #{oldtime[k].inspect}"
+                                            a << "#{k}: #{old_map.title_at(k)} => #{oldtime[k].inspect}"
                                           end.join("\n    ")}"
       end
       (old.timeto.keys & new.timeto.keys).each do |k|
@@ -358,7 +374,7 @@ end
 if @missing_titles.size.positive?
   @report << '-' * 50
   @report << 'missing titles:'
-  @missing_titles.sort_by { |t| [t[2].inspect, t[0], t[1]] }.each do |t|
+  @missing_titles.sort_by { |t| [t[2].inspect, t[0].to_s, t[1]] }.each do |t|
     @report << "  #{t[2]} - #{t[0]} - #{t[1]} - #{t[3]}"
   end
 end
@@ -367,7 +383,7 @@ if @missing_descriptions.size.positive?
   @report << '-' * 50
   @report << 'missing descriptions:'
   # @missing_descriptions.sort_by{|t| [t[3],t[2],t[1]]}.each {|t|
-  @missing_descriptions.sort_by { |t| t[2] }.each do |t|
+  @missing_descriptions.sort_by { |t| t[2].to_s }.each do |t|
     @report << "  #{t[3]} - #{t[2]} - #{t[1]} - #{t[0]}"
   end
 end
