@@ -6,7 +6,7 @@
   game: Gemstone
   tags: hunting, combat, automate, society, arcarium, trinkets, gemstones, paladin, warrior, rogue, ranger, bard, cleric, empath, wizard, sorcerer
   required: Lich >= 5.19.0
-  version: 3.2.0
+  version: 3.2.1
 
   Usage:
     ;gshunting4all setup  -- open setup wizard
@@ -26,6 +26,33 @@
 
 =begin
   changelog:
+    3.2.1:
+      - Fixed low-health heals (Fated Fruit, Aethereal Abstergent, society heal) firing
+        after an escape had already triggered/succeeded -- e.g. Fated Fruit spending a
+        precious 1-2x/day charge right after Symbol of Return already got you to safety.
+        The background health-escape thread can complete an escape (setting
+        GSH4AState.hunting = false) between when a given monitor_emergencies pass read
+        hp_pct and when it reaches run_low_health_priorities later in the same pass.
+        Added an explicit "return unless GSH4AState.hunting" guard at the top of
+        run_low_health_priorities and check_rejuvenation, so neither can fire once the
+        fight is already over regardless of which code path raced with which.
+      - Fixed Rejuvenation (1607) effectively never firing: it was entry #2 in the
+        low_health priority chain (which stops at the first entry that succeeds), behind
+        society heal -- and both use an identical 300s cooldown, so whenever both were
+        off cooldown at once, society heal won every single time and 1607 never got a
+        turn. Gave 1607 its own independent trigger (on low health OR low stamina,
+        mirroring the low-stamina trigger added earlier) instead of competing inside that
+        chain; its own cd_ready? check still caps it to once per 5 minutes regardless of
+        how many triggers fire. Removed the now-redundant "rejuvenation" entry from
+        Falvicar's low_health priority list.
+      - Fixed a real poaching risk: the Creature Overflow "move to adjacent room" action
+        fired the movement command but never reset @combat_engaged/@last_room_id
+        afterward (unlike the go2-hold-resume path right above it, which already does
+        this correctly). The stranger-presence snapshot on room entry only runs when
+        !@combat_engaged -- so if you were already mid-combat when overflow triggered a
+        move, that flag carried into the new room, the snapshot was skipped entirely, and
+        the script could immediately attack a creature another player was already
+        fighting there. Now forces a fresh snapshot after every overflow move.
     3.2.0:
       - Added a dedicated "Group" tab (positioned right after Hunting Preferences 2),
         consolidating everything that only matters -- or behaves differently -- while
@@ -385,7 +412,7 @@ require 'set'
 # All script internals live inside this module -- no global namespace pollution.
 module GSH4A
 
-SCRIPT_VERSION = "3.2.0".freeze
+SCRIPT_VERSION = "3.2.1".freeze
 PROFILE_DIR = File.join(File.dirname(__FILE__), "gsh4a_profiles")
 FileUtils.mkdir_p(PROFILE_DIR)
 
@@ -8291,6 +8318,7 @@ module Engine
   # know a number we can't independently verify.
   # @return [Boolean] true if cast was attempted
   def self.check_rejuvenation
+    return false unless GSH4AState.hunting
     return false unless (Spell[1607].known? rescue false)
     return false if casting_blocked?
     return false unless mana_ok?(7)
@@ -8963,6 +8991,12 @@ module Engine
 
   # Fires the first ready entry from the low_health emergency priority list.
   def self.run_low_health_priorities
+    # An escape can complete asynchronously (the background health-escape thread
+    # calls attempt_escape independently of the caller here) between when this pass
+    # of monitor_emergencies read hp_pct and when it reaches this call. Once hunting
+    # is false the fight is already over -- healing charges (Fated Fruit, etc.) spent
+    # after that are pure waste.
+    return unless GSH4AState.hunting
     Array(@profile.dig("emergency_priorities", "low_health")).each do |entry|
       return if fire_priority_entry(entry)
     end
@@ -10852,6 +10886,7 @@ module Engine
   def self.start_attack_result_watcher
     @high_ds_detected   = false
     @_hds_player_swung  = false
+    @last_spell_warded  = false
     DownstreamHook.remove("gsh4a_attack_result_watcher") rescue nil
     DownstreamHook.add("gsh4a_attack_result_watcher", proc { |line|
       clean = line.gsub(/<[^>]+>/, "")
@@ -10867,8 +10902,17 @@ module Engine
         threshold = [[threshold, 2].max, 99].min
         needed    = 101 - (end_roll - d100_roll)
         @high_ds_detected  = needed >= threshold
+        @last_spell_warded = false if needed < threshold  # weapon hitting fine
         @_hds_player_swung = false
       end
+      # Spell warded off: creature's TD beat our CS. Clear HDS flag (warding fail != high
+      # weapon DS) and set @last_spell_warded so walk_rotation skips AS-only self-buffs.
+      if clean =~ /\bWarded off!\b/i
+        @last_spell_warded = true
+        @high_ds_detected  = false
+      end
+      # Spell landed -- creature's warding failed. Clear the warded flag.
+      @last_spell_warded = false if clean =~ /\bWarding failed!\b/i
       line
     })
   end
@@ -10877,12 +10921,14 @@ module Engine
     DownstreamHook.remove("gsh4a_attack_result_watcher") rescue nil
     @high_ds_detected  = false
     @_hds_player_swung = false
+    @last_spell_warded = false
   end
 
   # Fires ALL slots in the High DS Rotation in order, then returns so the
   # normal ST/AoE attack fires immediately after. Skips slots that are on
   # cooldown or unavailable. Called before each attack when @high_ds_detected.
   def self.fire_high_ds_step(target_id)
+    return false if @last_spell_warded  # warding fail != high weapon DS; skip until a spell lands
     rot = Array(@profile.dig("weapons", "high_ds_rotation")).select { |e| e.is_a?(Hash) && e["type"].to_s != "skip" }
     return false if rot.empty?
     fired_any = false
@@ -11137,6 +11183,8 @@ module Engine
       next unless entry.is_a?(Hash)
       cond = entry["condition"].to_s.strip
       next unless rotation_condition_met?(cond)
+      # After a warding failure, skip AS-only self-buffs -- they boost weapon AS, not CS vs TD
+      next if @last_spell_warded && SELF_CAST_SPELL_NUMS.include?(entry["cmd"].to_s[/\d+/].to_i)
       return true if fire_weapon_rot_entry(entry, target_id)
     end
     false
@@ -11545,12 +11593,14 @@ module Engine
       @low_health_responded = false
     end
 
-    # Rejuvenation (1607) restores both health and stamina, so it gets its own
-    # low-stamina trigger independent of the health priority chain above -- the other
-    # low_health entries (society heal, Fated Fruit, Aethereal Abstergent) are HP-only
-    # and self-gate on health internally, so they shouldn't be invoked just because
-    # stamina dipped while health is fine.
-    if sta_pct < low_stamina_pct
+    # Rejuvenation (1607) gets its own independent trigger on BOTH low health and low
+    # stamina, rather than only competing as an entry inside the low_health priority
+    # chain above. That chain stops at the first entry that succeeds -- if another
+    # entry (e.g. society heal) shares an identical cooldown and sits earlier in the
+    # list, it wins every single time and Rejuvenation can end up never firing at all.
+    # check_rejuvenation's own 300s cooldown still caps it to once per 5 minutes
+    # regardless of how many of these triggers fire in the same window.
+    if hp_pct < low_health_pct || sta_pct < low_stamina_pct
       unless @low_stamina_responded
         check_rejuvenation
         @low_stamina_responded = true
@@ -12825,6 +12875,12 @@ module Engine
             waitrt? rescue nil
             fput dir
             sleep 1.5
+            # Force a fresh stranger-presence snapshot in the room we just moved to --
+            # @combat_engaged otherwise carries over from the room we left, which skips
+            # the snapshot entirely (it only runs when !@combat_engaged) and can lead to
+            # attacking a creature a stranger already engaged in the new room.
+            @combat_engaged = false
+            @last_room_id   = nil
           else
             pause 2
           end
@@ -12877,6 +12933,8 @@ module Engine
         @last_room_id        = current_room_id
         @holding_for_player  = false
         @combat_engaged      = false
+        @last_spell_warded   = false
+        @ovf_banner_shown    = false
         @in_sanctuary        = SANCTUARY_ROOMS.include?(current_room_id)
         if @in_sanctuary
           log "Sanctuary room #{current_room_id} -- halting attacks"
