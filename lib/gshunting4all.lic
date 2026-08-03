@@ -132,6 +132,29 @@
       - Enabled stamina_floor_enabled (reserve 50, the setup wizard's own suggested
         default) on Falvicar's profile -- previously off, same as mana_floor_enabled was
         before 3.0.5, so none of the above guards had any effect for him until now.
+    3.1.5:
+      - Fixed slow immobility response (Beseech firing after several failed actions):
+        monitor_emergencies is polled once per loop iteration so the script could fire
+        stand/release/technique/feat commands before detecting the IP state. Added a
+        DownstreamHook (gsh4a_immobility_watcher) that fires run_abilities_when(
+        "emergency_status") in a thread the instant the game rejects any action with
+        "You don't seem to be able to move to do that." -- same pattern used by the
+        reaction and GM watchers.
+    3.1.4:
+      - Fixed potential post-escape disconnect from orphaned Glorious Momentum thread:
+        the GM thread spawned by the DownstreamHook had no stored reference, so
+        stop_gm_watcher (called on script stop) couldn't kill it. If the thread was
+        mid-waitrt? or attempted fput after the script died, it could destabilize Lich.
+        Fixed by storing the thread in @gm_thread and killing it in stop_gm_watcher.
+      - Note: 52% escape at health_retreat_pct 54 was correct behavior. Lower the
+        threshold in Hunting Preferences if 54% feels too conservative.
+    3.1.3:
+      - Fixed "waitfor: Unable to identify calling script" error in the Glorious Momentum
+        thread: Lich requires threads that call waitrt?/waitcastrt?/fput to be registered
+        in the script's ThreadGroup. The GM hook thread was missing the _tg.add() call
+        that the reaction watcher already uses. Fixed by capturing Thread.current.group
+        in start_gm_watcher (called from script context) and adding each spawned thread
+        to it before calling any Lich blocking functions.
     3.1.2:
       - Fixed creature overflow triggering in crowded player rooms: room_creature_count
         used GameObj.npcs (all NPCs including familiars, companions, pets) instead of
@@ -12053,6 +12076,9 @@ module Engine
     @gm_active_at = 0.0
     DownstreamHook.remove("gsh4a_gm_watcher") rescue nil
     return unless @profile.dig("paladin_spells", "gm_enabled")
+    # Capture the script's thread group now (called from script context) so spawned
+    # threads can be registered with it -- Lich requires this for waitrt?/waitcastrt?.
+    _tg = Thread.current.group
     DownstreamHook.add("gsh4a_gm_watcher", proc { |line|
       if line.gsub(/<[^>]+>/, "") =~ /gaining the upper hand against your foes spurs you to sustain the glorious momentum/i
         @gm_active    = true
@@ -12062,8 +12088,10 @@ module Engine
         log "Glorious Momentum activated -- will fire: #{cmd}"
         # Fire from a thread so GM works even when the loop is mid-iteration
         # (e.g. manual spell cast procced GM while the script was past the poll point).
-        Thread.new do
+        @gm_thread&.kill rescue nil
+        @gm_thread = Thread.new do
           begin
+            (_tg.add(Thread.current) rescue nil)
             waitrt?
             waitcastrt?
             # Re-check the flag -- the main loop may have already fired it
@@ -12083,8 +12111,38 @@ module Engine
 
   def self.stop_gm_watcher
     DownstreamHook.remove("gsh4a_gm_watcher") rescue nil
+    @gm_thread&.kill rescue nil
+    @gm_thread    = nil
     @gm_active    = false
     @gm_active_at = 0.0
+  end
+
+  # ---------------------------------------------------------------------------
+  # Immobility watcher -- fires emergency_status (Beseech etc.) the instant the
+  # game rejects an action with "You don't seem to be able to move to do that."
+  # rather than waiting for the next monitor_emergencies poll.
+  # ---------------------------------------------------------------------------
+
+  def self.start_immobility_watcher
+    DownstreamHook.remove("gsh4a_immobility_watcher") rescue nil
+    _tg = Thread.current.group
+    DownstreamHook.add("gsh4a_immobility_watcher", proc { |line|
+      if GSH4AState.hunting &&
+         line.gsub(/<[^>]+>/, "") =~ /You don't seem to be able to move to do that/i
+        Thread.new do
+          begin
+            (_tg.add(Thread.current) rescue nil)
+            run_abilities_when("emergency_status")
+          rescue
+          end
+        end
+      end
+      line
+    })
+  end
+
+  def self.stop_immobility_watcher
+    DownstreamHook.remove("gsh4a_immobility_watcher") rescue nil
   end
 
   def self.fire_glorious_momentum
@@ -12799,6 +12857,7 @@ module Engine
     start_group_watcher
     start_dread_watcher
     start_gm_watcher
+    start_immobility_watcher
     start_health_escape_watcher
     start_disarm_watcher
     start_ecleanse_yield_watcher
@@ -13155,6 +13214,7 @@ before_dying do
   GSH4A::Engine.stop_technique_cd_watcher              rescue nil
   GSH4A::Engine.stop_dread_watcher                     rescue nil
   GSH4A::Engine.stop_gm_watcher                        rescue nil
+  GSH4A::Engine.stop_immobility_watcher                rescue nil
   GSH4A::Engine.stop_health_escape_watcher             rescue nil
   GSH4A::Engine.stop_disarm_watcher                    rescue nil
   GSH4A::Engine.stop_ecleanse_yield_watcher            rescue nil
