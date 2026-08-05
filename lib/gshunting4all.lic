@@ -6,7 +6,7 @@
   game: Gemstone
   tags: hunting, combat, automate, society, arcarium, trinkets, gemstones, paladin, warrior, rogue, ranger, bard, cleric, empath, wizard, sorcerer
   required: Lich >= 5.19.0
-  version: 3.2.1
+  version: 3.2.2
 
   Usage:
     ;gshunting4all setup  -- open setup wizard
@@ -26,6 +26,25 @@
 
 =begin
   changelog:
+    3.2.2:
+      - Fixed a real danger scenario: monitor_emergencies' CC response block (fires Beseech
+        1635 on stun/web/bind) already has zero cooldown of its own, but only re-checks
+        once per main-loop pass and only re-fires every 5s (@cc_responded debounce) -- if
+        the loop was busy elsewhere (attack attempts, eloot retries) exactly when a stun
+        landed, the response could end up delayed well past what the debounce alone would
+        suggest, leaving the character stunned and unanswered while multiple enemies kept
+        attacking. Added start_player_cc_watcher: a DownstreamHook that reacts to the
+        literal "you are stunned" onset text the instant it streams in and clears
+        @cc_responded directly, so the next monitor_emergencies pass treats it as a brand
+        new CC event and fires Beseech immediately rather than waiting on the debounce.
+        Deliberately does not fput anything itself from within the hook -- that raises
+        "Unable to identify calling script" outside the main script fiber (see
+        recover_flying_weapon) -- it only flips the flag the main loop already checks.
+        Currently only covers stun's confirmed onset text; web/bind onset text for the
+        same treatment would need their exact GS4 wording confirmed first.
+      - Not to be confused with the pre-existing start_stun_watcher, which is unrelated:
+        that one tracks the Rogue Guild's stun *maneuver used on enemies* and only runs
+        when rogue_guild.stun_enabled -- it was never applicable to Falvicar (Paladin).
     3.2.1:
       - Fixed low-health heals (Fated Fruit, Aethereal Abstergent, society heal) firing
         after an escape had already triggered/succeeded -- e.g. Fated Fruit spending a
@@ -132,6 +151,19 @@
       - Enabled stamina_floor_enabled (reserve 50, the setup wizard's own suggested
         default) on Falvicar's profile -- previously off, same as mana_floor_enabled was
         before 3.0.5, so none of the above guards had any effect for him until now.
+    3.1.7:
+      - Fixed flying weapon recovery thread not registered in Lich's ThreadGroup:
+        Thread.new { recover_flying_weapon } in both the DownstreamHook spawn and the
+        combat-loop restart path were missing _tg.add(Thread.current), causing Lich to
+        log commands as "[(unknown script)]" and making waitrt?/fput unreliable inside
+        the recovery thread. Fixed by capturing _tg = Thread.current.group before each
+        spawn site and adding the thread to the group on entry.
+      - Fixed spell 119 success detection logging a false "Spell 119 cast failed"
+        immediately after a successful recovery: the dothistimeout regex matched
+        "returns to your hand|flies back" but the actual GS output for a flying weapon
+        recovered by 119 is "settles into your right hand" / "energies holding it aloft
+        come apart". Added both phrases to both the match and the success branch so the
+        thread exits cleanly instead of logging a failure and sleeping before rechecking.
     3.1.6:
       - Fixed creature overflow "move" action silently doing nothing: when checkroomexits
         returned empty (no Lich map data for the room), dir was nil and the code fell into
@@ -475,7 +507,7 @@ require 'set'
 # All script internals live inside this module -- no global namespace pollution.
 module GSH4A
 
-SCRIPT_VERSION = "3.2.1".freeze
+SCRIPT_VERSION = "3.2.2".freeze
 PROFILE_DIR = File.join(File.dirname(__FILE__), "gsh4a_profiles")
 FileUtils.mkdir_p(PROFILE_DIR)
 
@@ -10374,6 +10406,33 @@ module Engine
     GSH4AState.stun_pending = false
   end
 
+  # Watches for the player's OWN stun onset text directly (not to be confused with
+  # start_stun_watcher above, which tracks the Rogue Guild's stun *maneuver on enemies*
+  # and only runs when rogue_guild.stun_enabled). monitor_emergencies' CC response block
+  # already fires Beseech (1635) with no cooldown of its own, but only re-fires every 5s
+  # (@cc_responded debounce) and only when its own poll of stunned? happens to land while
+  # the flag is fresh -- if the main loop is busy elsewhere (attack attempts, eloot, etc.)
+  # when stun actually lands, the response can end up delayed well past 5s. This watcher
+  # reacts to the literal onset text the instant it streams in and clears @cc_responded
+  # directly, so the very next monitor_emergencies pass treats it as a brand new CC event
+  # and fires immediately instead of waiting out the debounce. Deliberately does NOT fput
+  # anything itself -- DownstreamHook callbacks run outside the main script fiber, and
+  # fput from there raises "Unable to identify calling script" (see recover_flying_weapon).
+  def self.start_player_cc_watcher
+    DownstreamHook.remove("gsh4a_player_cc_watcher") rescue nil
+    DownstreamHook.add("gsh4a_player_cc_watcher", proc { |line|
+      clean = line.gsub(/<[^>]+>/, "")
+      if clean =~ /\byou are stunned\b/i
+        @cc_responded = false
+      end
+      line
+    })
+  end
+
+  def self.stop_player_cc_watcher
+    DownstreamHook.remove("gsh4a_player_cc_watcher") rescue nil
+  end
+
   # Watches for berserk onset/end messages so the attack loop knows to step aside.
   def self.start_berserk_watcher
     wg = @profile["warrior_guild"] || {}
@@ -12281,6 +12340,8 @@ module Engine
     noun = @profile.dig("weapons", "primary", "noun").to_s.strip.downcase
     return if noun.empty?
 
+    _tg = Thread.current.group
+
     DownstreamHook.add("gsh4a_disarm_watcher", proc { |line|
       clean = line.gsub(/<[^>]+>/, "").strip
       if use_119 && clean =~ /Your (.+?) tears free from your hands and floats/i
@@ -12294,7 +12355,10 @@ module Engine
           respond "[gsh4a]  Weapon flying (Room #{room_id}) -- attempting recovery via spell 119"
           respond "[gsh4a] ------------------------------------------"
           respond ""
-          @disarm_thread = Thread.new { recover_flying_weapon(flying_noun) }
+          @disarm_thread = Thread.new do
+            (_tg.add(Thread.current) rescue nil)
+            recover_flying_weapon(flying_noun)
+          end
         end
       elsif clean =~ /knocked from your grasp and out of sight/i
         if @disarm_thread.nil? || !@disarm_thread.alive?
@@ -12417,8 +12481,8 @@ module Engine
         sleep 0.1 while (checkcastrt rescue 0) > 0
         return if dead?
         result = dothistimeout("cast #{noun}", 4,
-          /returns to your hand|flies back|You cast|Nothing happens|hindrance|You are unable|no spell/i)
-        if result =~ /returns to your hand|flies back/i
+          /returns to your hand|flies back|settles into your|energies holding it aloft|You cast|Nothing happens|hindrance|You are unable|no spell/i)
+        if result =~ /returns to your hand|flies back|settles into your|energies holding it aloft/i
           sleep 0.5
           put "ready weapon" unless weapon_in_hand?
           return
@@ -12687,7 +12751,11 @@ module Engine
             # Recovery thread exited but weapon still flying -- restart 119 recovery.
             log "Weapon still not in hand after recovery thread exited -- restarting 119 recovery"
             @weapon_disarmed = true
-            @disarm_thread = Thread.new { recover_flying_weapon(noun) }
+            _tg2 = Thread.current.group
+            @disarm_thread = Thread.new do
+              (_tg2.add(Thread.current) rescue nil)
+              recover_flying_weapon(noun)
+            end
           elsif @disarm_thread.nil? || !@disarm_thread.alive?
             # Physical disarm recovery thread done (or no recovery configured) -- just re-ready.
             log "Weapon not in hand -- re-readying"
@@ -12852,6 +12920,7 @@ module Engine
     start_uac_watcher
     start_mount_cd_watcher
     start_stun_watcher
+    start_player_cc_watcher
     start_berserk_watcher
     start_holy_weapon_watcher
     start_mount_watcher
@@ -13216,6 +13285,7 @@ before_dying do
   GSH4A::Engine.stop_reaction_watcher                  rescue nil
   GSH4A::Engine.stop_uac_watcher                       rescue nil
   GSH4A::Engine.stop_stun_watcher                      rescue nil
+  GSH4A::Engine.stop_player_cc_watcher                 rescue nil
   GSH4A::Engine.stop_berserk_watcher                   rescue nil
   GSH4A::Engine.stop_holy_weapon_watcher               rescue nil
   GSH4A::Engine.stop_attack_result_watcher             rescue nil
