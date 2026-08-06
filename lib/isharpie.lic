@@ -24,7 +24,7 @@ The following inputs are available:
       Other scripts: Combatical, Merchantical, Loresang, VolnRestore2
       game: gs
       tags: items, inventory, notes, highlight, Sharpie
-      version: 1.1.0
+      version: 1.2.0
       required: Lich > 5.0
 
       \\Version\\
@@ -36,13 +36,25 @@ The following inputs are available:
       1.0.7 07/01/2026 - silent notes (SN): per-item, list-only, no inline annotation
       1.0.8 07/01/2026 - trimmed help to one SN example with brief mention of variations
       1.1.0 07/02/2026 - startup Container search, silent mode added
+      1.2.0 08/05/2026 - recall-based tagging with configurable loud/silent/both note modes
 
 =end
 
 module ISharpie
-  VERSION = '1.1.0'.freeze
+  VERSION = '1.2.0'.freeze
 
   VALID_COLORS = %w[orange teal green yellow none].freeze
+  DEFAULT_RECALL_MODE = 'loud'.freeze
+  RECALL_MODE_ALIASES = {
+    'loud note' => 'loud',
+    'silent note' => 'silent',
+    'both notes' => 'both',
+    'loud' => 'loud',
+    'silent' => 'silent',
+    'both' => 'both',
+    'sn' => 'silent',
+    'bn' => 'both'
+  }.freeze
 
   # GS4 crafting/quality descriptors that are legitimately dropped from worn or
   # display names. The word-set fallback only fires when the stored name is
@@ -99,6 +111,7 @@ module ISharpie
   @note_counter         = nil
   @startup_suppress     = false
   @inventory_only       = false
+  @recall_mode          = nil
 
   ## ---- persisted notes ---------------------------------------------------
 
@@ -107,29 +120,53 @@ module ISharpie
     File.join(EDUBARBARIAN_DIR, "isharpie_#{char}.json")
   end
 
-  def self.notes
-    @notes ||= begin
-      path = notes_path
-      if File.exist?(path)
-        data = JSON.parse(File.read(path), symbolize_names: true)
-        if data.is_a?(Array)
-          data  # old format: plain array, @inventory_only stays false
-        else
-          @inventory_only = data[:inventory_only] || false
-          Array(data[:notes])
-        end
+  def self.normalize_recall_mode(value)
+    raw = value.to_s.strip.downcase
+    return DEFAULT_RECALL_MODE if raw.empty?
+
+    RECALL_MODE_ALIASES[raw] || RECALL_MODE_ALIASES[raw.gsub(/\s+/, ' ')] || DEFAULT_RECALL_MODE
+  end
+
+  def self.load_state
+    path = notes_path
+    if File.exist?(path)
+      data = JSON.parse(File.read(path), symbolize_names: true)
+      if data.is_a?(Array)
+        state = { notes: data, inventory_only: false, recall_mode: DEFAULT_RECALL_MODE }
       else
-        []
+        state = {
+          notes: Array(data[:notes]),
+          inventory_only: data[:inventory_only] || false,
+          recall_mode: normalize_recall_mode(data[:recall_mode] || DEFAULT_RECALL_MODE)
+        }
       end
-    rescue StandardError => e
-      say "could not load notes from #{notes_path}: #{e.class}"
-      []
+    else
+      state = { notes: [], inventory_only: false, recall_mode: DEFAULT_RECALL_MODE }
     end
+
+    @inventory_only = state[:inventory_only]
+    @recall_mode = state[:recall_mode]
+    state
+  rescue StandardError => e
+    say "could not load notes from #{notes_path}: #{e.class}"
+    { notes: [], inventory_only: false, recall_mode: DEFAULT_RECALL_MODE }
+  end
+
+  def self.notes
+    @notes ||= load_state[:notes]
+  end
+
+  def self.recall_mode
+    @recall_mode ||= load_state[:recall_mode]
   end
 
   def self.save_notes!
     FileUtils.mkdir_p(EDUBARBARIAN_DIR)
-    File.write(notes_path, JSON.pretty_generate({ notes: @notes, inventory_only: @inventory_only }))
+    File.write(notes_path, JSON.pretty_generate({
+      notes: @notes || notes,
+      inventory_only: @inventory_only,
+      recall_mode: recall_mode
+    }))
   rescue StandardError => e
     say "could not save notes to #{notes_path}: #{e.class}"
   end
@@ -141,6 +178,15 @@ module ISharpie
     state = @inventory_only ? 'ON  - notes only appear on items in your own inventory' \
                             : 'OFF - notes appear everywhere a matching item name is seen'
     say "inventory-only: #{state}"
+  end
+
+  def self.set_recall_mode(mode)
+    normalized = normalize_recall_mode(mode)
+    return say("unknown recall mode #{mode.inspect} - try loud, silent, or both") unless %w[loud silent both].include?(normalized)
+
+    @recall_mode = normalized
+    save_notes!
+    say "recall mode: #{normalized}"
   end
 
   def self.next_note_id
@@ -574,6 +620,12 @@ module ISharpie
       answer_confirmation(false)
     when /^tag\s+(.+)$/i
       handle_tag_command($1)
+    when /^(?:recall|r)\s+(.+)$/i
+      handle_recall_command($1)
+    when /^(?:recall|r)$/i
+      handle_recall_command(nil)
+    when /^set\s+recall\s+(.+)$/i
+      set_recall_mode($1)
     when /^color\s+(\w+)$/i
       set_color($1)
     when /^remove\s+(\S+)$/i
@@ -609,6 +661,243 @@ module ISharpie
     tag_held_item(noun, note_text, color, silent)
   end
 
+  def self.handle_recall_command(body)
+    noun = body.to_s.strip
+    noun = nil if noun.empty?
+
+    item = held_item(noun)
+    unless item
+      say "you're not holding a #{noun || 'target item'}"
+      return
+    end
+
+    recall_text = fetch_recall_text(noun || item.noun.to_s)
+    summary = summarize_recall(recall_text)
+    unless summary && !summary.empty?
+      say 'no useful recall details found'
+      return
+    end
+
+    note_text, silent_note = recall_note_parts(summary)
+    tag_item(item, note_text, nil, silent_note)
+  end
+
+  def self.fetch_recall_text(noun)
+    target = noun.to_s.strip.empty? ? 'item' : noun.to_s.strip
+    fput "recall #{target}"
+    waitrt?
+    pause 0.8
+    Array(reget(40, /.*/) || []).join("\n")
+  end
+
+  def self.recall_note_parts(summary)
+    case recall_mode
+    when 'silent'
+      [nil, summary]
+    when 'both'
+      [summary, summary]
+    else
+      [summary, nil]
+    end
+  end
+
+  ADJECTIVE_TO_CER = {
+    'lightly' => '1-2',
+    'fairly' => '3-4',
+    'somewhat' => '5-6',
+    'decently' => '7-8',
+    'heavily' => '9-10',
+    'very heavily' => '11-13',
+    'exceptionally' => '14-15',
+    'masterfully' => '16-20',
+    'superbly' => '21-25',
+    'expertly' => '26-30',
+    'phenomenally' => '31-35',
+    'fantastically' => '36-40',
+    'incredibly' => '41-45',
+    'wondrously' => '46-50'
+  }.freeze
+
+  def self.extract_cer_tags(text)
+    content = text.to_s.gsub(/\e\[[0-9;]*m/, '').gsub(/\s+/, ' ').strip
+    return '' if content.empty?
+
+    tags = []
+
+    if content =~ /temporarily serves/i
+      tags << 'TEMP'
+    end
+
+    if content =~ /(\w+(?:\s+\w+)?)\s+padded\s+to\s+lessen\s+the\s+damage/i
+      adj = $1.downcase
+      if content =~ /exactly how much requires assessment/i
+        tags << 'DAM?'
+      else
+        range = ADJECTIVE_TO_CER[adj] || '?'
+        tags << "DAM#{range}"
+      end
+    end
+
+    if content =~ /(\w+(?:\s+\w+)?)\s+padded\s+against\s+critical/i
+      adj = $1.downcase
+      if content =~ /exactly how much requires assessment/i
+        tags << 'CRT?'
+      else
+        range = ADJECTIVE_TO_CER[adj] || '?'
+        tags << "CRT#{range}"
+      end
+    end
+
+    unless tags.any? { |t| t.start_with?('CRT') }
+      if content =~ /(\w+(?:\s+\w+)?)\s+weighted\s+to\s+inflict/i
+        adj = $1.downcase
+        if content =~ /exactly how much requires assessment/i
+          tags << 'CRT?'
+        else
+          range = ADJECTIVE_TO_CER[adj] || '?'
+          tags << "CRT#{range}"
+        end
+      end
+    end
+
+    if content =~ /(\w+(?:\s+\w+)?)\s+sighted/i
+      adj = $1.downcase
+      if content =~ /exactly how much requires assessment/i
+        tags << 'SIGT?'
+      else
+        range = ADJECTIVE_TO_CER[adj] || '?'
+        tags << "SIGT#{range}"
+      end
+    elsif content =~ /sighted\s+to\s+assist/i
+      if content =~ /exactly how much requires assessment/i
+        tags << 'SIGT?'
+      end
+    end
+
+    tags.join(',')
+  end
+
+  def self.extract_script_name(text)
+    content = text.to_s.gsub(/\e\[[0-9;]*m/, '').gsub(/\s+/, ' ').strip
+    return nil if content.empty?
+
+    if content =~ /unknown \(scripted\) benefit/i
+      return '?'
+    end
+
+    tier = content[/It is a tier (\d+)/i, 1]
+    
+    if content =~ /currently set to\s+([^.]+)/i
+      script_name = $1.strip
+      return tier ? "Tier #{tier} #{script_name}" : script_name
+    end
+
+    if content =~ /It is a tier \d+\s+(.+?)\s+(?:weapon|armor|shield|wps|device|orb|sceptre|figurine|jewelry|ring|bracelet|amulet|brooch|cloak|gloves|boots|leggings|tunic|robe|gown|shirt|pants|coat|jacket|vest|belt|hat|crown|circlet|helm|hood|mask|veil)\b/i
+      script_name = $1.strip
+      return tier ? "Tier #{tier} #{script_name}" : script_name
+    end
+
+    nil
+  end
+
+  def self.extract_enhancive_info(text)
+    content = text.to_s.gsub(/\e\[[0-9;]*m/, '').gsub(/\s+/, ' ').strip
+    return nil unless content =~ /it is an enhancive item/i
+
+    boosts = []
+    content.scan(/It provides a boost of (\d+) to ([^.]+?)(?=\.|\n|It provides|This enhancement|It seems)/i) do |match|
+      amount = match[0]
+      name = match[1].strip
+      name = name.sub(/\s+Ranks\s*$/, '')
+      boosts << "+#{amount} #{name}"
+    end
+
+    return nil if boosts.empty?
+
+    status = if content =~ /will persist after its last enhancive charge/i
+               'Persists'
+             elsif content =~ /will crumble into dust after its last.*charge/i
+               'Crumbles'
+             else
+               nil
+             end
+
+    result = boosts.join(', ')
+    result += " #{status}" if status
+    result
+  end
+
+  def self.extract_imbed_info(text)
+    content = text.to_s.gsub(/\e\[[0-9;]*m/, '').gsub(/\s+/, ' ').strip
+    return nil if content.empty?
+
+    spell = content[/imbedded with the\s+(\w+)\s+spell/i, 1]
+    spell = 'None' if spell.nil? && content =~ /could be imbedded with a spell/i
+
+    return nil if spell.nil?
+
+    current = content[/It has\s+(\d+)\s+charges/i, 1]
+    additional = content[/can be charged for an additional\s+(\d+)/i, 1]
+
+    recharge = content =~ /rechargeable/i
+
+    status = if recharge
+               'Recharge'
+             elsif content =~ /will persist after its last magical charge/i
+               'Persists'
+             elsif content =~ /will disintegrate after its last.*charge/i
+               'Disintegrates'
+             else
+               nil
+             end
+
+    if current && additional
+      return "#{spell} #{current}/#{additional} #{status}".strip
+    elsif current
+      return "#{spell} #{current} #{status}".strip
+    elsif spell == 'None'
+      return "#{spell} #{status}".strip
+    end
+
+    nil
+  end
+
+  def self.summarize_recall(text)
+    content = text.to_s.gsub(/\e\[[0-9;]*m/, '').gsub(/\s+/, ' ').strip
+    return '' if content.empty?
+
+    enchant = content[/\b(?:enchant(?:ment)?)(?:\s+of)?\s*\+?(\d+)/i, 1]
+    sorcery = content[/\b(?:sorcery)(?:\s+of)?\s*\+?(\d+)/i, 1]
+    sorcery = '6' if sorcery.nil? && content =~ /holy fire/i
+    ensorcel = content[/\b(?:ensorcel(?:ment)?)(?:\s+of)?\s*\+?(\d+)/i, 1]
+
+    parts = []
+    parts << "+#{enchant}" if enchant
+    parts << "S#{sorcery}" if sorcery
+    parts << "E#{ensorcel}" if ensorcel
+
+    cer_tags = extract_cer_tags(content)
+    parts << "CER:#{cer_tags}" if cer_tags && !cer_tags.empty?
+
+    script = extract_script_name(content)
+    parts << "Script:#{script}" if script
+
+    imbed = extract_imbed_info(content)
+    parts << "Imbed:\"#{imbed}\"" if imbed
+
+    enhancive = extract_enhancive_info(content)
+    parts << "ENH: #{enhancive}" if enhancive
+
+    parts << "Spiked" if content =~ /it is spiked/i
+
+    return parts.join(' ') unless parts.empty?
+
+    fallback = content.sub(/^as you recall\.\.\.\s*/i, '').split(/(?:\.\s+|!\s+|\?\s+)/).first.to_s.strip
+    fallback = fallback.gsub(/\b(?:it|is|has|with|and|the|a|an|of|for|to|on|in|from)\b/i, '')
+    fallback = fallback.gsub(/[^a-z0-9\s\/\+\-]/i, ' ').squeeze(' ').strip
+    fallback[0, 40]
+  end
+
   ## ---- command handlers -------------------------------------------------------
 
   def self.held_item(noun = nil)
@@ -623,12 +912,8 @@ module ISharpie
     name.to_s.strip.downcase
   end
 
-  def self.tag_held_item(noun, note_text, color_name, silent_note = nil)
-    item = held_item(noun)
-    unless item
-      say "you're not holding a #{noun}"
-      return
-    end
+  def self.tag_item(item, note_text, color_name, silent_note = nil)
+    return unless item
 
     long_name = long_name_for(item)
     existing  = bound_note_for(item.id)
@@ -657,6 +942,16 @@ module ISharpie
       @last_touched_note_id = record[:id]
       say "tagged #{long_name}: #{label}"
     end
+  end
+
+  def self.tag_held_item(noun, note_text, color_name, silent_note = nil)
+    item = held_item(noun)
+    unless item
+      say "you're not holding a #{noun}"
+      return
+    end
+
+    tag_item(item, note_text, color_name, silent_note)
   end
 
   def self.set_color(color_name)
@@ -731,14 +1026,21 @@ module ISharpie
       return
     end
 
-    rows = notes.map { |n|
+    notes.each { |n|
       visible = n[:note].to_s.strip
       silent  = n[:silent_note].to_s.strip
-      label   = [visible.empty? ? nil : visible,
-                 silent.empty?  ? nil : "SN: #{silent}"].compact.join(' | ')
-      "#{n[:id]}: #{n[:long_name]} [#{n[:container]}] -> #{label} (#{n[:color]})"
+      
+      item_name = Lich::Messaging.msg_format('yellow', n[:long_name], encode: false)
+      container = Lich::Messaging.msg_format('green', "[#{n[:container]}]", encode: false)
+      
+      label_parts = []
+      label_parts << Lich::Messaging.msg_format('teal', visible, encode: false) unless visible.empty?
+      label_parts << "SN: #{silent}" unless silent.empty?
+      label = label_parts.join(' | ')
+      
+      line = "#{n[:id]}: #{item_name} #{container} -> #{label} (#{n[:color]})"
+      _respond line
     }
-    Lich::Messaging.mono(rows.join("\n"))
   end
 
   def self.show_colors
@@ -763,15 +1065,26 @@ module ISharpie
     _respond b.call('  -- Usage --') + '  (hold item first. You can add tag, SN, and color all in one command)'
     _respond "  #{w.call(';isharpie tag <noun> "<note>"')}  tag item in hand"
     _respond "  #{w.call(';isharpie tag <noun> SN "<note>"')}  silent note - shows in list only, no inline tag"
+    _respond "  #{w.call(';isharpie recall <noun>')}  recall item and automatically add summary notes based off toggle logic below"
     _respond "  #{w.call(';isharpie color <name>')}  update color on last tagged"
     _respond "  #{w.call(';isharpie remove <noun>')}  remove note from item in hand"
     _respond "  #{w.call(';isharpie list')}  list all stored notes"
+    _respond ''
+    _respond b.call('  -- Toggles --')
+    _respond "  #{w.call(';isharpie set recall loud')}      - notes appear inline with item names (default)"
+    _respond "  #{w.call(';isharpie set recall silent')}    - notes appear in list only, not inline"
+    _respond "  #{w.call(';isharpie set recall both')}      - notes appear both inline and in list"
     _respond "  #{w.call(';isharpie silent')}  toggle silent mode (notes show only on your own items)"
     _respond ''
     _respond b.call('  -- Colors --')
     VALID_COLORS.each do |c|
       _respond(c == 'none' ? '  none' : "  #{Lich::Messaging.msg_format(COLOR_MAP[c], c, encode: false)}")
     end
+    _respond ''
+    _respond b.call('  -- Recall Feature --')
+    _respond '  Hold an item and use ;isharpie recall (or ;isharpie r) to automatically parse its recall'
+    _respond '  output and create a compact summary note with enchantment, sorcery, ensorcelment, CER,'
+    _respond '  scripts, imbed spells, enhancives, and other properties. Saves manual typing!'
     _respond ''
     _respond b.call('  -- Notes --')
     _respond '  item id resets each login, after locker storage, or scripted item mutations - matched automatically by name'
