@@ -32,10 +32,12 @@
   other Scripts: Loresang, VolnRestore2, Merchantical
   game: gs
   tags: conundrum, Zephyra wilds, inquisition, minigame
-  version: 1.27.0
+  version: 1.28.0
   required: Lich > 5.0; go2.lic (mapdb required - ;repository download-mapdb)
   \\Version\\
 			1.0.0 6/21/2026 - initial release
+      1.1.0 6/25/2026 - Logic improvements, multiplayer added
+      1.28.0 08/07/2026 - Added mac compatibility
 =end
 
 module InquiConundrum
@@ -60,16 +62,45 @@ module InquiConundrum
   # actually finish.
   class RunEnding < StandardError; end
 
+  # Raised by move() the moment it's been retrying the exact same failing
+  # direction for too long. Confirmed in the field: continue_exploration's
+  # backtrack step (move(@parent[uid][:back])) trusts that the reverse of
+  # whatever direction got us into a room is always a working way back out
+  # - this maze has confirmed non-reciprocal passages (see explore_new_
+  # exits' own comment on the same risk), so that assumption can be wrong,
+  # and move's own retry-forever loop had no escape from it at all. Stood
+  # there repeating "n"/"You can't go there" while a monster wandered in
+  # and killed it. Unwinds the same way PieceBecameAvailable/RunEnding do -
+  # straight back to tick's rescue, which re-runs tick's own top-level
+  # dispatch fresh on the next call (transporting a known piece? something
+  # located? more to explore? an obstacle to clear?) instead of staying
+  # wedged on whatever specific move was never going to succeed. Carries
+  # uid/direction so tick's rescue can also invalidate @parent[uid][:back]
+  # when that's specifically what got stuck - otherwise the very next
+  # continue_exploration call at the same room would just retry the exact
+  # same doomed backtrack and raise this all over again every cycle.
+  class StuckMove < StandardError
+    attr_reader :uid, :direction
+
+    def initialize(message, uid:, direction:)
+      super(message)
+      @uid = uid
+      @direction = direction
+    end
+  end
+
   PIECE_DESCRIPTOR_REGEX = /\b((?:[a-z]+ ){1,3}(?:gear|screw|lever|cog|spring))\b/i
   VINE_REGEX             = /tangle of .*?vines|vine-tangled/i
   # Confirmed in the field: a vine-tangled solid rock wall phrased its
-  # direction as "blocking the path east" - not "blocking the passage
-  # east" - so this missed it entirely (every directional lookup for that
-  # exact obstacle silently came back nil, including attempt_move's own
-  # obstacle-destroy check, which is how a return-trip move ended up
-  # retrying "you can't go there" against a wall that was still standing).
-  # Matches either wording now.
-  VINE_DIRECTION_REGEX   = /covering the (?:path|passage) (north|south|east|west|northeast|northwest|southeast|southwest|up|down|out)/i
+  # direction as "blocking the path north" - not "covering the passage
+  # north" like an actual tangle of vines does - so this missed it
+  # entirely (every directional lookup for that exact obstacle silently
+  # came back nil, including attempt_move's own obstacle-destroy check,
+  # which is how a return-trip move ended up retrying "you can't go
+  # there" against a wall that was still standing, and how the room
+  # behind it - piece included - went permanently unreachable without
+  # ever being recognized as blocked at all). Matches either wording now.
+  VINE_DIRECTION_REGEX   = /(?:covering|blocking) the (?:path|passage) (north|south|east|west|northeast|northwest|southeast|southwest|up|down|out)/i
   WARD_REGEX             = /thornbound ward/i
   WARD_DIRECTION_REGEX   = /blocking the (?:path|passage) (north|south|east|west|northeast|northwest|southeast|southwest|up|down|out)/i
   TRAP_REGEX             = /formation of smooth bone spikes|twisting coral tendrils/i
@@ -112,6 +143,23 @@ module InquiConundrum
   ARENA_MAGISTER_UID = '36701'.freeze
   GO2_TIMEOUT_SECONDS = 5 * 60
 
+  # Fixed entry-point room id a fresh event instance always drops you into
+  # (unlike the maze rooms themselves, which get regenerated per run). A
+  # follower has no business fighting anything while being dragged along
+  # mid-regroup/mid-requeue - inky.lic gets paused for the whole stretch
+  # and only unpaused once this room confirms the new run has actually
+  # started.
+  NEW_EVENT_START_ROOM_UID = '8401129'.freeze
+  INKY_SCRIPT = 'inky'.freeze
+
+  # Grouped + repeatevent: how long the leader waits, after stowing/girding,
+  # for followers to "join" them before heading back to the arena anyway.
+  # Followers themselves never wait on a timer here at all - they only ever
+  # join and then ride along with whatever the leader does (see
+  # regroup_with_leader_then_return_to_arena) - wait_for_new_event_then_
+  # unpause_inky's own GO2_TIMEOUT_SECONDS deadline is their only safety net.
+  REGROUP_TIMEOUT_SECONDS = 30
+
   OPTION_KEYS = [:destroytraps, :debug, :repeatevent, :surrendermania, :pacifist].freeze
   OPTION_DEFAULTS = { destroytraps: false, debug: false, repeatevent: false, surrendermania: false, pacifist: false }.freeze
 
@@ -138,24 +186,100 @@ module InquiConundrum
   # distance check to an active return-part job too.
   PACIFIST_BLOCKED_RETRY_SECONDS = 1 * 60
 
+  # "Claimed by another player" (continue_transport's GameObj.pcs.any?
+  # check - some other player physically standing in the room with the
+  # piece) was confirmed in the field to be permanent for the rest of the
+  # run, with nothing ever rechecking it: that other player might just
+  # have been passing through, fighting a monster, or have already left
+  # by the time we'd come back - not necessarily still pushing the piece
+  # at all. A run was observed delivering 0 pieces despite logging 150+
+  # parts, ending in a "all pieces claimed by another player" idle stall
+  # because every currently-announced piece got marked :claimed once and
+  # never revisited. Same retry-window pattern as @blocked_pieces above -
+  # recheck_stale_claims! flips a :claimed piece back to :located once
+  # this long has passed since it was marked, so it becomes a normal
+  # pickup candidate again instead of being abandoned forever. Acts as the
+  # ultimate backstop when group sync can't tell us anything more precise
+  # (solo play, or sync data unavailable for some reason) - whenever group
+  # sync IS available, CLAIMED_GROUP_SYNC_GRACE_SECONDS below recovers a
+  # stale claim far sooner than this.
+  CLAIMED_RETRY_SECONDS = 3 * 60
+  # group_sync: every player who can physically be in this zone is a
+  # teammate also running this same script (confirmed - no random/untracked
+  # players are ever possible here), so a teammate's own published claim
+  # (current_claim_snapshot, merged into @remote_claims) is authoritative
+  # for "is anyone actually still working this piece" - no need to wait out
+  # the full CLAIMED_RETRY_SECONDS once that says no. Still wait this short
+  # grace period after we first mark something :claimed before trusting an
+  # absent remote claim, purely to cover the gap between physically seeing
+  # the other character in the room and their own next sync publish
+  # actually landing in our merge - not a real "are they still working it"
+  # signal on its own.
+  CLAIMED_GROUP_SYNC_GRACE_SECONDS = 15
+
+  # Only worth resweeping the known map for missed obstacles (see
+  # resweep_for_missed_obstacles!) this often - if nothing's changed since
+  # the last sweep, walking the whole map again won't find anything new
+  # either.
+  RESWEEP_COOLDOWN_SECONDS = 5 * 60
+
+  # move() gives up and raises StuckMove after retrying the same direction
+  # for this long with zero progress - "a few moments," not a real
+  # roundtime/combat-scale wait. Confirmed in the field: a monster
+  # wandering into the room while the script stood there repeating a
+  # doomed move is exactly the failure mode this is meant to cut short.
+  MOVE_STUCK_TIMEOUT_SECONDS = 10
+
+  # group_sync: only actually publish to the shared Settings row this often
+  # (unless something claim-worthy forces an immediate publish) - avoids
+  # hammering the shared SQLite-backed blob with redundant writes once the
+  # maze is mostly explored and little is changing tick to tick.
+  SYNC_THROTTLE_SECONDS = 10
+  # group_sync: how long a teammate's claim (mid-transport, mid-obstacle) is
+  # trusted before being treated as stale - covers their process dying or
+  # silently abandoning without ever publishing the clear.
+  SYNC_CLAIM_TTL_SECONDS = 90
+  # group_sync: cap on @recently_cleared_obstacles so it can't grow forever
+  # over a long run.
+  RECENTLY_CLEARED_CAP = 20
+  # group_sync: how long merge_remote_pieces! refuses to re-adopt the exact
+  # same descriptor+room a teammate's slice still claims :located, once this
+  # character has personally just disproven it (see @rejected_locations
+  # below) - long enough to outlast SYNC_THROTTLE_SECONDS so the teammate's
+  # own next publish has a real chance to catch up.
+  REJECTED_LOCATION_COOLDOWN_SECONDS = 30
+
   # Friendly NPC the guide spawns, floats through rooms with - never counts
   # as a hostile. Kept independent from inky.lic's own copy of this same
   # regex on purpose - this script never depends on Inky being loaded.
   FRIENDLY_NPC_REGEX = /floating spherical guide/i
 
+  # Don't re-ask every single time the guide happens to be in whatever room
+  # we're standing in (the guide room gets revisited constantly during
+  # normal delivery) - but do re-ask often enough that a script restarted
+  # mid-run (killed and relaunched after an error, say) catches up on
+  # whatever was already announced before it died, the next time it
+  # happens to pass the guide, rather than only ever learning about NEW
+  # announcements from here on.
+  GUIDE_STATUS_RECHECK_SECONDS = 60
+
   @in_run        = false
   @guide_room_id = nil
   @guide_room_confirmed = false # whether @guide_room_id is the real guide room, not just our entry point
+  @last_guide_status_check_at = nil
   @run_started_at = nil
   @completions    = 0 # total successful run completions this session, for repeatevent reporting
   @last_room_id  = nil # last room we actually scanned - lets us notice the player moving us manually
+  @rooms_moved_since_run_start = 0 # drives the every-3/every-10-rooms progress pings
   @surrender_triggered = false # surrendermania: set once we've surrendered, so maybe_end_run treats the run as over
 
-  @needed         = {}   # descriptor => :needed/:located/:in_transit/:delivered
+  @needed         = {}   # descriptor => :needed/:located/:in_transit/:delivered/:claimed
   @seen           = {}   # descriptor => room_id (most recent sighting)
   @piece_location = {}   # descriptor => room_id (while :located)
   @transporting   = nil  # { descriptor:, } while actively pushing a piece
+  @kick_arrival_uid = nil # one-shot grace flag - see continue_transport's "lost track" handling
   @delivered      = []
+  @claimed_pieces = {}   # descriptor => room_id, informational only - see continue_transport
 
   # pacifist: descriptor => { room:, blocked_at: } - room it's currently
   # stuck in, kicked back there by "too dangerous" rather than fought
@@ -175,6 +299,44 @@ module InquiConundrum
   # is - once it's cycled through every logged obstacle without finding a
   # clear one, the next one gets cleared anyway rather than stalling.
   @obstacle_skip_streak = 0
+  @last_resweep_at = nil # throttles resweep_for_missed_obstacles!
+  @blocks_directive_active = false # set by ";inqui blocks" - see blocks_directive_tick
+  @blocks_known_descriptors = [] # snapshot at ";inqui blocks" time - see handle_blocks
+
+  # group_sync: shares discovered map/piece/obstacle state with teammates
+  # also running InquiConundrum.lic, via a shared Settings row - see the
+  # "multi-character cooperation" section below for the full mechanism.
+  @last_sync_publish_at = nil # throttles sync_publish_local_state!
+  @sync_dirty = false # set whenever local state changes something worth publishing
+  @remote_claims = {} # descriptor/uid => { kind:, char:, room:, at: } - teammate in-progress work
+  @remote_claims_by_char = {} # char_name => last claim key, so merge_remote_claim! can drop a stale one actively
+  @piece_last_updated_at = {} # descriptor => Time.now.to_i, stamped wherever @piece_location is set
+  @recently_cleared_obstacles = [] # rolling list of uids this character personally confirmed cleared
+  # Tracked purely for awareness (shared via group_sync below) - bone-spike/
+  # coral-tendril traps have no avoidance behavior of their own the way moss/
+  # mushroom crawl-hazards do, so a teammate who's never personally seen a
+  # given trap room has no way to know it's there at all otherwise. uid stays
+  # in this list until handle_traps confirms the trap itself is actually
+  # gone (destroyed by either character, or already gone on revisit) - see
+  # handle_traps and path_avoiding_hazards below.
+  @trap_rooms = []
+  @recently_cleared_traps = [] # rolling list of uids this character personally confirmed trap-free
+  @sync_scope_for_run = nil # frozen once per run at maybe_start_run time - never recomputed live
+  @sync_force_pending = false # set by force_sync_publish! - consumed only from tick's own thread
+
+  # Confirmed in the field: continue_transport demoting a descriptor back
+  # to :needed because the piece genuinely isn't in this room anymore got
+  # immediately undone by the very next sync_merge_remote_state! - a
+  # teammate's still-stale published slice kept re-asserting the exact same
+  # :located/uid we'd just personally disproven, which sent begin_transport/
+  # continue_transport into a tight loop with no fput/move/pause anywhere
+  # in it (the room never changes, so nothing ever yields) - 30,000+ log
+  # lines in under a minute. @rejected_locations remembers "I just checked
+  # this room and it wasn't there" per descriptor so merge_remote_pieces!
+  # can refuse to re-adopt that exact same stale claim until the cooldown
+  # passes (REJECTED_LOCATION_COOLDOWN_SECONDS above), without blocking a
+  # genuinely different (new) remote location.
+  @rejected_locations = {} # descriptor => { uid:, at: }
 
   @edges          = Hash.new { |h, k| h[k] = {} } # uid => { short_dir => dest_uid }
   @parent         = {}   # uid => { from:, back: } (back = short dir toward guide room)
@@ -255,6 +417,67 @@ module InquiConundrum
 
   def self.pacifist?
     !!setting(:pacifist)
+  end
+
+  ## ---- startup diagnostics ------------------------------------------------
+  #
+  # A round-trip write+read against the actual Settings-backed SQLite db
+  # (the same lich.db3/database_adapter.rb machinery group_sync depends on),
+  # under its own dedicated scratch scope - never touches real run data, so
+  # this is exempt from the group_sync section's "only the quartet may call
+  # Settings.root_proxy_for/refresh_data" rule (that rule is about avoiding
+  # lost-update races on the shared RUN state specifically; nothing else
+  # ever reads or writes this scope, so there's no race to avoid here).
+  #
+  # Confirmed via database_adapter.rb: save_settings is a single upsert
+  # statement, so a script killed and restarted mid-run can never leave a
+  # half-written row behind in the db - worst case from restarting is
+  # briefly-stale published state (already self-healing via the various
+  # retry-window/TTL mechanisms elsewhere in this file), never corruption.
+  # What this check actually guards against is the db file itself being
+  # unreachable (permissions, disk, a stuck lock) - which would otherwise
+  # only ever surface later as a silently-swallowed "group sync: ... failed"
+  # debug line the first time something actually tried to use it.
+  DB_HEALTH_CHECK_SCOPE = 'inquiconundrum_dbcheck'.freeze
+
+  def self.check_database_health
+    probe = Time.now.to_f
+    Settings.refresh_data(DB_HEALTH_CHECK_SCOPE)
+    shared = Settings.root_proxy_for(DB_HEALTH_CHECK_SCOPE)
+    shared['probe'] = probe
+    Settings.refresh_data(DB_HEALTH_CHECK_SCOPE)
+    shared = Settings.root_proxy_for(DB_HEALTH_CHECK_SCOPE)
+
+    if shared['probe'] == probe
+      debug_say "database check: read/write round-trip OK"
+      true
+    else
+      say "WARNING: database read/write check came back wrong (expected #{probe}, got #{shared['probe'].inspect}) - group sync with a teammate may not work correctly this session"
+      false
+    end
+  rescue StandardError => e
+    say "WARNING: database check failed (#{e.class}: #{e.message}) - group sync with a teammate may not work correctly this session"
+    false
+  end
+
+  # group_sync gating - see the full "multi-character cooperation" section
+  # below (after run lifecycle) for the rest of the mechanism and the
+  # ground rules these helpers exist to support.
+
+  # Group.members (not bare Group.nouns) so this triggers Group.maybe_check
+  # if the roster has never been checked yet - Group.nouns reads the cached
+  # roster directly and never checks on its own, which would otherwise make
+  # this read as "no group" forever until something else happens to call
+  # Group.check first.
+  def self.group_sync_enabled?
+    Group.members.map(&:noun).reject { |n| n == Char.name }.any?
+  rescue StandardError
+    false
+  end
+
+  def self.compute_sync_scope
+    roster = ([Char.name] + Group.members.map(&:noun)).uniq.sort
+    "inquiconundrum_group:#{roster.join(',')}"
   end
 
   # GameObj.npcs has no hostile/friendly distinction of its own - the guide
@@ -371,7 +594,11 @@ module InquiConundrum
   # never even sees it, and queue whatever follows for main_loop to act on.
   CMD_QUEUE = Queue.new
   UPSTREAM_HOOK_ID = 'inquiconundrum_upstream'
-  HOOK_CMD_RX = /^(?:<c>)?;(?:#{Regexp.escape(Script.current.name)}|inqui)(?:\s+(.*))?$/i
+  # $lich_char_regex (','|';') because Lich uses ',' as the script-trigger
+  # character on the Genie frontend (the mac-compatible client) instead of
+  # ';' - hardcoding ';' here left Genie/mac players unable to reach this
+  # hook at all.
+  HOOK_CMD_RX = /^(?:<c>)?#{$lich_char_regex}(?:#{Regexp.escape(Script.current.name)}|inqui)(?:\s+(.*))?$/i
 
   def self.parse_upstream(command)
     if (m = HOOK_CMD_RX.match(command))
@@ -408,9 +635,19 @@ module InquiConundrum
     return unless triggered
 
     say "surrendermania: passed the prize threshold - surrendering to end the match"
-    fput('surrender')
-    pause 1
-    fput('surrender')
+    # Confirmed in the field: a flat pause(1) between the two surrenders
+    # wasn't long enough to clear whatever roundtime the first one left
+    # behind - the second fput went out while still in RT and the game
+    # silently dropped it, never actually completing the surrender. We
+    # still set @surrender_triggered below regardless of whether the game
+    # actually accepted it, which is exactly what let this go unnoticed:
+    # the script believed the run was over and started wrapping up
+    # (stow/gird/walk back) while still physically standing in the still-
+    # active event, instead of waiting for the real ejection.
+    wait_out_roundtime
+    send_command('surrender')
+    wait_out_roundtime
+    send_command('surrender')
     @surrender_triggered = true
   end
 
@@ -455,7 +692,15 @@ module InquiConundrum
     return unless descriptor
 
     if @blocked_pieces.key?(descriptor)
-      return unless distance_to_guide(@piece_location[descriptor]) < distance_to_guide(XMLData.room_id)
+      # Same reasoning as maybe_abandon_for_closer_piece: distance-to-guide
+      # alone says nothing about how far this piece's room actually is
+      # from wherever we currently stand - only interrupt if it's a
+      # genuinely short detour from here, not just "closer to the guide"
+      # in tree terms while sitting at the far end of an unrelated branch.
+      travel = tree_distance(XMLData.room_id, @piece_location[descriptor])
+      return if travel.nil?
+
+      return unless travel + distance_to_guide(@piece_location[descriptor]) < distance_to_guide(XMLData.room_id)
     end
 
     raise PieceBecameAvailable
@@ -537,6 +782,18 @@ module InquiConundrum
     @delivered << descriptor
     @transporting = nil if @transporting && @transporting[:descriptor] == descriptor
     say "delivered #{descriptor} (#{@delivered.size}/#{@needed.size} known so far)"
+
+    # Confirmed in the field: this was the one major state transition in
+    # the whole file that never marked @sync_dirty or force-published -
+    # located/transport-started/obstacle-claimed-or-cleared all do. Without
+    # this, a delivery only ever reached a teammate as a side effect of
+    # something UNRELATED dirtying state afterward (a new edge, a newly
+    # seen piece) - if nothing else happened to do that, the other
+    # character genuinely never learned this piece was already done for
+    # the rest of the run, and could go on to needlessly re-fetch/re-claim
+    # it.
+    @sync_dirty = true
+    force_sync_publish!
   end
 
   def self.observe_descriptor(descriptor)
@@ -544,6 +801,9 @@ module InquiConundrum
 
     @needed[descriptor] = :located
     @piece_location[descriptor] = @seen[descriptor]
+    @piece_last_updated_at[descriptor] = Time.now.to_i
+    @sync_dirty = true
+    force_sync_publish!
   end
 
   ## ---- room scanning -----------------------------------------------------
@@ -570,7 +830,10 @@ module InquiConundrum
         if @needed[descriptor] == :needed
           @needed[descriptor] = :located
           @piece_location[descriptor] = uid
+          @piece_last_updated_at[descriptor] = Time.now.to_i
+          @sync_dirty = true
           debug_say "#{descriptor} matches a needed piece - marking located"
+          force_sync_publish!
         end
       end
     end
@@ -714,13 +977,13 @@ module InquiConundrum
     attempts = 0
     loop do
       wait_while_paused_externally
-      fput("kill ##{obj.id}")
+      send_command("kill ##{obj.id}")
       wait_out_roundtime
       outcome = wait_for_destroy_outcome
 
       case outcome
       when :gird_needed
-        fput('gird')
+        send_command('gird')
         wait_out_roundtime
       when :destroyed, :gone
         return true
@@ -740,10 +1003,39 @@ module InquiConundrum
     end
   end
 
+  # Logs/clears @trap_rooms for awareness regardless of destroytraps - a
+  # teammate who's never personally stood in this exact room otherwise has
+  # no way to know a trap is here at all, since (unlike moss/mushroom)
+  # nothing about a bone-spike/coral-tendril trap is visible from "Obvious
+  # paths" or any other ambient state. Only actually attacks it (and clears
+  # the log entry once confirmed gone) when destroytraps is on.
   def self.handle_traps
+    uid = XMLData.room_id
+    traps = current_traps
+
+    if traps.empty?
+      if @trap_rooms.delete(uid)
+        @recently_cleared_traps = (@recently_cleared_traps + [uid]).last(RECENTLY_CLEARED_CAP)
+        @sync_dirty = true
+        debug_say "room #{uid}'s trap is gone (destroyed earlier, by us or a teammate) - no longer a hazard"
+      end
+      return
+    end
+
+    unless @trap_rooms.include?(uid)
+      @trap_rooms << uid
+      @sync_dirty = true
+      debug_say "room #{uid} has #{traps.size} trap(s) - logged for awareness"
+    end
+
     return unless destroy_traps?
 
-    current_traps.each { |trap| destroy_obstacle(trap) }
+    if traps.all? { |trap| destroy_obstacle(trap) }
+      @trap_rooms.delete(uid)
+      @recently_cleared_traps = (@recently_cleared_traps + [uid]).last(RECENTLY_CLEARED_CAP)
+      @sync_dirty = true
+      debug_say "room #{uid}'s trap(s) destroyed - no longer a hazard"
+    end
   end
 
   # Vines/wards are never destroyed on first sight anymore - logged for
@@ -768,6 +1060,7 @@ module InquiConundrum
     return if @obstacle_rooms.include?(uid)
 
     @obstacle_rooms << uid
+    @sync_dirty = true
     debug_say "room #{uid} has #{obstacles.size} obstacle(s) - logged for later clearing"
   end
 
@@ -807,6 +1100,47 @@ module InquiConundrum
     debug_say "resumed"
   end
 
+  ## ---- low-level game I/O ---------------------------------------------------
+  #
+  # Confirmed in the field: the game itself can hang/crash mid-session
+  # (server stops responding entirely, TCP connection still nominally open)
+  # without ever actually closing the socket for a while - fput's own
+  # 60s-no-response timeout already detects and echoes that for a single
+  # command, but every call site here used bare fput directly, so the
+  # script just silently tried the NEXT command, got ANOTHER full 60s of
+  # silence, then the next, forever - each cycle a full minute of nothing
+  # visible at all. Looked exactly like "the script went unresponsive" even
+  # though technically it kept retrying the whole time. send_command wraps
+  # every fput call site in this script (mechanical replacement, see
+  # below) so CONNECTION_UNRESPONSIVE_THRESHOLD consecutive timeouts - a
+  # much stronger signal than just one slow response - pauses the script
+  # and says so loudly instead of quietly grinding through 60s cycles
+  # forever. The player can still type ;unpause (or anything else) through
+  # Lich's local connection even while the upstream game connection itself
+  # is the thing that's actually dead, exactly as already happened in the
+  # field before this existed (manual ";kill inqui" was the only way out).
+  @consecutive_fput_timeouts = 0
+  CONNECTION_UNRESPONSIVE_THRESHOLD = 2
+
+  def self.send_command(message, *args)
+    result = fput(message, *args)
+
+    if result == false
+      @consecutive_fput_timeouts += 1
+      if @consecutive_fput_timeouts >= CONNECTION_UNRESPONSIVE_THRESHOLD
+        say "PAUSED: no response from the game for #{@consecutive_fput_timeouts} commands in a row - the game may have crashed or your connection may be down. Check it, then ;unpause inquiconundrum to continue"
+        pause_script
+        sleep 0.2 while Script.current.paused?
+        say "unpaused, resuming"
+        @consecutive_fput_timeouts = 0
+      end
+    else
+      @consecutive_fput_timeouts = 0
+    end
+
+    result
+  end
+
   ## ---- movement -----------------------------------------------------------
 
   # Always the last thing to arrive in a room description, so waiting for
@@ -822,7 +1156,7 @@ module InquiConundrum
   # return) and separately drain (without ever resending anything) until
   # the arrival marker shows up or we give up waiting.
   def self.fput_move(command)
-    fput(command)
+    send_command(command)
     wait_for_room_arrival
   end
 
@@ -863,7 +1197,7 @@ module InquiConundrum
     # handling below. That's always auto-recoverable - just stand up.
     if checknotstanding
       debug_say "not standing - standing up before moving #{direction}"
-      fput('stand')
+      send_command('stand')
       wait_out_roundtime
     end
 
@@ -875,11 +1209,11 @@ module InquiConundrum
       fput_move(direction)
       wait_out_roundtime
     elsif crawl_hazard_in_room?
-      fput('kneel')
+      send_command('kneel')
       wait_out_roundtime
       fput_move("crawl #{direction}")
       wait_out_roundtime
-      fput('stand')
+      send_command('stand')
       wait_out_roundtime
     else
       fput_move(direction)
@@ -900,8 +1234,17 @@ module InquiConundrum
     raise "move called with a blank direction" if direction.to_s.empty?
 
     attempts = 0
+    stuck_since = Time.now
     until attempt_move(direction)
       attempts += 1
+
+      if Time.now - stuck_since > MOVE_STUCK_TIMEOUT_SECONDS
+        raise StuckMove.new(
+          "move #{direction} from room #{XMLData.room_id} went nowhere after #{attempts} attempts over #{MOVE_STUCK_TIMEOUT_SECONDS}s",
+          uid: XMLData.room_id, direction: direction
+        )
+      end
+
       debug_say "move #{direction} didn't go anywhere (attempt #{attempts}), retrying"
       poll_background_events!
       pause 1
@@ -911,6 +1254,7 @@ module InquiConundrum
   def self.record_edge(from_uid, direction, to_uid)
     @edges[from_uid][direction] = to_uid
     @edges[to_uid][reverse_direction(direction)] = from_uid
+    @sync_dirty = true
   end
 
   def self.find_direction(from_uid, to_uid)
@@ -952,21 +1296,41 @@ module InquiConundrum
 
   def self.on_room_entered(uid)
     @last_room_id = uid
+    @rooms_moved_since_run_start += 1
+    report_room_progress
 
     if !@guide_room_confirmed && XMLData.room_title =~ START_ROOM_REGEX
       debug_say "confirmed the guide's room is #{uid}"
       reroot_tree(uid) if uid != @guide_room_id
       @guide_room_id = uid
       @guide_room_confirmed = true
-
-      # Worth a shot now that we're actually standing in front of the
-      # guide - it'll answer even before all pieces are known.
-      fput('ask guide about status')
     end
+
+    maybe_ask_guide_for_status
 
     scan_room(uid)
     handle_traps
     handle_obstacles_on_entry
+  end
+
+  # Whenever the guide is physically standing in whatever room we just
+  # entered - not just the one special-cased first sighting of the guide's
+  # own room - ask it for status, throttled to GUIDE_STATUS_RECHECK_SECONDS.
+  # The reply gets parsed by the listener (STATUS_HEADER_REGEX/STATUS_ITEM_
+  # REGEX) into ordinary announce() calls, which are already idempotent
+  # against anything we already know about - so this is always safe to
+  # call, and is exactly what lets a script that got killed and restarted
+  # mid-run (an error, say) catch back up on whatever the guide had already
+  # announced before it died, the next time it happens to cross paths with
+  # the guide, rather than only ever learning about announcements made
+  # AFTER the restart.
+  def self.maybe_ask_guide_for_status
+    return unless GameObj.npcs.any? { |npc| npc.name =~ FRIENDLY_NPC_REGEX }
+    return if @last_guide_status_check_at && (Time.now - @last_guide_status_check_at) < GUIDE_STATUS_RECHECK_SECONDS
+
+    @last_guide_status_check_at = Time.now
+    debug_say "spirit guide is here - asking for status to catch up on anything already announced"
+    send_command('ask guide about status')
   end
 
   ## ---- piece transport --------------------------------------------------
@@ -1028,15 +1392,69 @@ module InquiConundrum
     @needed[descriptor] = :in_transit
     @transporting = { descriptor: descriptor }
     @current_operation = :transporting
+    @sync_dirty = true
+    force_sync_publish! # teammates should see this claim ASAP, not wait out the throttle
     say "picked up trail of #{descriptor}, pushing it home"
   end
 
+  # Only even tries the BFS route when a trap is actually known about -
+  # for the common case (no traps logged yet), behavior is byte-for-byte
+  # the old tree-walk, zero added risk. Once a trap room IS known, prefers
+  # a path that avoids it (this maze's confirmed cycles sometimes really do
+  # offer another way around) and only falls through to the tree-walk if
+  # the avoiding search can't find any route at all (e.g. @edges doesn't
+  # yet have full connectivity to target_uid).
   def self.navigate_to(target_uid)
     return if XMLData.room_id == target_uid
+
+    if @trap_rooms.any?
+      avoiding = path_avoiding_traps(XMLData.room_id, target_uid)
+      if avoiding
+        avoiding.each { |dir| move(dir); on_room_entered(XMLData.room_id) }
+        return
+      end
+    end
 
     path = path_from_root(target_uid)
     walk_to_root
     path.each { |dir| move(dir); on_room_entered(XMLData.room_id) }
+  end
+
+  # General shortest-path search over the full known @edges graph (not just
+  # the @parent breadcrumb tree, which only ever has ONE path between any
+  # two rooms) - optionally treating avoid's rooms as impassable so a
+  # detour can be found around them when this maze's cycles actually offer
+  # one. Returns a list of directions, or nil if to_uid isn't reachable
+  # from from_uid via @edges at all (callers fall back to the tree-based
+  # path in that case, same as ever).
+  def self.bfs_path(from_uid, to_uid, avoid: [])
+    return [] if from_uid == to_uid
+
+    visited = { from_uid => true }
+    queue = [[from_uid, []]]
+    until queue.empty?
+      current, path = queue.shift
+      @edges[current].each do |dir, neighbor|
+        next if visited[neighbor]
+        next if avoid.include?(neighbor) && neighbor != to_uid
+
+        new_path = path + [dir]
+        return new_path if neighbor == to_uid
+
+        visited[neighbor] = true
+        queue << [neighbor, new_path]
+      end
+    end
+    nil
+  end
+
+  # Prefers a path that avoids every known @trap_rooms entry; falls back to
+  # allowing them through if no avoiding route exists at all - a known
+  # trap is still strictly better to walk past than to never reach the
+  # target over, and nil (not an empty/wrong path) only when to_uid isn't
+  # reachable via @edges yet either way.
+  def self.path_avoiding_traps(from_uid, to_uid)
+    bfs_path(from_uid, to_uid, avoid: @trap_rooms) || bfs_path(from_uid, to_uid)
   end
 
   def self.walk_to_root
@@ -1095,6 +1513,47 @@ module InquiConundrum
     steps
   end
 
+  # uid's full ancestor chain (itself, its @parent, its parent's parent,
+  # ...) up to the guide room - used by tree_distance below to find the
+  # lowest common ancestor of two rooms.
+  def self.ancestor_chain(uid)
+    chain = []
+    node = uid
+    loop do
+      chain << node
+      break if node == @guide_room_id
+
+      info = @parent[node]
+      break unless info && info[:from]
+
+      node = info[:from]
+    end
+    chain
+  end
+
+  # Real number of moves between two arbitrary known rooms via their
+  # lowest common ancestor in the @parent tree - nil if either isn't
+  # connected to the map at all. Confirmed in the field: maybe_abandon_
+  # for_closer_piece used to compare a candidate's distance-to-guide
+  # against the player's own distance-to-guide, with no idea how far the
+  # player would actually have to walk to reach the candidate in the
+  # first place - a candidate "closer to the guide" in tree terms can
+  # still be a long detour from wherever the player actually is, and
+  # comparing the wrong two numbers like that made it possible to switch
+  # back and forth between two pieces forever, never delivering either.
+  def self.tree_distance(a, b)
+    return 0 if a == b
+
+    chain_a = ancestor_chain(a)
+    chain_b = ancestor_chain(b)
+    index_in_b = chain_b.each_with_index.to_h
+    chain_a.each_with_index do |node, steps_from_a|
+      steps_from_b = index_in_b[node]
+      return steps_from_a + steps_from_b if steps_from_b
+    end
+    nil
+  end
+
   def self.continue_transport
     @current_operation = :transporting
     descriptor = @transporting[:descriptor]
@@ -1115,6 +1574,28 @@ module InquiConundrum
       return
     end
 
+    # Confirmed in the field: another player sharing the room with the
+    # piece we're pushing usually means they're already kicking the same
+    # one - we'd otherwise just keep following it along, racing them with
+    # no way to win since we only ever kick on our own turn. Treat the
+    # piece as someone else's the moment we see this, log it, and move on
+    # to whatever else is available (another part, exploration, an
+    # obstacle) rather than keep chasing it. If it turns out the other
+    # player actually delivers it, the existing DELIVERY_REGEX listener
+    # still marks it :delivered correctly regardless of who kicked it in -
+    # deliver() doesn't check who.
+    if GameObj.pcs.any?
+      @piece_location[descriptor] = uid
+      @needed[descriptor] = :claimed
+      @claimed_pieces[descriptor] = uid
+      @piece_last_updated_at[descriptor] = Time.now.to_i
+      @sync_dirty = true
+      force_sync_publish!
+      @transporting = nil
+      say "#{descriptor} appears to be claimed by another player in room #{uid} - leaving it and moving on"
+      return
+    end
+
     back = @parent[uid] && @parent[uid][:back]
     unless back
       say "lost the way back to the guide room with #{descriptor} in tow, stopping transport"
@@ -1129,10 +1610,36 @@ module InquiConundrum
     end
 
     piece = GameObj.loot.find { |o| strip_article(o.name).downcase == descriptor }
+
+    # Confirmed in the field: a piece we ourselves just kicked into this
+    # exact room can still momentarily be missing from GameObj.loot - the
+    # room's object list doesn't always finish populating before
+    # wait_for_room_arrival's "Obvious paths" marker shows up (the kick that
+    # carried it in landed before the object got added). Believing "lost
+    # track" on that very first check would abandon a piece that's almost
+    # certainly sitting right here - give the object list one more chance
+    # to catch up with a fresh look before believing it's really gone. Only
+    # the ONE check immediately following our own kick gets this grace -
+    # @kick_arrival_uid is consumed (cleared) right after, so a genuinely
+    # stale re-check later doesn't get an extra look every time.
+    if !piece && @kick_arrival_uid == uid
+      debug_say "#{descriptor} not seen yet right after kicking it in here - looking again before giving up"
+      send_command('look')
+      wait_for_room_arrival
+      piece = GameObj.loot.find { |o| strip_article(o.name).downcase == descriptor }
+    end
+    @kick_arrival_uid = nil
+
     unless piece
       say "lost track of #{descriptor} in this room, re-scanning"
+      # Remembered so merge_remote_pieces! doesn't immediately undo this by
+      # re-adopting a teammate's still-stale :located claim for this exact
+      # same descriptor+room - see @rejected_locations' declaration comment.
+      @rejected_locations[descriptor] = { uid: uid, at: Time.now.to_i }
       @transporting = nil
       @needed[descriptor] = :needed
+      @sync_dirty = true
+      force_sync_publish!
       return
     end
 
@@ -1145,7 +1652,7 @@ module InquiConundrum
     # decided server-side. Send the command once, then separately wait
     # out the roundtime and poll (without ever resending anything) for
     # whichever real outcome line shows up after it.
-    fput("kick #{kick_phrase(descriptor)} #{back}")
+    send_command("kick #{kick_phrase(descriptor)} #{back}")
     wait_out_roundtime
     outcome = wait_for_kick_outcome
     debug_say "kick result: #{outcome.inspect}"
@@ -1159,6 +1666,9 @@ module InquiConundrum
         # one later if nothing better turns up.
         @piece_location[descriptor] = uid
         @needed[descriptor] = :located
+        @piece_last_updated_at[descriptor] = Time.now.to_i
+        @sync_dirty = true
+        force_sync_publish!
         @blocked_pieces[descriptor] = { room: uid, blocked_at: Time.now }
         @transporting = nil
         say "pacifist: #{descriptor} is blocked by a monster #{back} of room #{uid} - abandoning it for now"
@@ -1191,6 +1701,10 @@ module InquiConundrum
     end
 
     on_room_entered(XMLData.room_id)
+
+    # Grace flag for the very next continue_transport check in this room -
+    # see its declaration comment above the "lost track" handling.
+    @kick_arrival_uid = XMLData.room_id
 
     remaining = rooms_remaining_to_guide(XMLData.room_id)
     if remaining.nil?
@@ -1257,7 +1771,18 @@ module InquiConundrum
         raise "explore_new_exits: expected to be in room #{uid} but actually in #{XMLData.room_id}"
       end
 
-      candidate_exits = (short_exits + extra_candidates).uniq
+      # extra_candidates first, not last - these are the direction(s) an
+      # obstacle was just destroyed to open up, and the whole point of
+      # passing them in is to explore them right away. Confirmed in the
+      # field: with short_exits first, a room reached by a cyclical path
+      # (this maze has confirmed cycles/non-reciprocal exits) can still
+      # have one of its own *ordinary* cardinal exits genuinely unexplored
+      # too (reaching the room from a different direction than the one
+      # being explored here doesn't confirm this room's own exits) - that
+      # ordinary exit's entire recursive subtree got explored first every
+      # time, deferring the actually-just-revealed room arbitrarily long
+      # behind it instead of "immediately."
+      candidate_exits = (extra_candidates + short_exits).uniq
       unexplored = candidate_exits.find { |dir| @edges[uid][dir].nil? }
       break unless unexplored
 
@@ -1277,6 +1802,93 @@ module InquiConundrum
   # an obstacle died - confirmed in the field: a vine covering northeast
   # was destroyed and the very next thing the script did was explore west,
   # never touching northeast at all.
+  # uid is a leaf if nothing in @parent ever points back to it as a :from -
+  # i.e. nothing branches further from it. The path from the guide room to
+  # EVERY leaf, taken together, covers every room in the known map (every
+  # room lies on the path to at least one of its own descendant leaves) -
+  # so revisiting just the leaves re-triggers on_room_entered/handle_
+  # obstacles_on_entry everywhere we've ever been, without needing a
+  # separate navigate_to per room.
+  def self.leaf_rooms
+    children = Hash.new(0)
+    @parent.each_value { |info| children[info[:from]] += 1 if info[:from] }
+    @parent.keys.select { |uid| children[uid].zero? }
+  end
+
+  # Confirmed in the field: pieces can end up permanently "needed -
+  # location unknown" even after the whole known map is explored and every
+  # logged obstacle cleared, if something blocking a passage was never
+  # recognized as an obstacle at all (e.g. haze, before it was added to
+  # all_vines/all_wards/current_vines/current_wards) - that exit just
+  # silently never made it into candidate_exits, and once @fully_explored
+  # flips true the DFS never revisits anywhere to notice. Revisits every
+  # leaf room so handle_obstacles_on_entry gets another look at everywhere
+  # we've ever been and picks up anything that wasn't recognized the first
+  # time, then resumes obstacle-clearing if it finds something new. Called
+  # from tick's idle branch only when truly stuck (fully explored, still
+  # missing pieces, nothing else to do) - returns whether it actually
+  # found anything new, so that branch knows whether to expect work on the
+  # next tick.
+  def self.resweep_for_missed_obstacles!
+    return false if @last_resweep_at && (Time.now - @last_resweep_at) < RESWEEP_COOLDOWN_SECONDS
+
+    @last_resweep_at = Time.now
+    before = @obstacle_rooms.size
+    leaves = leaf_rooms
+    debug_say "still missing pieces with nothing left to explore - resweeping #{leaves.size} leaf room(s) for obstacles that weren't recognized the first time"
+
+    leaves.each { |uid| navigate_to(uid) }
+    navigate_to(@guide_room_id)
+
+    found = @obstacle_rooms.size - before
+    if found > 0
+      say "resweep found #{found} obstacle room#{'s' unless found == 1} that weren't caught the first time - resuming obstacle-clearing"
+      @phase = :clearing_obstacles
+      @fully_explored = false
+      true
+    else
+      debug_say "resweep found nothing new"
+      false
+    end
+  end
+
+  # Drives tick's dispatch while ";inqui blocks" is in effect - room-block
+  # clearing (and the exploration needed to find more of them) takes
+  # priority over everything except a genuinely *new* piece turning up
+  # (handle_blocks snapshots @blocks_known_descriptors at activation time,
+  # so re-finding whatever was already known - including whatever was just
+  # dropped to start this directive - doesn't end it early). A new piece
+  # immediately ends the directive and resumes normal pickup. Returns true
+  # if it did something; false once there's truly nothing left to explore
+  # or clear, at which point it deactivates itself and lets tick fall
+  # through to its normal dispatch in the same call.
+  def self.blocks_directive_tick
+    descriptor = next_located_descriptor
+    descriptor = nil if descriptor && @blocks_known_descriptors.include?(descriptor)
+
+    if descriptor
+      @blocks_directive_active = false
+      say "a new part is locatable - resuming normal pickup"
+      begin_transport(descriptor)
+      return true
+    end
+
+    if @obstacle_rooms.any?
+      @phase = :clearing_obstacles
+      process_obstacle_queue
+      return true
+    end
+
+    if !@fully_explored
+      continue_exploration
+      return true
+    end
+
+    @blocks_directive_active = false
+    debug_say "blocks directive: nothing left to explore or clear - resuming normal handling"
+    false
+  end
+
   def self.process_obstacle_queue
     @current_operation = :exploring
     if @obstacle_rooms.empty?
@@ -1285,14 +1897,24 @@ module InquiConundrum
       return
     end
 
-    uid = @obstacle_rooms.first
+    uid = @obstacle_rooms.find { |u| !(group_sync_enabled? && remote_claim_fresh?(u)) }
+    unless uid
+      debug_say "all logged obstacles are claimed by teammates right now - nothing to do this tick"
+      return
+    end
+
+    @sync_dirty = true
+    force_sync_publish! # claim this room before walking to it, so a teammate doesn't pick it too
     navigate_to(uid)
 
     obstacles = all_vines + all_wards
     if obstacles.empty?
       debug_say "room #{uid} obstacles already gone (cleared incidentally earlier) - dropping from queue"
-      @obstacle_rooms.shift
+      @obstacle_rooms.delete(uid)
+      @recently_cleared_obstacles = (@recently_cleared_obstacles + [uid]).last(RECENTLY_CLEARED_CAP)
       @obstacle_skip_streak = 0
+      @sync_dirty = true
+      force_sync_publish!
       return
     end
 
@@ -1306,7 +1928,12 @@ module InquiConundrum
     if pacifist? && hostile_present?
       if @obstacle_skip_streak < @obstacle_rooms.size - 1
         debug_say "room #{uid} has a hostile present and pacifist is on - abandoning this block for now, trying another"
-        @obstacle_rooms.rotate!
+        # Move uid (not necessarily @obstacle_rooms.first - the claim
+        # filter above may have skipped past already-claimed rooms ahead
+        # of it) to the back, rather than a blind rotate! that would
+        # rotate starting from position 0 regardless of where uid is.
+        @obstacle_rooms.delete(uid)
+        @obstacle_rooms.push(uid)
         @obstacle_skip_streak += 1
         return
       end
@@ -1349,7 +1976,10 @@ module InquiConundrum
 
     @obstacle_skip_streak = 0
     if all_cleared
-      @obstacle_rooms.shift
+      @obstacle_rooms.delete(uid)
+      @recently_cleared_obstacles = (@recently_cleared_obstacles + [uid]).last(RECENTLY_CLEARED_CAP)
+      @sync_dirty = true
+      force_sync_publish!
     else
       debug_say "room #{uid} still has an obstacle standing after giving up on it - leaving queued to retry later"
     end
@@ -1427,17 +2057,23 @@ module InquiConundrum
     @in_run         = true
     @guide_room_id  = XMLData.room_id
     @guide_room_confirmed = false
+    @last_guide_status_check_at = nil
     @run_started_at = Time.now
+    @rooms_moved_since_run_start = 0
     @needed         = {}
     @seen           = {}
     @piece_location = {}
     @transporting   = nil
+    @kick_arrival_uid = nil
     @delivered      = []
+    @claimed_pieces = {}
     @edges          = Hash.new { |h, k| h[k] = {} }
     @parent         = { @guide_room_id => { from: nil, back: nil } }
     @exploration_cursor = nil
     @phase          = :exploring_free
     @obstacle_rooms = []
+    @trap_rooms     = []
+    @recently_cleared_traps = []
     @all_known      = false
     @fully_explored = false
     @parsing_status = false
@@ -1450,6 +2086,18 @@ module InquiConundrum
     @blocked_pieces = {}
     @forced_piece = nil
     @obstacle_skip_streak = 0
+    @last_resweep_at = nil
+    @blocks_directive_active = false
+    @blocks_known_descriptors = []
+    @last_sync_publish_at = nil
+    @sync_dirty = false
+    @remote_claims = {}
+    @remote_claims_by_char = {}
+    @piece_last_updated_at = {}
+    @recently_cleared_obstacles = []
+    @sync_scope_for_run = nil
+    @sync_force_pending = false
+    @rejected_locations = {}
 
     # Inky (or any other combat-assist script) reads this directly out of
     # UserVars rather than calling into this module - same independence
@@ -1461,6 +2109,23 @@ module InquiConundrum
     say "run started in #{XMLData.room_title}"
     say "PACIFIST RUN! KIL.... err.. peeeeace.... ehh." if pacifist?
     debug_say "provisional anchor room id = #{@guide_room_id}"
+
+    # Frozen for the whole run, never recomputed live from Group.members -
+    # a mid-run roster change would otherwise silently switch which shared
+    # DB row this character reads/writes, orphaning everything already
+    # published under the old scope.
+    if group_sync_enabled?
+      @sync_scope_for_run = compute_sync_scope
+      Settings.refresh_data(@sync_scope_for_run)
+      shared = Settings.root_proxy_for(@sync_scope_for_run)
+      started_at = shared['run_started_at']
+      if started_at.nil? || (Time.now.to_i - started_at.to_i) > MAX_RUN_SECONDS
+        debug_say "group sync: shared run state for scope #{@sync_scope_for_run} is stale or absent - resetting"
+        shared['run_started_at'] = Time.now.to_i
+        shared['slices'] = {}
+      end
+    end
+
     on_room_entered(@guide_room_id)
   end
 
@@ -1468,16 +2133,43 @@ module InquiConundrum
     return unless @in_run
 
     ended_by_room = !!(XMLData.room_title =~ END_ROOM_REGEX)
-    return unless ended_by_room || @surrender_triggered || (Time.now - @run_started_at) > MAX_RUN_SECONDS
+    ended_by_surrender = @surrender_triggered
+    return unless ended_by_room || ended_by_surrender || (Time.now - @run_started_at) > MAX_RUN_SECONDS
+
+    run_duration = Time.now - @run_started_at
 
     say "run ended - delivered #{@delivered.size} piece(s): #{@delivered.join(', ')}"
     debug_say(if ended_by_room
                 "ended: exit room title matched"
-              elsif @surrender_triggered
+              elsif ended_by_surrender
                 "ended: surrendermania surrendered"
               else
                 "ended: MAX_RUN_SECONDS timeout reached"
               end)
+
+    say "surrender run time: #{format_duration(run_duration)}" if ended_by_surrender
+
+    # A timeout means the script gave up, not a real completion - doesn't
+    # belong in "best" time tracking alongside actual finishes.
+    unless !ended_by_room && !ended_by_surrender
+      best = settings[:best_run_seconds]
+      if best.nil? || run_duration < best
+        settings[:best_run_seconds] = run_duration
+        say "new best run time: #{format_duration(run_duration)}"
+      end
+    end
+
+    # Whatever this character published for this run (edges, obstacle
+    # rooms, piece locations, claims) is about to go stale the moment the
+    # next run starts - clear it now rather than leaving it for a
+    # teammate's very next merge to pick up and get confused by. Confirmed
+    # in the field: a follow-up run starting soon after the last one ended
+    # (the normal repeatevent case) never tripped maybe_start_run's own
+    # staleness check, since "soon after" is never older than
+    # MAX_RUN_SECONDS - so the previous run's stale slice just sat there
+    # and got merged straight into the fresh run.
+    clear_sync_state_for_completed_run!
+
     @in_run = false
     @transporting = nil
     @surrender_triggered = false
@@ -1529,19 +2221,91 @@ module InquiConundrum
   # and asks for entry twice (the second confirms entering without an
   # aevarch), putting us back into the minigame. Only called when
   # repeatevent is on.
+  #
+  # A follower needs to be physically present to get pulled into the new
+  # run (confirmed - entry isn't group-wide regardless of location), but
+  # never travels or asks the magister independently - they only ever
+  # "join" the leader (see regroup_with_leader_then_return_to_arena) and
+  # get dragged along as the leader walks and asks for both. Asking twice
+  # themselves on top of that would be redundant at best and risks a
+  # "you must wait" rejection at worst.
   def self.requeue_for_next_run
-    fput('stow hands')
-    fput('get package')
-    pause 1
-    fput('stow hands')
-    fput('gird')
+    following = group_sync_enabled? && !Group.leader?
+    Script.pause(INKY_SCRIPT) if following
 
-    run_go2_to_arena
+    begin
+      send_command('stow hands')
+      send_command('get package')
+      pause 1
+      send_command('stow hands')
+      send_command('gird')
 
-    pause 1
-    fput('ask magister about entry')
-    pause 1
-    fput('ask magister about entry')
+      if group_sync_enabled?
+        regroup_with_leader_then_return_to_arena
+      else
+        run_go2_to_arena
+      end
+
+      unless following
+        pause 1
+        send_command('ask magister about entry')
+        pause 1
+        send_command('ask magister about entry')
+      end
+    ensure
+      # Always attempt the unpause, even if something above raised - a
+      # follower stuck with inky permanently paused would otherwise have
+      # no combat assist for the rest of the session.
+      wait_for_new_event_then_unpause_inky if following
+    end
+  end
+
+  # A follower has nothing useful to fight while being dragged along
+  # mid-regroup - inky stays paused for the whole requeue_for_next_run
+  # stretch (stow/gird/join/walk/ask-for-entry) and only resumes once
+  # NEW_EVENT_START_ROOM_UID confirms the new run has actually begun.
+  # Bounded the same way run_go2_to_arena is - inky shouldn't stay paused
+  # forever just because this character never actually arrived.
+  def self.wait_for_new_event_then_unpause_inky
+    deadline = Time.now + GO2_TIMEOUT_SECONDS
+    until XMLData.room_id.to_s == NEW_EVENT_START_ROOM_UID
+      if Time.now > deadline
+        debug_say "never saw room #{NEW_EVENT_START_ROOM_UID} within #{GO2_TIMEOUT_SECONDS}s - unpausing #{INKY_SCRIPT} anyway"
+        break
+      end
+      pause 0.5
+    end
+    Script.unpause(INKY_SCRIPT)
+  end
+
+  # Grouped: only the leader ever navigates - a follower never independently
+  # go2's to the arena and never asks the magister themselves (confirmed:
+  # entry requires physically being in the room, but the leader walking
+  # there with the group already in tow, then asking, is what actually gets
+  # everyone in - a follower racing there on their own just risks scattering
+  # the group again right after finally regrouping). A follower only ever
+  # "join"s the leader, right here in the post-ejection room, and is then
+  # fully along for whatever the leader does next - no fallback go2, ever,
+  # even if leader_name can't be determined or the join doesn't seem to be
+  # taking. wait_for_new_event_then_unpause_inky's own timeout is the only
+  # safety net for "this character never actually made it in."
+  def self.regroup_with_leader_then_return_to_arena
+    if Group.leader?
+      debug_say "group sync: leading - waiting up to #{REGROUP_TIMEOUT_SECONDS}s for the group to join up before heading back"
+      pause REGROUP_TIMEOUT_SECONDS
+      run_go2_to_arena
+      return
+    end
+
+    leader = Group.leader
+    leader_name = leader.respond_to?(:noun) ? leader.noun : nil
+    unless leader_name
+      debug_say "group sync: couldn't determine the group leader - nothing to join, waiting for the new run to start on its own"
+      return
+    end
+
+    say "joining #{leader_name} to follow back to the arena"
+    send_command("join #{leader_name}")
   end
 
   # A room only has a usable path back to the guide room if the DFS
@@ -1561,8 +2325,43 @@ module InquiConundrum
     (Time.now - blocked[:blocked_at]) < PACIFIST_BLOCKED_RETRY_SECONDS
   end
 
+  # Flips any :claimed piece whose CLAIMED_RETRY_SECONDS window has
+  # elapsed back to :located, so next_located_descriptor's normal :located
+  # selection picks it up again - the other player may never come back,
+  # and there's no other code path that ever revisits a :claimed entry.
+  # @piece_last_updated_at already gets stamped at the moment a piece is
+  # marked :claimed (continue_transport), so it doubles as "claimed at"
+  # here with no extra bookkeeping needed.
+  def self.recheck_stale_claims!
+    @needed.each do |descriptor, status|
+      next unless status == :claimed
+
+      claimed_at = @piece_last_updated_at[descriptor]
+      age = claimed_at ? Time.now.to_i - claimed_at : Float::INFINITY
+
+      # Every possible player here is a teammate also running this script -
+      # trust their own claim publish over a flat timer once it's actually
+      # had a chance to land (CLAIMED_GROUP_SYNC_GRACE_SECONDS). Recovers a
+      # piece the moment the teammate's own next sync shows they're no
+      # longer working it, instead of always waiting out the full
+      # CLAIMED_RETRY_SECONDS regardless of what's actually still true.
+      if group_sync_enabled? && age >= CLAIMED_GROUP_SYNC_GRACE_SECONDS && !remote_claim_fresh?(descriptor)
+        debug_say "#{descriptor}: group sync shows no teammate currently claims this - reconsidering it now"
+        @needed[descriptor] = :located
+        next
+      end
+
+      next unless age >= CLAIMED_RETRY_SECONDS
+
+      debug_say "#{descriptor}: claimed-by-another-player retry window elapsed - reconsidering it"
+      @needed[descriptor] = :located
+    end
+  end
+
   def self.next_located_descriptor
+    recheck_stale_claims!
     candidates = @needed.select { |d, status| status == :located && reachable?(@piece_location[d]) }.keys
+    candidates = candidates.reject { |d| group_sync_enabled? && remote_claim_fresh?(d) }
     return closest_by_distance(candidates) unless pacifist?
 
     # pacifist: anything not currently blocked by a monster takes priority
@@ -1625,21 +2424,31 @@ module InquiConundrum
     return unless @transporting
 
     current_descriptor = @transporting[:descriptor]
-    current_distance = distance_to_guide(XMLData.room_id)
+    current_room = XMLData.room_id
+    current_distance = distance_to_guide(current_room)
 
     alternatives = @needed.select { |d, status| status == :located && reachable?(@piece_location[d]) }.keys
     alternatives = alternatives.reject { |d| pacifist_blocked?(d) } if pacifist?
-    closest = closest_by_distance(alternatives)
-    return unless closest
+    alternatives = alternatives.reject { |d| group_sync_enabled? && remote_claim_fresh?(d) }
+    return if alternatives.empty?
 
-    closest_distance = distance_to_guide(@piece_location[closest])
-    return unless closest_distance < current_distance
+    # Total cost of switching: walk from here to the alternative's room,
+    # then push it the rest of the way home - not just the alternative's
+    # own distance-to-guide, which says nothing about how far out of the
+    # way it actually is from here. Comparing that alone is what let this
+    # flip back and forth between two pieces forever (see tree_distance).
+    costed = alternatives.map { |d| [d, tree_distance(current_room, @piece_location[d])] }
+                          .reject { |_, travel| travel.nil? }
+                          .map { |d, travel| [d, travel + distance_to_guide(@piece_location[d])] }
+    return if costed.empty?
 
-    uid = XMLData.room_id
-    @piece_location[current_descriptor] = uid
+    closest, closest_cost = costed.min_by { |_, cost| cost }
+    return unless closest_cost < current_distance
+
+    @piece_location[current_descriptor] = current_room
     @needed[current_descriptor] = :located
     @transporting = nil
-    say "#{closest} is closer to the guide (#{closest_distance} room#{'s' unless closest_distance == 1}) than #{current_descriptor} is from here (#{current_distance} room#{'s' unless current_distance == 1}) - abandoning #{current_descriptor} here to go get it instead"
+    say "#{closest} is a better pickup from here (#{closest_cost} room#{'s' unless closest_cost == 1} total) than finishing #{current_descriptor} (#{current_distance} room#{'s' unless current_distance == 1} left) - abandoning #{current_descriptor} here to go get it instead"
   end
 
   # Room number for whatever's left (anything not yet :delivered), with
@@ -1689,6 +2498,7 @@ module InquiConundrum
     unless @in_run
       say "status: no run currently active - waiting to be placed in the zone."
       say "completions this session: #{@completions}"
+      say "best run time: #{best_run_time_description}"
       return
     end
 
@@ -1716,28 +2526,9 @@ module InquiConundrum
       end
     end
 
-    case @current_operation
-    when :destroying_obstacle
-      say "current operation: destroying room blockers"
-    when :fetching
-      say "current operation: fetching #{@fetching_descriptor}"
-    when :transporting
-      descriptor = @transporting && @transporting[:descriptor]
-      if descriptor
-        remaining = rooms_remaining_to_guide(XMLData.room_id)
-        if remaining
-          say "current operation: returning #{descriptor} to guide, #{remaining} room#{'s' unless remaining == 1} left"
-        else
-          say "current operation: returning #{descriptor} to guide"
-        end
-      end
-    when :exploring
-      say "current operation: exploring rooms"
-    else
-      say "current operation: waiting on next announcement"
-    end
-
+    say "current operation: #{current_operation_description}"
     say "completions this session: #{@completions}"
+    say "best run time: #{best_run_time_description}"
   end
 
   # Throttled to STATUS_UPDATE_INTERVAL_SECONDS so it summarizes progress
@@ -1748,6 +2539,64 @@ module InquiConundrum
 
     @last_status_update_at = now
     report_status_now
+  end
+
+  # Shared by report_status_now and the every-3-rooms progress ping, so
+  # both describe "what am I doing right now" identically.
+  def self.current_operation_description
+    case @current_operation
+    when :destroying_obstacle
+      "destroying room blockers"
+    when :fetching
+      "fetching #{@fetching_descriptor}"
+    when :transporting
+      descriptor = @transporting && @transporting[:descriptor]
+      if descriptor
+        remaining = rooms_remaining_to_guide(XMLData.room_id)
+        if remaining
+          "returning #{descriptor} to guide, #{remaining} room#{'s' unless remaining == 1} left"
+        else
+          "returning #{descriptor} to guide"
+        end
+      else
+        "waiting on next announcement"
+      end
+    when :exploring
+      "exploring rooms"
+    else
+      "waiting on next announcement"
+    end
+  end
+
+  def self.format_duration(seconds)
+    total = seconds.to_i
+    minutes, secs = total.divmod(60)
+    "#{minutes}m #{secs}s"
+  end
+
+  # settings[:best_run_seconds] persists across sessions (per character) -
+  # a personal best should survive a relog, not just last this process.
+  def self.best_run_time_description
+    best = settings[:best_run_seconds]
+    best ? format_duration(best) : 'none yet'
+  end
+
+  # Called from on_room_entered every time a room actually changes -
+  # surfaces what the script is doing/how long it's been going without
+  # the player having to type ;inqui status themselves.
+  ROOM_PROGRESS_OPERATION_INTERVAL = 3
+  ROOM_PROGRESS_ELAPSED_INTERVAL = 10
+
+  def self.report_room_progress
+    return unless @in_run
+
+    if (@rooms_moved_since_run_start % ROOM_PROGRESS_OPERATION_INTERVAL).zero?
+      say "[#{@rooms_moved_since_run_start} rooms moved] current operation: #{current_operation_description}"
+    end
+
+    if (@rooms_moved_since_run_start % ROOM_PROGRESS_ELAPSED_INTERVAL).zero?
+      say "[#{@rooms_moved_since_run_start} rooms moved] time elapsed: #{format_duration(Time.now - @run_started_at)}"
+    end
   end
 
   # ;inqui reset - manual recovery: walk back to the guide room (abandoning
@@ -1786,7 +2635,69 @@ module InquiConundrum
     say "waiting for 5 seconds"
     pause 5
 
-    fput('ask guide about status')
+    send_command('ask guide about status')
+  end
+
+  # ";inqui blocks" - drop whatever's in progress and prioritize room-block
+  # clearing (and the exploration needed to find more of them) over
+  # everything else, until a genuinely new part turns up - see
+  # blocks_directive_tick, which actually drives this each tick.
+  def self.handle_blocks
+    unless @in_run
+      say "blocks: no run currently active"
+      return
+    end
+
+    if @transporting
+      descriptor = @transporting[:descriptor]
+      uid = XMLData.room_id
+      @piece_location[descriptor] = uid
+      @needed[descriptor] = :located
+      @transporting = nil
+      debug_say "blocks: abandoned in-progress transport of #{descriptor}"
+    end
+
+    @blocks_known_descriptors = @needed.select { |_, status| status == :located }.keys
+    @blocks_directive_active = true
+    say "blocks: dropping everything to hunt down room blockers until a new part turns up"
+  end
+
+  # ";inqui return" - drop whatever's in progress and immediately start
+  # kicking a different known, reachable part home. Unlike ";inqui blocks"
+  # this is a one-shot pivot, not an ongoing directive - it just picks the
+  # best located candidate right now (excluding whatever was just dropped,
+  # so it doesn't pick the exact same part right back up).
+  def self.handle_return
+    unless @in_run
+      say "return: no run currently active"
+      return
+    end
+
+    dropped = nil
+    if @transporting
+      dropped = @transporting[:descriptor]
+      uid = XMLData.room_id
+      @piece_location[dropped] = uid
+      @needed[dropped] = :located
+      @transporting = nil
+      debug_say "return: dropped in-progress transport of #{dropped}"
+    end
+
+    candidates = @needed.select { |d, status| status == :located && reachable?(@piece_location[d]) }.keys
+    candidates -= [dropped] if dropped
+
+    descriptor = closest_by_distance(candidates)
+    unless descriptor
+      if dropped
+        say "CANNOT OBEY - This is the only part I know!"
+      else
+        say "CANNOT OBEY - I don't know where a part is!"
+      end
+      return
+    end
+
+    say "return: heading for #{descriptor} instead"
+    begin_transport(descriptor)
   end
 
   # Commands intercepted by the upstream hook (see parse_upstream) land in
@@ -1801,7 +2712,7 @@ module InquiConundrum
     text = msg.to_s.strip
     case text
     when ''
-      say "already running - try: status, set, help, reset"
+      say "already running - try: status, set, help, reset, blocks, return"
     when /^status$/i
       report_status_now
     when /^set$/i
@@ -1813,8 +2724,12 @@ module InquiConundrum
       respond(INQUICONUNDRUM_HELP)
     when /^reset$/i
       handle_reset
+    when /^blocks$/i
+      handle_blocks
+    when /^return$/i
+      handle_return
     else
-      say "unrecognized message: '#{text}' (try: status, set, help, reset)"
+      say "unrecognized message: '#{text}' (try: status, set, help, reset, blocks, return)"
     end
   end
 
@@ -1850,10 +2765,14 @@ module InquiConundrum
         end
       end
 
+      sync_merge_remote_state! if group_sync_enabled?
+
       maybe_abandon_for_closer_piece
 
       if @transporting
         continue_transport
+      elsif @blocks_directive_active && blocks_directive_tick
+        # handled inside blocks_directive_tick
       elsif (descriptor = next_located_descriptor)
         begin_transport(descriptor)
       elsif !@fully_explored
@@ -1883,10 +2802,16 @@ module InquiConundrum
         elsif still_needed.any? || unreachable.any?
           unreachable_desc = unreachable.map { |d| "#{d} (u#{@piece_location[d]})" }.join(', ')
           debug_say "fully explored with nothing deliverable; still missing: #{still_needed.join(', ')}; seen but unreachable: #{unreachable_desc}"
+          resweep_for_missed_obstacles!
           pause 2
         else
           unless @idle_announced
-            say "All currently announced pieces delivered. Waiting on next announcement! Watch for monsters!"
+            claimed = @needed.select { |_, status| status == :claimed }.keys
+            if claimed.any?
+              say "All currently announced pieces accounted for - #{claimed.size} claimed by another player (#{claimed.join(', ')}). Waiting on next announcement!"
+            else
+              say "All currently announced pieces delivered. Waiting on next announcement! Watch for monsters!"
+            end
             say "Completed so far (#{@delivered.size}): #{@delivered.join(', ')}"
             @idle_announced = true
           end
@@ -1897,6 +2822,32 @@ module InquiConundrum
       debug_say "a piece's location just became known - abandoning exploration to go fetch it"
     rescue RunEnding
       debug_say "run is over - abandoning whatever action was in progress so maybe_end_run can actually end it"
+    rescue StuckMove => e
+      debug_say "#{e.message} - pivoting back to the main dispatch instead of repeating it"
+
+      if @parent[e.uid] && @parent[e.uid][:back] == e.direction
+        debug_say "room #{e.uid}'s recorded backtrack direction (#{e.direction}) doesn't actually work - this maze isn't always reciprocal. Clearing it so it isn't retried forever"
+        @parent[e.uid][:back] = nil
+      end
+    ensure
+      # Runs even when this tick ended via one of the rescues above - all
+      # three (PieceBecameAvailable/RunEnding/StuckMove) are routine,
+      # expected unwinds, not crashes, so whatever state was true at the
+      # point of raise (a just-recorded edge, a freshly-set @transporting)
+      # is still meaningful and worth a teammate seeing promptly.
+      #
+      # The only place sync_publish_local_state! is ever actually called -
+      # this is always this script's own thread, never the DownstreamHook
+      # thread force_sync_publish! can be triggered from (confirmed in the
+      # field: a real Settings DB write happening directly on that thread
+      # froze the entire client for minutes whenever it contended with the
+      # other character's process). @sync_force_pending just carries
+      # "something urgent happened" over to here, where it's safe to act
+      # on it.
+      if group_sync_enabled?
+        sync_publish_local_state!(force: @sync_force_pending)
+        @sync_force_pending = false
+      end
     end
   end
 
@@ -1907,6 +2858,17 @@ module InquiConundrum
 
         if @in_run
           tick
+          # Floor on how fast this loop can ever spin. tick() normally
+          # yields on its own (an fput's roundtime, a move, an explicit
+          # pause elsewhere) - but a logic bug that lets it return without
+          # ever sending anything to the game (confirmed in the field: a
+          # piece location ping-ponging between :needed and :located with
+          # group_sync re-adopting the same stale claim every merge) had
+          # nothing else to slow it down, and produced 30,000+ log lines in
+          # under a minute. This doesn't fix that kind of bug - it just
+          # bounds the damage to ~20 ticks/sec instead of an unbounded tight
+          # loop, whatever the cause.
+          pause 0.05
         else
           maybe_start_run
           pause 1
@@ -1929,6 +2891,17 @@ module InquiConundrum
         # iteration's tick call runs maybe_end_run fresh and actually ends
         # it correctly.
         debug_say "run ending detected outside tick - retrying"
+      rescue StuckMove => e
+        # Same safety net as the other two above, for the same kind of
+        # outside-tick path (e.g. ;inqui reset's or begin_transport's own
+        # navigate_to walk). The very next loop iteration's tick call
+        # re-dispatches fresh instead of repeating whatever was stuck.
+        debug_say "#{e.message} - pivoting back to the main dispatch instead of repeating it"
+
+        if @parent[e.uid] && @parent[e.uid][:back] == e.direction
+          debug_say "room #{e.uid}'s recorded backtrack direction (#{e.direction}) doesn't actually work - this maze isn't always reciprocal. Clearing it so it isn't retried forever"
+          @parent[e.uid][:back] = nil
+        end
       rescue StandardError => e
         # An uncaught exception here would otherwise kill the script thread
         # silently - no pause message, no error, it just stops reacting.
@@ -1938,6 +2911,318 @@ module InquiConundrum
         pause 1
       end
     end
+  end
+
+  ## ---- multi-character cooperation (group_sync) --------------------------
+  #
+  # Two-plus characters, each running their own InquiConundrum.lic instance,
+  # grouped together in-game, sharing the same local Lich DATA_DIR. Settings'
+  # database_adapter.rb does a whole-row Marshal blob upsert keyed on
+  # (script, scope) - confirmed by reading database_adapter.rb directly,
+  # there is no partial/column-level update. Both processes run the literal
+  # same script file, so Script.current.name (the "script" half of that key)
+  # is identical between them - only the scope string (@sync_scope_for_run,
+  # frozen once per run from the sorted group roster, see maybe_start_run)
+  # separates "this group's shared state" from anything else. That
+  # collapses the lost-update risk down to "two characters both writing the
+  # SAME scope's blob" - avoided entirely by each character writing ONLY to
+  # its own ['slices'][Char.name] leaf via a single SettingsProxy#[]= call.
+  # save_proxy_changes (settings.rb) re-reads the fresh row before applying
+  # a leaf write, so a single targeted leaf write is safe even if a
+  # teammate's own leaf write lands concurrently.
+  #
+  # HARD RULE: no method outside this quartet - sync_publish_local_state!,
+  # sync_merge_remote_state!, clear_sync_state_for_completed_run!, and the
+  # staleness check in maybe_start_run - may call Settings.root_proxy_for or
+  # Settings.refresh_data for this feature. Never read the whole shared root
+  # into a local Hash, mutate multiple characters' branches, and save it
+  # back - that reintroduces the exact lost-update race this whole approach
+  # exists to avoid.
+
+  # What this character is actively claiming right now, if anything - mirrors
+  # @transporting / process_obstacle_queue's current obstacle pick. Returns
+  # nil when nothing is claimed (teammates should not treat absence as
+  # "claim cleared instantly" - they age out stale claims via
+  # remote_claim_fresh?/SYNC_CLAIM_TTL_SECONDS instead, in case this
+  # character's process died mid-claim without ever publishing the clear).
+  def self.current_claim_snapshot
+    if @transporting
+      { kind: :transport, descriptor: @transporting[:descriptor], room: @piece_location[@transporting[:descriptor]] }
+    elsif @phase == :clearing_obstacles && @obstacle_rooms.any?
+      # @current_operation flips to :destroying_obstacle only transiently
+      # inside destroy_obstacle itself - not durable enough to read back
+      # from here. @phase/@obstacle_rooms.first stays stable for as long
+      # as this obstacle room is actually the one being worked.
+      { kind: :obstacle, room: @obstacle_rooms.first }
+    end
+  end
+
+  def self.sync_publish_local_state!(force: false)
+    return unless @sync_scope_for_run
+
+    now = Time.now
+    return if !force && !@sync_dirty
+    return if !force && @last_sync_publish_at && (now - @last_sync_publish_at) < SYNC_THROTTLE_SECONDS
+
+    @last_sync_publish_at = now
+    @sync_dirty = false
+
+    shared = Settings.root_proxy_for(@sync_scope_for_run)
+    shared['slices'] ||= {}
+    shared['slices'][Char.name] = {
+      updated_at: now.to_i,
+      edges: @edges.each_with_object({}) { |(k, v), h| h[k] = v },
+      obstacle_rooms: @obstacle_rooms.dup,
+      cleared_obstacle_rooms: @recently_cleared_obstacles.dup,
+      trap_rooms: @trap_rooms.dup,
+      cleared_trap_rooms: @recently_cleared_traps.dup,
+      needed: @needed.dup,
+      piece_location: @piece_location.dup,
+      piece_updated_at: @piece_last_updated_at.dup,
+      seen: @seen.dup,
+      claim: current_claim_snapshot,
+    }
+  rescue StandardError => e
+    debug_say "group sync: publish failed (#{e.class}: #{e.message}) - continuing solo this tick"
+  end
+
+  # Called once, from maybe_end_run, right as a run actually ends. Writes
+  # nil to this character's own leaf under shared['slices'] rather than
+  # deleting the key outright - same single-leaf-write shape as
+  # sync_publish_local_state!'s normal publish (race-safe against a
+  # teammate's own concurrent write to *their* leaf), and
+  # sync_merge_remote_state! already skips a nil slice (`next if ...
+  # slice.nil?`), so readers treat it identically to "never published."
+  def self.clear_sync_state_for_completed_run!
+    return unless group_sync_enabled? && @sync_scope_for_run
+
+    shared = Settings.root_proxy_for(@sync_scope_for_run)
+    shared['slices'] ||= {}
+    shared['slices'][Char.name] = nil
+  rescue StandardError => e
+    debug_say "group sync: failed clearing this run's published state (#{e.class}: #{e.message})"
+  end
+
+  # Bypasses the throttle/dirty-flag gate for claim-worthy events (a piece
+  # just became located, a transport/obstacle claim just started or
+  # cleared) - teammates should see these promptly, not wait up to
+  # SYNC_THROTTLE_SECONDS.
+  #
+  # Deliberately defers rather than calling sync_publish_local_state!
+  # directly: observe_descriptor (and therefore this) can be reached from
+  # install_listener's DownstreamHook proc, which runs on the socket-
+  # reading thread, not this script's own thread - confirmed in the field,
+  # this caused the *entire client* to freeze for minutes at a time
+  # whenever a real Settings DB write here happened to contend with the
+  # other character's process (SQLite's busy_timeout blocks synchronously
+  # for up to 5s per attempt, on whatever thread called it). Just flag it
+  # here; tick's own ensure block (always on this script's own thread)
+  # is the only place that ever actually performs the write.
+  def self.force_sync_publish!
+    @sync_dirty = true
+    @sync_force_pending = true
+  end
+
+  def self.merge_remote_edges!(remote_edges)
+    return false unless remote_edges.is_a?(Hash)
+
+    changed = false
+    remote_edges.each do |from_uid, dirs|
+      next unless dirs.is_a?(Hash)
+
+      dirs.each do |dir, to_uid|
+        next if @edges[from_uid].key?(dir) # fill-only - never overwrite a local entry
+
+        @edges[from_uid][dir] = to_uid
+        changed = true
+      end
+    end
+    changed
+  end
+
+  # Thrown away and rebuilt from scratch rather than hand-grafting a
+  # teammate's breadcrumb tree onto ours - much more robust given this
+  # maze's confirmed cycles/non-reciprocal exits. Built into a fresh local
+  # hash, then swapped in with one atomic assignment - never mutated
+  # key-by-key mid-rebuild. Only ever called from tick's own quiescent top
+  # (see sync_merge_remote_state!), never mid-navigation.
+  def self.rebuild_parent_from_edges!
+    return unless @guide_room_id
+
+    new_parent = { @guide_room_id => { from: nil, back: nil } }
+    queue = [@guide_room_id]
+    until queue.empty?
+      current = queue.shift
+      @edges[current].each_value do |neighbor|
+        next if new_parent.key?(neighbor)
+
+        # Real reverse-edge lookup, never reverse_direction(dir) - this
+        # maze has confirmed non-reciprocal exits (see StuckMove). Mirrors
+        # reroot_tree's existing use of find_direction. Left nil if no
+        # reverse edge is known, same as every other @parent[:back] miss
+        # elsewhere in this file - never a crash.
+        back = find_direction(neighbor, current)
+        new_parent[neighbor] = { from: current, back: back }
+        queue << neighbor
+      end
+    end
+
+    @parent = new_parent
+  end
+
+  def self.merge_remote_obstacles!(slice)
+    remote_pending = slice[:obstacle_rooms] || slice['obstacle_rooms']
+    remote_cleared = slice[:cleared_obstacle_rooms] || slice['cleared_obstacle_rooms']
+
+    @obstacle_rooms |= remote_pending if remote_pending.is_a?(Array)
+    @obstacle_rooms -= remote_cleared if remote_cleared.is_a?(Array)
+  end
+
+  # Same union/subtract shape as merge_remote_obstacles! - a teammate's
+  # known trap room is fill-only (never dropped just because their own
+  # publish doesn't mention it - they may simply never have revisited it),
+  # only actually removed once either character's own handle_traps
+  # personally confirms it's gone.
+  def self.merge_remote_trap_rooms!(slice)
+    remote_pending = slice[:trap_rooms] || slice['trap_rooms']
+    remote_cleared = slice[:cleared_trap_rooms] || slice['cleared_trap_rooms']
+
+    @trap_rooms |= remote_pending if remote_pending.is_a?(Array)
+    @trap_rooms -= remote_cleared if remote_cleared.is_a?(Array)
+  end
+
+  # :delivered always wins; adopt a teammate's :located info if we only
+  # have :needed; keep ours if we already know more than they do; "newer
+  # timestamp wins" when both have conflicting :located info. A teammate's
+  # :in_transit is deliberately downgraded to :located here, never adopted
+  # verbatim - :in_transit only means something paired with THAT
+  # character's own @transporting. Their in-progress claim is represented
+  # separately via merge_remote_claim! (with its own TTL), so a dead/
+  # disconnected teammate's claim ages out instead of permanently hiding a
+  # piece behind a status nothing will ever clear.
+  def self.merge_remote_pieces!(slice)
+    remote_needed   = slice[:needed] || slice['needed'] || {}
+    remote_location = slice[:piece_location] || slice['piece_location'] || {}
+    remote_seen     = slice[:seen] || slice['seen'] || {}
+    remote_stamps   = slice[:piece_updated_at] || slice['piece_updated_at'] || {}
+
+    remote_needed.each do |descriptor, remote_status|
+      local_status = @needed[descriptor]
+
+      if remote_status == :delivered
+        @needed[descriptor] = :delivered
+        next
+      end
+      next if local_status == :delivered
+
+      if local_status.nil? || local_status == :needed
+        if [:located, :in_transit, :claimed].include?(remote_status)
+          remote_uid = remote_location[descriptor]
+          rejected = @rejected_locations[descriptor]
+          # Refuse to re-adopt the exact same descriptor+room we just
+          # personally confirmed empty (continue_transport's "lost track"
+          # path) until REJECTED_LOCATION_COOLDOWN_SECONDS passes - without
+          # this, a teammate's still-stale slice re-asserts the same bad
+          # location every merge, and local_status flips :needed -> :located
+          # -> :needed forever with no fput/move/pause anywhere in the loop
+          # to ever yield. A genuinely different remote_uid still goes
+          # through normally - this only blocks the identical stale claim.
+          stale_rejection = rejected && remote_uid && rejected[:uid] == remote_uid &&
+                             (Time.now.to_i - rejected[:at]) < REJECTED_LOCATION_COOLDOWN_SECONDS
+          unless stale_rejection
+            @needed[descriptor] = remote_status == :in_transit ? :located : remote_status
+            if remote_uid
+              @piece_location[descriptor] = remote_uid
+              @piece_last_updated_at[descriptor] = remote_stamps[descriptor] || Time.now.to_i
+            end
+          end
+        end
+      elsif local_status == :located && remote_status == :located
+        local_at = @piece_last_updated_at[descriptor] || 0
+        remote_at = remote_stamps[descriptor] || 0
+        if remote_at > local_at && remote_location[descriptor]
+          @piece_location[descriptor] = remote_location[descriptor]
+          @piece_last_updated_at[descriptor] = remote_at
+        end
+      end
+      # local_status == :located/:in_transit and remote is :needed/nothing -> keep ours, no-op.
+    end
+
+    remote_seen.each { |descriptor, uid| @seen[descriptor] = uid unless @seen.key?(descriptor) }
+  end
+
+  # Confirmed in the field: this used to just `return` whenever a
+  # teammate's current claim was nil, leaving their PREVIOUS claim sitting
+  # in @remote_claims untouched - so the moment they delivered/abandoned a
+  # piece, everyone else kept treating it as actively claimed for up to a
+  # full SYNC_CLAIM_TTL_SECONDS (90s) anyway, purely because nothing ever
+  # told the entry to go away early. @remote_claims_by_char remembers each
+  # teammate's last claim key so it can be actively dropped the instant
+  # their own publish stops reasserting it, rather than only ever expiring
+  # by elapsed time.
+  def self.merge_remote_claim!(char_name, claim, claimed_at)
+    new_key = claim.is_a?(Hash) ? (claim[:kind] == :transport ? claim[:descriptor] : claim[:room]) : nil
+
+    previous_key = @remote_claims_by_char[char_name]
+    if previous_key && previous_key != new_key
+      entry = @remote_claims[previous_key]
+      @remote_claims.delete(previous_key) if entry && entry[:char] == char_name
+    end
+    @remote_claims_by_char[char_name] = new_key
+
+    return unless new_key
+
+    @remote_claims[new_key] = { kind: claim[:kind], char: char_name, room: claim[:room], at: claimed_at || Time.now.to_i }
+  end
+
+  # Used by next_located_descriptor/maybe_abandon_for_closer_piece/
+  # process_obstacle_queue to skip anything a teammate is actively working
+  # on. A stale (process died, or silently abandoned without publishing
+  # the clear) claim ages out on its own past SYNC_CLAIM_TTL_SECONDS rather
+  # than needing an explicit removal path.
+  def self.remote_claim_fresh?(key)
+    claim = @remote_claims[key]
+    return false unless claim
+
+    (Time.now.to_i - claim[:at].to_i) < SYNC_CLAIM_TTL_SECONDS
+  end
+
+  def self.sync_merge_remote_state!
+    return unless @sync_scope_for_run
+
+    Settings.refresh_data(@sync_scope_for_run)
+    shared = Settings.root_proxy_for(@sync_scope_for_run)
+    slices = shared['slices'] || {}
+
+    edges_changed = false
+    slices.each do |char_name, slice|
+      next if char_name == Char.name || slice.nil?
+
+      edges_changed ||= merge_remote_edges!(slice[:edges] || slice['edges'])
+      merge_remote_obstacles!(slice)
+      merge_remote_trap_rooms!(slice)
+      merge_remote_pieces!(slice)
+      merge_remote_claim!(char_name, slice[:claim] || slice['claim'], slice[:updated_at] || slice['updated_at'])
+    end
+
+    rebuild_parent_from_edges! if edges_changed
+
+    # Confirmed in the field: merge_remote_obstacles! can repopulate
+    # @obstacle_rooms from a teammate's still-pending list well after this
+    # character's own @fully_explored already flipped true (each side
+    # reaches "nothing left to do" on its own schedule) - tick's dispatch
+    # only ever calls process_obstacle_queue while !@fully_explored, so
+    # without this, both characters ended up sitting in the idle branch
+    # forever with a real, known block sitting unclaimed in @obstacle_rooms.
+    # Same reopening as resweep_for_missed_obstacles! uses when it finds
+    # something new.
+    if @fully_explored && @obstacle_rooms.any?
+      debug_say "group sync: teammate published obstacle room(s) we hadn't accounted for - resuming obstacle-clearing"
+      @phase = :clearing_obstacles
+      @fully_explored = false
+    end
+  rescue StandardError => e
+    debug_say "group sync: merge failed (#{e.class}: #{e.message}) - continuing on local state only this tick"
   end
 end
 
@@ -1954,8 +3239,19 @@ INQUICONUNDRUM_HELP = <<~HELP
      ;inquiconundrum reset            Walk back to the guide, report status,
                                        wait 5 seconds, then re-ask the guide
                                        for its current list of needed pieces
+     ;inquiconundrum blocks           Drop whatever's in progress and focus
+                                       on finding/destroying room blocks
+                                       (vines, wards, walls) until a new
+                                       part turns up, then resume normally
+     ;inquiconundrum return           Drop whatever's in progress and kick
+                                       a different known part home instead.
+                                       "CANNOT OBEY - I don't know where a
+                                       part is!" if nothing is located at
+                                       all, or "CANNOT OBEY - This is the
+                                       only part I know!" if the one just
+                                       dropped is the only located piece
 
-   set/help/status/reset all work even while a run is already active
+   set/help/status/reset/blocks/return all work even while a run is active
    EX: ;inqui set option=state, ;inqui help, ;inqui status, ;inqui reset
 
    Setting options:
@@ -1977,6 +3273,9 @@ INQUICONUNDRUM_HELP = <<~HELP
                      post-ejection room and pause_scripts itself - it never
                      walks back toward the arena on its own; resume with
                      ;unpause inquiconundrum when you're ready to go again.
+                     If grouped, only the group leader walks back - everyone
+                     else "join"s the leader first so they're dragged along,
+                     instead of each character go2-ing back independently.
      surrendermania When the guide says you've passed the threshold for
                      winning a prize if you surrender (even though the
                      contest isn't concluded), surrender twice and treat
@@ -2007,7 +3306,17 @@ INQUICONUNDRUM_HELP = <<~HELP
 
    Vines and thornbound wards are destroyed to reveal sealed off a rooms with needed parts.
 
-   Combat is left to you, and only ever comes up when moving a part home. 
+   If another player is found in the same room as a part being pushed, it's
+   assumed claimed by them - the script abandons it and moves on to another
+   part, exploration, or obstacle clearing instead of racing them for it.
+
+   If you're grouped with another character also running this script, they
+   automatically share discovered rooms, parts, and obstacles with each
+   other (no setup needed) - whoever finds something first benefits both,
+   and a part/obstacle one of you is actively working is skipped by the
+   other instead of being duplicated.
+
+   Combat is left to you, and only ever comes up when moving a part home.
    The only time it pauses is when a kick is rejected as "too dangerous" 
    while pushing a found piece home. Kill whatever's blocking
    the kick, then resume with ;u.
@@ -2049,6 +3358,13 @@ end
 
 InquiConundrum.install_listener
 InquiConundrum.install_upstream_hook
+
+# One-shot, ~3s-bounded - satisfies Group.members' own maybe_check so
+# group_sync_enabled? never has to trigger a blocking re-check mid-tick
+# later. Group::Observer keeps the roster live off game output afterward.
+Group.check rescue nil
+
+InquiConundrum.check_database_health
 
 before_dying do
   InquiConundrum.remove_listener
