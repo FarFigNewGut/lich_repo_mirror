@@ -15,7 +15,7 @@ List the enhancive benefits of your items right next to their name!
 The following inputs are available:
   ;isharpie tag <noun> ["<note>"] [SN "<silent>"] [color ...]  - tag item in hand
   ;isharpie color <name>                 - set color on last tagged item
-  ;isharpie remove <noun>                - remove note from item in hand
+  ;isharpie delete <noun>                - remove note from item in hand (or ;isharpie d <noun>)
   ;isharpie list                         - list all stored notes
   ;isharpie colors                       - list valid color names
   ;isharpie help                         - command list
@@ -24,7 +24,7 @@ The following inputs are available:
       Other scripts: Combatical, Merchantical, Loresang, VolnRestore2
       game: gs
       tags: items, inventory, notes, highlight, Sharpie
-      version: 1.3.0
+      version: 1.3.6
       required: Lich > 5.0
 
       \\Version\\
@@ -38,11 +38,14 @@ The following inputs are available:
       1.1.0 07/02/2026 - startup Container search, silent mode added
       1.2.0 08/05/2026 - recall-based tagging with configurable loud/silent/both note modes
       1.3.0 08/07/2026 - Added mac compatibility
+      1.3.1 08/08/2026 - fixed enchantment and ensorcelment parsing
+      1.3.5 08/08/2026 - recall capture no longer uses reget - fixes tagged lines silently dropped from recall text
+      1.3.6 08/08/2026 - sorcery now read from sanctify count instead of a dead "sorcery" keyword match; enchant/sorcery/ensorcel always render as one +XX/SX/EX group
 
 =end
 
 module ISharpie
-  VERSION = '1.3.0'.freeze
+  VERSION = '1.3.6'.freeze
 
   VALID_COLORS = %w[orange teal green yellow none].freeze
   DEFAULT_RECALL_MODE = 'loud'.freeze
@@ -99,6 +102,7 @@ module ISharpie
   ANNOTATOR_HOOK_ID          = 'isharpie_annotator'.freeze
   CONTAINER_TRACKER_HOOK_ID  = 'isharpie_container_tracker'.freeze
   UPSTREAM_HOOK_ID           = 'isharpie_upstream'.freeze
+  RECALL_CAPTURE_HOOK_ID     = 'isharpie_recall_capture'.freeze
   # $lich_char_regex (','|';') because Lich uses ',' as the script-trigger
   # character on the Genie frontend (the mac-compatible client) instead of
   # ';' - hardcoding ';' here left Genie/mac players unable to reach this
@@ -633,10 +637,10 @@ module ISharpie
       set_recall_mode($1)
     when /^color\s+(\w+)$/i
       set_color($1)
-    when /^remove\s+(\S+)$/i
+    when /^(?:delete|d)\s+(\S+)$/i
       remove_by_token($1)
-    when /^remove$/i
-      say "usage: remove <noun>  e.g.  remove hatchet"
+    when /^(?:delete|d)$/i
+      say "usage: delete <noun>  e.g.  delete hatchet"
     when /^silent$/i
       toggle_inventory_only
     else
@@ -687,12 +691,27 @@ module ISharpie
     tag_item(item, note_text, nil, silent_note)
   end
 
+  # Captures via a temporary DownstreamHook rather than reget - reget scrapes
+  # the shared server buffer (vulnerable to unrelated lines crowding out the
+  # response in the capture window) and, worse, its XML cleanup deletes the
+  # full text content between certain tag pairs (compDef/component/spell/etc),
+  # not just the tags - GS wraps some in-line stat callouts (exactly the kind
+  # of enchant/ensorcel bonus lines recall produces) in those same tags, so
+  # reget silently threw the sentence away along with the tag. A hook sees
+  # the raw line before any of that, so we strip tags ourselves (keeping the
+  # inner text) instead.
   def self.fetch_recall_text(noun)
     target = noun.to_s.strip.empty? ? 'item' : noun.to_s.strip
-    fput "recall #{target}"
-    waitrt?
-    pause 0.8
-    Array(reget(40, /.*/) || []).join("\n")
+    captured = []
+    DownstreamHook.add(RECALL_CAPTURE_HOOK_ID, proc { |line| captured << line; line })
+    begin
+      fput "recall #{target}"
+      waitrt?
+      pause 0.8
+    ensure
+      DownstreamHook.remove(RECALL_CAPTURE_HOOK_ID)
+    end
+    captured.join("\n").gsub(/<[^>]+>/, '')
   end
 
   def self.recall_note_parts(summary)
@@ -871,15 +890,39 @@ module ISharpie
     content = text.to_s.gsub(/\e\[[0-9;]*m/, '').gsub(/\s+/, ' ').strip
     return '' if content.empty?
 
-    enchant = content[/\b(?:enchant(?:ment)?)(?:\s+of)?\s*\+?(\d+)/i, 1]
-    sorcery = content[/\b(?:sorcery)(?:\s+of)?\s*\+?(\d+)/i, 1]
-    sorcery = '6' if sorcery.nil? && content =~ /holy fire/i
-    ensorcel = content[/\b(?:ensorcel(?:ment)?)(?:\s+of)?\s*\+?(\d+)/i, 1]
+    # "imparts a bonus of +N" is the actual current-value phrasing GS4 uses
+    # for weapon/armor enchant bonuses - the word "enchant" itself only shows
+    # up elsewhere in the recall text on the crafter-credit line ("was last
+    # enchanted by <name>") and the max-cap line ("may be enchanted up to a
+    # bonus of N"), neither of which is the current bonus. Falls back to the
+    # old enchant-word pattern for item types phrased differently.
+    enchant = content[/\bimparts a bonus of \+?(\d+)/i, 1] ||
+              content[/\b(?:enchant(?:ed|ment)?)(?:\s+of)?\s*\+?(\d+)/i, 1]
+    # GS4 recall never actually says "sorcery" - it reports the sanctify
+    # count as "It has been sanctified N times.", the direct parallel to
+    # "It has been ensorcelled N times." below. Permanent Holy Fire flares
+    # take priority over that count when present: Holy Fire is a tier-6-only
+    # flare, a more reliable signal of the true sorcery level than a
+    # "times" count that can lag behind (confirmed against a real item:
+    # "sanctified 5 times" + Holy Fire flares is actually sorcery 6).
+    sorcery = if content =~ /holy fire/i
+                '6'
+              else
+                content[/\bsanctified\s+(\d+)\s+times?/i, 1] ||
+                content[/\b(?:sorcery)(?:\s+of)?\s*\+?(\d+)/i, 1]
+              end
+    ensorcel = content[/\b(?:ensorcel(?:led|ment)?)(?:\s+of)?\s*\+?(\d+)/i, 1]
+
+    # Enchant/sorcery/ensorcel render as one slash-joined group (e.g.
+    # "+35/S5/E5", or "+35/E5" when there's no sanctify) - everything else
+    # stays space-separated.
+    core = []
+    core << "+#{enchant}" if enchant
+    core << "S#{sorcery}" if sorcery
+    core << "E#{ensorcel}" if ensorcel
 
     parts = []
-    parts << "+#{enchant}" if enchant
-    parts << "S#{sorcery}" if sorcery
-    parts << "E#{ensorcel}" if ensorcel
+    parts << core.join('/') unless core.empty?
 
     cer_tags = extract_cer_tags(content)
     parts << "CER:#{cer_tags}" if cer_tags && !cer_tags.empty?
@@ -994,7 +1037,7 @@ module ISharpie
     else
       @last_ambiguous_list = candidates
       listing = candidates.each_with_index.map { |c, i| "#{i + 1}) #{c[:note]}" }.join(', ')
-      say "multiple notes match #{long_name} - #{listing} - then ';isharpie remove <n>'"
+      say "multiple notes match #{long_name} - #{listing} - then ';isharpie delete <n>'"
     end
   end
 
@@ -1072,7 +1115,7 @@ module ISharpie
     _respond "  #{w.call(';isharpie tag <noun> SN "<note>"')}  silent note - shows in list only, no inline tag"
     _respond "  #{w.call(';isharpie recall <noun>')}  recall item and automatically add summary notes based off toggle logic below"
     _respond "  #{w.call(';isharpie color <name>')}  update color on last tagged"
-    _respond "  #{w.call(';isharpie remove <noun>')}  remove note from item in hand"
+    _respond "  #{w.call(';isharpie delete <noun>')}  remove note from item in hand (or ;isharpie d <noun>)"
     _respond "  #{w.call(';isharpie list')}  list all stored notes"
     _respond ''
     _respond b.call('  -- Toggles --')
