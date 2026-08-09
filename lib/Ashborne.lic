@@ -5,7 +5,7 @@ Please adhere to POLICY 18 & 19.
 Owner and maintainer: NecroDeus
 author: NecroDeus
 game: Gemstone
-version: 0.4.0-rc50
+version: 0.4.0-rc52
 tags: hunting, combat, group, gui, utility, automation
 required: Lich >= 5.17.1
 
@@ -13,7 +13,15 @@ Ashborne is a mixed-class solo and group hunting coordinator with per-character
 combat styles, safety checks, loot rotation, town services, and repeat hunts.
 Requires intel_ashborne.lic. Group mode also requires Borg, Drone, and Queen.
 
-Recent updates (0.4.0-rc50 - 2026-08-06):
+Recent updates (0.4.0-rc52 - 2026-08-08):
+- Combat now stays locked on a living target between attack rounds instead of
+  bouncing through movement mode and issuing a redundant TARGET command.
+- Ordinary arrivals no longer steal focus from the creature already being
+  attacked; forced, bounty, and severity-one targets can still take priority.
+- Clerics and Empaths can optionally cast Bind (214) before using melee weapon
+  styles against undead, with bounded retries and per-target success tracking.
+- The Bind Then Kill flag is available in the GUI Combat page and through
+  ;ashborne setup change bindkill 0|1. It is off by default.
 - Repeat-hunt town travel now detects and clears a paused go2 automatically,
   preventing the queue from waiting forever for a manual ;unpause.
 - Leader and follower town-service travel now share the guarded go2 watcher,
@@ -68,7 +76,7 @@ begin
 rescue
   nil
 end
-ashborne_version = "0.4.0-rc50"
+ashborne_version = "0.4.0-rc51"
 ashborne_last_update = "8/6/2026"
 # Hide Command Inputs
 silence_me
@@ -157,6 +165,7 @@ ashborne_setting_combat_cleanup		= Settings[Char.name]['ashborne_setting_combat_
 ashborne_setting_turbo_crowd_control	= Settings[Char.name]['ashborne_setting_turbo_crowd_control'] || "0"
 ashborne_setting_crowd_control		= Settings[Char.name]['ashborne_setting_crowd_control'] || "0"
 ashborne_setting_huntpro_spell_baseline	= Settings[Char.name]['ashborne_setting_huntpro_spell_baseline'] || "1"
+ashborne_setting_bind_then_kill		= Settings[Char.name]['ashborne_setting_bind_then_kill'] || "0"
 ashborne_setting_no_crowd_control	= Settings[Char.name]['ashborne_setting_no_crowd_control'] || "0"
 
 # Migrate the original loot-rotation defaults, which were outside Lich's normal 0-100 encumbrance meter.
@@ -3106,6 +3115,7 @@ module Ashborne_toolkit
     respond ";ashborne doctor               Installation and configuration check"
     respond ";ashborne setup preflight      Group safety and readiness report"
     respond ";ashborne setup change huntprocasting 0|1   Toggle the complete HuntPro caster cycle (default: 1)"
+    respond ";ashborne setup change bindkill 0|1         Bind undead before Cleric/Empath melee attacks (default: 0)"
     respond ";ashborne plan                 Show elected group jobs"
     respond ";ashborne bounty               Read your current Adventurer's Guild bounty and hunt it"
     respond ";ashborne support              Write a compact diagnostic report"
@@ -3397,6 +3407,22 @@ module Ashborne_toolkit
       return nil
     end
 
+    previous_target_id = begin
+      xml_target_id = XMLData.current_target_id.to_s
+      if xml_target_id.empty? || xml_target_id == "0"
+        $ashborne_id_placeholder.to_s
+      else
+        xml_target_id
+      end
+    rescue
+      $ashborne_id_placeholder.to_s
+    end
+    previous_target = GameObj.targets.find do |creature|
+      creature.id.to_s == previous_target_id &&
+        creature.status.to_s !~ /dead|gone/i &&
+        !Ashborne_toolkit.environmental_hazard_target?(creature)
+    end
+
     $ashborne_current_target = nil
     $ashborne_id_placeholder = nil
     $ashborne_name_placeholder = nil
@@ -3523,7 +3549,24 @@ module Ashborne_toolkit
       if $ashborne_recent_eviction == "1"
         nil
       else
-        if $ashborne_creature_id_sev_1_attack.length >= 1
+        forced_target = $ashborne_force_target.to_s
+        bounty_target = $ashborne_bounty_creature_name.to_s
+        previous_names = if previous_target
+                           [previous_target.id, previous_target.name, previous_target.noun].compact.map { |value| value.to_s.downcase }
+                         else
+                           []
+                         end
+        forced_target_matches = forced_target == "0" || previous_names.any? { |value| value.include?(forced_target.downcase) }
+        bounty_target_matches = $ashborne_bounty_lite == "1" || bounty_target == "0" ||
+          previous_names.any? { |value| value.include?(bounty_target.downcase) }
+        severity_target_matches = $ashborne_creature_id_sev_1_attack.empty? ||
+          $ashborne_creature_id_sev_1_attack.map(&:to_s).include?(previous_target_id)
+
+        if previous_target && forced_target_matches && bounty_target_matches && severity_target_matches
+          $ashborne_current_target = previous_target.name
+          $ashborne_id_placeholder = previous_target.id
+          $ashborne_name_placeholder = previous_target.name
+        elsif $ashborne_creature_id_sev_1_attack.length >= 1
           # respond "Debug Output - Sev 1."
           if $ashborne_force_target != "0"
             fput "target #{$ashborne_creature_id_sev_1_attack[0]}"
@@ -6789,6 +6832,8 @@ module Ashborne_toolkit
     noise_lockdown = Ashborne_toolkit.noise_lockdown?
     Ashborne_toolkit.maintain_noise_lockdown if noise_lockdown
 
+    return if !noise_lockdown && Ashborne_toolkit.bind_undead_before_weapon_attack
+
     # Paladin Stamina Recover
     Spell[1607].cast() if !noise_lockdown && Spell[1607].known? && Stats.level >= 7 && Spell[1607].affordable? && percentstamina <= 50 && !Spell.active?("1607")
 
@@ -6950,6 +6995,76 @@ module Ashborne_toolkit
     end
   ensure
     Ashborne_toolkit.movement_guard if $ashborne_group_ai != "0"
+  end
+
+  def bind_then_kill_undead_target?(target)
+    return false if target.nil?
+
+    target_type = target.respond_to?(:type) ? target.type.to_s : ""
+    target_type =~ /undead/i ? true : $ashborne_my_area_type.to_s.casecmp("Undead").zero?
+  rescue
+    $ashborne_my_area_type.to_s.casecmp("Undead").zero?
+  end
+
+  def bind_then_kill_target_bound?(target)
+    return false if target.nil?
+
+    status = target.respond_to?(:status) ? target.status.to_s : ""
+    return true if status =~ /bound|entangled|immobile/i
+
+    target_id = target.id.to_s
+    bound_at = ($ashborne_bind_then_kill_bound_targets || {})[target_id].to_f
+    bound_at > 0 && Time.now.to_f - bound_at < 30.0
+  rescue
+    false
+  end
+
+  def bind_undead_before_weapon_attack
+    return false unless $ashborne_bind_then_kill == "1"
+    return false unless Stats.prof =~ /Cleric|Empath/
+    return false unless $ashborne_my_style.to_s =~ /\A[34]\z/
+    return false unless Spell[214].known? && Spell[214].affordable?
+    return false unless Ashborne_toolkit.ability_allowed?("spell", 214)
+    return false unless Ashborne_toolkit.ensure_fresh_attack_target
+
+    target = GameObj.target
+    return false if target.nil? || target.status.to_s =~ /dead/i
+    return false unless Ashborne_toolkit.bind_then_kill_undead_target?(target)
+
+    target_id = target.id.to_s
+    if $ashborne_bind_then_kill_target_id.to_s != target_id
+      $ashborne_bind_then_kill_target_id = target_id
+      $ashborne_bind_then_kill_attempts = 0
+      $ashborne_bind_then_kill_fallback_noted = false
+    end
+    return false if Ashborne_toolkit.bind_then_kill_target_bound?(target)
+
+    if $ashborne_bind_then_kill_attempts.to_i >= 3
+      unless $ashborne_bind_then_kill_fallback_noted
+        respond "Bind then kill: #{target.name} resisted three attempts; continuing with weapon attacks."
+        $ashborne_bind_then_kill_fallback_noted = true
+      end
+      return false
+    end
+
+    $ashborne_bind_then_kill_attempts = $ashborne_bind_then_kill_attempts.to_i + 1
+    Ashborne_toolkit.waitcast_waitrt
+    Ashborne_toolkit.stance_guarded
+    result = dothistimeout(
+      "incant 214",
+      6,
+      /form is entangled|Warding failed|Warded off|armor prevents the spell|Cast Roundtime|not enough mana|do not know|cannot|can't/i
+    ).to_s
+    waitcastrt? if checkcastrt.to_f > 0
+
+    if result =~ /form is entangled|Warding failed/i || Ashborne_toolkit.bind_then_kill_target_bound?(target)
+      $ashborne_bind_then_kill_bound_targets[target_id] = Time.now.to_f
+      respond "Bind then kill: #{target.name} is controlled; switching to weapon attacks."
+    end
+    true
+  rescue => error
+    respond "Bind then kill warning: #{error.message}" if $ashborne_qc_debug == "1"
+    false
   end
 
   def prep_reset
@@ -8956,6 +9071,9 @@ module Ashborne_toolkit
     elsif $ashborne_action == 99
       nil
 
+    elsif !GameObj.targets.empty?
+      $ashborne_action = 7
+      $ashborne_own_this_room = 1
     else
       $ashborne_action = 0
     end
@@ -16737,6 +16855,11 @@ $ashborne_aim_fail = 0
 $ashborne_turbo_crowd_control = "0"
 $ashborne_crowd_control = "0"
 $ashborne_huntpro_spell_baseline = ashborne_setting_huntpro_spell_baseline.to_s == "0" ? "0" : "1"
+$ashborne_bind_then_kill = "0"
+$ashborne_bind_then_kill_target_id = nil
+$ashborne_bind_then_kill_attempts = 0
+$ashborne_bind_then_kill_bound_targets = {}
+$ashborne_bind_then_kill_fallback_noted = false
 $ashborne_no_crowd_control = "0"
 $ashborne_style9_low_mana_return = "0"
 $ashborne_cman_control = "0"
@@ -24843,6 +24966,12 @@ ashborne_setup = proc {
     respond "Style 9 uses HuntPro's complete default casting cycle, including support and cooldown spells."
   end
 
+  if ashborne_setting_bind_then_kill.to_s == "1"
+    respond "Bind then kill is enabled: Cleric/Empath melee styles attempt Bind (214) against undead before weapon attacks."
+  end
+
+  $ashborne_bind_then_kill = ashborne_setting_bind_then_kill.to_s == "1" ? "1" : "0"
+
   if ashborne_setting_no_crowd_control == "0"
     nil
   else
@@ -25403,6 +25532,7 @@ if script.vars[1].downcase =~ /reset/
   Settings[Char.name]['ashborne_setting_turbo_crowd_control'] = "0"
   Settings[Char.name]['ashborne_setting_crowd_control'] = "0"
   Settings[Char.name]['ashborne_setting_huntpro_spell_baseline'] = "1"
+  Settings[Char.name]['ashborne_setting_bind_then_kill'] = "0"
   Settings[Char.name]['ashborne_setting_no_crowd_control'] = "0"
   Settings[Char.name]['ashborne_setting_no_stun'] = "0"
   Settings[Char.name]['ashborne_setting_no_cock'] = "0"
@@ -25574,6 +25704,8 @@ module AshborneGui
       "Allows appropriate spells and abilities that disable or slow multiple creatures.",
     "ashborne_setting_huntpro_spell_baseline" =>
       "On by default. Style 9 uses HuntPro's complete profession casting cycle before its main attack, including spells such as Earthen Fury (917), Tremors (909), Mana Leech (516), and Chromatic Circle (502) when HuntPro's normal level, mana, training, and cooldown conditions are met. Turn this off only to let Ashborne's custom ability rules filter those spells.",
+    "ashborne_setting_bind_then_kill" =>
+      "Off by default. For Clerics and Empaths using melee style 3 or 4, Ashborne attempts Bind (214) up to three times against each undead target before switching to weapon attacks. Bind must remain enabled on the Abilities & Rules page.",
     "ashborne_setting_cman_control" =>
       "Allows known Combat Maneuvers when Ashborne considers them useful.",
     "ashborne_setting_no_shield_control" =>
@@ -26029,6 +26161,7 @@ module AshborneGui
 
       [
         ["ashborne_setting_huntpro_spell_baseline", "Use complete HuntPro casting cycle", false],
+        ["ashborne_setting_bind_then_kill", "Bind undead before melee attacks", false],
         ["ashborne_setting_crowd_control", "Use crowd control", false],
         ["ashborne_setting_cman_control", "Use Combat Maneuvers", false],
         ["ashborne_setting_no_shield_control", "Disable Shield abilities", false],
@@ -27216,6 +27349,11 @@ elsif script.vars[1].downcase =~ /setup/ && script.vars[2].downcase =~ /change/ 
   Settings[Char.name]['ashborne_setting_anti_caster'] = script.vars[4].to_s == "0" ? "0" : "1"
   Settings.save
   respond "Reactive anti-caster coordination is now #{Settings[Char.name]['ashborne_setting_anti_caster'] == '1' ? 'enabled' : 'disabled'}."
+  exit
+elsif script.vars[1].downcase =~ /setup/ && script.vars[2].downcase =~ /change/ && script.vars[3].downcase =~ /\A(bindkill|bindthenkill)\z/
+  Settings[Char.name]['ashborne_setting_bind_then_kill'] = script.vars[4].to_s == "1" ? "1" : "0"
+  Settings.save
+  respond "Bind then kill is now #{Settings[Char.name]['ashborne_setting_bind_then_kill'] == '1' ? 'enabled' : 'disabled'} for #{Char.name}."
   exit
 elsif script.vars[1].downcase =~ /setup/ && script.vars[2].downcase =~ /change/ && script.vars[3].downcase =~ /antimana|antireserve/
   reserve = script.vars[4].to_s.to_i
