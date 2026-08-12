@@ -5,7 +5,7 @@ Please adhere to POLICY 18 & 19.
 Owner and maintainer: NecroDeus
 author: NecroDeus
 game: Gemstone
-version: 0.4.0-rc60
+version: 0.4.0-rc61
 tags: hunting, combat, group, gui, utility, automation
 required: Lich >= 5.17.1
 
@@ -13,7 +13,15 @@ Ashborne is a mixed-class solo and group hunting coordinator with per-character
 combat styles, safety checks, loot rotation, town services, and repeat hunts.
 Requires intel_ashborne.lic. Group mode also requires Borg, Drone, and Queen.
 
-Recent updates (0.4.0-rc60 - 2026-08-11):
+Recent updates (0.4.0-rc61 - 2026-08-11):
+- Added an optional Mana Conservation casting mode for Wizard, Sorcerer, and
+  Cleric style 9 hunters; the complete HuntPro power cycle remains the default.
+- Mana Conservation suppresses ordinary single-target support stacks, while
+  preserving configured crowd control for fights that meet the minimum count.
+- Wizards use target-aware low-cost bolts plus the saved Mana Leech threshold,
+  Sorcerers favor Mana Disruption (702), and Clerics combine free Ethereal
+  Censer (320) with direct Smite/Bane (302) or qualified Holy Bolt (306).
+- Custom spell rotations still take priority over both automatic caster modes.
 - Performance pass: environmental hazards share one room-object snapshot,
   ability/profile files use bounded caches, and boost/quartz probes are
   throttled instead of running on every hot-loop pass.
@@ -207,6 +215,7 @@ ashborne_setting_combat_cleanup		= Settings[Char.name]['ashborne_setting_combat_
 ashborne_setting_turbo_crowd_control	= Settings[Char.name]['ashborne_setting_turbo_crowd_control'] || "0"
 ashborne_setting_crowd_control		= Settings[Char.name]['ashborne_setting_crowd_control'] || "0"
 ashborne_setting_huntpro_spell_baseline	= Settings[Char.name]['ashborne_setting_huntpro_spell_baseline'] || "1"
+ashborne_setting_mana_efficient		= Settings[Char.name]['ashborne_setting_mana_efficient'] || "0"
 ashborne_setting_bind_then_kill		= Settings[Char.name]['ashborne_setting_bind_then_kill'] || "0"
 ashborne_setting_cleric_bolt_web		= Settings[Char.name]['ashborne_setting_cleric_bolt_web'] || "0"
 ashborne_setting_no_crowd_control	= Settings[Char.name]['ashborne_setting_no_crowd_control'] || "0"
@@ -352,7 +361,7 @@ module Ashborne_toolkit
   CROWD_CONTROL_SPELLS = {
     212 => ["Interference", 3],
     317 => ["Divine Fury", 3],
-    320 => ["Censure", 3],
+    320 => ["Ethereal Censer", 1],
     335 => ["Divine Wrath", 3],
     505 => ["Hand of Tonis", 3],
     516 => ["Mana Leech", 1],
@@ -2088,7 +2097,8 @@ module Ashborne_toolkit
       ashborne_setting_group_additional ashborne_setting_multi_account_tool
       ashborne_setting_health_floor ashborne_setting_mana_reserve ashborne_setting_stamina_reserve
       ashborne_setting_anti_caster ashborne_setting_anti_caster_mana ashborne_setting_noise_lockdown
-      ashborne_setting_huntpro_spell_baseline ashborne_setting_crowd_control ashborne_setting_spell_default
+      ashborne_setting_huntpro_spell_baseline ashborne_setting_mana_efficient
+      ashborne_setting_crowd_control ashborne_setting_spell_default
       ashborne_setting_loot_rotation ashborne_setting_loot_handoff ashborne_setting_loot_emergency
       ashborne_setting_hunt_cycles ashborne_setting_rest_mind ashborne_setting_rest_healing
       ashborne_setting_rest_ask_empath ashborne_setting_rest_sell
@@ -2289,9 +2299,32 @@ module Ashborne_toolkit
   end
 
   def crowd_control_enabled_for_combat?
+    if Ashborne_toolkit.mana_efficient_caster_mode?
+      return false unless Ashborne_toolkit.mana_efficient_crowd_control_needed?
+    end
+
     $ashborne_crowd_control.to_s == "1"
   rescue
     false
+  end
+
+  def mana_efficient_caster_mode?
+    return false unless defined?($ashborne_my_style) && $ashborne_my_style.to_s == "9"
+    return false unless defined?($ashborne_mana_efficient) && $ashborne_mana_efficient.to_s == "1"
+    return false if Ashborne_toolkit.custom_spell_rotation_enabled?
+
+    %w[Wizard Sorcerer Cleric].include?(Stats.prof.to_s)
+  rescue
+    false
+  end
+
+  def mana_efficient_crowd_control_needed?
+    rule = Ashborne_toolkit.load_ability_rules.dig("crowd_control") || {}
+    minimum = rule.fetch("min_targets", 3).to_i
+    minimum = 3 if minimum < 1
+    GameObj.targets.length >= minimum
+  rescue
+    GameObj.targets.length >= 3
   end
 
   def custom_spell_rotation_enabled?
@@ -3194,6 +3227,8 @@ module Ashborne_toolkit
     respond "HuntPlan catalog aliases use hp_creature_name, such as hp_krag_dweller or hp_three_toed_tegu."
     respond "Style 3 covers one weapon, two weapons, two-handed weapons, and weapon plus shield."
     respond "Style 9 uses HuntPro's complete default casting cycle, including its support and cooldown spells."
+    respond "Optional Mana Conservation replaces that power cycle with lean Wizard, Sorcerer, or Cleric attacks."
+    respond "Enable it in ;ashborne gui or with ;ashborne setup change manaefficient 1."
     respond "Leave the custom spell rotation at 0 unless you deliberately want to replace HuntPro's normal attack choice."
     respond
     respond "GROUP MODE REQUIREMENTS"
@@ -3235,6 +3270,7 @@ module Ashborne_toolkit
     respond ";ashborne doctor               Installation and configuration check"
     respond ";ashborne setup preflight      Group safety and readiness report"
     respond ";ashborne setup change huntprocasting 0|1   Toggle the complete HuntPro caster cycle (default: 1)"
+    respond ";ashborne setup change manaefficient 0|1    Toggle lean caster attacks (default: 0)"
     respond ";ashborne setup change bindkill 0|1         Bind undead before Cleric/Empath melee attacks (default: 0)"
     respond ";ashborne setup change clericboltweb 0|1    Cleric: 306 vs undead, 118 EVOKE vs living (default: 0)"
     respond ";ashborne plan                 Show elected group jobs"
@@ -7111,13 +7147,18 @@ module Ashborne_toolkit
       if $ashborne_combat_wands == "0"
         Ashborne_toolkit.stance_guarded
         Ashborne_toolkit.prep_reset
-        Ashborne_toolkit.select_custom_spell_rotation unless Ashborne_toolkit.huntpro_spell_attack_cycle?
-        Ashborne_toolkit.spell_choice
-        Ashborne_toolkit.stand_check
-        if Ashborne_toolkit.huntpro_spell_attack_cycle?
-          Ashborne_toolkit.spell_cast
+        if Ashborne_toolkit.mana_efficient_caster_mode?
+          Ashborne_toolkit.stand_check
+          Ashborne_toolkit.mana_efficient_spell_round
         else
-          Ashborne_toolkit.style9_spell_cast
+          Ashborne_toolkit.select_custom_spell_rotation unless Ashborne_toolkit.huntpro_spell_attack_cycle?
+          Ashborne_toolkit.spell_choice
+          Ashborne_toolkit.stand_check
+          if Ashborne_toolkit.huntpro_spell_attack_cycle?
+            Ashborne_toolkit.spell_cast
+          else
+            Ashborne_toolkit.style9_spell_cast
+          end
         end
         Ashborne_toolkit.stance_guarded
         Ashborne_toolkit.loot_script("#{$ashborne_loot_script}") unless $ashborne_my_area =~ /group|follow|qfollow/
@@ -8164,7 +8205,8 @@ module Ashborne_toolkit
       state = { target: target_key, attempts: 0, next_at: 0.0 }
       $ashborne_wizard_mana_leech_state = state
     end
-    state[:attempts].to_i < 2 && Time.now.to_f >= state[:next_at].to_f
+    attempt_limit = Ashborne_toolkit.mana_efficient_caster_mode? ? 1 : 2
+    state[:attempts].to_i < attempt_limit && Time.now.to_f >= state[:next_at].to_f
   rescue
     false
   end
@@ -8198,6 +8240,168 @@ module Ashborne_toolkit
 
     Spell[spell_number].known? && Spell[spell_number].affordable?
   rescue
+    false
+  end
+
+  def mana_efficient_spell_allowed?(spell_number, ignore_minimum = false)
+    rule = Ashborne_toolkit.load_ability_rules.dig("abilities", "spell:#{spell_number}")
+    if ignore_minimum && rule.is_a?(Hash)
+      rule = rule.dup
+      rule["min_targets"] = 0
+    end
+    rule.nil? || Ashborne_toolkit.rule_matches_room?(rule)
+  rescue
+    true
+  end
+
+  def mana_efficient_spell_ready?(spell_number, minimum_mana = nil, ignore_minimum = false)
+    Ashborne_toolkit.mana_efficient_spell_allowed?(spell_number, ignore_minimum) &&
+      Ashborne_toolkit.caster_spell_ready?(spell_number, minimum_mana)
+  rescue
+    false
+  end
+
+  def mana_efficient_mana_reserve
+    [[(defined?($ashborne_mana_reserve) ? $ashborne_mana_reserve : 40).to_i, 0].max, 95].min
+  rescue
+    40
+  end
+
+  def mana_efficient_wizard_spell_choice
+    target_name = Ashborne_toolkit.wizard_target_name
+    low_mana = percentmana.to_i <= Ashborne_toolkit.mana_efficient_mana_reserve
+    cold_target = target_name.match?(/(?:ice|icy|frost|frozen|snow|rime|cold|glacier)/)
+    fire_target = target_name.match?(/(?:fire|flame|ember|lava|magma|inferno)/)
+    undead_target = Ashborne_toolkit.bind_then_kill_undead_target?(GameObj.target)
+
+    if cold_target && Skills.elfire.to_i >= 20 && Spell[903].known? &&
+        Ashborne_toolkit.mana_efficient_spell_allowed?(1707) && Spell[1707].affordable? && checkmana.to_i >= 6
+      return 1707
+    end
+    return 906 if cold_target && Ashborne_toolkit.mana_efficient_spell_ready?(906, 6)
+    return 906 if undead_target && !low_mana && Ashborne_toolkit.mana_efficient_spell_ready?(906, 6)
+    return 903 if fire_target && Ashborne_toolkit.mana_efficient_spell_ready?(903, 3)
+    return 903 if low_mana && Ashborne_toolkit.mana_efficient_spell_ready?(903, 3)
+    return 904 if Ashborne_toolkit.mana_efficient_spell_ready?(904, 4)
+    return 903 if Ashborne_toolkit.mana_efficient_spell_ready?(903, 3)
+    return 901 if Ashborne_toolkit.mana_efficient_spell_ready?(901, 1)
+
+    nil
+  rescue
+    nil
+  end
+
+  def mana_efficient_cleric_spell_choice
+    undead_target = Ashborne_toolkit.bind_then_kill_undead_target?(GameObj.target)
+    bolt_trained = Skills.spellaiming.to_i / 2 - 1 >= Stats.level.to_i
+    above_reserve = percentmana.to_i > Ashborne_toolkit.mana_efficient_mana_reserve
+
+    if undead_target && bolt_trained && above_reserve && $ashborne_disable_306.to_s == "0" &&
+        Ashborne_toolkit.mana_efficient_spell_ready?(306, 6)
+      return 306
+    end
+    return 302 if Ashborne_toolkit.mana_efficient_spell_ready?(302, 4)
+    return 306 if undead_target && $ashborne_disable_306.to_s == "0" &&
+      Ashborne_toolkit.mana_efficient_spell_ready?(306, 6)
+
+    nil
+  rescue
+    nil
+  end
+
+  def mana_efficient_sorcerer_spell_choice
+    return 702 if Ashborne_toolkit.mana_efficient_spell_ready?(702, 2)
+    return 705 if Ashborne_toolkit.mana_efficient_spell_ready?(705, 5)
+    return 711 if Ashborne_toolkit.mana_efficient_spell_ready?(711, 11)
+
+    nil
+  rescue
+    nil
+  end
+
+  def mana_efficient_spell_choice
+    case Stats.prof.to_s
+    when "Wizard"
+      Ashborne_toolkit.mana_efficient_wizard_spell_choice
+    when "Cleric"
+      Ashborne_toolkit.mana_efficient_cleric_spell_choice
+    when "Sorcerer"
+      Ashborne_toolkit.mana_efficient_sorcerer_spell_choice
+    end
+  rescue
+    nil
+  end
+
+  def mana_efficient_cleric_censer
+    return false unless Stats.prof.to_s == "Cleric"
+    return false unless Ashborne_toolkit.mana_efficient_spell_ready?(320, 0, true)
+    return false if Spell.active?("399")
+    return false if Time.now.to_f - $ashborne_mana_efficient_censer_at.to_f < 30.0
+
+    Ashborne_toolkit.waitcast_waitrt
+    Spell[320].cast()
+    $ashborne_mana_efficient_censer_at = Time.now.to_f
+    Ashborne_toolkit.waitcast_waitrt
+    true
+  rescue
+    false
+  end
+
+  def set_mana_efficient_primary_spell(spell_number)
+    case Stats.prof.to_s
+    when "Wizard"
+      $ashborne_wizard_primary_spell = spell_number
+    when "Cleric"
+      $ashborne_cleric_primary_spell = spell_number
+    when "Sorcerer"
+      $ashborne_sorcerer_primary_spell = spell_number
+    end
+    spell_number
+  end
+
+  def mana_efficient_wizard_cast(spell_number)
+    Ashborne_toolkit.stance_offensive
+    if spell_number.to_i == 1707
+      fput "incant 903 evoke"
+    else
+      fput "incant #{spell_number.to_i}"
+    end
+    Ashborne_toolkit.waitcast_waitrt
+    Ashborne_toolkit.true_stance_guarded
+    $ashborne_wizard_primary_spell = 1700
+    true
+  rescue
+    false
+  end
+
+  def mana_efficient_spell_round
+    if Stats.prof.to_s == "Wizard" && Ashborne_toolkit.mana_efficient_spell_allowed?(516) &&
+        Ashborne_toolkit.wizard_mana_leech_due?
+      Ashborne_toolkit.waitcast_waitrt
+      Spell[516].cast()
+      Ashborne_toolkit.record_wizard_mana_leech_attempt
+      return true
+    end
+
+    Ashborne_toolkit.mana_efficient_cleric_censer
+    spell_number = Ashborne_toolkit.mana_efficient_spell_choice
+    if spell_number.nil?
+      respond "Mana Conservation has no affordable direct attack; returning to recover mana."
+      $ashborne_action = 99
+      return false
+    end
+
+    Ashborne_toolkit.set_mana_efficient_primary_spell(spell_number)
+    Ashborne_toolkit.waitcast_waitrt
+    if Stats.prof.to_s == "Wizard"
+      return Ashborne_toolkit.mana_efficient_wizard_cast(spell_number)
+    end
+
+    Ashborne_toolkit.spell_cast
+    true
+  rescue => error
+    Ashborne_toolkit.record_runtime_error("mana-efficient-casting", error) if Ashborne_toolkit.respond_to?(:record_runtime_error)
+    $ashborne_action = 99
     false
   end
 
@@ -17279,6 +17483,8 @@ $ashborne_aim_fail = 0
 $ashborne_turbo_crowd_control = "0"
 $ashborne_crowd_control = "0"
 $ashborne_huntpro_spell_baseline = ashborne_setting_huntpro_spell_baseline.to_s == "0" ? "0" : "1"
+$ashborne_mana_efficient = "0"
+$ashborne_mana_efficient_censer_at = 0.0
 $ashborne_bind_then_kill = "0"
 $ashborne_cleric_bolt_web = ashborne_setting_cleric_bolt_web.to_s == "1" ? "1" : "0"
 $ashborne_bind_then_kill_target_id = nil
@@ -20105,6 +20311,7 @@ ashborne_load_settings = proc {
 
   $ashborne_spell_learning = ashborne_setting_spell_learning.to_s == "1" ? "1" : "0"
   $ashborne_mana_leech_percent = [[ashborne_setting_mana_leech_percent.to_i, 1].max, 100].min
+  $ashborne_mana_efficient = ashborne_setting_mana_efficient.to_s == "1" ? "1" : "0"
 
   if Stats.prof =~ /Wizard/ && Stats.level >= 50 && Skills.spellaiming < 1
     $ashborne_immolate = "1"
@@ -25418,7 +25625,10 @@ ashborne_setup = proc {
     respond "You will use crowd control options during combat."
   end
 
-  if ashborne_setting_huntpro_spell_baseline.to_s != "0"
+  if ashborne_setting_mana_efficient.to_s == "1"
+    respond "Mana Conservation casting is enabled for Wizard, Sorcerer, and Cleric style 9 combat."
+    respond "Single targets use lean direct attacks; configured crowd control still runs at its minimum creature count."
+  elsif ashborne_setting_huntpro_spell_baseline.to_s != "0"
     respond "Style 9 uses HuntPro's complete default casting cycle, including support and cooldown spells."
   end
 
@@ -25640,10 +25850,16 @@ ashborne_setup = proc {
 
   if ashborne_setting_spell_learning == "1"
     respond "Optional spell learning is enabled; manual casts may become evidence-based Wizard choices."
+  elsif ashborne_setting_mana_efficient == "1"
+    respond "Optional spell learning is disabled; caster attacks use Mana Conservation choices."
   else
     respond "Optional spell learning is disabled; caster attacks use the standard HuntPro cycle."
   end
-  respond "Wizards will attempt Mana Leech at or below #{ashborne_setting_mana_leech_percent}% mana."
+  if ashborne_setting_mana_efficient == "1"
+    respond "Mana Conservation Wizards attempt Mana Leech at or below #{ashborne_setting_mana_leech_percent}% mana."
+  else
+    respond "Power-mode Wizards use HuntPro's normal Mana Leech timing."
+  end
 
   if ashborne_setting_timelimit == "0"
     nil
@@ -25961,6 +26177,7 @@ if script.vars[1].downcase =~ /reset/
   Settings[Char.name]['ashborne_setting_immolate']	= "0"
   Settings[Char.name]['ashborne_setting_spell_learning'] = "0"
   Settings[Char.name]['ashborne_setting_mana_leech_percent'] = 60
+  Settings[Char.name]['ashborne_setting_mana_efficient'] = "0"
   Settings[Char.name]['ashborne_setting_timelimit']	= "0"
   Settings[Char.name]['ashborne_setting_taxi']	= "0"
   Settings[Char.name]['ashborne_setting_noquartz']	= "0"
@@ -26107,7 +26324,7 @@ module AshborneGui
   ].freeze
   ABILITY_CATALOG = {
     210 => "Silence", 212 => "Interference", 214 => "Bind",
-    301 => "Prayer of Holding", 317 => "Divine Fury", 320 => "Censure",
+    301 => "Prayer of Holding", 317 => "Divine Fury", 320 => "Ethereal Censer",
     335 => "Divine Wrath", 410 => "Elemental Wave", 505 => "Hand of Tonis",
     516 => "Mana Leech", 603 => "Foraging", 607 => "Sounds",
     609 => "Sun Burst", 610 => "Tangleweed", 611 => "Mass Calm",
@@ -26123,6 +26340,12 @@ module AshborneGui
   TOOLTIPS = {
     "ashborne_setting_mana_leech_percent" =>
       "Wizard only. Ashborne attempts Mana Leech (516) when current mana is at or below this percentage. Default is 60%.",
+    "ashborne_setting_mana_efficient" =>
+      "Off by default. Enables Mana Conservation for Wizard, Sorcerer, and Cleric style 9 combat. " \
+      "Wizards use target-aware low-cost bolts and Mana Leech, Sorcerers favor Mana Disruption (702), " \
+      "and Clerics use free Ethereal Censer (320) plus direct Smite/Bane (302) or qualified Holy Bolt (306).\n\n" \
+      "The complete HuntPro casting cycle remains the power-mode default when this is off. " \
+      "A custom spell rotation takes priority over this switch.",
     "ashborne_setting_style9_arcaneblast" =>
       "Off by default. Allows style 9 to use Arcane Blast (1700) as a low-mana fallback. Even when enabled, Ashborne returns to town immediately at 5% mana or lower.",
     "ashborne_setting_spell_learning" =>
@@ -26627,6 +26850,7 @@ module AshborneGui
 
       [
         ["ashborne_setting_huntpro_spell_baseline", "Use complete HuntPro casting cycle", false],
+        ["ashborne_setting_mana_efficient", "Use Mana Conservation casting", false],
         ["ashborne_setting_bind_then_kill", "Bind undead before melee attacks", false],
         ["ashborne_setting_cleric_bolt_web", "Cleric Bolt/Web casting build", false],
         ["ashborne_setting_crowd_control", "Use crowd control", false],
@@ -27938,6 +28162,14 @@ elsif script.vars[1].downcase =~ /setup/ && script.vars[2].downcase =~ /change/ 
   Settings[Char.name]['ashborne_setting_huntpro_spell_baseline'] = enabled
   Settings.save
   respond "Complete HuntPro casting cycle #{enabled == '1' ? 'enabled' : 'disabled'}."
+  exit
+
+elsif script.vars[1].downcase =~ /setup/ && script.vars[2].downcase =~ /change/ && script.vars[3].downcase =~ /\A(manaefficient|manaconservation|conservemana)\z/
+  enabled = script.vars[4].to_s == "1" ? "1" : "0"
+  Settings[Char.name]['ashborne_setting_mana_efficient'] = enabled
+  Settings.save
+  respond "Mana Conservation casting #{enabled == '1' ? 'enabled' : 'disabled'}."
+  respond "Custom spell rotations take priority when configured." if enabled == "1"
   exit
 
 elsif script.vars[1].downcase =~ /setup/ && script.vars[2].downcase =~ /change/ && script.vars[3].downcase =~ /nocrowd/
