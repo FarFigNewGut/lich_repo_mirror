@@ -4,6 +4,8 @@
   Item type-specific highlighting using GameObj data with universal link coloring functionality.
   Replaces linktothefast with comprehensive link color management and type-specific overrides.
   Shared configuration with other scripts via UserVars.
+  Frontend-aware: XML preset tags on Wrayth/Stormfront, GSL highlight codes on Wizard/Avalon.
+  Per-frontend config: commands edit the XML or GSL side matching the active frontend.
 
   Examples:
     ;high_type                     - Show current configuration
@@ -14,6 +16,22 @@
     ;high_type help                - Show comprehensive help
 
   Revision History:
+    v2.12.1 - 2026-08-12 - Multi-line output (showconfig, colors, help, debug) now emits as single
+                           atomic blocks via respond/_respond array form - one header, no per-line
+                           [high_type:] prefixes; color samples inline with their labels
+    v2.12.0 - 2026-08-12 - Per-frontend configuration: XML side (types_to_color) and GSL side
+                           (types_to_color_gsl) edited automatically per active FE; GSL side seeded
+                           from XML defaults filtered to GSL-renderable colors; side-aware validation
+                           and colors/showconfig; fixed [unknownscript] attribution on runtime
+                           commands (hook thread has no Script.current - output now self-identifies)
+    v2.11.0 - 2026-08-12 - Frontend awareness: GSL mode for Wizard/Avalon emits raw highlight bytes
+                           (link/selectedlink -> \207, speech -> \212, bold -> GSL codes); colors with
+                           no GSL equivalent (thought, whisper) are not applied; replaced dead
+                           $fake_stormfront check with Frontend.supports_gsl?
+                           (v2.6.0-v2.10.0 skipped - burned by the rolled-back NPC coloring line)
+    v2.5.1 - 2026-08-12 - Fixed startup ordering crashes (reset/debug/first-run), version display drift,
+                          color_all_links persistence; added color validation to add; deduplicated
+                          startup/runtime code; fixed nested presets in character coloring; exact type matching
     v2.5.0 - 2025-09-20 - Added character default color feature (setcharcolor/clearcharcolor commands)
     v2.4.1 - 2025-09-20 - Internal refactoring
     v2.4.0 - 2025-09-20 - Added showconfig, remove commands and HT alias for runtime processing
@@ -33,16 +51,102 @@
             game: GS
             tags: highlighting, colors, links, item_types
         required: Lich >= 4.6
-         version: 2.5.0
+         version: 2.12.1
 =end
 script.want_downstream_xml = true
 script.want_downstream = false
 
+# Single source of truth for version - interpolated into all version-bearing messages
+@version = '2.12.1'
+@script_name = script.name
+
 #------------------------------------------------------------------------------#
-# Format detection for different front-ends
+# Frontend detection
 #------------------------------------------------------------------------------#
-@monsterbold_start = $fake_stormfront ? "\034GSL\r\n " : "<pushBold\/>"
-@monsterbold_end   = $fake_stormfront ? "\034GSM\r\n " : "<popBold\/>"
+# GSL front-ends (Wizard/Avalon) cannot render XML preset tags - sf_to_wiz strips
+# all tags before sending to the client. They render inline highlight bytes instead.
+@gsl_mode = Frontend.supports_gsl?
+
+@monsterbold_start = @gsl_mode ? "\034GSL\r\n " : "<pushBold\/>"
+@monsterbold_end   = @gsl_mode ? "\034GSM\r\n " : "<popBold\/>"
+
+# All color names (XML side); the GSL side accepts the subset gsl_color_codes can map
+@valid_colors = %w[speech whisper thought link selectedlink bold monsterbold]
+
+#------------------------------------------------------------------------------#
+# Output helper
+#------------------------------------------------------------------------------#
+# Runtime commands execute inside the UpstreamHook proc on Lich's client thread,
+# where Script.current is nil - echo there prints [unknownscript: ...]. All output
+# reachable from the hook path self-identifies via _respond instead.
+def self.ht_echo(msg = '')
+  _respond "[#{@script_name}: #{msg}]"
+end
+
+# Emit a multi-line report as ONE atomic block (respond/_respond accept arrays and
+# send all lines in a single client write - no per-line prefixes, no interleaving).
+# raw=true uses _respond so embedded color markup/bytes render instead of escaping.
+def self.ht_block(lines, raw = false)
+  raw ? _respond(lines) : respond(lines)
+end
+
+#------------------------------------------------------------------------------#
+# GSL color mapping (Wizard/Avalon)
+#------------------------------------------------------------------------------#
+# Returns [start_code, end_code] for colors the GSL protocol can render, or nil
+# for colors with no GSL equivalent (per design: unmappable colors are NOT set).
+# The highlight byte globals are populated by Lich core for the wizard FE.
+def self.gsl_color_codes(color_type)
+  case color_type.to_s.downcase
+  when "monsterbold", "bold"
+    [@monsterbold_start, @monsterbold_end]
+  when "link", "selectedlink", "selected"
+    [$link_highlight_start.to_s, $link_highlight_end.to_s]
+  when "speech"
+    [$speech_highlight_start.to_s, $speech_highlight_end.to_s]
+  else
+    nil  # thought, whisper, unknown: no GSL equivalent
+  end
+end
+
+#------------------------------------------------------------------------------#
+# Per-frontend configuration sides
+#------------------------------------------------------------------------------#
+# XML side: UserVars.types_to_color / character_default_color (shared with htsorter)
+# GSL side: UserVars.types_to_color_gsl / character_default_color_gsl
+# Commands automatically edit the side matching the active frontend.
+def self.active_side
+  @gsl_mode ? 'GSL' : 'XML'
+end
+
+def self.active_types
+  @gsl_mode ? UserVars.types_to_color_gsl : UserVars.types_to_color
+end
+
+def self.set_active_types(hash)
+  if @gsl_mode
+    UserVars.types_to_color_gsl = hash
+  else
+    UserVars.types_to_color = hash
+  end
+end
+
+def self.active_char_color
+  @gsl_mode ? UserVars.character_default_color_gsl : UserVars.character_default_color
+end
+
+def self.set_active_char_color(color)
+  if @gsl_mode
+    UserVars.character_default_color_gsl = color
+  else
+    UserVars.character_default_color = color
+  end
+end
+
+# Colors valid for the active side (GSL side only accepts renderable colors)
+def self.active_valid_colors
+  @gsl_mode ? @valid_colors.select { |c| !self.gsl_color_codes(c).nil? } : @valid_colors
+end
 
 #------------------------------------------------------------------------------#
 # Color functions (unified from FSP)
@@ -54,6 +158,12 @@ end
 def self.color(msg, color_type, skip_encoding=false)
   # If msg already contains XML tags (like <a> tags), don't encode
   encoded_msg = skip_encoding || msg.include?('<a ') ? msg : self.xml_encode(msg)
+
+  if @gsl_mode
+    codes = self.gsl_color_codes(color_type)
+    return encoded_msg if codes.nil? || codes[0].empty?
+    return "#{codes[0]}#{encoded_msg}#{codes[1]}"
+  end
 
   case color_type.downcase
   when "monsterbold"
@@ -71,8 +181,8 @@ def self.color(msg, color_type, skip_encoding=false)
   when "bold"
     return "<preset id=\"bold\">#{encoded_msg}</preset>"
   else
-    echo "Unknown color type: #{color_type}. Valid colors:"
-    echo "  speech, whisper, thought, link, selectedlink, bold, monsterbold"
+    self.ht_echo "Unknown color type: #{color_type}. Valid colors:"
+    self.ht_echo "  #{@valid_colors.join(', ')}"
     return encoded_msg
   end
 end
@@ -100,30 +210,296 @@ end
 # Configuration display and testing
 #------------------------------------------------------------------------------#
 def self.display_configuration
-  echo "=== High Type Configuration ==="
-  echo "Item types configured for highlighting: #{UserVars.types_to_color.keys.size}"
-  UserVars.types_to_color.each { |type, color|
-    echo "  #{type.ljust(12)} -> #{color}"
+  lines = []
+  lines << "=== High Type v#{@version} Configuration ==="
+  lines << "Frontend: #{Frontend.client} (#{@gsl_mode ? 'GSL' : 'XML preset'} mode) - editing the #{self.active_side} config side"
+  lines << ""
+  lines << "Item types configured for highlighting (#{self.active_side} side): #{self.active_types.keys.size}"
+  self.active_types.each { |type, color|
+    if @gsl_mode && self.gsl_color_codes(color).nil?
+      lines << "  #{type.ljust(12)} -> #{color} (no GSL equivalent - not applied)"
+    else
+      lines << "  #{type.ljust(12)} -> #{color}"
+    end
   }
-  echo ""
-  echo "Universal link coloring: #{UserVars.color_all_links ? 'enabled' : 'disabled'}"
-  echo "  - Colors ALL links with 'link' preset when enabled"
-  echo "  - Item types override with specific colors"
-  echo "  - Replaces linktothefast functionality"
-
-  if UserVars.character_default_color
-    echo "Character default color: #{UserVars.character_default_color}"
-    echo "  - All character names use this color instead of link default"
+  lines << ""
+  lines << "Universal link coloring: #{UserVars.color_all_links ? 'enabled' : 'disabled'} (shared across frontends)"
+  lines << "  - Colors ALL links when enabled"
+  lines << "  - Item types override with specific colors"
+  lines << "  - Replaces linktothefast functionality"
+  if self.active_char_color
+    lines << "Character default color (#{self.active_side} side): #{self.active_char_color}"
+    lines << "  - All character names use this color instead of link default"
   else
-    echo "Character default color: not set (using link default)"
+    lines << "Character default color (#{self.active_side} side): not set (using link default)"
   end
-  echo ""
-  echo "Available colors: #{%w[speech whisper thought link selectedlink bold monsterbold].join(', ')}"
-  echo ""
-  echo "Configuration stored in UserVars (shared with other scripts)"
-  echo "=== End Configuration ==="
+  lines << ""
+  lines << "Available colors (#{self.active_side} side): #{self.active_valid_colors.join(', ')}"
+  lines << "Configuration stored in UserVars (XML side shared with other scripts)"
+  lines << "=== End Configuration ==="
+  self.ht_block(lines)
 end
 
+#------------------------------------------------------------------------------#
+# Item type to color mapping configuration in UserVars for shared access
+#------------------------------------------------------------------------------#
+XML_DEFAULT_COLORS = {
+  # Valuable items
+  'gem'         => 'thought',      # Purple/magenta for gems
+  'jewelry'     => 'thought',      # Same color family as gems
+  'valuable'    => 'thought',      # Consistent with gems
+
+  # Containers and boxes
+  'box'         => 'speech',       # Speech color for lockboxes
+  'boatcrate'   => 'whisper'       # Subdued for boat crates
+} unless defined?(XML_DEFAULT_COLORS)
+
+def self.setup_color_defaults
+  # Initialize UserVars for both sides if not already set
+  UserVars.types_to_color ||= {}
+  UserVars.types_to_color_gsl ||= {}
+  # ||= would clobber a persisted false, so only initialize when truly unset
+  UserVars.color_all_links = true if UserVars.color_all_links.nil?
+
+  # Seed XML side with standard defaults if empty
+  if UserVars.types_to_color.empty?
+    UserVars.types_to_color = XML_DEFAULT_COLORS.dup
+    UserVars.save
+  end
+
+  # Seed GSL side with XML defaults filtered to GSL-renderable colors if empty
+  if UserVars.types_to_color_gsl.empty?
+    UserVars.types_to_color_gsl = XML_DEFAULT_COLORS.select { |_type, color| !self.gsl_color_codes(color).nil? }
+    UserVars.save
+  end
+end
+
+#------------------------------------------------------------------------------#
+# Load only the type data we need for comparisons (active side)
+#------------------------------------------------------------------------------#
+def self.reload_type_data
+  @high_type_data = GameObj.type_data.select { |k, _v| self.active_types.keys.include?(k) }
+end
+
+def self.identify_item_category(name,noun)
+    list = @high_type_data.keys.find_all { |t| (name =~ @high_type_data[t][:name] or noun =~ @high_type_data[t][:noun]) and (@high_type_data[t][:exclude].nil? or name !~ @high_type_data[t][:exclude]) }
+    return nil if list.empty?
+    type = list.include?('collectible') ? 'collectible' : list.join(',');
+    return type
+end
+
+#------------------------------------------------------------------------------#
+# Shared command actions (used by both startup and runtime paths)
+#------------------------------------------------------------------------------#
+def self.show_color_examples
+  sample_text = "Sample Item Text"
+  lines = []
+  lines << "=== High Type Color Examples (#{self.active_side} side - #{Frontend.client}) ==="
+  lines << ""
+  # Each active-side color rendered inline with its label
+  %w[monsterbold speech whisper thought link selectedlink bold].each { |color_name|
+    next unless self.active_valid_colors.include?(color_name)
+    lines << "  #{(color_name + ':').ljust(14)} #{self.color(sample_text, color_name)}"
+  }
+  lines << ""
+  lines << "NOTE: If all colors look the same, your client presets may"
+  lines << "      be configured to use the same 'skin' color for all presets."
+  lines << "=== End Color Examples ==="
+  self.ht_block(lines, true)
+end
+
+def self.add_type_color(type_arg, color_arg)
+  type_name = type_arg.gsub(/["']/, '')  # Remove quotes if present
+  color_name = color_arg.gsub(/["']/, '') # Remove quotes if present
+  unless self.active_valid_colors.include?(color_name)
+    self.ht_echo "Invalid color for the #{self.active_side} side: #{color_name}"
+    self.ht_echo "Valid colors (#{self.active_side}): #{self.active_valid_colors.join(', ')}"
+    return false
+  end
+  self.active_types[type_name] = color_name
+  UserVars.save
+  self.reload_type_data
+  self.ht_echo "Added (#{self.active_side} side): #{type_name} => #{color_name}"
+  return true
+end
+
+def self.reset_config
+  self.set_active_types({})
+  self.setup_color_defaults
+  self.reload_type_data
+end
+
+#------------------------------------------------------------------------------#
+# GSL colorization (Wizard/Avalon) - single pass
+#------------------------------------------------------------------------------#
+# Resolves each link's final color once (character color -> type color ->
+# universal link fallback) and wraps it in highlight bytes. sf_to_wiz strips the
+# <a>/<d> tags afterward, leaving the bytes around the plain text.
+def self.apply_gsl_colors(game_output)
+  begin
+    return game_output unless game_output =~ /<[ad][ >]/
+
+    link_codes = [$link_highlight_start.to_s, $link_highlight_end.to_s]
+
+    colored = game_output.gsub(/<([ad])((?: [^>]*)?)>(.*?)<\/\1>/) do |whole_link|
+      attrs = $2
+      text  = $3
+      codes = nil
+
+      # Character names (negative exist IDs) use the character default color
+      if self.active_char_color && attrs =~ /exist="-\d+"/
+        codes = self.gsl_color_codes(self.active_char_color)
+      elsif attrs =~ /exist="-?\d+" noun="([^"]+)"/
+        # Item link: resolve type-specific color
+        type = self.identify_item_category(text, $1)
+        if type
+          type_list = type.split(',')
+          self.active_types.each { |k, v|
+            if type_list.include?(k)
+              codes = self.gsl_color_codes(v)
+              break
+            end
+          }
+        end
+      end
+
+      # No type/character color applied (or no GSL equivalent): universal link fallback
+      codes = link_codes if codes.nil? && UserVars.color_all_links
+
+      if codes.nil? || codes[0].empty?
+        whole_link
+      else
+        "#{codes[0]}#{whole_link}#{codes[1]}"
+      end
+    end
+
+    # Bold text exclusion: strip injected highlight bytes inside bold sections
+    if @gsl_strip_pattern
+      colored = colored.gsub(/<pushBold\s*\/>.*?<popBold\s*\/>/m) do |bold_content|
+        bold_content.gsub(@gsl_strip_pattern, '')
+      end
+    end
+
+    colored
+  rescue
+    # Encoding or matching failure: pass the line through uncolored
+    game_output
+  end
+end
+
+#------------------------------------------------------------------------------#
+# Runtime command processing (using recolor.lic proven pattern)
+#------------------------------------------------------------------------------#
+def self.handle_runtime_command(args, running=true)
+  return unless args
+
+  # Parse the arguments if they come as a single string
+  args = args.strip.split(/\s+/) if args.is_a?(String)
+  return if args.empty?
+
+  case args[0].downcase
+  when "help"
+    lines = []
+    lines << "=== High Type v#{@version} Runtime Commands ==="
+    lines << "Commands edit the #{self.active_side} config side (current frontend: #{Frontend.client})"
+    lines << ""
+    lines << "While script is running, use:"
+    lines << "  ;high_type (or ;ht)         - Show current configuration"
+    lines << "  ;high_type help (or ;ht help) - Show this help"
+    lines << "  ;high_type add <type> <color> - Add/update type color"
+    lines << "  ;high_type remove <type>     - Remove type color"
+    lines << "  ;high_type showconfig        - Show current configuration"
+    lines << "  ;high_type reset            - Reset #{self.active_side} side to defaults"
+    lines << "  ;high_type colors           - Show color examples"
+    lines << "  ;high_type setcharcolor <color> - Set default color for all characters"
+    lines << "  ;high_type clearcharcolor  - Clear character color (use link default)"
+    lines << ""
+    lines << "Script continues running after commands."
+    lines << "=== End Runtime Help ==="
+    self.ht_block(lines)
+
+  when "add"
+    if args[1] && args[2]
+      if self.add_type_color(args[1], args[2])
+        self.ht_echo "Configuration updated (script continues running)"
+      end
+    else
+      self.ht_echo "Usage: ;high_type add <type> <color>"
+      self.ht_echo "Example: ;high_type add weapon speech"
+    end
+
+  when "reset"
+    self.ht_echo "Resetting #{self.active_side} side configuration to defaults..."
+    self.reset_config
+    self.ht_echo "Configuration reset complete! (script continues running)"
+    self.display_configuration
+
+  when "colors", "examples"
+    self.show_color_examples
+
+  when "showconfig", "config", "show"
+    self.display_configuration
+
+  when "remove"
+    if args[1]
+      type_name = args[1].gsub(/["']/, '')
+      if self.active_types.key?(type_name)
+        self.active_types.delete(type_name)
+        UserVars.save
+        self.ht_echo "Removed (#{self.active_side} side): #{type_name}"
+        self.reload_type_data
+        self.ht_echo "Configuration updated (script continues running)"
+      else
+        self.ht_echo "Type '#{type_name}' not found in the #{self.active_side} side configuration"
+      end
+    else
+      self.ht_echo "Usage: ;high_type remove <type>"
+      self.ht_echo "Example: ;high_type remove weapon"
+    end
+
+  when "setcharcolor"
+    if args[1]
+      color_name = args[1].gsub(/["']/, '')
+      if self.active_valid_colors.include?(color_name)
+        self.set_active_char_color(color_name)
+        UserVars.save
+        self.ht_echo "Character default color (#{self.active_side} side) set to: #{color_name}"
+        self.ht_echo "All character names will now use #{color_name} color"
+      else
+        self.ht_echo "Invalid color for the #{self.active_side} side: #{color_name}"
+        self.ht_echo "Valid colors (#{self.active_side}): #{self.active_valid_colors.join(', ')}"
+      end
+    else
+      self.ht_echo "Usage: ;high_type setcharcolor <color>"
+      self.ht_echo "Example: ;high_type setcharcolor whisper"
+    end
+
+  when "clearcharcolor"
+    self.set_active_char_color(nil)
+    UserVars.save
+    self.ht_echo "Character default color (#{self.active_side} side) cleared - characters will use link default"
+
+  else
+    # Default to showing configuration
+    self.display_configuration
+  end
+end
+
+#------------------------------------------------------------------------------#
+# Initialize configuration BEFORE argument handling so every startup path
+# (reset, debug, add, first run) has methods and type data available
+#------------------------------------------------------------------------------#
+self.setup_color_defaults
+self.reload_type_data
+
+# Precompute the byte-strip pattern for bold-section exclusion in GSL mode
+# (the highlight byte globals are populated by Lich core before scripts start)
+@gsl_strip_pattern = nil
+if @gsl_mode
+  strip_codes = [$link_highlight_start, $speech_highlight_start,
+                 $link_highlight_end, $speech_highlight_end].map(&:to_s).reject(&:empty?).uniq
+  @gsl_strip_pattern = Regexp.union(strip_codes) unless strip_codes.empty?
+end
 
 # Handle initial startup arguments - parse manually since Lich may pass as single string
 if script.vars[0]
@@ -132,107 +508,96 @@ if script.vars[0]
 
   case args[0].downcase
   when "quiet"
-    echo "High Type loaded silently - #{UserVars.types_to_color.keys.size} item types configured"
+    echo "High Type loaded silently - #{self.active_types.keys.size} item types configured (#{self.active_side} side)"
   when "reset"
-    echo "Resetting types_to_color configuration to defaults..."
-    UserVars.types_to_color = nil
-    self.setup_color_defaults
+    echo "Resetting #{self.active_side} side configuration to defaults..."
+    self.reset_config
     echo "Configuration reset complete!"
     self.display_configuration
     exit
   when "add"
     if args[1] && args[2]
-      type_name = args[1].gsub(/["']/, '')  # Remove quotes if present
-      color_name = args[2].gsub(/["']/, '') # Remove quotes if present
-      UserVars.types_to_color[type_name] = color_name
-      UserVars.save
-      echo "Added: #{type_name} => #{color_name}"
-      self.display_configuration
+      if self.add_type_color(args[1], args[2])
+        self.display_configuration
+      end
     else
       echo "Usage: ;high_type add <type> <color>"
       echo "Example: ;high_type add boatcrate whisper"
     end
     exit
   when "debug"
-    echo "=== High Type Debug Info ==="
-    echo "Configured types: #{UserVars.types_to_color.keys.join(', ')}"
-    echo ""
-    echo "GameObj type data loaded for:"
+    lines = []
+    lines << "=== High Type v#{@version} Debug Info ==="
+    lines << "Frontend: #{Frontend.client} (#{@gsl_mode ? 'GSL' : 'XML preset'} mode) - #{self.active_side} config side"
+    lines << "Configured types (#{self.active_side}): #{self.active_types.keys.join(', ')}"
+    lines << ""
+    lines << "GameObj type data loaded for:"
     @high_type_data.each { |type, data|
-      echo "  #{type}: name=#{data[:name].inspect}, noun=#{data[:noun].inspect}"
+      lines << "  #{type}: name=#{data[:name].inspect}, noun=#{data[:noun].inspect}"
     }
-    echo ""
-    echo "Testing 'salvage crate' items:"
+    lines << ""
+    lines << "Testing 'salvage crate' items:"
     test_names = ["a cheap salvage crate", "a shoddy salvage crate", "a silver salvage crate"]
     test_names.each { |name|
       type = self.identify_item_category(name, "crate")
-      echo "  '#{name}' => type: #{type || 'nil (no match)'}"
+      lines << "  '#{name}' => type: #{type || 'nil (no match)'}"
     }
-    echo "=== End Debug ==="
+    lines << "=== End Debug ==="
+    self.ht_block(lines)
     exit
   when "colors", "examples"
-    echo "=== High Type Color Examples ==="
-    echo ""
-    echo "Available colors with examples:"
-    echo ""
-
-    sample_text = "Sample Item Text"
-
-    # Show each color with actual formatting using _respond to render colors
-    echo "  monsterbold:   (see below)"
-    _respond "  #{self.color(sample_text, 'monsterbold')}\n"
-    echo "  speech:        (see below)"
-    _respond "  #{self.color(sample_text, 'speech')}\n"
-    echo "  whisper:       (see below)"
-    _respond "  #{self.color(sample_text, 'whisper')}\n"
-    echo "  thought:       (see below)"
-    _respond "  #{self.color(sample_text, 'thought')}\n"
-    echo "  link:          (see below)"
-    _respond "  #{self.color(sample_text, 'link')}\n"
-    echo "  selectedlink:  (see below)"
-    _respond "  #{self.color(sample_text, 'selectedlink')}\n"
-    echo "  bold:          (see below)"
-    _respond "  #{self.color(sample_text, 'bold')}\n"
-    echo ""
-    echo "NOTE: If all colors look the same, your client presets may"
-    echo "      be configured to use the same 'skin' color for all presets."
-    echo "=== End Color Examples ==="
+    self.show_color_examples
     exit
   when "help"
-    echo "=== High Type v2.5.0 Help ==="
-    echo ""
-    echo "USAGE: ;high_type [command]"
-    echo ""
-    echo "STARTUP COMMANDS (exits after execution):"
-    echo "  quiet             Load silently with item count"
-    echo "  debug             Show debug information and test cases"
-    echo ""
-    echo "RUNTIME COMMANDS (script continues running):"
-    echo "  ;high_type        Show current configuration"
-    echo "  ;high_type help   Show this help message"
-    echo "  ;high_type add <type> <color> Add or update type color"
-    echo "  ;high_type reset  Reset configuration to defaults"
-    echo "  ;high_type colors Show color examples"
-    echo "  ;high_type setcharcolor <color> Set default color for all characters"
-    echo "  ;high_type clearcharcolor    Clear character color (use link default)"
-    echo ""
-    echo "FEATURES:"
-    echo "  - Runtime command processing for dynamic configuration"
-    echo "  - Universal link coloring (replaces linktothefast)"
-    echo "  - Item type-specific highlighting using GameObj data"
-    echo "  - Shared configuration with other scripts via UserVars"
-    echo "  - 7 available colors: speech, whisper, thought, link, selectedlink, bold, monsterbold"
-    echo ""
-    echo "EXAMPLES:"
-    echo "  ;high_type add gem thought      # Gems use purple color"
-    echo "  ;high_type colors               # Show color examples"
-    echo "  ;high_type add weapon speech    # Weapons use speech color"
-    echo "=== End Help ==="
+    lines = []
+    lines << "=== High Type v#{@version} Help ==="
+    lines << ""
+    lines << "USAGE: ;high_type [command]"
+    lines << ""
+    lines << "PER-FRONTEND CONFIG:"
+    lines << "  Commands edit the config side matching your frontend:"
+    lines << "  - Wrayth/Stormfront -> XML side (all 7 colors)"
+    lines << "  - Wizard/Avalon     -> GSL side (speech, link, selectedlink, bold, monsterbold)"
+    lines << "  Current: #{Frontend.client} -> #{self.active_side} side"
+    lines << ""
+    lines << "STARTUP COMMANDS:"
+    lines << "  quiet             Load silently with item count (script keeps running)"
+    lines << "  reset             Reset active side to defaults (exits)"
+    lines << "  add <type> <color> Add or update type color (exits)"
+    lines << "  colors            Show color examples (exits)"
+    lines << "  debug             Show debug information and test cases (exits)"
+    lines << "  help              Show this help message (exits)"
+    lines << ""
+    lines << "RUNTIME COMMANDS (script continues running):"
+    lines << "  ;high_type        Show current configuration"
+    lines << "  ;high_type help   Show runtime command help"
+    lines << "  ;high_type add <type> <color> Add or update type color"
+    lines << "  ;high_type remove <type>     Remove type color"
+    lines << "  ;high_type showconfig        Show current configuration"
+    lines << "  ;high_type reset  Reset active side to defaults"
+    lines << "  ;high_type colors Show color examples"
+    lines << "  ;high_type setcharcolor <color> Set default color for all characters"
+    lines << "  ;high_type clearcharcolor    Clear character color (use link default)"
+    lines << ""
+    lines << "FEATURES:"
+    lines << "  - Frontend-aware: XML presets on Wrayth/Stormfront, GSL codes on Wizard/Avalon"
+    lines << "  - Per-frontend configuration (XML and GSL sides edited independently)"
+    lines << "  - Runtime command processing for dynamic configuration"
+    lines << "  - Universal link coloring (replaces linktothefast)"
+    lines << "  - Item type-specific highlighting using GameObj data"
+    lines << "  - XML-side configuration shared with other scripts via UserVars"
+    lines << ""
+    lines << "EXAMPLES:"
+    lines << "  ;high_type add gem thought      # Gems use purple color (XML side)"
+    lines << "  ;high_type add gem speech       # Gems use speech color (works both sides)"
+    lines << "  ;high_type colors               # Show color examples for this frontend"
+    lines << "=== End Help ==="
+    self.ht_block(lines)
     exit
   else
     echo "Unknown startup command: #{args[0]}"
-    echo "Commands: quiet, debug, help"
-    echo "For runtime commands, start the script first."
+    echo "Startup commands: quiet, reset, add, colors, debug, help"
+    echo "For runtime commands (remove, showconfig, setcharcolor, ...), start the script first."
     exit
   end
 else
@@ -240,100 +605,61 @@ else
 end
 
 #------------------------------------------------------------------------------#
-# Item type to color mapping configuration in UserVars for shared access
-#------------------------------------------------------------------------------#
-def self.setup_color_defaults
-  # Initialize UserVars with default color mappings if not already set
-  UserVars.types_to_color ||= {}
-  UserVars.color_all_links ||= true  # Enable universal link coloring
-  UserVars.character_default_color ||= nil  # Default color for all character names (negative exist IDs)
-
-  # Set defaults if UserVars is empty
-  if UserVars.types_to_color.empty?
-    default_colors = {
-      # Valuable items
-      'gem'         => 'thought',      # Purple/magenta for gems
-      'jewelry'     => 'thought',      # Same color family as gems
-      'valuable'    => 'thought',      # Consistent with gems
-
-      # Containers and boxes
-      'box'         => 'speech',       # Speech color for lockboxes
-      'boatcrate'   => 'whisper'       # Subdued for boat crates
-    }
-    UserVars.types_to_color = default_colors
-    UserVars.save
-  end
-end
-
-# Initialize configuration on script load
-self.setup_color_defaults
-
-
-#------------------------------------------------------------------------------#
-# Load only the type data we need for comparisons
-#------------------------------------------------------------------------------#
-@high_type_data = GameObj.type_data.select{ |k,v| k if UserVars.types_to_color.keys.include?(k) }
-
-def self.identify_item_category(name,noun)
-    list = @high_type_data.keys.find_all { |t| (name =~ @high_type_data[t][:name] or noun =~ @high_type_data[t][:noun]) and (@high_type_data[t][:exclude].nil? or name !~ @high_type_data[t][:exclude]) }
-    return nil if list.empty?
-    type = list.include?('collectible') ? 'collectible' : list.join(',');
-    return type
-end
-#------------------------------------------------------------------------------#
 # hook proc
 #------------------------------------------------------------------------------#
 @match_patterns = Hash.new
 @match_patterns[:item_link] = /<a exist="(?<id>-?\d+)" noun="(?<noun>[^"]+)">(?<name>[^<]+)<\/a>/;
 
 # Main processing pipeline for game output colorization
-# Applies multi-phase enhancement to links and items based on configuration
+# GSL front-ends: single-pass byte colorization; XML front-ends: 3-phase preset tagging
 apply_type_colors = proc {|game_output|
-  # Phase 1: Universal link enhancement - Apply base coloring to all link elements
-  if UserVars.color_all_links && game_output =~ /<[ad](?: [^>]*)?>.*?<\/[ad]>/
-    game_output = game_output.gsub(/(<[ad](?: [^>]*)?>.*?<\/[ad]>)/, "<preset id='link'>\\1</preset>")
+  if @gsl_mode
+    game_output = self.apply_gsl_colors(game_output)
+  else
+    # Phase 1: Universal link enhancement - Apply base coloring to all link elements
+    if UserVars.color_all_links && game_output =~ /<[ad](?: [^>]*)?>.*?<\/[ad]>/
+      game_output = game_output.gsub(/(<[ad](?: [^>]*)?>.*?<\/[ad]>)/, "<preset id='link'>\\1</preset>")
 
-    # Bold text exclusion: Remove link coloring from bold sections to prevent conflicts
-    game_output = game_output.gsub(/<pushBold\s*\/>.*?<popBold\s*\/>/) do |bold_content|
-      bold_content.gsub(/<preset id='link'>(.*?)<\/preset>/, "\\1")
+      # Bold text exclusion: Remove link coloring from bold sections to prevent conflicts
+      game_output = game_output.gsub(/<pushBold\s*\/>.*?<popBold\s*\/>/) do |bold_content|
+        bold_content.gsub(/<preset id='link'>(.*?)<\/preset>/, "\\1")
+      end
+
+      # Additional bold tag handling for compatibility
+      game_output = game_output.gsub(/<b\s*>.*?<\/b\s*>/) do |bold_content|
+        bold_content.gsub(/<preset id='link'>(.*?)<\/preset>/, "\\1")
+      end
     end
 
-    # Additional bold tag handling for compatibility
-    game_output = game_output.gsub(/<b\s*>.*?<\/b\s*>/) do |bold_content|
-      bold_content.gsub(/<preset id='link'>(.*?)<\/preset>/, "\\1")
+    # Phase 2: Character default color - Apply color to all character names (negative exist IDs)
+    # Strips any Phase 1 link-preset wrapper first to avoid nested presets
+    if self.active_char_color && game_output =~ /<[ad] exist="-\d+"/
+      game_output = game_output.gsub(/(?:<preset id='link'>)?(<([ad]) exist="-\d+"[^>]*>[^<]+<\/\2>)(?:<\/preset>)?/) do
+        "<preset id='#{self.active_char_color}'>#{$1}</preset>"
+      end
     end
-  end
 
-  # Phase 2: Character default color - Apply color to all character names (negative exist IDs)
-  if UserVars.character_default_color && game_output =~ /<[ad] exist="-\d+"/
-    game_output = game_output.gsub(/<([ad]) exist="(-\d+)"([^>]*)>([^<]+)<\/\1>/) do |match|
-      tag_type = $1
-      exist_id = $2
-      attributes = $3
-      name = $4
-      # Apply character color to negative exist IDs
-      "<preset id='#{UserVars.character_default_color}'><#{tag_type} exist=\"#{exist_id}\"#{attributes}>#{name}</#{tag_type}></preset>"
-    end
-  end
-
-  # Phase 3: Type-specific colorization - Override colors based on GameObj classification
-  if game_output =~ /<a exist="(?:-?\d+)" noun="(?:[^"]+)">(?:[^<]+)<\/a>/
-    color_queue = []
-    game_output.scan(@match_patterns[:item_link]).each { |id,noun,name|
-      type = self.identify_item_category(name,noun)
-      UserVars.types_to_color.each { |k,v|
-        if type =~ /#{k}/
-          color_queue << [id,v]
-          break
-        end
+    # Phase 3: Type-specific colorization - Override colors based on GameObj classification
+    if game_output =~ /<a exist="(?:-?\d+)" noun="(?:[^"]+)">(?:[^<]+)<\/a>/
+      color_queue = []
+      game_output.scan(@match_patterns[:item_link]).each { |id,noun,name|
+        type = self.identify_item_category(name,noun)
+        next if type.nil?
+        type_list = type.split(',')
+        self.active_types.each { |k,v|
+          if type_list.include?(k)
+            color_queue << [id,v]
+            break
+          end
+        }
       }
-    }
-    if color_queue.size > 0
-      color_queue.each { |id,color_type|
-        # Remove any existing preset wrapper and apply type-specific color
-        item_pattern = /(<preset id='link'>)?(<a exist="#{id}".*?<\/a>)(<\/preset>)?/
-        game_output.gsub!(item_pattern, self.color('\\2', color_type, true))
-      }
+      if color_queue.size > 0
+        color_queue.each { |id,color_type|
+          # Remove any existing preset wrapper and apply type-specific color
+          item_pattern = /(<preset id='link'>)?(<a exist="#{id}".*?<\/a>)(<\/preset>)?/
+          game_output.gsub!(item_pattern, self.color('\\2', color_type, true))
+        }
+      end
     end
   end
 
@@ -345,133 +671,10 @@ apply_type_colors = proc {|game_output|
 #------------------------------------------------------------------------------#
 startup_delay = ((Time.now - $login_time) < 10 ? (10 - (Time.now - $login_time)).ceil : 0)
 if startup_delay > 0
-  echo "High Type v2.4.0 starting - waiting #{startup_delay} seconds for session stabilization..."
+  echo "High Type v#{@version} starting - waiting #{startup_delay} seconds for session stabilization..."
   sleep startup_delay
 else
-  echo "High Type v2.4.0 starting - session already stable, no delay needed..."
-end
-
-#------------------------------------------------------------------------------#
-# Runtime command processing hook (using recolor.lic proven pattern)
-#------------------------------------------------------------------------------#
-def self.handle_runtime_command(args, running=true)
-  return unless args
-
-  # Parse the arguments if they come as a single string
-  args = args.strip.split(/\s+/) if args.is_a?(String)
-  return if args.empty?
-
-  case args[0].downcase
-  when "help"
-    _respond "[high_type: === High Type v2.5.0 Runtime Commands ===]"
-    _respond "[high_type: ]"
-    _respond "[high_type: While script is running, use:]"
-    _respond "[high_type:   ;high_type (or ;ht)         - Show current configuration]"
-    _respond "[high_type:   ;high_type help (or ;ht help) - Show this help]"
-    _respond "[high_type:   ;high_type add <type> <color> - Add/update type color]"
-    _respond "[high_type:   ;high_type remove <type>     - Remove type color]"
-    _respond "[high_type:   ;high_type showconfig        - Show current configuration]"
-    _respond "[high_type:   ;high_type reset            - Reset to defaults]"
-    _respond "[high_type:   ;high_type colors           - Show color examples]"
-    _respond "[high_type:   ;high_type setcharcolor <color> - Set default color for all characters]"
-    _respond "[high_type:   ;high_type clearcharcolor  - Clear character color (use link default)]"
-    _respond "[high_type: ]"
-    _respond "[high_type: Script continues running after commands.]"
-    _respond "[high_type: === End Runtime Help ===]"
-
-  when "add"
-    if args[1] && args[2]
-      type_name = args[1].gsub(/[\"']/, '')
-      color_name = args[2].gsub(/[\"']/, '')
-      UserVars.types_to_color[type_name] = color_name
-      UserVars.save
-      echo "Added: #{type_name} => #{color_name}"
-      # Reload type data for the new type
-      @high_type_data = GameObj.type_data.select{ |k,v| k if UserVars.types_to_color.keys.include?(k) }
-      echo "Configuration updated (script continues running)"
-    else
-      echo "Usage: ;high_type add <type> <color>"
-      echo "Example: ;high_type add weapon speech"
-    end
-
-  when "reset"
-    echo "Resetting types_to_color configuration to defaults..."
-    UserVars.types_to_color = nil
-    self.setup_color_defaults
-    # Reload type data after reset
-    @high_type_data = GameObj.type_data.select{ |k,v| k if UserVars.types_to_color.keys.include?(k) }
-    echo "Configuration reset complete! (script continues running)"
-    self.display_configuration
-
-  when "colors", "examples"
-    echo "=== High Type Color Examples ==="
-    echo ""
-    sample_text = "Sample Item Text"
-    echo "  monsterbold:   (see below)"
-    _respond "  #{self.color(sample_text, 'monsterbold')}\n"
-    echo "  speech:        (see below)"
-    _respond "  #{self.color(sample_text, 'speech')}\n"
-    echo "  whisper:       (see below)"
-    _respond "  #{self.color(sample_text, 'whisper')}\n"
-    echo "  thought:       (see below)"
-    _respond "  #{self.color(sample_text, 'thought')}\n"
-    echo "  link:          (see below)"
-    _respond "  #{self.color(sample_text, 'link')}\n"
-    echo "  selectedlink:  (see below)"
-    _respond "  #{self.color(sample_text, 'selectedlink')}\n"
-    echo "  bold:          (see below)"
-    _respond "  #{self.color(sample_text, 'bold')}\n"
-    echo ""
-    echo "=== End Color Examples ==="
-
-  when "showconfig", "config", "show"
-    self.display_configuration
-
-  when "remove"
-    if args[1]
-      type_name = args[1].gsub(/[\"']/, '')
-      if UserVars.types_to_color.key?(type_name)
-        UserVars.types_to_color.delete(type_name)
-        UserVars.save
-        echo "Removed: #{type_name}"
-        # Reload type data after removal
-        @high_type_data = GameObj.type_data.select{ |k,v| k if UserVars.types_to_color.keys.include?(k) }
-        echo "Configuration updated (script continues running)"
-      else
-        echo "Type '#{type_name}' not found in configuration"
-      end
-    else
-      echo "Usage: ;high_type remove <type>"
-      echo "Example: ;high_type remove weapon"
-    end
-
-  when "setcharcolor"
-    if args[1]
-      color_name = args[1].gsub(/[\"']/, '')
-      valid_colors = %w[speech whisper thought link selectedlink bold monsterbold]
-      if valid_colors.include?(color_name)
-        UserVars.character_default_color = color_name
-        UserVars.save
-        echo "Character default color set to: #{color_name}"
-        echo "All character names will now use #{color_name} color"
-      else
-        echo "Invalid color: #{color_name}"
-        echo "Valid colors: #{valid_colors.join(', ')}"
-      end
-    else
-      echo "Usage: ;high_type setcharcolor <color>"
-      echo "Example: ;high_type setcharcolor whisper"
-    end
-
-  when "clearcharcolor"
-    UserVars.character_default_color = nil
-    UserVars.save
-    echo "Character default color cleared - characters will use link default"
-
-  else
-    # Default to showing configuration
-    self.display_configuration
-  end
+  echo "High Type v#{@version} starting - session already stable, no delay needed..."
 end
 
 #------------------------------------------------------------------------------#
@@ -498,7 +701,7 @@ before_dying{
   UpstreamHook.remove('high_type_commands')
 }
 
-echo "High Type v2.4.0 fully active - link coloring and type highlighting enabled"
+echo "High Type v#{@version} fully active - #{@gsl_mode ? 'GSL highlight codes' : 'link coloring and type highlighting'} enabled (#{Frontend.client}, #{self.active_side} config side)"
 echo "Runtime commands available: ;high_type (or ;ht) help, ;high_type add <type> <color>, ;high_type reset, etc."
 
 while true;sleep 1;end
