@@ -5,16 +5,33 @@ Please adhere to POLICY 18 & 19.
 Owner and maintainer: NecroDeus
 author: NecroDeus
 game: Gemstone
-version: 0.4.0-rc43
+version: 0.4.0-rc60
 tags: hunting, combat, group, support, utility
 required: Lich >= 5.17.1
 
 Companion intelligence service required by ashborne.lic.
 
 Internal hunting intelligence service for ;ashborne.
-Release pairing: Ashborne 0.4.0-rc43.
+Release pairing: Ashborne 0.4.0-rc60.
 
-Recent updates (0.4.0-rc43 - 2026-07-20):
+Recent updates (0.4.0-rc60 - 2026-08-11):
+- Removes the per-line Intel delay and throttles cooldown bookkeeping.
+- Caches the spell-learning toggle and saves changed metrics atomically.
+- Contains transient runtime errors and records compact diagnostics under
+  data/ashborne instead of silently exiting.
+- Paired with Ashborne's optional Cleric Bolt/Web casting build.
+- Paired with Ashborne's combat-safe automatic rally and obstacle split checks.
+- Paired with Ashborne's stale-occupancy clearing and dead-end transit escape.
+- Paired with Ashborne's empty post-loot combat-state recovery.
+- Paired with Ashborne's lower-I/O runtime and bounded service polling.
+- Paired with Ashborne's verified-group-only local account room exemption.
+- Paired with Ashborne's leader-owned shared group target coordination.
+- Paired with Ashborne's combat-progress-aware watchdog improvements.
+- Paired with Ashborne's sticky-target and continuous combat-round improvements.
+- Paired with Ashborne's optional Cleric/Empath Bind-then-melee behavior.
+- Paired with Ashborne's guarded repeat-travel go2 unpause fix.
+- Paired with Ashborne's Anwyn environmental escape and avoided-room boundary
+  fixes.
 - Provides the shared combat, group-state, and optional spell-observation support
   used by the current Ashborne release.
 - Stores generated support data under the Lich data/ashborne folder.
@@ -37,9 +54,10 @@ module Intel_ashborne_toolkit
   SPELL_SAMPLE_MINIMUM = 5
 
   def spell_learning_enabled?
-    Settings[Char.name]['ashborne_setting_spell_learning'].to_s == "1"
+    return @spell_learning_enabled unless @spell_learning_enabled.nil?
+    @spell_learning_enabled = Settings[Char.name]['ashborne_setting_spell_learning'].to_s == "1"
   rescue
-    false
+    @spell_learning_enabled = false
   end
 
   def spell_metrics_file
@@ -186,11 +204,18 @@ module Intel_ashborne_toolkit
 
   def flush_spell_metrics
     return unless @spell_metrics
-    File.write(spell_metrics_file, YAML.dump(@spell_metrics))
+    return unless @spell_metrics_dirty.to_i > 0
+
+    destination = spell_metrics_file
+    temporary = "#{destination}.tmp"
+    File.write(temporary, YAML.dump(@spell_metrics))
+    FileUtils.mv(temporary, destination, force: true)
     @spell_metrics_dirty = 0
     @spell_metrics_flushed_at = Time.now.to_f
   rescue
     nil
+  ensure
+    FileUtils.rm_f(temporary) if defined?(temporary) && temporary
   end
 
   def intel_ashborne_feedback
@@ -459,6 +484,11 @@ module Intel_ashborne_toolkit
   end
 
   def time_zone
+    now = Time.now.to_f
+    return if @time_zone_last_check && now - @time_zone_last_check < 0.25
+    @time_zone_last_check = now
+    current_time = now.to_i
+
     # respond "You're in the time zone."
 
     # respond "140 cooldown is #{$ashborne_140_cooldown}."
@@ -472,7 +502,7 @@ module Intel_ashborne_toolkit
     if $ashborne_future_140 == 0
       nil
     else
-      if Time.now.to_i > $ashborne_future_140
+      if current_time > $ashborne_future_140
         # respond "140 cooldown is over, you can cast this spell again."
         $ashborne_140_cooldown = "0"
         $ashborne_future_140 = 0
@@ -482,7 +512,7 @@ module Intel_ashborne_toolkit
     if $ashborne_future_919 == 0
       nil
     else
-      if Time.now.to_i > $ashborne_future_919
+      if current_time > $ashborne_future_919
         # respond "919 cooldown is over, you can cast this spell again."
         $ashborne_919_cooldown = "0"
         $ashborne_future_919 = 0
@@ -494,15 +524,45 @@ module Intel_ashborne_toolkit
       nil
     else
       if $ashborne_killtimelimit == 0
-        $ashborne_killtimelimit = Time.now.to_i + $ashborne_timelimit.to_i
+        $ashborne_killtimelimit = current_time + $ashborne_timelimit.to_i
       else
-        if Time.now.to_i > $ashborne_killtimelimit
+        if current_time > $ashborne_killtimelimit
           # respond "Time to stop hunting."
           $ashborne_return_why = "You have reached your time limit for running Ashborne."
           $ashborne_action = 99
         end
       end
     end
+  end
+
+  def runtime_error_log_file
+    directory = File.join($lich_dir, "data", "ashborne")
+    FileUtils.mkdir_p(directory) unless File.directory?(directory)
+    safe_name = Char.name.to_s.gsub(/[^A-Za-z0-9_\-]/, "")
+    File.join(directory, "#{safe_name}_intel_ashborne_runtime_errors.log")
+  end
+
+  def handle_runtime_error(error)
+    path = runtime_error_log_file
+    if File.exist?(path) && File.size(path) > 262_144
+      recent = File.readlines(path).last(200)
+      File.write(path, recent.join)
+    end
+
+    backtrace = Array(error.backtrace).first(5).join(" | ")
+    File.open(path, "a") do |file|
+      file.puts "#{Time.now.strftime('%Y-%m-%d %H:%M:%S')} | intel loop | #{error.class}: #{error.message} | #{backtrace}"
+    end
+
+    now = Time.now.to_f
+    if !@runtime_error_notice_at || now - @runtime_error_notice_at >= 10
+      respond "[Intel Ashborne] Recovered from a runtime error; details were saved under data/ashborne."
+      @runtime_error_notice_at = now
+    end
+  rescue
+    nil
+  ensure
+    sleep 0.1
   end
 end
 
@@ -559,6 +619,7 @@ end
 
 
 loop {
+  begin
   Intel_ashborne_toolkit.time_zone
   # Intel_ashborne_toolkit.path_rt
   if Script.running?("ashborne")
@@ -13607,5 +13668,7 @@ loop {
 
   end
 
-  sleep 0.01
+  rescue => error
+    Intel_ashborne_toolkit.handle_runtime_error(error)
+  end
 }

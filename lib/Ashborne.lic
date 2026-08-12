@@ -5,7 +5,7 @@ Please adhere to POLICY 18 & 19.
 Owner and maintainer: NecroDeus
 author: NecroDeus
 game: Gemstone
-version: 0.4.0-rc59
+version: 0.4.0-rc60
 tags: hunting, combat, group, gui, utility, automation
 required: Lich >= 5.17.1
 
@@ -13,7 +13,15 @@ Ashborne is a mixed-class solo and group hunting coordinator with per-character
 combat styles, safety checks, loot rotation, town services, and repeat hunts.
 Requires intel_ashborne.lic. Group mode also requires Borg, Drone, and Queen.
 
-Recent updates (0.4.0-rc59 - 2026-08-11):
+Recent updates (0.4.0-rc60 - 2026-08-11):
+- Performance pass: environmental hazards share one room-object snapshot,
+  ability/profile files use bounded caches, and boost/quartz probes are
+  throttled instead of running on every hot-loop pass.
+- Main and follower loops now contain transient runtime errors, record compact
+  diagnostics under data/ashborne, and route repeated leader errors through the
+  normal safe-return path instead of silently dying in the field.
+- Intel no longer delays every incoming game line, caches its learning toggle,
+  throttles cooldown bookkeeping, and saves changed spell metrics atomically.
 - Clerics can toggle a per-character Bolt/Web casting build. It uses Holy Bolt
   (306) against undead and evoked Web (118) against living targets, while the
   normal HuntPro warding cycle remains the default.
@@ -110,7 +118,7 @@ begin
 rescue
   nil
 end
-ashborne_version = "0.4.0-rc59"
+ashborne_version = "0.4.0-rc60"
 ashborne_last_update = "8/11/2026"
 # Hide Command Inputs
 silence_me
@@ -337,6 +345,10 @@ module Ashborne_toolkit
   VERIFIED_REACTIVE_SPELLS = [210, 214, 301, 609, 610, 1005, 1008, 1602, 1615].freeze
   VERIFIED_REACTIVE_SKILLS = ["Throatchop", "Shield Bash", "Shield Charge"].freeze
   ABILITY_RULE_VERSION = 1
+  ABILITY_RULE_CACHE_TTL = 5.0
+  CAPABILITY_PROFILE_CACHE_TTL = 10.0
+  RUNTIME_ERROR_WINDOW = 15.0
+  RUNTIME_ERROR_LIMIT = 3
   CROWD_CONTROL_SPELLS = {
     212 => ["Interference", 3],
     317 => ["Divine Fury", 3],
@@ -1923,6 +1935,52 @@ module Ashborne_toolkit
     target || File.join($lich_dir, "data", "ashborne", filename)
   end
 
+  def runtime_error_log_file
+    safe_name = Char.name.to_s.gsub(/[^A-Za-z0-9_\-]/, "")
+    Ashborne_toolkit.ashborne_data_file("#{safe_name}_ashborne_runtime_errors.log")
+  end
+
+  def handle_runtime_error(error, context)
+    now = Time.now.to_f
+    @runtime_error_times = Array(@runtime_error_times).select { |timestamp| now - timestamp.to_f <= RUNTIME_ERROR_WINDOW }
+    @runtime_error_times << now
+
+    begin
+      path = Ashborne_toolkit.runtime_error_log_file
+      if File.exist?(path) && File.size(path) > 262_144
+        recent_lines = File.readlines(path).last(200)
+        File.write(path, recent_lines.join)
+      end
+      detail = Array(error.backtrace).first(5).join(" | ")
+      File.open(path, "a") do |file|
+        file.puts "#{Time.now.strftime('%Y-%m-%d %H:%M:%S %z')} [#{context}] #{error.class}: #{error.message} | #{detail}"
+      end
+    rescue
+      nil
+    end
+
+    if !@runtime_error_notice_at || now - @runtime_error_notice_at.to_f >= 10.0
+      respond "Ashborne recovered from a #{context} error: #{error.class}: #{error.message}"
+      respond "Diagnostic: #{Ashborne_toolkit.runtime_error_log_file}"
+      @runtime_error_notice_at = now
+    end
+
+    if @runtime_error_times.length >= RUNTIME_ERROR_LIMIT && $ashborne_group_ai != "2"
+      Ashborne_toolkit.stance_defensive
+      $ashborne_return_why = "Repeated Ashborne runtime errors; returning safely for review."
+      $ashborne_action = 99
+    end
+    sleep 0.1
+    true
+  rescue
+    sleep 0.1
+    true
+  end
+
+  def runtime_yield
+    sleep 0.01
+  end
+
   def installed_script?(name)
     Script.exists?(name.to_s.sub(/\.lic\z/i, ""))
   rescue
@@ -2155,13 +2213,21 @@ module Ashborne_toolkit
 
   def load_ability_rules(name = Char.name)
     path = Ashborne_toolkit.ability_rules_file(name)
+    cache_name = name.to_s.downcase
+    now = Time.now.to_f
+    cached = @ability_rules_cache && @ability_rules_cache[cache_name]
+    return cached[:rules] if cached && now - cached[:checked_at].to_f < ABILITY_RULE_CACHE_TTL
+
     modified = File.exist?(path) ? File.mtime(path).to_i : 0
-    cache_key = "#{name}:#{modified}"
-    return @ability_rules_cache[cache_key] if @ability_rules_cache && @ability_rules_cache.key?(cache_key)
+    if cached && cached[:modified].to_i == modified
+      cached[:checked_at] = now
+      return cached[:rules]
+    end
 
     saved = File.exist?(path) ? YAML.load_file(path) : {}
     rules = Ashborne_toolkit.merge_ability_rules(Ashborne_toolkit.default_ability_rules, saved)
-    @ability_rules_cache = { cache_key => rules }
+    @ability_rules_cache ||= {}
+    @ability_rules_cache[cache_name] = { modified: modified, checked_at: now, rules: rules }
     rules
   rescue
     Ashborne_toolkit.default_ability_rules
@@ -2171,8 +2237,8 @@ module Ashborne_toolkit
     path = Ashborne_toolkit.ability_rules_file(name)
     temporary_file = "#{path}.tmp"
     File.write(temporary_file, rules.to_yaml)
-    FileUtils.mv(temporary_file, path)
-    @ability_rules_cache = nil
+    FileUtils.mv(temporary_file, path, force: true)
+    @ability_rules_cache&.delete(name.to_s.downcase)
     true
   end
 
@@ -2452,7 +2518,8 @@ module Ashborne_toolkit
 
     temporary_file = "#{Ashborne_toolkit.capability_profile_file}.tmp"
     File.write(temporary_file, profile.to_yaml)
-    FileUtils.mv(temporary_file, Ashborne_toolkit.capability_profile_file)
+    FileUtils.mv(temporary_file, Ashborne_toolkit.capability_profile_file, force: true)
+    @capability_profile_cache&.delete(Char.name.to_s.downcase)
 
     Settings[Char.name]['ashborne_setting_capability_scan'] = profile["scanned_at"]
     Settings.save
@@ -2476,20 +2543,44 @@ module Ashborne_toolkit
 
   def load_capability_profile(name = Char.name)
     path = Ashborne_toolkit.capability_profile_file(name)
+    cache_name = name.to_s.downcase
+    now = Time.now.to_f
+    cached = @capability_profile_cache && @capability_profile_cache[cache_name]
+    return cached[:profile] if cached && now - cached[:checked_at].to_f < CAPABILITY_PROFILE_CACHE_TTL
+
     unless File.exist?(path)
       huntpro_path = Ashborne_toolkit.huntpro_capability_profile_file(name)
-      return nil unless File.exist?(huntpro_path)
+      unless File.exist?(huntpro_path)
+        @capability_profile_cache ||= {}
+        @capability_profile_cache[cache_name] = { modified: 0, checked_at: now, profile: nil }
+        return nil
+      end
 
       imported_profile = YAML.load_file(huntpro_path)
       imported_profile = Ashborne_toolkit.normalized_capability_profile(imported_profile)
       return nil unless imported_profile
 
       File.write(path, imported_profile.to_yaml)
+      @capability_profile_cache ||= {}
+      @capability_profile_cache[cache_name] = {
+        modified: File.mtime(path).to_i,
+        checked_at: now,
+        profile: imported_profile
+      }
       return imported_profile
     end
 
+    modified = File.mtime(path).to_i
+    if cached && cached[:modified].to_i == modified
+      cached[:checked_at] = now
+      return cached[:profile]
+    end
+
     profile = YAML.load_file(path)
-    Ashborne_toolkit.normalized_capability_profile(profile)
+    profile = Ashborne_toolkit.normalized_capability_profile(profile)
+    @capability_profile_cache ||= {}
+    @capability_profile_cache[cache_name] = { modified: modified, checked_at: now, profile: profile }
+    profile
   rescue
     nil
   end
@@ -10272,11 +10363,12 @@ module Ashborne_toolkit
     false
   end
 
-  def visible_group_pc(name)
+  def visible_group_pc(name, players = nil)
     safe_name = Ashborne_toolkit.canonical_character_name(name)
     return nil if safe_name.empty?
 
-    GameObj.pcs.find do |pc|
+    players ||= GameObj.pcs
+    players.find do |pc|
       pc_name = pc.name.to_s
       pc_noun = pc.noun.to_s
       pc_name.casecmp(safe_name).zero? || pc_noun.casecmp(safe_name).zero?
@@ -10316,12 +10408,12 @@ module Ashborne_toolkit
     false
   end
 
-  def rescue_visible_groupmate(target_name, reason = "group danger")
+  def rescue_visible_groupmate(target_name, reason = "group danger", pc = nil)
     return false if $ashborne_group_ai == "0"
     return false if target_name.to_s.casecmp(Char.name.to_s).zero?
     return false if checkdead || checkstunned || webbed? || bound?
 
-    pc = Ashborne_toolkit.visible_group_pc(target_name)
+    pc ||= Ashborne_toolkit.visible_group_pc(target_name)
     return false if pc.nil?
 
     rescue_key = "rescue_#{target_name.to_s.downcase.gsub(/[^a-z0-9_\\-]/, '')}"
@@ -13613,7 +13705,8 @@ module Ashborne_toolkit
 
     return true if required.empty?
 
-    required.all? { |member_name| Ashborne_toolkit.visible_group_pc(member_name) }
+    players = GameObj.pcs
+    required.all? { |member_name| Ashborne_toolkit.visible_group_pc(member_name, players) }
   end
 
   def group_kill_scripts
@@ -14247,9 +14340,9 @@ module Ashborne_toolkit
     fput "fire"
   end
 
-  def pod_check
+  def pod_check(loot = nil)
     if $ashborne_my_area =~ /patrol|iceshrub|icebush/
-      GameObj.loot.each { |i|
+      (loot || GameObj.loot).each { |i|
         if i.noun =~ /pod/
           # respond "Debug Output - I detected a pod, RUN."
 
@@ -14263,8 +14356,8 @@ module Ashborne_toolkit
     end
   end
 
-  def cloud_check
-    GameObj.loot.each { |i|
+  def cloud_check(loot = nil)
+    (loot || GameObj.loot).each { |i|
       if i.noun =~ /cloud/
         # respond "Debug Output - I detected a cloud."
         if Spell[119].known? && Spell[119].affordable?
@@ -14290,8 +14383,8 @@ module Ashborne_toolkit
     }
   end
 
-  def void_check
-    GameObj.loot.each { |i|
+  def void_check(loot = nil)
+    (loot || GameObj.loot).each { |i|
       if i.noun =~ /void/
         # respond "Debug Output - I detected a void."
         Ashborne_toolkit.evicted
@@ -14300,11 +14393,11 @@ module Ashborne_toolkit
     }
   end
 
-  def vine_check
+  def vine_check(loot = nil)
     if $ashborne_group_ai == "1"
       nil
     else
-      GameObj.loot.each { |i|
+      (loot || GameObj.loot).each { |i|
         if i.noun =~ /dreamvine/
           nil
         elsif i.noun =~ /vine/
@@ -14324,8 +14417,8 @@ module Ashborne_toolkit
     end
   end
 
-  def sandstorm_check
-    GameObj.loot.each { |i|
+  def sandstorm_check(loot = nil)
+    (loot || GameObj.loot).each { |i|
       if i.noun =~ /sandstorm/
         # respond "Debug Output - I detected a sandstorm."
         if Spell[119].known? && Spell[119].affordable?
@@ -14340,8 +14433,8 @@ module Ashborne_toolkit
     }
   end
 
-  def web_check
-    GameObj.loot.each { |i|
+  def web_check(loot = nil)
+    (loot || GameObj.loot).each { |i|
       if i.noun =~ /web/
         # respond "Debug Output - I detected a web."
         if Spell[119].known? && Spell[119].affordable?
@@ -14366,7 +14459,7 @@ module Ashborne_toolkit
     }
   end
 
-  def arm_check
+  def arm_check(targets = nil)
     # GameObj.targets.each { |i|
     # if i.noun =~ /arm/
     # respond "Debug Output - I detected an arm."
@@ -14377,7 +14470,8 @@ module Ashborne_toolkit
 
 
 
-    if GameObj.targets.length >= 1
+    targets ||= GameObj.targets
+    if targets.length >= 1
 
       $ashborne_arm_check_array = Array.new
       $ashborne_arm_check_array = []
@@ -14385,7 +14479,7 @@ module Ashborne_toolkit
       $ashborne_arm_all_targets_array = Array.new
       $ashborne_arm_all_targets_array = []
 
-      GameObj.targets.each { |i|
+      targets.each { |i|
         $ashborne_arm_all_targets_array.push(i.name)
 
 
@@ -14486,8 +14580,8 @@ module Ashborne_toolkit
     end
   end
 
-  def tempest_check
-    GameObj.loot.each { |i|
+  def tempest_check(loot = nil)
+    (loot || GameObj.loot).each { |i|
       if i.noun =~ /tempest/
         # respond "Debug Output - I detected a tempest."
         if Spell[119].known? && Spell[119].affordable?
@@ -15034,35 +15128,28 @@ module Ashborne_toolkit
   end
 
   def upkeep_quartz
-    if $ashborne_my_style != "9"
-      nil
+    return nil if $ashborne_my_style != "9" || $ashborne_noquartz == "1"
 
-    elsif $ashborne_noquartz == "1"
-      # respond "no quartz feature is turned on."
-      nil
+    now = Time.now.to_f
+    return nil if @upkeep_quartz_last_check && now - @upkeep_quartz_last_check < 2.0
 
+    @upkeep_quartz_last_check = now
+    return nil if Spell.active? "1711"
+
+    result = dothistimeout "get my quartz orb", 5, /Get what|You remove a/
+    if result =~ /Get what/
+      $ashborne_noquartz = "1"
+      Ashborne_toolkit.top_menu
+      respond "#{Char.name}, you don't have any quartz orbs for this hunt.  I'll stop trying to find them."
+      respond
+      respond "You can disable the quartz orb feature with ;ashborne setup change noquartz 1 "
+      Ashborne_toolkit.bottom_menu
     else
-      if Spell.active? "1711"
-        # respond "1711 is active."
-        nil
-      else
-        result = dothistimeout "get my quartz orb", 5, /Get what|You remove a/
-
-        if result =~ /Get what/
-          $ashborne_noquartz = "1"
-          Ashborne_toolkit.top_menu
-          respond "#{Char.name}, you don't have any quartz orbs for this hunt.  I'll stop trying to find them."
-          respond
-          respond "You can disable the quartz orb feature with ;ashborne setup change noquartz 1 "
-          Ashborne_toolkit.bottom_menu
-        else
-          fput "rub my quartz orb"
-          fput "stow my quartz orb"
-          waitrt?
-          waitcastrt?
-          sleep 1
-        end
-      end
+      fput "rub my quartz orb"
+      fput "stow my quartz orb"
+      waitrt?
+      waitcastrt?
+      sleep 1
     end
   end
 
@@ -16482,25 +16569,37 @@ module Ashborne_toolkit
   end
 
   def boost_long
-    if $ashborne_boost_long == "1"
-      if checkmind =~ /saturated|must rest|numbed/
-        fput "boost long"
-        sleep 0.25
-      end
-    end
+    return nil unless $ashborne_boost_long == "1"
+
+    now = Time.now.to_f
+    return nil if @boost_long_last_check && now - @boost_long_last_check < 2.0
+
+    @boost_long_last_check = now
+    return nil unless checkmind =~ /saturated|must rest|numbed/
+    return nil if @boost_long_last_command && now - @boost_long_last_command < 15.0
+
+    @boost_long_last_command = now
+    fput "boost long"
+    sleep 0.25
   end
 
   def boost_loot
     # respond "You're in boost_loot" if $ashborne_qc_testing == "1"
 
-    if $ashborne_boost_loot == "0"
-      # respond "Boost Loot is 0" if $ashborne_qc_testing == "1"
-      nil
-    elsif $ashborne_boost_loot == "minor"
+    return nil if $ashborne_boost_loot == "0"
+
+    now = Time.now.to_f
+    return nil if @boost_loot_last_check && now - @boost_loot_last_check < 2.0
+
+    @boost_loot_last_check = now
+
+    if $ashborne_boost_loot == "minor"
       if Spell.active? "9101"
         # respond "You already have a minor boost active."
         nil
       else
+        return nil if @boost_loot_last_command && now - @boost_loot_last_command < 10.0
+        @boost_loot_last_command = now
         waitrt?
         fput "boost loot minor"
       end
@@ -16509,6 +16608,8 @@ module Ashborne_toolkit
         # respond "You already have a major boost active."
         nil
       else
+        return nil if @boost_loot_last_command && now - @boost_loot_last_command < 10.0
+        @boost_loot_last_command = now
         waitrt?
         fput "boost loot major"
       end
@@ -17157,6 +17258,7 @@ $ashborne_last_group_leader_room = nil
 $ashborne_last_group_target_signature = nil
 $ashborne_last_group_target_at = 0.0
 $ashborne_last_upkeep_at = 0.0
+$ashborne_last_gameobj_scan_at = 0.0
 $ashborne_last_group_cluster_at = 0.0
 $ashborne_last_group_support_at = 0.0
 $ashborne_group_session_id = ""
@@ -24255,14 +24357,20 @@ ashborne_group_status_check = proc {
 
 
 ashborne_gameobj_check = proc {
-  Ashborne_toolkit.pod_check unless $ashborne_disable_pod == "1"
-  Ashborne_toolkit.cloud_check unless $ashborne_disable_cloud == "1"
-  Ashborne_toolkit.void_check unless $ashborne_disable_void == "1"
-  Ashborne_toolkit.vine_check unless $ashborne_disable_vine == "1"
-  Ashborne_toolkit.sandstorm_check unless $ashborne_disable_sandstorm == "1"
-  Ashborne_toolkit.web_check unless $ashborne_disable_web == "1"
-  Ashborne_toolkit.arm_check unless $ashborne_disable_arms == "1"
-  Ashborne_toolkit.tempest_check unless $ashborne_disable_tempest == "1"
+  now = Time.now.to_f
+  next if now - $ashborne_last_gameobj_scan_at.to_f < 0.1
+
+  $ashborne_last_gameobj_scan_at = now
+  loot = GameObj.loot
+  targets = GameObj.targets
+  Ashborne_toolkit.pod_check(loot) unless $ashborne_disable_pod == "1"
+  Ashborne_toolkit.cloud_check(loot) unless $ashborne_disable_cloud == "1"
+  Ashborne_toolkit.void_check(loot) unless $ashborne_disable_void == "1"
+  Ashborne_toolkit.vine_check(loot) unless $ashborne_disable_vine == "1"
+  Ashborne_toolkit.sandstorm_check(loot) unless $ashborne_disable_sandstorm == "1"
+  Ashborne_toolkit.web_check(loot) unless $ashborne_disable_web == "1"
+  Ashborne_toolkit.arm_check(targets) unless $ashborne_disable_arms == "1"
+  Ashborne_toolkit.tempest_check(loot) unless $ashborne_disable_tempest == "1"
 }
 
 ashborne_upkeep_buffs = proc {
@@ -24838,14 +24946,15 @@ ashborne_group_support = proc {
     Ashborne_toolkit.rescue_current_group_danger
 
     if !checkstunned && !checkdead
+      visible_players = GameObj.pcs
       Ashborne_toolkit.group_session_names.each do |member_name|
         next if member_name.to_s.casecmp(Char.name.to_s).zero?
 
-        pc = Ashborne_toolkit.visible_group_pc(member_name)
+        pc = Ashborne_toolkit.visible_group_pc(member_name, visible_players)
         next if pc.nil?
         next unless pc.status.to_s =~ /stun|lying down|prone|kneeling/i
 
-        Ashborne_toolkit.rescue_visible_groupmate(member_name, "visible groupmate needs help")
+        Ashborne_toolkit.rescue_visible_groupmate(member_name, "visible groupmate needs help", pc)
       end
       pause 0.1
     end
@@ -28153,6 +28262,7 @@ Ashborne_toolkit.maintain_noise_lockdown if Ashborne_toolkit.noise_lockdown? && 
 # characters continue into their dedicated loops below.
 unless $ashborne_qfollow == "1" || $ashborne_group_ai == "2"
 loop {
+  begin
   # Ashborne_toolkit.milk_carton
   # respond "Debug Output - Loop starting."
   # respond "Debug Output - Intel Check."
@@ -28415,6 +28525,11 @@ loop {
 
 
   ashborne_zone_reset_check.call
+  rescue => error
+    Ashborne_toolkit.handle_runtime_error(error, "leader loop")
+  ensure
+    Ashborne_toolkit.runtime_yield
+  end
 }
 end
 
@@ -28428,6 +28543,7 @@ end
 if $ashborne_group_ai == "2" && $ashborne_qfollow != "1"
 Ashborne_toolkit.follower_status_notice_rc18
 loop {
+  begin
   # respond "I'm in tailmode"
   sleep 0.1
   Ashborne_toolkit.process_follower_control_requests_rc15
@@ -28442,7 +28558,6 @@ loop {
   Ashborne_toolkit.group_danger_retreat_if_needed
   ashborne_group_support.call unless $ashborne_follow_mode == "1"
   Ashborne_toolkit.loot_script("#{$ashborne_loot_script}") if GameObj.dead.length >= 1 && (GameObj.targets.empty? || Ashborne_toolkit.urgent_loot_needed?)
-  Ashborne_toolkit.boost_long
   ashborne_upkeep_buffs.call
 
   # if checkgrouped
@@ -28507,6 +28622,9 @@ loop {
     end
   end
 
+  rescue => error
+    Ashborne_toolkit.handle_runtime_error(error, "follower loop")
+  end
 }
 end
 
@@ -28516,6 +28634,7 @@ end
 # Quick-follow characters use this loop.
 Ashborne_toolkit.follower_status_notice_rc18
 loop {
+  begin
   Ashborne_toolkit.process_follower_control_requests_rc15
   Ashborne_toolkit.publish_group_state
   ashborne_group_status_check.call
@@ -28540,4 +28659,7 @@ loop {
     end
   end
 
+  rescue => error
+    Ashborne_toolkit.handle_runtime_error(error, "quick-follow loop")
+  end
 }
