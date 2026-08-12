@@ -5,7 +5,7 @@ Please adhere to POLICY 18 & 19.
 Owner and maintainer: NecroDeus
 author: NecroDeus
 game: Gemstone
-version: 0.4.0-rc53
+version: 0.4.0-rc59
 tags: hunting, combat, group, gui, utility, automation
 required: Lich >= 5.17.1
 
@@ -13,7 +13,37 @@ Ashborne is a mixed-class solo and group hunting coordinator with per-character
 combat styles, safety checks, loot rotation, town services, and repeat hunts.
 Requires intel_ashborne.lic. Group mode also requires Borg, Drone, and Queen.
 
-Recent updates (0.4.0-rc53 - 2026-08-09):
+Recent updates (0.4.0-rc59 - 2026-08-11):
+- Clerics can toggle a per-character Bolt/Web casting build. It uses Holy Bolt
+  (306) against undead and evoked Web (118) against living targets, while the
+  normal HuntPro warding cycle remains the default.
+- Bolt/Web mode verifies Spell Aiming, Summoning lore, known spells, available
+  mana, and existing spell-disable settings before falling back safely.
+- Missing followers now receive a real Queen/Thunder rally before the leader
+  defends against destination-room hostiles, with five-second retry throttling.
+- Group travel now corroborates visible followers with fresh room telemetry and
+  catches obstacle splits without treating normal brief movement lag as a split.
+- Occupied-room marks now clear as soon as the current room is empty, and mapped
+  dead ends may transit through an avoided connector to reach a clear room.
+- Repeated occupied-room exit failures are throttled to prevent client spam.
+- Empty post-loot rooms now clear stale combat state and resume catalog movement,
+  preventing dead-end rooms from holding the hunter after the last kill.
+- Catalog dead ends no longer wait forever when their only exit is temporarily
+  avoided; Ashborne routes defensively through it to another clear in-area room.
+- Removed the obsolete local-presence file bus, eliminating continuous disk
+  writes from every solo and group account.
+- Intel/Infomon discovery, buff upkeep, and group support now run on bounded
+  schedules instead of on every main-loop pass.
+- Group movement, readiness, room, and combat-target files now write only when
+  state changes or their freshness interval requires renewal.
+- Concurrent local Ashborne characters are exempt from occupied-room safety only
+  when the game reports them in the same current group; solo accounts yield.
+- Occupied-room detection now trusts live group membership instead of a saved
+  roster, preventing ungrouped configured characters from sharing a hunt room.
+- Group leaders now publish one room-specific combat target by creature ID, and
+  followers focus that exact creature instead of independently splitting fights.
+- Followers hold their attacks when no fresh leader target exists; anti-caster
+  reactions can still interrupt briefly before returning to the shared target.
 - The combat watchdog now recognizes weapon roundtime, cast roundtime, and
   player-side attacks or spell casts as progress instead of false stalls.
 - Watchdog recovery keeps a valid target untouched and only selects a new target
@@ -63,7 +93,6 @@ require 'fileutils'
 require 'time'
 
 before_dying do
-  Ashborne_toolkit.remove_local_presence if defined?(Ashborne_toolkit)
   Ashborne_toolkit.mark_group_not_ready if defined?(Ashborne_toolkit)
   Ashborne_toolkit.remove_anti_caster_hook if defined?(Ashborne_toolkit)
   Ashborne_toolkit.remove_environmental_danger_hook if defined?(Ashborne_toolkit)
@@ -81,8 +110,8 @@ begin
 rescue
   nil
 end
-ashborne_version = "0.4.0-rc51"
-ashborne_last_update = "8/6/2026"
+ashborne_version = "0.4.0-rc59"
+ashborne_last_update = "8/11/2026"
 # Hide Command Inputs
 silence_me
 
@@ -171,6 +200,7 @@ ashborne_setting_turbo_crowd_control	= Settings[Char.name]['ashborne_setting_tur
 ashborne_setting_crowd_control		= Settings[Char.name]['ashborne_setting_crowd_control'] || "0"
 ashborne_setting_huntpro_spell_baseline	= Settings[Char.name]['ashborne_setting_huntpro_spell_baseline'] || "1"
 ashborne_setting_bind_then_kill		= Settings[Char.name]['ashborne_setting_bind_then_kill'] || "0"
+ashborne_setting_cleric_bolt_web		= Settings[Char.name]['ashborne_setting_cleric_bolt_web'] || "0"
 ashborne_setting_no_crowd_control	= Settings[Char.name]['ashborne_setting_no_crowd_control'] || "0"
 
 # Migrate the original loot-rotation defaults, which were outside Lich's normal 0-100 encumbrance meter.
@@ -269,6 +299,9 @@ module Ashborne_toolkit
         singleton = toolkit.singleton_class
         singleton.send(:remove_method, method_name) if singleton.instance_methods(false).include?(method_name)
       end
+    end
+    Dir.glob(File.join(Ashborne_toolkit.ashborne_data_directory, "ashborne_presence_*.txt")).each do |path|
+      File.delete(path) if File.file?(path)
     end
     nil
   rescue
@@ -1392,10 +1425,24 @@ module Ashborne_toolkit
     return [] unless $ashborne_group_ai == "1"
 
     Ashborne_toolkit.configured_group_members.reject do |member_name|
-      Ashborne_toolkit.visible_group_pc(member_name)
+      Ashborne_toolkit.follower_confirmed_in_current_room?(member_name)
     end
   rescue
     Ashborne_toolkit.configured_group_members rescue []
+  end
+
+  def follower_confirmed_in_current_room?(member_name)
+    return false unless Ashborne_toolkit.visible_group_pc(member_name)
+
+    current_room_id = Room.current && Ashborne_toolkit.current_room_id
+    return false unless current_room_id
+    state = Ashborne_toolkit.read_group_state(member_name)
+    state_is_fresh = state && Time.now.to_i - state["timestamp"].to_i <= 10
+    return true unless state_is_fresh
+
+    state["room_id"].to_s == current_room_id.to_s
+  rescue
+    false
   end
 
   def stop_group_travel_without_group(reason)
@@ -1445,6 +1492,7 @@ module Ashborne_toolkit
       Ashborne_toolkit.defend_while_waiting_for_group unless GameObj.targets.empty?
       if Time.now >= next_rally
         respond "Rallying missing follower(s): #{missing.join(', ')}."
+        Ashborne_toolkit.rally_group_members
         Ashborne_toolkit.command_missing_followers_for_regroup(missing, context)
         next_rally = Time.now + 5
       end
@@ -1486,7 +1534,7 @@ module Ashborne_toolkit
             missing_since = nil
           else
             missing_since ||= Time.now
-            if room_changed || Time.now - missing_since >= 2.0
+            if Time.now - missing_since >= 1.25
               regroup_needed = true
               break
             elsif Time.now.to_i > last_warning
@@ -1738,6 +1786,30 @@ module Ashborne_toolkit
     nil
   end
 
+  def catalog_dead_end_escape_destination(current_id, blocked_room_id)
+    return nil unless Ashborne_toolkit.huntplan_catalog_zone?
+    return nil unless Room.current
+
+    allowed = Array($ashborne_huntplan_catalog_rooms).map(&:to_i).uniq
+    candidates = allowed.reject do |room_id|
+      room_id == current_id.to_i ||
+        room_id == blocked_room_id.to_i ||
+        Ashborne_toolkit.avoided_room_reason(room_id)
+    end
+    anchor = $ashborne_huntplan_catalog_anchor.to_i
+    return anchor if candidates.include?(anchor)
+
+    candidates.min_by do |room_id|
+      destination = Room[room_id]
+      path = destination ? Room.current.path_to(destination) : nil
+      path ? path.length : 100_000
+    rescue
+      100_000
+    end
+  rescue
+    nil
+  end
+
   def huntplan_catalog_walk
     return nil unless Ashborne_toolkit.huntplan_catalog_zone?
 
@@ -1766,6 +1838,15 @@ module Ashborne_toolkit
     recent = Array($ashborne_huntplan_catalog_recent_rooms).map(&:to_i)
     open_candidates = candidates.reject { |room_id| Ashborne_toolkit.avoided_room_reason(room_id) }
     if open_candidates.empty?
+      if candidates.length == 1
+        escape_destination = Ashborne_toolkit.catalog_dead_end_escape_destination(current_id, candidates.first)
+        if escape_destination
+          respond "Ashborne catalog dead end: passing through avoided room #{candidates.first} to clear room #{escape_destination}."
+          Ashborne_toolkit.monitored_group_go2(escape_destination, "catalog dead-end escape")
+          $ashborne_huntplan_catalog_recent_rooms = (recent + [current_id, escape_destination.to_i]).last(8)
+          return true
+        end
+      end
       now = Time.now.to_f
       if now - $ashborne_huntplan_catalog_avoid_wait_notice_at.to_f >= 5.0
         reasons = candidates.map { |room_id| Ashborne_toolkit.avoided_room_reason(room_id) }.compact.uniq
@@ -2047,68 +2128,11 @@ module Ashborne_toolkit
       .uniq
   end
 
-  def local_presence_file(name = Char.name)
-    safe_name = Ashborne_toolkit.canonical_character_name(name).gsub(/[^A-Za-z0-9_\-]/, "")
-    Ashborne_toolkit.ashborne_data_file("ashborne_presence_#{safe_name}.txt")
-  end
-
-  def publish_local_presence(force = false)
-    now = Time.now.to_f
-    return true unless force || now - $ashborne_last_local_presence_at.to_f >= 1.0
-
-    room_id = Room.current && Ashborne_toolkit.current_room_id ? Ashborne_toolkit.current_room_id.to_s : "0"
-    payload = [
-      Char.name,
-      now.to_i,
-      room_id,
-      defined?($ashborne_my_area) ? $ashborne_my_area.to_s : "0",
-      defined?($ashborne_my_style) ? $ashborne_my_style.to_s : "0"
-    ].join("|")
-    File.write(Ashborne_toolkit.local_presence_file, payload)
-    $ashborne_last_local_presence_at = now
-    true
-  rescue
-    false
-  end
-
-  def remove_local_presence
-    path = Ashborne_toolkit.local_presence_file
-    File.delete(path) if File.exist?(path)
-    true
-  rescue
-    false
-  end
-
-  def fresh_local_ashborne_names(max_age = 30)
-    Ashborne_toolkit.publish_local_presence
-    pattern = File.join(Ashborne_toolkit.ashborne_data_directory, "ashborne_presence_*.txt")
-    now = Time.now.to_i
-    Dir.glob(pattern).each_with_object([]) do |path, names|
-      name, timestamp, _room_id, _area, _style = File.read(path).strip.split("|", 5)
-      next if timestamp.to_i <= 0 || now - timestamp.to_i > max_age.to_i
-      next unless Ashborne_toolkit.valid_character_name?(name)
-
-      names << Ashborne_toolkit.canonical_character_name(name).downcase
-    rescue
-      nil
-    end.uniq
-  rescue
-    []
-  end
-
   def occupied_room_players
-    players = if defined?($ashborne_group_ai) && $ashborne_group_ai != "0"
-                Ashborne_toolkit.visible_non_group_players
-              else
-                GameObj.pcs
-              end
-    local_names = Ashborne_toolkit.fresh_local_ashborne_names
-    players.reject do |player|
-      names = [
-        Ashborne_toolkit.canonical_character_name(player.name),
-        Ashborne_toolkit.canonical_character_name(player.noun)
-      ].map { |name| name.to_s.downcase }.reject(&:empty?)
-      names.any? { |name| local_names.include?(name) }
+    if defined?($ashborne_group_ai) && $ashborne_group_ai != "0"
+      Ashborne_toolkit.visible_non_group_players
+    else
+      GameObj.pcs
     end
   rescue
     []
@@ -3121,6 +3145,7 @@ module Ashborne_toolkit
     respond ";ashborne setup preflight      Group safety and readiness report"
     respond ";ashborne setup change huntprocasting 0|1   Toggle the complete HuntPro caster cycle (default: 1)"
     respond ";ashborne setup change bindkill 0|1         Bind undead before Cleric/Empath melee attacks (default: 0)"
+    respond ";ashborne setup change clericboltweb 0|1    Cleric: 306 vs undead, 118 EVOKE vs living (default: 0)"
     respond ";ashborne plan                 Show elected group jobs"
     respond ";ashborne bounty               Read your current Adventurer's Guild bounty and hunt it"
     respond ";ashborne support              Write a compact diagnostic report"
@@ -3359,10 +3384,14 @@ module Ashborne_toolkit
   end
 
   def ashborne_intel_service_check
-    return nil if Script.running?("intel_ashborne")
-    return nil if @intel_ashborne_last_start && Time.now.to_i - @intel_ashborne_last_start < 30
+    now = Time.now.to_f
+    return nil if @intel_ashborne_last_check && now - @intel_ashborne_last_check < 5.0
 
-    @intel_ashborne_last_start = Time.now.to_i
+    @intel_ashborne_last_check = now
+    return nil if Script.running?("intel_ashborne")
+    return nil if @intel_ashborne_last_start && now - @intel_ashborne_last_start < 30.0
+
+    @intel_ashborne_last_start = now
     Script.start("intel_ashborne") if Script.exists?("intel_ashborne")
   end
 
@@ -3376,9 +3405,14 @@ module Ashborne_toolkit
   end
 
   def infomon_check
+    now = Time.now.to_f
+    return nil if @infomon_last_check && now - @infomon_last_check < 10.0
+
+    @infomon_last_check = now
     if Script.running?("infomon") || defined?(Infomon)
       nil
-    else
+    elsif !@infomon_last_start || now - @infomon_last_start >= 30.0
+      @infomon_last_start = now
       do_client ";fixit"
     end
   end
@@ -3516,6 +3550,10 @@ module Ashborne_toolkit
 
     return nil if Ashborne_toolkit.handle_environmental_hazard_targets
 
+    if defined?($ashborne_group_ai) && $ashborne_group_ai == "2" && Ashborne_toolkit.group_follower_attack_priority
+      return Ashborne_toolkit.sync_group_combat_target(previous_target_id)
+    end
+
     Ashborne_toolkit.target_reset_check unless $ashborne_my_area == "group"
 
     if $huuntpro_action == 98
@@ -3606,6 +3644,7 @@ module Ashborne_toolkit
       end
 
     end
+    Ashborne_toolkit.publish_group_combat_target if defined?($ashborne_group_ai) && $ashborne_group_ai == "1"
   end
 
   def bounty_objective_present?
@@ -6824,6 +6863,11 @@ module Ashborne_toolkit
       Ashborne_toolkit.publish_group_ready_state(true)
     end
     return if Ashborne_toolkit.process_anti_caster_event
+    if $ashborne_group_ai == "2" && Ashborne_toolkit.group_follower_attack_priority
+      return unless Ashborne_toolkit.sync_group_combat_target
+    elsif $ashborne_group_ai == "1"
+      Ashborne_toolkit.publish_group_combat_target
+    end
     Ashborne_toolkit.publish_group_move_state(false) if $ashborne_group_ai != "0"
     Ashborne_toolkit.publish_group_leader_room
     Ashborne_toolkit.group_follow_sync
@@ -8066,6 +8110,28 @@ module Ashborne_toolkit
     false
   end
 
+  def cleric_bolt_web_mode?
+    Stats.prof.to_s == "Cleric" && $ashborne_my_style.to_s == "9" &&
+      $ashborne_cleric_bolt_web.to_s == "1" && !Ashborne_toolkit.custom_spell_rotation_enabled?
+  rescue
+    false
+  end
+
+  def cleric_bolt_web_spell_choice
+    return nil unless Ashborne_toolkit.cleric_bolt_web_mode?
+
+    if Ashborne_toolkit.bind_then_kill_undead_target?(GameObj.target)
+      return 306 if $ashborne_disable_306.to_s == "0" && Ashborne_toolkit.caster_spell_ready?(306, 6)
+    elsif Skills.spellaiming.to_i >= 1 && Skills.slsummoning.to_i >= 20 &&
+        Ashborne_toolkit.caster_spell_ready?(118, 9)
+      return "118b"
+    end
+
+    nil
+  rescue
+    nil
+  end
+
   def caster_low_mana_spell_choice(profession = Stats.prof)
     case profession.to_s
     when "Wizard"
@@ -8134,6 +8200,16 @@ module Ashborne_toolkit
 
   def spell_choice
     Ashborne_toolkit.style_9_spell_overrides
+
+    # BEGIN ASHBORNE CLERIC BOLT WEB
+    if Stats.prof == "Cleric"
+      bolt_web_spell = Ashborne_toolkit.cleric_bolt_web_spell_choice
+      unless bolt_web_spell.nil?
+        $ashborne_cleric_primary_spell = bolt_web_spell
+        return
+      end
+    end
+    # END ASHBORNE CLERIC BOLT WEB
 
     # Determine if you should make a last minute decision about what spell to cast
     if $ashborne_style_9_primary_spell_override == "1700"
@@ -8449,6 +8525,17 @@ module Ashborne_toolkit
       $ashborne_bard_primary_spell = "9999"
       $ashborne_paladin_primary_spell = "9999"
     end
+
+    # BEGIN ASHBORNE CLERIC BOLT WEB
+    if Stats.prof == "Cleric" && $ashborne_cleric_primary_spell == "118b"
+      Ashborne_toolkit.stance_offensive
+      fput "incant 118 channel evoke" if Spell[118].known? && Spell[118].affordable? && Skills.slsummoning.to_i >= 20
+      Ashborne_toolkit.true_stance_guarded
+      $ashborne_cleric_primary_spell = 1700
+      Ashborne_toolkit.stance_guarded
+      return
+    end
+    # END ASHBORNE CLERIC BOLT WEB
 
     if Stats.prof == "Empath"
       if $ashborne_empath_primary_spell == "9999"
@@ -9108,6 +9195,26 @@ module Ashborne_toolkit
     false
   end
 
+  def recover_empty_combat_state
+    return false unless $ashborne_action == 7
+    return false unless GameObj.targets.empty? && GameObj.dead.empty?
+    return false if Script.running?($ashborne_loot_script.to_s)
+    return false if Ashborne_toolkit.hidden_threat_present?
+
+    $ashborne_current_target = nil
+    $ashborne_id_placeholder = nil
+    $ashborne_name_placeholder = nil
+    $ashborne_recent_eviction = "0"
+    $ashborne_own_this_room = 0
+    $ashborne_action = 6
+    Ashborne_toolkit.publish_group_combat_target if $ashborne_group_ai == "1"
+    respond "Ashborne cleared an empty combat state and resumed hunting."
+    true
+  rescue => error
+    respond "Ashborne empty-combat recovery warning: #{error.message}" if $ashborne_qc_debug == "1"
+    false
+  end
+
   def run_post_hunt_ewaggle_rc45(force = false)
     return true if !force && $ashborne_no_waggle != "0"
     unless GameObj.targets.empty?
@@ -9244,6 +9351,95 @@ module Ashborne_toolkit
 
   def group_looter_file
     Ashborne_toolkit.ashborne_data_file("#{Ashborne_toolkit.group_bus_leader_name}_ashborne_group_looter.txt")
+  end
+
+  def group_combat_target_file
+    Ashborne_toolkit.ashborne_data_file("#{Ashborne_toolkit.group_bus_leader_name}_ashborne_group_target.txt")
+  end
+
+  def publish_group_combat_target
+    return false unless $ashborne_group_ai == "1"
+    return false unless Room.current && Ashborne_toolkit.current_room_id
+
+    target_id = $ashborne_id_placeholder.to_s
+    target = GameObj.targets.find do |creature|
+      creature.id.to_s == target_id &&
+        creature.status.to_s !~ /dead|gone/i &&
+        !Ashborne_toolkit.environmental_hazard_target?(creature)
+    end
+    return false unless target
+
+    now = Time.now.to_f
+    signature = [Ashborne_toolkit.current_group_session_id, Ashborne_toolkit.current_room_id, target.id].join("|")
+    if signature == $ashborne_last_group_target_signature && now - $ashborne_last_group_target_at.to_f < 2.0
+      return true
+    end
+    payload = [
+      Ashborne_toolkit.current_group_session_id,
+      Ashborne_toolkit.current_room_id,
+      target.id,
+      target.name.to_s.gsub("|", " "),
+      now
+    ].join("|")
+    File.open(Ashborne_toolkit.group_combat_target_file, File::RDWR | File::CREAT, 0644) do |file|
+      file.flock(File::LOCK_EX)
+      file.rewind
+      file.truncate(0)
+      file.write(payload)
+      file.flush
+    end
+    $ashborne_last_group_target_signature = signature
+    $ashborne_last_group_target_at = now
+    true
+  rescue => error
+    respond "Group target publish warning: #{error.message}" if $ashborne_qc_debug == "1"
+    false
+  end
+
+  def shared_group_combat_target
+    return nil unless $ashborne_group_ai == "2"
+    return nil unless Room.current && Ashborne_toolkit.current_room_id
+
+    path = Ashborne_toolkit.group_combat_target_file
+    return nil unless File.exist?(path)
+    payload = File.open(path, "r") do |file|
+      file.flock(File::LOCK_SH)
+      file.read.to_s.strip
+    end
+    session_id, room_id, target_id, _target_name, timestamp = payload.split("|", 5)
+    return nil unless session_id.to_s == Ashborne_toolkit.current_group_session_id.to_s
+    return nil unless room_id.to_s == Ashborne_toolkit.current_room_id.to_s
+    return nil if timestamp.to_f <= 0 || Time.now.to_f - timestamp.to_f > 20.0
+
+    GameObj.targets.find do |creature|
+      creature.id.to_s == target_id.to_s &&
+        creature.status.to_s !~ /dead|gone/i &&
+        !Ashborne_toolkit.environmental_hazard_target?(creature)
+    end
+  rescue
+    nil
+  end
+
+  def sync_group_combat_target(current_target_id = nil)
+    return true unless $ashborne_group_ai == "2" && Ashborne_toolkit.group_follower_attack_priority
+
+    target = Ashborne_toolkit.shared_group_combat_target
+    return false unless target
+
+    current_target_id = begin
+      xml_target_id = XMLData.current_target_id.to_s
+      xml_target_id.empty? || xml_target_id == "0" ? $ashborne_id_placeholder.to_s : xml_target_id
+    rescue
+      $ashborne_id_placeholder.to_s
+    end if current_target_id.nil?
+    fput "target ##{target.id}" unless current_target_id.to_s == target.id.to_s
+    $ashborne_current_target = target.name
+    $ashborne_id_placeholder = target.id
+    $ashborne_name_placeholder = target.name
+    true
+  rescue => error
+    respond "Group target sync warning: #{error.message}" if $ashborne_qc_debug == "1"
+    false
   end
 
   def group_session_file
@@ -9968,6 +10164,13 @@ module Ashborne_toolkit
     end
 
     catalog_regroup = Ashborne_toolkit.huntplan_catalog_zone? && Ashborne_toolkit.group_incomplete_in_current_room?
+    missing = Ashborne_toolkit.configured_followers_missing_in_room
+    next_rally = Time.at(0)
+    if $ashborne_group_ai == "1" && !missing.empty?
+      Ashborne_toolkit.rally_group_members
+      Ashborne_toolkit.command_missing_followers_for_regroup(missing, "combat-interrupted regroup")
+      next_rally = Time.now + 5
+    end
     if catalog_regroup
       respond "Catalog regroup interrupted by combat; defending while the missing group catches up."
     else
@@ -9976,6 +10179,14 @@ module Ashborne_toolkit
     defense_deadline = Time.now + 30
     until GameObj.targets.empty? || Time.now >= defense_deadline
       Ashborne_toolkit.publish_group_leader_room if $ashborne_group_ai == "1"
+      if $ashborne_group_ai == "1" && Time.now >= next_rally
+        missing = Ashborne_toolkit.configured_followers_missing_in_room
+        unless missing.empty?
+          Ashborne_toolkit.rally_group_members
+          Ashborne_toolkit.command_missing_followers_for_regroup(missing, "combat-interrupted regroup")
+          next_rally = Time.now + 5
+        end
+      end
       Ashborne_toolkit.target_check
       Ashborne_toolkit.combat_unique_to_ashborne
       if checkdead
@@ -10075,7 +10286,7 @@ module Ashborne_toolkit
   end
 
   def visible_non_group_players
-    group_names = Ashborne_toolkit.configured_group_names.map { |name| name.to_s.downcase }
+    group_names = Ashborne_toolkit.actual_group_names.map { |name| name.to_s.downcase }
     GameObj.pcs.select do |pc|
       names = [
         Ashborne_toolkit.canonical_character_name(pc.name),
@@ -10978,6 +11189,13 @@ module Ashborne_toolkit
     $ashborne_avoided_rooms ||= {}
     data = $ashborne_avoided_rooms[room.to_s]
     return nil unless data
+    current_room = Room.current && Ashborne_toolkit.current_room_id
+    if data["reason"].to_s == "occupied by another player" &&
+        current_room && room.to_s == current_room.to_s &&
+        Ashborne_toolkit.occupied_room_players.empty?
+      $ashborne_avoided_rooms.delete(room.to_s)
+      return nil
+    end
     if data["until"].to_i <= Time.now.to_i
       $ashborne_avoided_rooms.delete(room.to_s)
       return nil
@@ -11065,11 +11283,21 @@ module Ashborne_toolkit
     return false unless routes.respond_to?(:keys)
 
     allowed_rooms = Ashborne_toolkit.huntplan_catalog_zone? ? Array($ashborne_huntplan_catalog_rooms).map(&:to_i) : nil
-    candidates = routes.keys.map(&:to_i).uniq
-    candidates.select! { |room_id| allowed_rooms.include?(room_id) } if allowed_rooms && !allowed_rooms.empty?
-    candidates.reject! { |room_id| room_id.to_s == starting_room.to_s }
+    raw_candidates = routes.keys.map(&:to_i).uniq
+    raw_candidates.select! { |room_id| allowed_rooms.include?(room_id) } if allowed_rooms && !allowed_rooms.empty?
+    raw_candidates.reject! { |room_id| room_id.to_s == starting_room.to_s }
+    candidates = raw_candidates.dup
     candidates.reject! { |room_id| Ashborne_toolkit.avoided_room_reason(room_id) }
-    return false if candidates.empty?
+    if candidates.empty?
+      if Ashborne_toolkit.huntplan_catalog_zone? && !raw_candidates.empty?
+        destination = Ashborne_toolkit.catalog_dead_end_escape_destination(starting_room, raw_candidates.first)
+        if destination
+          respond "Ashborne occupied dead end: transiting through a blocked connector to clear room #{destination}."
+          return Ashborne_toolkit.monitored_group_go2(destination, "occupied or hazardous dead-end escape")
+        end
+      end
+      return false
+    end
 
     recent = Array($ashborne_environmental_recent_escape_rooms).map(&:to_i)
     destination = (candidates - recent).first || candidates.first
@@ -11357,8 +11585,15 @@ module Ashborne_toolkit
 
     begin
       room_id = Room.current && Ashborne_toolkit.current_room_id ? Ashborne_toolkit.current_room_id.to_s : "0"
-      payload = [safe ? "1" : "0", room_id, Time.now.to_i.to_s].join("|")
+      now = Time.now.to_f
+      signature = [safe ? "1" : "0", room_id].join("|")
+      elapsed = now - $ashborne_last_group_move_state_at.to_f
+      return nil if signature == $ashborne_last_group_move_state_signature && elapsed < 1.0
+
+      payload = [safe ? "1" : "0", room_id, now.to_i.to_s].join("|")
       File.write(Ashborne_toolkit.group_move_state_file, payload)
+      $ashborne_last_group_move_state_signature = signature
+      $ashborne_last_group_move_state_at = now
     rescue
       nil
     end
@@ -12943,7 +13178,11 @@ module Ashborne_toolkit
     return nil unless Room.current && Ashborne_toolkit.current_room_id
 
     begin
-      File.write(Ashborne_toolkit.group_leader_room_file, Ashborne_toolkit.current_room_id.to_s)
+      room_id = Ashborne_toolkit.current_room_id.to_s
+      return nil if room_id == $ashborne_last_group_leader_room
+
+      File.write(Ashborne_toolkit.group_leader_room_file, room_id)
+      $ashborne_last_group_leader_room = room_id
     rescue
       nil
     end
@@ -12956,8 +13195,15 @@ module Ashborne_toolkit
     return nil unless Room.current && Ashborne_toolkit.current_room_id
 
     begin
-      payload = [ready ? "1" : "0", Ashborne_toolkit.current_room_id.to_s, Time.now.to_i.to_s].join("|")
+      now = Time.now.to_f
+      signature = [ready ? "1" : "0", Ashborne_toolkit.current_room_id.to_s].join("|")
+      elapsed = now - $ashborne_last_group_ready_at.to_f
+      return nil if signature == $ashborne_last_group_ready_signature && elapsed < 5.0
+
+      payload = [ready ? "1" : "0", Ashborne_toolkit.current_room_id.to_s, now.to_i.to_s].join("|")
       File.write(Ashborne_toolkit.group_ready_file, payload)
+      $ashborne_last_group_ready_signature = signature
+      $ashborne_last_group_ready_at = now
     rescue
       nil
     end
@@ -14298,7 +14544,13 @@ module Ashborne_toolkit
 
     names = players.map { |player| Ashborne_toolkit.canonical_character_name(player.name) }
       .select { |name| Ashborne_toolkit.valid_character_name?(name) }
-    respond "Room already occupied by #{names.join(', ')}; leaving without engaging."
+    now = Time.now.to_f
+    notice_signature = "#{Ashborne_toolkit.current_room_id}:#{names.sort.join(',')}"
+    if notice_signature != @occupied_exit_notice_signature || now - @occupied_exit_notice_at.to_f >= 5.0
+      respond "Room already occupied by #{names.join(', ')}; leaving without engaging."
+      @occupied_exit_notice_signature = notice_signature
+      @occupied_exit_notice_at = now
+    end
 
     waitrt?
     Ashborne_toolkit.stance_defensive
@@ -14309,7 +14561,12 @@ module Ashborne_toolkit
     $ashborne_action = 0
     $ashborne_own_this_room = 0
     $ashborne_my_vine = "0"
-    respond "Occupied-room exit failed; remaining defensive." unless moved
+    if moved
+      @occupied_exit_failure_notice_at = 0.0
+    elsif now - @occupied_exit_failure_notice_at.to_f >= 5.0
+      respond "Occupied-room exit failed; remaining defensive."
+      @occupied_exit_failure_notice_at = now
+    end
     moved
   rescue => error
     Ashborne_toolkit.stance_defensive
@@ -16892,6 +17149,16 @@ $ashborne_environmental_recent_escape_rooms = []
 $ashborne_room_yield_stats = {}
 $ashborne_last_group_state_payload = nil
 $ashborne_last_group_state_at = 0.0
+$ashborne_last_group_move_state_signature = nil
+$ashborne_last_group_move_state_at = 0.0
+$ashborne_last_group_ready_signature = nil
+$ashborne_last_group_ready_at = 0.0
+$ashborne_last_group_leader_room = nil
+$ashborne_last_group_target_signature = nil
+$ashborne_last_group_target_at = 0.0
+$ashborne_last_upkeep_at = 0.0
+$ashborne_last_group_cluster_at = 0.0
+$ashborne_last_group_support_at = 0.0
 $ashborne_group_session_id = ""
 $ashborne_startup_ready = "0"
 $ashborne_group_startup_missing = []
@@ -16911,6 +17178,7 @@ $ashborne_turbo_crowd_control = "0"
 $ashborne_crowd_control = "0"
 $ashborne_huntpro_spell_baseline = ashborne_setting_huntpro_spell_baseline.to_s == "0" ? "0" : "1"
 $ashborne_bind_then_kill = "0"
+$ashborne_cleric_bolt_web = ashborne_setting_cleric_bolt_web.to_s == "1" ? "1" : "0"
 $ashborne_bind_then_kill_target_id = nil
 $ashborne_bind_then_kill_attempts = 0
 $ashborne_bind_then_kill_bound_targets = {}
@@ -23470,7 +23738,6 @@ ashborne_zone_reset_check = proc {
 
 
 ashborne_status_check = proc {
-  Ashborne_toolkit.publish_local_presence
   Ashborne_toolkit.publish_group_state
   Ashborne_toolkit.clear_stale_wrong_equipment_return_if_combat_progress
   next if Ashborne_toolkit.medical_retreat_if_needed
@@ -23999,7 +24266,10 @@ ashborne_gameobj_check = proc {
 }
 
 ashborne_upkeep_buffs = proc {
-  sleep 0.2
+  now = Time.now.to_f
+  next if now - $ashborne_last_upkeep_at.to_f < 1.0
+
+  $ashborne_last_upkeep_at = now
 
   if ashborne_setting_upkeep140 == "0"
     nil
@@ -24282,8 +24552,12 @@ ashborne_group_check = proc {
       Ashborne_toolkit.group_follow_sync
 
       respond "Waiting for group members to arrive."
-      Ashborne_toolkit.defend_while_waiting_for_group unless GameObj.targets.empty?
       Ashborne_toolkit.rally_group_members
+      Ashborne_toolkit.command_missing_followers_for_regroup(
+        Ashborne_toolkit.configured_followers_missing_in_room,
+        "group assembly"
+      )
+      Ashborne_toolkit.defend_while_waiting_for_group unless GameObj.targets.empty?
       ashborne_group_wait_counter = 1
       sleep 3
     end
@@ -24387,6 +24661,11 @@ ashborne_group_check = proc {
   else
     respond "Not all group members are here.  Holding hands and waiting for more."
     $ashborne_group_counter = 0
+    Ashborne_toolkit.rally_group_members
+    Ashborne_toolkit.command_missing_followers_for_regroup(
+      Ashborne_toolkit.configured_followers_missing_in_room,
+      "group presence check"
+    )
     Ashborne_toolkit.defend_while_waiting_for_group unless GameObj.targets.empty?
     sleep 3
   end
@@ -24513,8 +24792,17 @@ ashborne_soft_group = proc {
 
 ashborne_group_cluster = proc {
   if $ashborne_group_ai == "1"
+    now = Time.now.to_f
+    next if now - $ashborne_last_group_cluster_at.to_f < 0.5
+
+    $ashborne_last_group_cluster_at = now
     ashborne_soft_group.call
     if $ashborne_group_counter == 0
+      Ashborne_toolkit.rally_group_members
+      Ashborne_toolkit.command_missing_followers_for_regroup(
+        Ashborne_toolkit.configured_followers_missing_in_room,
+        "group cluster"
+      )
       Ashborne_toolkit.defend_while_waiting_for_group unless GameObj.targets.empty?
       until $ashborne_group_counter == $ashborne_group_array.length
         ashborne_group_check.call
@@ -24532,6 +24820,10 @@ ashborne_group_support = proc {
   if $ashborne_group_ai == "0"
     nil
   else
+    now = Time.now.to_f
+    next if now - $ashborne_last_group_support_at.to_f < 0.5
+
+    $ashborne_last_group_support_at = now
 
     if $ashborne_group_empath != "0"
       nil
@@ -25026,6 +25318,13 @@ ashborne_setup = proc {
   end
 
   $ashborne_bind_then_kill = ashborne_setting_bind_then_kill.to_s == "1" ? "1" : "0"
+
+  if ashborne_setting_cleric_bolt_web.to_s == "1" && Stats.prof.to_s == "Cleric"
+    respond "Cleric Bolt/Web build is enabled: Holy Bolt (306) against undead and evoked Web (118) against living targets."
+    respond "Ashborne falls back to the normal HuntPro cleric cycle when the selected bolt is unavailable."
+  end
+
+  $ashborne_cleric_bolt_web = ashborne_setting_cleric_bolt_web.to_s == "1" ? "1" : "0"
 
   if ashborne_setting_no_crowd_control == "0"
     nil
@@ -25588,6 +25887,7 @@ if script.vars[1].downcase =~ /reset/
   Settings[Char.name]['ashborne_setting_crowd_control'] = "0"
   Settings[Char.name]['ashborne_setting_huntpro_spell_baseline'] = "1"
   Settings[Char.name]['ashborne_setting_bind_then_kill'] = "0"
+  Settings[Char.name]['ashborne_setting_cleric_bolt_web'] = "0"
   Settings[Char.name]['ashborne_setting_no_crowd_control'] = "0"
   Settings[Char.name]['ashborne_setting_no_stun'] = "0"
   Settings[Char.name]['ashborne_setting_no_cock'] = "0"
@@ -25761,6 +26061,8 @@ module AshborneGui
       "On by default. Style 9 uses HuntPro's complete profession casting cycle before its main attack, including spells such as Earthen Fury (917), Tremors (909), Mana Leech (516), and Chromatic Circle (502) when HuntPro's normal level, mana, training, and cooldown conditions are met. Turn this off only to let Ashborne's custom ability rules filter those spells.",
     "ashborne_setting_bind_then_kill" =>
       "Off by default. For Clerics and Empaths using melee style 3 or 4, Ashborne attempts Bind (214) up to three times against each undead target before switching to weapon attacks. Bind must remain enabled on the Abilities & Rules page.",
+    "ashborne_setting_cleric_bolt_web" =>
+      "Cleric style 9 only. Off keeps HuntPro's normal CS warding cycle. On uses Holy Bolt (306) against undead and Web (118) EVOKE against living creatures. Web bolt requires Spell Aiming, 20 ranks of Spiritual Lore - Summoning, and 9 mana. Missing or unaffordable bolts fall back to the normal cleric cycle.",
     "ashborne_setting_cman_control" =>
       "Allows known Combat Maneuvers when Ashborne considers them useful.",
     "ashborne_setting_no_shield_control" =>
@@ -26217,6 +26519,7 @@ module AshborneGui
       [
         ["ashborne_setting_huntpro_spell_baseline", "Use complete HuntPro casting cycle", false],
         ["ashborne_setting_bind_then_kill", "Bind undead before melee attacks", false],
+        ["ashborne_setting_cleric_bolt_web", "Cleric Bolt/Web casting build", false],
         ["ashborne_setting_crowd_control", "Use crowd control", false],
         ["ashborne_setting_cman_control", "Use Combat Maneuvers", false],
         ["ashborne_setting_no_shield_control", "Disable Shield abilities", false],
@@ -27410,6 +27713,11 @@ elsif script.vars[1].downcase =~ /setup/ && script.vars[2].downcase =~ /change/ 
   Settings.save
   respond "Bind then kill is now #{Settings[Char.name]['ashborne_setting_bind_then_kill'] == '1' ? 'enabled' : 'disabled'} for #{Char.name}."
   exit
+elsif script.vars[1].downcase =~ /setup/ && script.vars[2].downcase =~ /change/ && script.vars[3].downcase =~ /\A(clericboltweb|boltweb)\z/
+  Settings[Char.name]['ashborne_setting_cleric_bolt_web'] = script.vars[4].to_s == "1" ? "1" : "0"
+  Settings.save
+  respond "Cleric Bolt/Web casting build is now #{Settings[Char.name]['ashborne_setting_cleric_bolt_web'] == '1' ? 'enabled' : 'disabled'} for #{Char.name}."
+  exit
 elsif script.vars[1].downcase =~ /setup/ && script.vars[2].downcase =~ /change/ && script.vars[3].downcase =~ /antimana|antireserve/
   reserve = script.vars[4].to_s.to_i
   reserve = 50 if reserve <= 0
@@ -27776,7 +28084,6 @@ end
 ashborne_run_script.call unless $ashborne_zonescripts == "1"
 
 Ashborne_toolkit.publish_group_state(true)
-Ashborne_toolkit.publish_local_presence(true)
 Ashborne_toolkit.coordinate_group_looter if $ashborne_group_ai == "1"
 Ashborne_toolkit.install_environmental_danger_hook
 Ashborne_toolkit.install_self_danger_hook
@@ -27871,6 +28178,7 @@ loop {
   # respond "Debug Output - Status Check 3."
   # respond "Debug Output - Game Obj Check."
   ashborne_gameobj_check.call
+  Ashborne_toolkit.recover_empty_combat_state
 
   # Ashborne Action Choice
 
