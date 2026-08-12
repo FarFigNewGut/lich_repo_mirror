@@ -17,7 +17,7 @@
        author: Mystienne
          game: gs
          tags: heal, empath, triage, injury, window, hud
-      version: 0.2.3
+      version: 0.2.6
      required: Lich >= 5.11.0
         email: Mystienne@mystienne.com
       discord: Mystienne
@@ -37,11 +37,9 @@ require 'set'
 # of the global namespace.
 module InjuryWatch
 
-  VERSION = '0.2.3'
+  VERSION = '0.2.6'
 
   CHECK_EVERY = 1.0
-  ROOM_LIST_NOTICE = "Too many PCs in room."
-  ROOM_LIST_DETAIL = "Tracking paused; fix in progress."
 
   HELP_TEXT = <<~HELP
     InjuryWatch #{VERSION}
@@ -99,7 +97,21 @@ module InjuryWatch
   CHANGELOG_TEXT = <<~CHANGELOG
     InjuryWatch Changelog
 
+    08-12-2026
+      - fix(room): Removed the untested too-many-PCs warning until crowded-room
+        behavior can be confirmed.
+      - fix(dock): Let an empty room list clear the display instead of keeping
+        stale people on screen.
+      - fix(look): Stop hiding injury lines from normal LOOK output while
+        InjuryWatch is running.
+      - fix(appraise): Only hide lines that come from InjuryWatch's own quiet
+        appraises.
+
     08-11-2026
+      - fix(appraise): Handle missing character names safely during appraise
+        retries.
+      - fix(debug): Show appraise errors in debug mode before returning an
+        unknown status.
       - fix(room): Treat a nil GameObj.pcs value as an empty room instead of an
         unavailable room list when no previously tracked PCs are present.
       - fix(display): Do not show "No one here" beneath a room-list warning.
@@ -520,10 +532,6 @@ module InjuryWatch
           warning = Gtk::Label.new(notice)
           warning.set_alignment(0.0, 0.5)
           @vbox.pack_start(warning, expand: false, fill: false, padding: 1)
-
-          detail = Gtk::Label.new(ROOM_LIST_DETAIL)
-          detail.set_alignment(0.0, 0.5)
-          @vbox.pack_start(detail, expand: false, fill: false, padding: 1)
         end
 
         if rows.empty? && !notice
@@ -538,7 +546,7 @@ module InjuryWatch
           end
         end
 
-        content_height = [total * 20 + 56 + (notice ? 40 : 0), 60].max
+        content_height = [total * 20 + 56 + (notice ? 20 : 0), 60].max
         if Vars[:injurywatch_autosize].to_s != 'false' && @window.respond_to?(:resize)
           @window.resize(200, content_height.clamp(60, 372))
         end
@@ -590,6 +598,7 @@ module InjuryWatch
   def self.appraise(pc_noun)
     wound_text = nil
     scar_text  = nil
+    target_noun = pc_noun.to_s.downcase
 
     3.times do |attempt|
       waitrt?
@@ -654,7 +663,8 @@ module InjuryWatch
       end
 
       break if wound_text || scar_text
-      break if GameObj.pcs && !GameObj.pcs.any? { |pc| pc.noun.downcase == pc_noun.downcase }
+      pcs = GameObj.pcs
+      break if pcs && !pcs.any? { |pc| pc.noun.to_s.downcase == target_noun }
       dbg "appraise #{pc_noun} -> no lines (attempt #{attempt + 1}/3), retrying..."
       sleep 0.5
     end
@@ -664,7 +674,8 @@ module InjuryWatch
     return "OK" if wound_text =~ /no apparent injuries|no apparent wounds/i && scar_text.nil?
 
     classify(wound_text, scar_text)
-  rescue
+  rescue StandardError => e
+    dbg "appraise #{pc_noun} failed: #{e.class}: #{e.message}"
     "?"
   end
 
@@ -721,9 +732,7 @@ module InjuryWatch
     if notice
       xml += "<label id='iw_notice' value='#{xml_escape(notice)}' justify='4' "
       xml += "top='#{top_pad}' left='5' height='#{row_height}' width='210'/>"
-      xml += "<label id='iw_notice2' value='#{xml_escape(ROOM_LIST_DETAIL)}' justify='4' "
-      xml += "top='#{top_pad + row_height}' left='5' height='#{row_height}' width='210'/>"
-      row_index = 2
+      row_index = 1
     end
 
     if rows.empty? && !notice
@@ -771,7 +780,6 @@ module InjuryWatch
         respond "--------------------"
         if notice
           respond "  #{notice}"
-          respond "  #{ROOM_LIST_DETAIL}"
           respond "--------------------"
         end
         if rows.empty?
@@ -983,9 +991,9 @@ module InjuryWatch
       wound_text = nil
       plain      = line.gsub(/<[^>]+>/, ' ').gsub(/\s+/, ' ').strip
 
-      # Suppress appraise usage error lines
+      # Suppress appraise usage error lines only during script appraises.
       if plain =~ /^APPRAISE \[|^APPRAISE GROUP|^APPRAISE TARGET/
-        next nil
+        next nil if InjuryWatch.bulk_appraising?
       end
 
       # Track heal refusals so we don't re-appraise on failed heals
@@ -1048,12 +1056,12 @@ module InjuryWatch
         next nil if InjuryWatch.bulk_appraising?
       end
 
-      # Scar/nerve follow-up line - suppress if person is dead
+      # Scar/nerve follow-up line.
       if line !~ /You take a quick appraisal/i && line =~ /<a [^>]*>(?:He|She)<\/a> has (.*?)\./i
-        # Suppress plain text scar line that leaks through for dead people
+        # Suppress leaked script-appraise scar lines for dead people.
         if last_appraised_noun
           entry = people_status.find { |_id, p| p[:noun].downcase == last_appraised_noun.downcase }
-          next nil if entry && entry[1][:status] =~ /^Dead/
+          next nil if InjuryWatch.bulk_appraising? && entry && entry[1][:status] =~ /^Dead/
         end
         if last_appraised_id
           candidate      = Regexp.last_match(1).gsub(/<[^>]+>/, '').gsub(/\s+/, ' ').strip
@@ -1071,12 +1079,11 @@ module InjuryWatch
         end
       end
 
-      # Suppress plain text "She/He has..." scar follow-up lines - we handle these
-      # internally via the XML path. Reset last_appraised_noun after suppressing so
-      # later unrelated "He/She has..." story text isn't also silently dropped.
+      # Suppress plain text "She/He has..." follow-up lines only during
+      # script appraises. Normal LOOK output must stay visible.
       if plain =~ /^(?:He|She) has /i && last_appraised_noun
         last_appraised_noun = nil
-        next nil
+        next nil if InjuryWatch.bulk_appraising?
       end
 
       if noun && wound_text && !InjuryWatch.bulk_appraising?
@@ -1144,13 +1151,7 @@ module InjuryWatch
       end
 
       current = current_people
-      room_list_unavailable = current.empty? && !people_status.empty?
-      if room_list_unavailable
-        dbg "room list unavailable; keeping last known display"
-        display(people_status, ROOM_LIST_NOTICE)
-        sleep CHECK_EVERY
-        next
-      end
+      current ||= {}
 
       # Check if any existing people have died or been rezzed since last tick
       current.each do |id, pc|
