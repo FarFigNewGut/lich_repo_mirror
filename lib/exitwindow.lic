@@ -16,12 +16,15 @@
   - Displays Lich ID and room UID.
 
   Commands:
-    *ewgtk - Enable GTK window.
+    *ewgtk                       - Enable GTK window.
+    *ewcol                       - Toggle single/double column layout
+    *ewcol3                      - Use a 3-column layout
+    *ewcol4                      - Use a 4-column layout
 
   Author: Phocosoen, ChatGPT
   Tags: wrayth, frontend, mod, window, paths, navigation, wizard, avalon
-  Version: 1.1.3
-  Recently changed: Run GTK main asynchronously so startup hooks/loop initialize reliably at logon.
+  Version: 1.2.0
+  Recently changed: Added configurable multi-column layout (1-4) matching creaturewindow/playerwindow, and Saga support.
 =end
 
 no_kill_all
@@ -33,13 +36,14 @@ module ExitWindow
   include Lich::Common if defined?(Lich::Common)
 
   class << self
-    attr_accessor :settings, :window_settings, :use_gtk_window
+    attr_accessor :settings, :window_settings, :use_gtk_window, :columns, :single_column
   end
 end
 
 EW_DEFAULT_WINDOW_SETTINGS = {
   "exitwindow" => {
 		  "single_column"        => false,
+    "columns"                => 2,
     "use_gtk_exitwindow" => true,
     "font_size"              => 17,
     "x"                      => 2280,
@@ -84,11 +88,43 @@ def ExitWindow.save_window_settings(settings, name: Char.name)
   File.write(filename, settings.to_yaml)
 end
 
+def ExitWindow.update_setting(key, value)
+  settings = ExitWindow.load_window_settings
+  settings["exitwindow"] ||= {}
+  settings["exitwindow"][key] = value
+  ExitWindow.save_window_settings(settings)
+end
+
+# Set the column count (1-4), persist it, and refresh both the dialog panel
+# and the GTK window. Returns the applied count.
+def ExitWindow.apply_column_setting(n)
+  n = [[n.to_i, 1].max, 4].min
+  ExitWindow.columns = n
+  ExitWindow.single_column = (n == 1)
+  ExitWindow.update_setting("columns", n)
+  ExitWindow.update_setting("single_column", n == 1)
+
+  ExitWindow.update_room_info if Frontend.supports_room_window?
+  if ExitWindow.use_gtk_window && ExitWindowGtk.instance_variable_get(:@window)
+    std   = ExitWindow.extract_exits_from_paths(Room.current.paths)
+    lich  = ExitWindow.extract_lich_exits(Room.current.id)
+    trash = ExitWindow.extract_trash_containers
+    ExitWindowGtk.update_exits(std, lich, trash)
+  end
+  n
+end
+
 ExitWindow.settings       = ExitWindow.load_window_settings
 ExitWindow.window_settings         = ExitWindow.settings["exitwindow"] ||= {}
 ExitWindow.use_gtk_window = ExitWindow.window_settings["use_gtk_window"] || false
+ExitWindow.columns = begin
+  c = ExitWindow.window_settings["columns"].to_i
+  c = (ExitWindow.window_settings["single_column"] ? 1 : 2) unless (1..4).include?(c)
+  [[c, 1].max, 4].min
+end
+ExitWindow.single_column = (ExitWindow.columns == 1)
 
-# if theyÃ¢â‚¬â„¢ve explicitly enabled GTK, always launch it
+# If GTK is explicitly enabled, always launch it.
 if ExitWindow.use_gtk_window
   respond ""
   respond " GTK exits window is enabled."
@@ -98,8 +134,8 @@ if ExitWindow.use_gtk_window
   Gtk.queue { ExitWindowGtk.create_main_window }
   Thread.new { Gtk.main if Gtk.main_level == 0 }
 
-# otherwise fall back to Ã¢â‚¬Å“if non-StormfrontÃ¢â‚¬Â auto-GTK
-elsif $frontend != "stormfront"
+# Otherwise fall back to auto-GTK for non-StormFront frontends.
+elsif !Frontend.supports_room_window?
   respond ""
   respond " Using a frontend other than Wrayth."
   respond ""
@@ -109,9 +145,9 @@ elsif $frontend != "stormfront"
   Thread.new { Gtk.main if Gtk.main_level == 0 }
 end
 
-if $frontend == "stormfront"
+if Frontend.supports_room_window?
 # Open the room info window using Wrayth's dynamic dialog.
-puts("<closeDialog id='Exits'/><openDialog type='dynamic' id='Exits' title='Exits' target='Exits' scroll='manual' location='main' justify='3' height='100' width='100' resident='true' ><dialogData id='Exits'></dialogData></openDialog>")
+_respond("<closeDialog id='Exits'/><openDialog type='dynamic' id='Exits' title='Exits' target='Exits' scroll='manual' location='main' justify='3' height='300' width='170' resident='true' ><dialogData id='Exits'></dialogData></openDialog>")
 end
 
 @ew_last_room_id = nil
@@ -182,6 +218,9 @@ end
 def ExitWindow.push_room_info_to_window(standard_exits, lich_exits, trash_containers)
   output = "<dialogData id='Exits' clear='t' wrap='true'>"
 
+  cols = [ExitWindow.columns, 1].max
+  col_width = 130
+
   # Room info at top (occupies 36 pixels)
   output += "<label id='room_info' value='Lid#: #{Room.current.id}' left='0' top='0' />"
   output += "<label id='room_info_uid' value='Uid#: #{Room.current.uid.to_s.gsub(/\[|\]/, '')}' left='0' top='18' />"
@@ -189,48 +228,57 @@ def ExitWindow.push_room_info_to_window(standard_exits, lich_exits, trash_contai
   # Spacing constants
   room_info_height = 36    # room info block height (0-36)
   header_height = 18       # height for a header label
-  link_height = 18         # height for each link/label
+  link_height = 18         # height for each link/label row
   section_gap = 18 # gap between sections
 
-  # Standard exits block
-  standard_exits_header_top = room_info_height + section_gap # start at 36
+  # Standard exits block, laid out in an N-column grid
+  standard_exits_header_top = room_info_height # no gap: right after Lid#/Uid#
   output += "<label id='total' value='Exits: #{standard_exits.size}' left='0' top='#{standard_exits_header_top}' />"
 
+  standard_exits_rows = (standard_exits.size.to_f / cols).ceil
   standard_exits.each_with_index do |exit, index|
-    exit_top = standard_exits_header_top + header_height + (link_height * index)
-    output += "<link id='room_exit_#{index}' value='#{exit}' cmd='go #{exit.downcase}' echo='go #{exit.downcase}' left='0' top='#{exit_top}' />"
+    col = index % cols
+    row = index / cols
+    exit_top = standard_exits_header_top + header_height + (link_height * row)
+    output += "<link id='room_exit_#{index}' value='#{exit}' cmd='go #{exit.downcase}' echo='go #{exit.downcase}' left='#{col * col_width}' top='#{exit_top}' />"
   end
 
   # Calculate end of standard exits block
-  standard_exits_block_end = standard_exits_header_top + header_height + (link_height * standard_exits.size)
+  standard_exits_block_end = standard_exits_header_top + header_height + (link_height * standard_exits_rows)
 
-  # Lich exits block
+  # Lich exits block, laid out in an N-column grid
   lich_exits_start = standard_exits_block_end + section_gap
+  lich_exits_rows = 0
   if lich_exits.any?
     output += "<label id='lich_exits' value='Lich Exits: #{lich_exits.size}' left='0' top='#{lich_exits_start}' />"
     lich_base_top = lich_exits_start + header_height
+    lich_exits_rows = (lich_exits.size.to_f / cols).ceil
     lich_exits.each_with_index do |lich_exit, index|
-      lich_exit_top = lich_base_top + (link_height * index)
-      output += "<link id='lich_exit_#{index}' value='#{lich_exit[:cmd]}' cmd='#{lich_exit[:cmd]}' echo='#{lich_exit[:cmd]}' left='0' top='#{lich_exit_top}' font='normal' />"
+      col = index % cols
+      row = index / cols
+      lich_exit_top = lich_base_top + (link_height * row)
+      output += "<link id='lich_exit_#{index}' value='#{lich_exit[:cmd]}' cmd='#{lich_exit[:cmd]}' echo='#{lich_exit[:cmd]}' left='#{col * col_width}' top='#{lich_exit_top}' font='normal' />"
     end
   end
 
   # Calculate end of Lich exits block
-  lich_exits_block_end = lich_exits.any? ? (lich_exits_start + header_height + (link_height * lich_exits.size)) : standard_exits_block_end
+  lich_exits_block_end = lich_exits.any? ? (lich_exits_start + header_height + (link_height * lich_exits_rows)) : standard_exits_block_end
 
-  # Trash containers block
+  # Trash containers block, laid out in an N-column grid
   trash_containers_start = lich_exits_block_end + section_gap
   if trash_containers.any?
     output += "<label id='trash_containers' value='Trash Containers: #{trash_containers.size}' left='0' top='#{trash_containers_start}' />"
     trash_base_top = trash_containers_start + header_height
     trash_containers.each_with_index do |trash, index|
-      trash_top = trash_base_top + (link_height * index)
-      output += "<label id='trash_#{index}' value='#{trash}' left='0' top='#{trash_top}' font='small' />"
+      col = index % cols
+      row = index / cols
+      trash_top = trash_base_top + (link_height * row)
+      output += "<label id='trash_#{index}' value='#{trash}' left='#{col * col_width}' top='#{trash_top}' font='small' />"
     end
   end
 
   output += "</dialogData>"
-  puts(output)
+  _respond(output)
 end
 
 # Update room exit information.
@@ -242,7 +290,7 @@ def ExitWindow.update_room_info
   ExitWindow.push_room_info_to_window(standard_exits, lich_exits, trash_containers)
 end
 
-# Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ 1) Define your palettes Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+# 1) Define palettes.
 ExitWindow::PALETTES = {
   "Lich Dark Mode"     => { bg: "#2E2E2E", fg: "#DADADA" },
   "Lich Light Mode"    => { bg: "#E6E6E6", fg: "#202020" },
@@ -257,9 +305,9 @@ class ExitWindowGtk
   @css_provider = nil
   @font_size    = nil
 
-  # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ 2) Regenerate & apply CSS using the chosen palette Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+  # Regenerate and apply CSS using the chosen palette.
   def self.reload_css
-    # Load persisted palette choice (default to Ã¢â‚¬Å“White on BlackÃ¢â‚¬Â)
+    # Load persisted palette choice.
     settings = ExitWindow.load_window_settings
     tw       = settings["exitwindow"] ||= {}
     pal_name = tw["palette"] || "White on Black"
@@ -303,7 +351,7 @@ class ExitWindowGtk
         box-shadow:       none;
       }
 
-      /* Ã¢â‚¬Å“onÃ¢â‚¬Â state for toggles */
+      /* On state for toggles */
       window#exitwindow headerbar .header-toggle:checked {
         background-color: #0a84ff; /* system blue */
         color:            #FFFFFF;
@@ -328,13 +376,13 @@ class ExitWindowGtk
   def self.create_main_window
     return if @window
 
-    # Ã¢â‚¬â€Ã¢â‚¬â€Ã¢â‚¬â€ load persisted settings Ã¢â‚¬â€Ã¢â‚¬â€Ã¢â‚¬â€
+    # Load persisted settings.
     settings = ExitWindow.load_window_settings
     ew = settings["exitwindow"] ||= {}
     dark_mode = ew["dark_mode"] || false
     @font_size = ew["font_size"] || 14
 
-    # Ã¢â‚¬â€Ã¢â‚¬â€Ã¢â‚¬â€ build topÃ¢â‚¬Âlevel window & HeaderBar Ã¢â‚¬â€Ã¢â‚¬â€Ã¢â‚¬â€
+    # Build top-level window and HeaderBar.
     @window = Gtk::Window.new(:toplevel)
     @window.set_name("exitwindow")
     @window.set_border_width(10)
@@ -345,8 +393,8 @@ class ExitWindowGtk
     header.show_close_button = true
     header.title = "EW"
 
-    # Ã¢â‚¬â€ Font size buttons Ã¢â‚¬â€
-    dec_btn = Gtk::Button.new(label: "AÃ¢Ë†â€™")
+    # Font size buttons.
+    dec_btn = Gtk::Button.new(label: "A-")
     inc_btn = Gtk::Button.new(label: "A+")
     [dec_btn, inc_btn].each { |b| b.style_context.add_class("header-toggle"); header.pack_start(b) }
     dec_btn.signal_connect("clicked") do
@@ -360,7 +408,7 @@ class ExitWindowGtk
       reload_css
     end
 
-    # Ã¢â‚¬â€ Dark/Light switch Ã¢â‚¬â€
+    # Dark/Light switch.
     theme_switch = Gtk::Switch.new
     theme_switch.active = dark_mode
     @window.style_context.add_class("dark") if dark_mode
@@ -377,7 +425,7 @@ class ExitWindowGtk
 
     @window.set_titlebar(header)
 
-    # Ã¢â‚¬â€ CSS provider & initial styling Ã¢â‚¬â€
+    # CSS provider and initial styling.
     @css_provider = Gtk::CssProvider.new
     reload_css
     screen = Gdk::Screen.default
@@ -387,7 +435,7 @@ class ExitWindowGtk
       Gtk::StyleProvider::PRIORITY_APPLICATION
     )
 
-    # Ã¢â‚¬â€ Restore geometry Ã¢â‚¬â€
+    # Restore geometry.
     @window.resize(ew["width"], ew["height"]) if ew["width"] && ew["height"]
     @window.move(ew["x"], ew["y"]) if ew["x"] && ew["y"]
 
@@ -408,7 +456,7 @@ class ExitWindowGtk
 
     @window.add(@scroll)
 
-    # Ã¢â‚¬â€ save geometry on move/resize Ã¢â‚¬â€
+    # Save geometry on move/resize.
     @ignore_next_configure = true
     @window.signal_connect("configure_event") do |_w, _ev|
       if @ignore_next_configure
@@ -426,11 +474,12 @@ class ExitWindowGtk
 
     @window.signal_connect("destroy") do
       @window = nil
-      Gtk.main_quit
+      # Do not quit the GTK main loop here. This window can share a GTK
+      # process with the frontend/other scripts, and quitting it can drop session.
     end
     @window.show_all
 
-    # Ã¢â‚¬â€ initial fill Ã¢â‚¬â€
+    # Initial fill.
     if defined?(Room) && Room.current
       std   = ExitWindow.extract_exits_from_paths(Room.current.paths)
       lich  = ExitWindow.extract_lich_exits(Room.current.id)
@@ -442,14 +491,26 @@ class ExitWindowGtk
   def self.update_exits(standard, lich, trash)
     return unless @window
     Gtk.queue do
+      @flow.max_children_per_line = [ExitWindow.columns, 1].max
+
       # clear out old widgets
       @flow.children.each { |c| @flow.remove(c) }
+
+      cols = [ExitWindow.columns, 1].max
+
+      # Pad out the remainder of the current row so the next section starts
+      # on a fresh row instead of sharing one with the tail of the previous.
+      pad_to_next_row = ->(count) {
+        remainder = count % cols
+        (cols - remainder).times { @flow.add(Gtk::Label.new("")) } if remainder != 0
+      }
 
       # ---- ROOM INFO: Add once at the top! ----
       room_info = Gtk::Label.new("Lid#: #{Room.current.id}   Uid#: #{Room.current.uid.to_s.gsub(/\[|\]/, '')}")
       room_info.set_xalign(0)
       room_info.style_context.add_class("room-info")
       @flow.add(room_info)
+      pad_to_next_row.call(1)
 
       # helper to render a titled section of plain labels/buttons
       render_section = ->(items) do
@@ -460,10 +521,12 @@ class ExitWindowGtk
           line.set_xalign(0)
           @flow.add(line)
         end
+        pad_to_next_row.call(items.size)
       end
 render_section.call(standard)
 render_section.call(lich)
       @flow.add(Gtk::Label.new(""))
+      pad_to_next_row.call(1)
       render_section.call(trash)
 
       @flow.show_all
@@ -492,6 +555,23 @@ UpstreamHook.add(upstream_hook_id, proc do |command|
       end
     end
     nil
+
+  when /\*ewcol3\b/
+    n = ExitWindow.apply_column_setting(3)
+    respond "Column Layout: #{n} columns"
+    nil
+
+  when /\*ewcol4\b/
+    n = ExitWindow.apply_column_setting(4)
+    respond "Column Layout: #{n} columns"
+    nil
+
+  when /\*ewcol\b/
+    # Classic single/double toggle (drops back to 1/2 even from 3/4).
+    n = ExitWindow.apply_column_setting(ExitWindow.columns == 2 ? 1 : 2)
+    respond "Column Layout: #{n == 1 ? 'Single' : 'Double'} (#{n} column#{n == 1 ? '' : 's'})"
+    nil
+
   else
     command
   end
@@ -505,7 +585,7 @@ before_dying do
   end
 end
 
-echo "Exitwindow is active." if $frontend == "stormfront"
+echo "Exitwindow is active." if Frontend.supports_room_window?
 
 loop do
   if @ew_last_room_id != Room.current.id
@@ -513,10 +593,11 @@ loop do
     lich  = ExitWindow.extract_lich_exits(Room.current.id)
     trash = ExitWindow.extract_trash_containers
 
-    ExitWindow.update_room_info if $frontend == "stormfront"
+    ExitWindow.update_room_info if Frontend.supports_room_window?
     ExitWindowGtk.update_exits(std, lich, trash) if ExitWindow.use_gtk_window
 
     @ew_last_room_id = Room.current.id
   end
   sleep 0.1
 end
+

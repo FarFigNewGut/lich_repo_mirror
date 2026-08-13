@@ -2,6 +2,7 @@
   https://discordapp.com/channels/226045346399256576/1339018254517145681
 
   This script creates a dedicated window to display hazards in real time.
+
   Features:
   - Continuously updates with hazards found in the room.
   - Displays hazards (black voids, clouds, ghostly rifts, vines, webs) in a standardized format.
@@ -10,55 +11,466 @@
   - Allows players to click on webs to cast spells 209.
   - Allows players that know SPELL CLEAVE to click on clouds, webs, and vines and cleave them.
   - Uses consistent window formatting.
+  - Supports Saga as well as Wrayth, with a GTK fallback for other frontends.
+
+  Commands:
+    *hwgtk                       - Enable GTK window.
+    *hwcol                       - Toggle single/double column layout
+    *hwcol3                      - Use a 3-column layout
+    *hwcol4                      - Use a 4-column layout
 
 author: Phocosoen, ChatGPT
 tags: wrayth, frontend, mod, window, hazards, apparatus, voids, rifts, clouds, vines, webs, spell cleave, point, click
-  
+version: 1.2.0
+Recently changed: Added a GTK fallback window (matching creaturewindow/playerwindow/exitwindow) instead of hard-exiting on unsupported frontends.
+
 =end
 
-hide_me
+no_kill_all
+require 'yaml'
 
-# Open the hazard window using Wrayth's dynamic dialog.
-puts("<closeDialog id='HazardWindow'/><openDialog type='dynamic' id='HazardWindow' title='Hazards' target='HazardWindow' scroll='manual' location='main' justify='3' height='100' resident='true'><dialogData id='HazardWindow'></dialogData></openDialog>")
+module HazardWindow
+  extend self
+  include Lich::Common if defined?(Lich::Common)
 
-@last_hazards = []
+  class << self
+    attr_accessor :settings, :window_settings, :columns, :single_column, :use_gtk_window
+  end
+end
 
-# Build and push the hazard list to the window.
-def push_hazards_to_window(hazards)
+HW_DEFAULT_WINDOW_SETTINGS = {
+  "hazardwindow" => {
+    "single_column"          => false,
+    "columns"                => 1,
+    "display_avg_ttk"        => false,
+    "display_last_ttk"       => false,
+    "display_kpm"            => false,
+    "display_bounty"         => true,
+    "display_claim"          => true,
+    "target_next_mode"       => "off",
+    "x"                      => 1440,
+    "y"                      => 1600,
+    "width"                  => 120,
+    "height"                 => 370,
+    "font_size"              => 17,
+    "use_gtk_creaturewindow" => true,
+    "palette"                => "White on Black"
+  },
+} unless defined?(HW_DEFAULT_WINDOW_SETTINGS)
+
+def HazardWindow.window_settings_path(name: Char.name)
+  # Use $data_dir and XMLData.game for Lich data structure
+  base_dir = "#{$data_dir}#{XMLData.game}/#{name}"
+  Dir.mkdir("#{$data_dir}#{XMLData.game}") unless File.exist?("#{$data_dir}#{XMLData.game}")
+  Dir.mkdir(base_dir) unless File.exist?(base_dir)
+  File.join(base_dir, "lichwindows.yaml")
+end
+
+def HazardWindow.load_window_settings(name: Char.name)
+  filename = HazardWindow.window_settings_path(name: name)
+
+  if File.exist?(filename)
+    YAML.load_file(filename)
+  else
+    File.write(filename, HW_DEFAULT_WINDOW_SETTINGS.to_yaml)
+    HW_DEFAULT_WINDOW_SETTINGS
+  end
+end
+
+def HazardWindow.save_window_settings(settings, name: Char.name)
+  filename = HazardWindow.window_settings_path(name: name)
+  File.write(filename, settings.to_yaml)
+end
+
+def HazardWindow.update_setting(key, value)
+  settings = HazardWindow.load_window_settings
+  settings["hazardwindow"] ||= {}
+  settings["hazardwindow"][key] = value
+  HazardWindow.save_window_settings(settings)
+end
+
+# Identify hazards present in the room.
+def HazardWindow.current_hazards
+  GameObj.loot.select do |obj|
+    obj.name && # safety check to avoid nil
+      obj.name !~ /disk/i && # exclude any "disk"
+      obj.name =~ /\b(acidic cloud of mist|glimmering boltstone apparatus|cloud|unearthly silvery blue globe|spiraling ghostly rift|sandstorm|vine|black void|windy vortex|web|whirlwind)\b/i
+  end
+end
+
+HAZARD_TARGET_PATTERN = /cloud|sandstorm|vine|web|whirlwind|unearthly silvery blue globe|spiraling ghostly rift/i unless defined?(HAZARD_TARGET_PATTERN)
+
+# Determine which action (spell id, or :cleave) applies to a hazard by name.
+# Shared by both the dialog link cmd= text and the GTK button click handler
+# so the two rendering paths can never drift out of sync.
+def HazardWindow.hazard_action_for(hazard_name)
+  return :cleave if CMan.known?('Spell Cleave') && hazard_name =~ HAZARD_TARGET_PATTERN
+  return 209 if Spell[209].known? && hazard_name =~ /web/i
+  return 602 if Spell[602].known? && hazard_name =~ /glimmering boltstone apparatus/i
+  return 1218 if Spell[1218].known? && hazard_name =~ HAZARD_TARGET_PATTERN
+  return 1013 if Spell[1013].known? && hazard_name =~ HAZARD_TARGET_PATTERN
+  return 119 if Spell[119].known? && hazard_name =~ HAZARD_TARGET_PATTERN
+  return 418 if Spell[418].known? && hazard_name =~ HAZARD_TARGET_PATTERN
+
+  nil
+end
+
+# Perform the click-to-cast/cleave action for a hazard (used by the GTK window).
+def HazardWindow.perform_hazard_action(hazard)
+  action = HazardWindow.hazard_action_for(hazard.name)
+  case action
+  when :cleave
+    fput("cman scleave ##{hazard.id}") if CMan.affordable?('Spell Cleave')
+  when Integer
+    spell_id = action
+    if Spell[spell_id].affordable? && Spell[spell_id].known?
+      fput('release') if checkprep != 'None'
+      fput("prep #{spell_id}")
+      fput("cast ##{hazard.id}")
+    end
+  end
+end
+
+# Build and push the hazard list to the window, laid out in an N-column grid.
+def HazardWindow.push_hazards_to_window(hazards)
   output = "<dialogData id='HazardWindow' clear='t'>"
-  output += "<label id='total' value='Hazards: #{hazards.size}' fontSize='32' />"
+  output += "<label id='total' value='Hazards: #{hazards.size}' />"
+
+  cols = [HazardWindow.columns, 1].max
+  col_width = 130
+  row_height = 20
+
   hazards.each_with_index do |hazard, index|
+    col = index % cols
+    row = index / cols
+    left = col * col_width
+    top = row_height * (row + 1)
     hazard_name = hazard.name
-	if CMan.known?('Spell Cleave') && hazard_name =~ /cloud|sandstorm|vine|web|whirlwind|unearthly silvery blue globe|spiraling ghostly rift|sandstorm/i
-	  output += "<link id='hazard_#{index}' value='#{hazard_name}' justify='bottom' left='0' top='#{20 * (index + 1)}' fontSize='32' cmd=\";e if CMan.affordable?('Spell Cleave'); fput('cman scleave ##{hazard.id}'); end\" />"
-	elsif Spell[209].known? && hazard_name =~ /web/i
-      output += "<link id='hazard_#{index}' value='#{hazard_name}' justify='bottom' left='0' top='#{20 * (index + 1)}' fontSize='32' cmd=\";e if Spell[209].affordable? && Spell[209].known?; fput('release') if checkprep != 'None'; fput('prep 209'); fput('cast ##{hazard.id}'); end\" />"
-	elsif Spell[602].known? && hazard_name =~ /glimmering boltstone apparatus/i
-	  output += "<link id='hazard_#{index}' value='#{hazard_name}' justify='bottom' left='0' top='#{20 * (index + 1)}' fontSize='32' cmd=\";e if Spell[602].affordable? && Spell[602].known?; fput('release') if checkprep != 'None'; fput('prep 602'); fput('cast ##{hazard.id}'); end\" />"
-	elsif Spell[1218].known? && hazard_name =~ /cloud|sandstorm|vine|web|glimmering boltstone apparatus|unearthly silvery blue globe|spiraling ghostly rift/i
-	  output += "<link id='hazard_#{index}' value='#{hazard_name}' justify='bottom' left='0' top='#{20 * (index + 1)}' fontSize='32' cmd=\";e if Spell[1218].affordable? && Spell[1218].known?; fput('release') if checkprep != 'None'; fput('prep 1218'); fput('cast ##{hazard.id}'); end\" />"
-	elsif Spell[1013].known? && hazard_name =~ /cloud|sandstorm|vine|web|glimmering boltstone apparatus|unearthly silvery blue globe|spiraling ghostly rift/i
-	  output += "<link id='hazard_#{index}' value='#{hazard_name}' justify='bottom' left='0' top='#{20 * (index + 1)}' fontSize='32' cmd=\";e if Spell[1013].affordable? && Spell[1013].known?; fput('release') if checkprep != 'None'; fput('prep 1013'); fput('cast ##{hazard.id}'); end\" />"
-	elsif Spell[119].known? && hazard_name =~ /cloud|sandstorm|vine|web|glimmering boltstone apparatus|unearthly silvery blue globe|spiraling ghostly rift/i 
-	  output += "<link id='hazard_#{index}' value='#{hazard_name}' justify='bottom' left='0' top='#{20 * (index + 1)}' fontSize='32' cmd=\";e if Spell[119].affordable? && Spell[119].known?; fput('release') if checkprep != 'None'; fput('prep 119'); fput('cast ##{hazard.id}'); end\" />"
-	elsif Spell[418].known? && hazard_name =~ /cloud|sandstorm|vine|web|glimmering boltstone apparatus|unearthly silvery blue globe|spiraling ghostly rift/i
-	  output += "<link id='hazard_#{index}' value='#{hazard_name}' justify='bottom' left='0' top='#{20 * (index + 1)}' fontSize='32' cmd=\";e if Spell[418].affordable? && Spell[418].known?; fput('release') if checkprep != 'None'; fput('prep 418'); fput('cast ##{hazard.id}'); end\" />"	
-	else
-      output += "<label id='hazard_#{index}' value='#{hazard_name}' justify='bottom' left='0' top='#{20 * (index + 1)}' fontSize='32' />"
+    action = HazardWindow.hazard_action_for(hazard_name)
+
+    case action
+    when :cleave
+      output += "<link id='hazard_#{index}' value='#{hazard_name}' justify='bottom' left='#{left}' top='#{top}' cmd=\";e if CMan.affordable?('Spell Cleave'); fput('cman scleave ##{hazard.id}'); end\" />"
+    when Integer
+      output += "<link id='hazard_#{index}' value='#{hazard_name}' justify='bottom' left='#{left}' top='#{top}' cmd=\";e if Spell[#{action}].affordable? && Spell[#{action}].known?; fput('release') if checkprep != 'None'; fput('prep #{action}'); fput('cast ##{hazard.id}'); end\" />"
+    else
+      output += "<label id='hazard_#{index}' value='#{hazard_name}' justify='bottom' left='#{left}' top='#{top}' />"
     end
   end
   output += "</dialogData>"
-  puts(output)
+  _respond(output)
 end
 
-# Main update loop.
+# Set the column count (1-4), persist it, and refresh both the dialog panel
+# and the GTK window. Returns the applied count.
+def HazardWindow.apply_column_setting(n)
+  n = [[n.to_i, 1].max, 4].min
+  HazardWindow.columns = n
+  HazardWindow.single_column = (n == 1)
+  HazardWindow.update_setting("columns", n)
+  HazardWindow.update_setting("single_column", n == 1)
+
+  hazards = HazardWindow.current_hazards
+  HazardWindow.push_hazards_to_window(hazards) if Frontend.supports_room_window?
+  HazardWindowGtk.update_hazards(hazards) if HazardWindow.use_gtk_window && HazardWindowGtk.instance_variable_get(:@window)
+  n
+end
+
+HazardWindow.settings = HazardWindow.load_window_settings
+HazardWindow.window_settings = HazardWindow.settings["hazardwindow"] ||= {}
+HazardWindow.use_gtk_window = HazardWindow.window_settings["use_gtk_window"] || false
+HazardWindow.columns = begin
+  c = HazardWindow.window_settings["columns"].to_i
+  c = (HazardWindow.window_settings["single_column"] ? 1 : 2) unless (1..4).include?(c)
+  [[c, 1].max, 4].min
+end
+HazardWindow.single_column = (HazardWindow.columns == 1)
+
+HazardWindow::PALETTES = {
+  "Lich Dark Mode"     => { bg: "#2E2E2E", fg: "#DADADA" },
+  "Lich Light Mode"    => { bg: "#E6E6E6", fg: "#202020" },
+  "Middle Ground"      => { bg: "#333333", fg: "#FFFFFF" },
+  "White on Black"     => { bg: "#000000", fg: "#FFFFFF" },
+  "NQWhite on NQBlack" => { bg: "#111111", fg: "#f6f6f6" },
+  "Black on White"     => { bg: "#FFFFFF", fg: "#000000" },
+} unless defined?(HazardWindow::PALETTES)
+
+class HazardWindowGtk
+  @window       = nil
+  @css_provider = nil
+  @font_size    = nil
+
+  def self.reload_css
+    settings = HazardWindow.load_window_settings
+    hw       = settings["hazardwindow"] ||= {}
+    pal_name = hw["palette"] || "White on Black"
+    colors   = HazardWindow::PALETTES[pal_name]
+
+    css = <<~CSS
+      window#hazardwindow {
+        background-color: #{colors[:bg]};
+        color:            #{colors[:fg]};
+        border:           0px solid #888888;
+        border-radius:    4px;
+      }
+
+      window#hazardwindow headerbar {
+        background-color: #{colors[:bg]};
+        color:            #{colors[:fg]};
+      }
+
+      window#hazardwindow headerbar .header-toggle {
+        margin:      0 2px;
+        padding:     2px 4px;
+        background-image: none;
+        background-color: transparent;
+        color:            #{colors[:fg]};
+        border:           none;
+        box-shadow:       none;
+      }
+
+      window#hazardwindow headerbar .header-toggle:checked {
+        background-color: #0a84ff;
+        color:            #FFFFFF;
+      }
+
+      window#hazardwindow label,
+      window#hazardwindow button {
+        font-size: #{@font_size}px;
+        color:     #{colors[:fg]};
+      }
+
+      window#hazardwindow GtkScrolledWindow,
+      window#hazardwindow GtkFlowBox {
+        background-color: #{colors[:bg]};
+      }
+    CSS
+
+    @css_provider.load(data: css)
+  end
+
+  def self.create_main_window
+    return if @window
+
+    settings = HazardWindow.load_window_settings
+    hw = settings["hazardwindow"] ||= {}
+    dark_mode = hw["dark_mode"] || false
+    @font_size = hw["font_size"] || 14
+
+    @window = Gtk::Window.new(:toplevel)
+    @window.set_name("hazardwindow")
+    @window.set_border_width(10)
+    @window.set_type_hint(Gdk::WindowTypeHint::UTILITY)
+    @window.set_keep_above(true)
+
+    header = Gtk::HeaderBar.new
+    header.show_close_button = true
+    header.title = "Hazards"
+
+    dec_btn = Gtk::Button.new(label: "A-")
+    inc_btn = Gtk::Button.new(label: "A+")
+    [dec_btn, inc_btn].each { |b| b.style_context.add_class("header-toggle"); header.pack_start(b) }
+    dec_btn.signal_connect("clicked") do
+      @font_size = [@font_size - 1, 8].max
+      hw["font_size"] = @font_size; HazardWindow.save_window_settings(settings)
+      reload_css
+    end
+    inc_btn.signal_connect("clicked") do
+      @font_size = [@font_size + 1, 30].min
+      hw["font_size"] = @font_size; HazardWindow.save_window_settings(settings)
+      reload_css
+    end
+
+    theme_switch = Gtk::Switch.new
+    theme_switch.active = dark_mode
+    @window.style_context.add_class("dark") if dark_mode
+    theme_switch.signal_connect("notify::active") do |sw, _|
+      if sw.active?
+        @window.style_context.add_class("dark")
+      else
+        @window.style_context.remove_class("dark")
+      end
+      hw["dark_mode"] = sw.active?; HazardWindow.save_window_settings(settings)
+      reload_css
+    end
+    header.pack_end(theme_switch)
+
+    @window.set_titlebar(header)
+
+    @css_provider = Gtk::CssProvider.new
+    reload_css
+    screen = Gdk::Screen.default
+    Gtk::StyleContext.add_provider_for_screen(
+      screen,
+      @css_provider,
+      Gtk::StyleProvider::PRIORITY_APPLICATION
+    )
+
+    @window.resize(hw["width"], hw["height"]) if hw["width"] && hw["height"]
+    @window.move(hw["x"], hw["y"]) if hw["x"] && hw["y"]
+
+    @scroll = Gtk::ScrolledWindow.new
+    @scroll.set_policy(Gtk::PolicyType::AUTOMATIC, Gtk::PolicyType::AUTOMATIC)
+    @scroll.set_hexpand(true)
+    @scroll.set_vexpand(true)
+
+    @flow = Gtk::FlowBox.new
+    @flow.selection_mode        = :none
+    @flow.max_children_per_line = [HazardWindow.columns, 1].max
+    @flow.column_spacing        = 0
+    @flow.row_spacing           = 0
+    @flow.set_vexpand(true)
+    @flow.valign                = Gtk::Align::START
+    @flow.homogeneous           = false
+    @scroll.add(@flow)
+
+    @window.add(@scroll)
+
+    @ignore_next_configure = true
+    @window.signal_connect("configure_event") do |_w, _ev|
+      if @ignore_next_configure
+        @ignore_next_configure = false
+      else
+        x, y = @window.position
+        w, h = @window.size
+        s = HazardWindow.load_window_settings
+        s["hazardwindow"] ||= {}
+        s["hazardwindow"].merge!("x" => x, "y" => y, "width" => w, "height" => h)
+        HazardWindow.save_window_settings(s)
+      end
+      false
+    end
+
+    @window.signal_connect("destroy") do
+      @window = nil
+      # Do not quit the GTK main loop here. This window can share a GTK
+      # process with the frontend/other scripts, and quitting it can drop session.
+    end
+    @window.show_all
+
+    HazardWindowGtk.update_hazards(HazardWindow.current_hazards)
+  end
+
+  def self.update_hazards(hazards)
+    return unless @window
+    Gtk.queue do
+      @flow.max_children_per_line = [HazardWindow.columns, 1].max
+      @flow.children.each { |c| @flow.remove(c) }
+
+      if hazards.empty?
+        label = Gtk::Label.new("No hazards.")
+        label.set_xalign(0)
+        @flow.add(label)
+      else
+        hazards.each do |hazard|
+          action = HazardWindow.hazard_action_for(hazard.name)
+          if action
+            btn = Gtk::Button.new(label: hazard.name)
+            btn.signal_connect("clicked") { HazardWindow.perform_hazard_action(hazard) }
+            @flow.add(btn)
+          else
+            label = Gtk::Label.new(hazard.name)
+            label.set_xalign(0)
+            @flow.add(label)
+          end
+        end
+      end
+
+      @flow.show_all
+    end
+  end
+end
+
+# if they've explicitly enabled GTK, always launch it
+if HazardWindow.use_gtk_window
+  respond ""
+  respond " GTK hazard window is enabled."
+  respond ""
+  respond " Initiating GTK window."
+  respond ""
+  Gtk.queue { HazardWindowGtk.create_main_window }
+  Thread.new { Gtk.main if Gtk.main_level == 0 }
+
+# otherwise fall back to GTK if the frontend can't render native dialogs
+elsif !Frontend.supports_room_window?
+  respond ""
+  respond " Using a frontend other than Wrayth or Saga."
+  respond ""
+  respond " Initiating GTK window."
+  respond ""
+  Gtk.queue { HazardWindowGtk.create_main_window }
+  Thread.new { Gtk.main if Gtk.main_level == 0 }
+end
+
+# Open the hazard window using Wrayth's dynamic dialog.
+if Frontend.supports_room_window?
+  _respond("<closeDialog id='HazardWindow'/><openDialog type='dynamic' id='HazardWindow' title='Hazards' target='HazardWindow' scroll='manual' location='main' justify='3' height='100' width='100' resident='true'><dialogData id='HazardWindow'></dialogData></openDialog>")
+end
+
+@last_hazards = []
+@hw_last_refresh_at = Time.at(0)
+
+upstream_hook_id = "#{Script.current.name}_upstream"
+UpstreamHook.remove(upstream_hook_id) rescue nil
+
+UpstreamHook.add(upstream_hook_id, proc do |command|
+  case command.strip.downcase
+  when /\*hwgtk/
+    HazardWindow.use_gtk_window = !HazardWindow.use_gtk_window
+    respond "GTK hazard window is now #{HazardWindow.use_gtk_window ? 'ENABLED' : 'DISABLED'}."
+    HazardWindow.update_setting("use_gtk_window", HazardWindow.use_gtk_window)
+
+    if HazardWindow.use_gtk_window
+      Gtk.queue { HazardWindowGtk.create_main_window }
+      Thread.new { Gtk.main if Gtk.main_level == 0 }
+    else
+      if HazardWindowGtk.instance_variable_get(:@window)
+        Gtk.queue { HazardWindowGtk.instance_variable_get(:@window).close }
+      end
+    end
+    nil
+
+  when /\*hwcol3\b/
+    n = HazardWindow.apply_column_setting(3)
+    respond "Column Layout: #{n} columns"
+    nil
+
+  when /\*hwcol4\b/
+    n = HazardWindow.apply_column_setting(4)
+    respond "Column Layout: #{n} columns"
+    nil
+
+  when /\*hwcol\b/
+    # Classic single/double toggle (drops back to 1/2 even from 3/4).
+    n = HazardWindow.apply_column_setting(HazardWindow.columns == 2 ? 1 : 2)
+    respond "Column Layout: #{n == 1 ? 'Single' : 'Double'} (#{n} column#{n == 1 ? '' : 's'})"
+    nil
+
+  else
+    command
+  end
+end)
+
+before_dying do
+  UpstreamHook.remove(upstream_hook_id)
+
+  if defined?(HazardWindowGtk) && HazardWindowGtk.instance_variable_get(:@window)
+    Gtk.queue { HazardWindowGtk.instance_variable_get(:@window).close }
+  end
+end
+
+# Main update loop. Refresh on a hazard change OR a 1-second heartbeat, so
+# the window always shows content (e.g. "Hazards: 0") immediately on open
+# instead of sitting on the empty initial shell when the room starts hazard-free.
 loop do
-  current_hazards = GameObj.loot.reject { |obj| obj.name !~ /(acidic cloud of mist|glimmering boltstone apparatus|cloud|unearthly silvery blue globe|spiraling ghostly rift|sandstorm|vine|black void|windy vortex|web|whirlwind)/i }
-  if current_hazards != @last_hazards
+  current_hazards = HazardWindow.current_hazards
+  if current_hazards != @last_hazards || (Time.now - @hw_last_refresh_at) > 1.0
     @last_hazards = current_hazards
-    push_hazards_to_window(current_hazards)
+    @hw_last_refresh_at = Time.now
+    HazardWindow.push_hazards_to_window(current_hazards) if Frontend.supports_room_window?
+    HazardWindowGtk.update_hazards(current_hazards) if HazardWindow.use_gtk_window
   end
   sleep 0.025
 end
 
-echo "Dedicated Hazard Window is active."
+echo "Dedicated Hazard Window is active." if Frontend.supports_room_window?
