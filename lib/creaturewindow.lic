@@ -362,10 +362,10 @@ def CreatureWindow.push_recent_line(line)
   @cw_recent_lines.shift if @cw_recent_lines.size > 25
 end
 
-@cw_startup_request_gtk = (CreatureWindow.use_gtk_window || $frontend != "stormfront")
+@cw_startup_request_gtk = (CreatureWindow.use_gtk_window || !Frontend.supports_room_window?)
 
-if $frontend == "stormfront"
-  puts("<closeDialog id='CreatureWindow'/><openDialog type='dynamic' id='CreatureWindow' title='Creatures' target='CreatureWindow' scroll='manual' location='main' justify='3' height='120' resident='true'><dialogData id='CreatureWindow'></dialogData></openDialog>")
+if Frontend.supports_room_window?
+  _respond("<closeDialog id='CreatureWindow'/><openDialog type='dynamic' id='CreatureWindow' title='Creatures' target='CreatureWindow' scroll='manual' location='main' justify='3' height='120' resident='true'><dialogData id='CreatureWindow'></dialogData></openDialog>")
 end
 
 @cw_last_targets = []
@@ -1546,6 +1546,15 @@ def CreatureWindow.capture_bounty_origin_context
   @cw_bounty_origin_npc_noun = npc.noun
 end
 
+def CreatureWindow.capture_herb_origin_context
+  @cw_bounty_origin_room_id ||= Room.current.id
+  npc = CreatureWindow.find_healer_bounty_npc
+  return unless npc
+
+  @cw_bounty_origin_npc_id = npc.id
+  @cw_bounty_origin_npc_noun = npc.noun
+end
+
 def CreatureWindow.capture_gem_origin_context
   @cw_bounty_origin_room_id ||= Room.current.id
   npc = GameObj.npcs.find do |n|
@@ -1562,6 +1571,20 @@ def CreatureWindow.find_origin_turnin_npc
   npc = GameObj.npcs.find { |n| n && !CreatureWindow.npc_is_invalid_turnin_target?(n) && n.id == @cw_bounty_origin_npc_id } if @cw_bounty_origin_npc_id
   npc ||= GameObj.npcs.find { |n| n && !CreatureWindow.npc_is_invalid_turnin_target?(n) && n.noun.to_s.casecmp(@cw_bounty_origin_npc_noun.to_s).zero? } if @cw_bounty_origin_npc_noun
   npc ||= GameObj.npcs.find { |n| n && !CreatureWindow.npc_is_invalid_turnin_target?(n) && n.name =~ CreatureWindow::BOUNTY_TURNIN_NPC_REGEX }
+  npc
+end
+
+def CreatureWindow.find_origin_healer_npc
+  npc = nil
+  if @cw_bounty_origin_npc_id
+    found_by_id = GameObj.npcs.find { |n| n && !CreatureWindow.npc_is_invalid_turnin_target?(n) && n.id == @cw_bounty_origin_npc_id }
+    npc = found_by_id if found_by_id && found_by_id.name.to_s =~ /alchemist|healer|herbalist|Sparkfinger|Maraene|Bumbleberry/i
+  end
+  if npc.nil? && @cw_bounty_origin_npc_noun
+    found_by_noun = GameObj.npcs.find { |n| n && !CreatureWindow.npc_is_invalid_turnin_target?(n) && n.noun.to_s.casecmp(@cw_bounty_origin_npc_noun.to_s).zero? }
+    npc = found_by_noun if found_by_noun && found_by_noun.name.to_s =~ /alchemist|healer|herbalist|Sparkfinger|Maraene|Bumbleberry/i
+  end
+  npc ||= CreatureWindow.find_healer_bounty_npc
   npc
 end
 
@@ -1592,6 +1615,13 @@ def CreatureWindow.herb_items_for_turnin
   CreatureWindow.collect_all_inv_items.select { |i| i.name.to_s.downcase.include?(herb_name) }
 end
 
+def CreatureWindow.held_herb_for_turnin
+  herb_name = CreatureWindow.current_herb_name.downcase
+  return nil if herb_name.empty?
+
+  [GameObj.left_hand, GameObj.right_hand].compact.find { |i| i.name.to_s.downcase.include?(herb_name) }
+end
+
 def CreatureWindow.herb_count_on_hand
   CreatureWindow.herb_items_for_turnin.inject(0) { |sum, item| sum + CreatureWindow.item_stack_count(item) }
 end
@@ -1599,20 +1629,37 @@ end
 def CreatureWindow.hand_in_herbs_to_npc(npc)
   return unless npc
 
-  # Re-resolve items each pass and execute synchronously to avoid stale IDs/race conditions.
   loop do
-    herb_item = CreatureWindow.herb_items_for_turnin.first
-    break unless herb_item
+    held_herb = CreatureWindow.held_herb_for_turnin
+    unless held_herb
+      herb_item = CreatureWindow.herb_items_for_turnin.first
+      break unless herb_item
 
-    fput "get ##{herb_item.id}"
-    fput "give ##{herb_item.id} to ##{npc.id}"
+      result = dothistimeout("get ##{herb_item.id}", 4, /You remove|You pick up|You need a free hand|Get what|What were you referring to/i)
+      if result.to_s =~ /need a free hand/i
+        CreatureWindow.prepare_turnin_hands
+        result = dothistimeout("get ##{herb_item.id}", 4, /You remove|You pick up|You need a free hand|Get what|What were you referring to/i)
+      end
+      break if result.to_s =~ /Get what|What were you referring to/i
+
+      held_herb = CreatureWindow.held_herb_for_turnin || CreatureWindow.find_item_in_hands_by_id(herb_item.id)
+      break unless held_herb
+    end
+
+    give_result = dothistimeout(
+      "give ##{held_herb.id} to ##{npc.id}",
+      6,
+      /I'll need \d+ more samples|finish my concoction|This looks perfect|What is it you're trying to give|moves out of your reach|You hand|accepts/i
+    )
+    break if give_result.to_s =~ /What is it you're trying to give|moves out of your reach/i
   end
 
   CreatureWindow.ask_bounty_and_sync(npc)
 end
 
 def CreatureWindow.go2_healer_room_for_turnin
-  Script.run("go2", "healer")
+  go2_target = CreatureWindow.hinterwilds_context? ? "advguard3" : "healer"
+  Script.run("go2", go2_target)
   sleep 0.2 while running?("go2")
   CreatureWindow.prepare_turnin_hands
 end
@@ -1874,7 +1921,7 @@ def CreatureWindow.run_herb_bounty_workflow
 
     if needs_specifics
       CreatureWindow.go2_healer_room_for_turnin
-      healer_npc = CreatureWindow.find_healer_bounty_npc || CreatureWindow.find_current_turnin_npc
+      healer_npc = CreatureWindow.find_healer_bounty_npc
       unless healer_npc
         respond "Creaturewindow: could not find healer/alchemist for herb specifics."
         return
@@ -1893,7 +1940,7 @@ def CreatureWindow.run_herb_bounty_workflow
       @cw_bounty_origin_npc_id = healer_npc.id
       @cw_bounty_origin_npc_noun = healer_npc.noun
     else
-      CreatureWindow.capture_bounty_origin_context
+      CreatureWindow.capture_herb_origin_context
     end
 
     unless @cw_bounty_task_type == :herbspecifics
@@ -1950,13 +1997,13 @@ def CreatureWindow.run_herb_bounty_workflow
       CreatureWindow.prepare_turnin_hands
     end
 
-    npc = CreatureWindow.find_origin_turnin_npc
+    npc = CreatureWindow.find_origin_healer_npc
     if npc
       CreatureWindow.hand_in_herbs_to_npc(npc)
     else
       respond "Creaturewindow: turn-in NPC not found in origin room, heading to healer room."
       CreatureWindow.go2_healer_room_for_turnin
-      healer_npc = CreatureWindow.find_origin_turnin_npc
+      healer_npc = CreatureWindow.find_origin_healer_npc
       if healer_npc
         CreatureWindow.hand_in_herbs_to_npc(healer_npc)
       else
@@ -2210,7 +2257,7 @@ def CreatureWindow.push_creatures_to_window(targets)
 
 
   output += "</dialogData>"
-  puts(output)
+  _respond(output)
 end
 
 def CreatureWindow.targets_snapshot(targets)
@@ -2230,7 +2277,7 @@ def CreatureWindow.refresh_creature_windows(targets)
   CreatureWindow.track_owned_room_kills(dead_creatures)
   kpm_display = CreatureWindow.calculate_owned_room_kpm
 
-  CreatureWindow.push_creatures_to_window(targets) if $frontend == "stormfront"
+  CreatureWindow.push_creatures_to_window(targets) if Frontend.supports_room_window?
 
   return unless CreatureWindow.gtk_enabled?
 
@@ -2415,7 +2462,7 @@ before_dying do
   end
 end
 
-echo "Creaturewindow is active." if $frontend == "stormfront"
+echo "Creaturewindow is active." if Frontend.supports_room_window?
 
 CreatureWindow.capture_bounty_origin_context
 CreatureWindow.parse_bounty_from_checkbounty
@@ -2484,5 +2531,3 @@ loop do
 
   sleep 0.1
 end
-
-
