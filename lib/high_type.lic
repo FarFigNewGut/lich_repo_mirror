@@ -16,6 +16,30 @@
     ;high_type help                - Show comprehensive help
 
   Revision History:
+    v2.16.4 - 2026-08-14 - Fixed profile persistence: Settings/CharSettings scope by Script.current
+                           (nil on the hook thread), so runtime-command saves silently failed and
+                           startup restored stale profiles. Hook commands now write an in-memory
+                           cache; the main loop and before_dying flush it on the script thread
+    v2.16.3 - 2026-08-13 - htsorter now auto-started when not running, with a bold banner
+                           (banner suppressed on quiet starts; auto-start still happens)
+    v2.16.2 - 2026-08-13 - Saga: ht_echo/ht_block output prefixed with the \x1f origin sentinel
+                           so reports render full-bright (Saga dims unmarked script output)
+    v2.16.1 - 2026-08-13 - Saga: type and character colors now strip the link wrapper (Saga paints
+                           link elements over enclosing presets - colored items are not clickable
+                           there, by design per Dave); full 9-color Saga vocabulary now renders
+    v2.16.0 - 2026-08-13 - Saga frontend support: third config side (types_to_color_saga etc.),
+                           Saga vocabulary (speech whisper thought watching roomname roomdesc
+                           bold monsterbold nonhostile - nonhostile via crtrStatus wrapper);
+                           phase 1 skipped on Saga (link preset dead, client paints links);
+                           setlinkcolor unavailable there; coord="x,y" attribute tolerance in
+                           item matching (Saga protocol drift); phase 2 char color now routed
+                           through ht_color (fixes monsterbold char colors on XML too)
+    v2.15.1 - 2026-08-12 - Startup banner suggests ;htsorter when it isn't running (suppressed on quiet)
+    v2.15.0 - 2026-08-12 - Profiles: named config sets shared across characters
+                           (Settings['ht_profiles']); per-character assignment auto-loads each
+                           session (CharSettings['ht_profile']); ;ht profile [name] command (new
+                           names seed from current config); migration preserves customized
+                           characters as their own named profile; help/showconfig/debug updated
     v2.14.0 - 2026-08-12 - Configurable universal link color: setlinkcolor/clearlinkcolor commands,
                            per-frontend (link_default_color / link_default_color_gsl); all four
                            rendering sites derive from one cache; monsterbold excluded (bold too on GSL)
@@ -64,13 +88,13 @@
             game: GS
             tags: highlighting, colors, links, item_types
         required: Lich >= 4.6
-         version: 2.14.0
+         version: 2.16.4
 =end
 script.want_downstream_xml = true
 script.want_downstream = false
 
 # Single source of truth for version - interpolated into all version-bearing messages
-@version = '2.14.0'
+@version = '2.16.4'
 @script_name = script.name
 
 #------------------------------------------------------------------------------#
@@ -79,12 +103,18 @@ script.want_downstream = false
 # GSL front-ends (Wizard/Avalon) cannot render XML preset tags - sf_to_wiz strips
 # all tags before sending to the client. They render inline highlight bytes instead.
 @gsl_mode = Frontend.supports_gsl?
+# Saga is XML-family but has its own vocabulary: link/selectedLink/bold presets are
+# dead there, while watching/roomName/roomDesc render and crtrStatus gives green
+@saga_mode = !@gsl_mode && $frontend.to_s.downcase == 'saga'
 
 @monsterbold_start = @gsl_mode ? "\034GSL\r\n " : "<pushBold\/>"
 @monsterbold_end   = @gsl_mode ? "\034GSM\r\n " : "<popBold\/>"
 
-# Standard color names (valid on both sides)
+# Standard color names (XML side)
 @valid_colors = %w[speech whisper thought link selectedlink bold monsterbold]
+
+# Saga-renderable colors (probed 2026-08-12): 6 presets + pushBold + crtrStatus green
+@saga_valid_colors = %w[speech whisper thought watching roomname roomdesc bold monsterbold nonhostile]
 
 #------------------------------------------------------------------------------#
 # Extended Wizard palette (GSL side only)
@@ -113,13 +143,16 @@ script.want_downstream = false
 # where Script.current is nil - echo there prints [unknownscript: ...]. All output
 # reachable from the hook path self-identifies via _respond instead.
 def self.ht_echo(msg = '')
-  _respond "[#{@script_name}: #{msg}]"
+  # \x1f origin sentinel on Saga: unmarked lines get dimmed as script output
+  _respond "#{@saga_mode ? "\x1f" : ''}[#{@script_name}: #{msg}]"
 end
 
 # Emit a multi-line report as ONE atomic block (respond/_respond accept arrays and
 # send all lines in a single client write - no per-line prefixes, no interleaving).
 # raw=true uses _respond so embedded color markup/bytes render instead of escaping.
 def self.ht_block(lines, raw = false)
+  # \x1f origin sentinel on Saga: unmarked lines get dimmed as script output
+  lines = lines.map { |l| "\x1f#{l}" } if @saga_mode
   raw ? _respond(lines) : respond(lines)
 end
 
@@ -157,42 +190,174 @@ end
 # GSL side: UserVars.types_to_color_gsl / character_default_color_gsl
 # Commands automatically edit the side matching the active frontend.
 def self.active_side
-  @gsl_mode ? 'GSL' : 'XML'
+  return 'GSL' if @gsl_mode
+  return 'SAGA' if @saga_mode
+  'XML'
 end
 
 def self.active_types
-  @gsl_mode ? UserVars.types_to_color_gsl : UserVars.types_to_color
+  return UserVars.types_to_color_gsl if @gsl_mode
+  return UserVars.types_to_color_saga if @saga_mode
+  UserVars.types_to_color
 end
 
 def self.set_active_types(hash)
   if @gsl_mode
     UserVars.types_to_color_gsl = hash
+  elsif @saga_mode
+    UserVars.types_to_color_saga = hash
   else
     UserVars.types_to_color = hash
   end
 end
 
 def self.active_char_color
-  @gsl_mode ? UserVars.character_default_color_gsl : UserVars.character_default_color
+  return UserVars.character_default_color_gsl if @gsl_mode
+  return UserVars.character_default_color_saga if @saga_mode
+  UserVars.character_default_color
 end
 
 def self.set_active_char_color(color)
   if @gsl_mode
     UserVars.character_default_color_gsl = color
+  elsif @saga_mode
+    UserVars.character_default_color_saga = color
   else
     UserVars.character_default_color = color
   end
 end
 
+# No universal link color on Saga - the client paints link elements natively
 def self.active_link_color
-  @gsl_mode ? UserVars.link_default_color_gsl : UserVars.link_default_color
+  return UserVars.link_default_color_gsl if @gsl_mode
+  return nil if @saga_mode
+  UserVars.link_default_color
 end
 
 def self.set_active_link_color(color)
   if @gsl_mode
     UserVars.link_default_color_gsl = color
+  elsif @saga_mode
+    # unavailable - setlinkcolor command rejects before reaching here
   else
     UserVars.link_default_color = color
+  end
+end
+
+#------------------------------------------------------------------------------#
+# Profiles
+#------------------------------------------------------------------------------#
+# Named config sets shared across characters: Settings['ht_profiles'] holds the
+# profiles (both XML and GSL sides); CharSettings['ht_profile'] holds this
+# character's assignment, auto-loaded at startup. The active profile is mirrored
+# into UserVars, which stay the runtime layer (rendering + htsorter unchanged).
+# NOTE: Settings nested hashes need read-modify-REASSIGN to persist reliably.
+def self.profile_snapshot
+  {
+    'types_xml'       => (UserVars.types_to_color || {}).dup,
+    'types_gsl'       => (UserVars.types_to_color_gsl || {}).dup,
+    'types_saga'      => (UserVars.types_to_color_saga || {}).dup,
+    'char_color_xml'  => UserVars.character_default_color,
+    'char_color_gsl'  => UserVars.character_default_color_gsl,
+    'char_color_saga' => UserVars.character_default_color_saga,
+    'link_color_xml'  => UserVars.link_default_color,
+    'link_color_gsl'  => UserVars.link_default_color_gsl
+  }
+end
+
+def self.factory_profile
+  {
+    'types_xml'       => XML_DEFAULT_COLORS.dup,
+    'types_gsl'       => XML_DEFAULT_COLORS.select { |_t, c| !self.gsl_color_codes(c).nil? },
+    'types_saga'      => XML_DEFAULT_COLORS.dup,
+    'char_color_xml'  => nil, 'char_color_gsl' => nil, 'char_color_saga' => nil,
+    'link_color_xml'  => nil, 'link_color_gsl' => nil
+  }
+end
+
+def self.apply_profile(prof)
+  UserVars.types_to_color = (prof['types_xml'] || {}).dup
+  UserVars.types_to_color_gsl = (prof['types_gsl'] || {}).dup
+  # Pre-2.16.0 profiles lack the Saga side - fall back to seeded defaults
+  UserVars.types_to_color_saga = (prof['types_saga'] || XML_DEFAULT_COLORS).dup
+  UserVars.character_default_color = prof['char_color_xml']
+  UserVars.character_default_color_gsl = prof['char_color_gsl']
+  UserVars.character_default_color_saga = prof['char_color_saga']
+  UserVars.link_default_color = prof['link_color_xml']
+  UserVars.link_default_color_gsl = prof['link_color_gsl']
+  UserVars.save
+  self.reload_type_data
+  self.refresh_link_color_cache
+end
+
+# Write the current UserVars config back into the active profile.
+# HOOK-SAFE: mutates only the in-memory cache and marks it dirty - Settings and
+# CharSettings scope storage by Script.current, which is nil on the hook thread,
+# so the actual DB write happens in the main loop (script thread) via the flag.
+def self.persist_profile
+  @ht_profiles ||= {}
+  @ht_profiles[@active_profile] = self.profile_snapshot
+  @profile_dirty = true
+end
+
+# Script-thread only: flush the profile cache and assignment to the database
+def self.flush_profiles
+  @profile_dirty = false
+  all = Settings['ht_profiles'] || {}
+  all.merge!(@ht_profiles || {})
+  Settings['ht_profiles'] = all
+  CharSettings['ht_profile'] = @active_profile
+rescue StandardError => e
+  self.ht_echo "profile save error: #{e.message}"
+end
+
+# Startup: assign + load this character's profile. Migration (first run with
+# profiles): factory-matching config -> 'default'; customized config -> a
+# profile named after the character, so nothing anyone configured is lost.
+def self.init_profiles
+  all = Settings['ht_profiles'] || {}
+  all['default'] ||= self.factory_profile
+  assigned = CharSettings['ht_profile']
+  if assigned.nil?
+    if self.profile_snapshot == self.factory_profile
+      assigned = 'default'
+    else
+      assigned = Char.name.to_s.downcase.gsub(/[^a-z0-9_-]/, '')
+      assigned = 'default' if assigned.empty?
+      all[assigned] = self.profile_snapshot unless assigned == 'default'
+    end
+    CharSettings['ht_profile'] = assigned
+  end
+  unless all.key?(assigned)
+    assigned = 'default'
+    CharSettings['ht_profile'] = assigned
+  end
+  Settings['ht_profiles'] = all
+  @ht_profiles = all          # in-memory cache - the only store hook commands touch
+  @profile_dirty = false
+  @active_profile = assigned
+  self.apply_profile(all[assigned])
+end
+
+# HOOK-SAFE: operates on the in-memory cache; DB writes happen via flush_profiles
+def self.switch_profile(raw_name)
+  name = raw_name.to_s.downcase.gsub(/[^a-z0-9_-]/, '')
+  if name.empty?
+    self.ht_echo "Invalid profile name (letters, numbers, - and _ only)"
+    return
+  end
+  @ht_profiles ||= {}
+  if @ht_profiles.key?(name)
+    @active_profile = name
+    @profile_dirty = true
+    self.apply_profile(@ht_profiles[name])
+    self.ht_echo "Switched to profile '#{name}' - #{Char.name} auto-loads it from now on"
+  else
+    @ht_profiles[name] = self.profile_snapshot
+    @active_profile = name
+    @profile_dirty = true
+    self.ht_echo "Created profile '#{name}' seeded from your current config"
+    self.ht_echo "#{Char.name} now auto-loads '#{name}' (switch back with ;ht profile default)"
   end
 end
 
@@ -209,10 +374,11 @@ def self.refresh_link_color_cache
   @gsl_link_codes = codes || [$link_highlight_start.to_s, $link_highlight_end.to_s]
 end
 
-# Colors valid for the active side: standard names on both sides,
-# plus the extended Wizard palette names on the GSL side only
+# Colors valid for the active side
 def self.active_valid_colors
-  @gsl_mode ? (@valid_colors + @gsl_palette.keys) : @valid_colors
+  return @valid_colors + @gsl_palette.keys if @gsl_mode
+  return @saga_valid_colors if @saga_mode
+  @valid_colors
 end
 
 #------------------------------------------------------------------------------#
@@ -232,6 +398,24 @@ def self.ht_color(msg, color_type, skip_encoding=false)
     codes = self.gsl_color_codes(color_type)
     return encoded_msg if codes.nil? || codes[0].empty?
     return "#{codes[0]}#{encoded_msg}#{codes[1]}"
+  end
+
+  if @saga_mode
+    case color_type.to_s.downcase
+    when "speech", "whisper", "thought", "watching"
+      return "<preset id=\"#{color_type.to_s.downcase}\">#{encoded_msg}</preset>"
+    when "roomname"
+      return "<preset id=\"roomName\">#{encoded_msg}</preset>"
+    when "roomdesc"
+      return "<preset id=\"roomDesc\">#{encoded_msg}</preset>"
+    when "bold", "monsterbold"
+      return "#{@monsterbold_start}#{encoded_msg}#{@monsterbold_end}"
+    when "nonhostile"
+      # crtrStatus inferior triggers Saga's Non-Hostile green on the bold content
+      return "<crtrStatus exist=\"-1\" inferior=\"1\"/>#{@monsterbold_start}#{encoded_msg}#{@monsterbold_end}"
+    else
+      return encoded_msg  # link/selectedlink/unknown: no Saga channel - not set
+    end
   end
 
   case color_type.downcase
@@ -281,7 +465,8 @@ end
 def self.display_configuration
   lines = []
   lines << "=== High Type v#{@version} Configuration ==="
-  lines << "Frontend: #{Frontend.client} (#{@gsl_mode ? 'GSL' : 'XML preset'} mode) - editing the #{self.active_side} config side"
+  lines << "Frontend: #{Frontend.client} (#{@gsl_mode ? 'GSL' : (@saga_mode ? 'Saga' : 'XML preset')} mode) - editing the #{self.active_side} config side"
+  lines << "Profile: #{@active_profile} (change with ;ht profile <name>)"
   lines << ""
   lines << "Item types configured for highlighting (#{self.active_side} side): #{self.active_types.keys.size}"
   self.active_types.each { |type, color|
@@ -296,7 +481,7 @@ def self.display_configuration
   lines << "  - Colors ALL links when enabled"
   lines << "  - Item types override with specific colors"
   lines << "  - Replaces linktothefast functionality"
-  lines << "Universal link color (#{self.active_side} side): #{self.active_link_color || 'default (Links color)'}"
+  lines << (@saga_mode ? "Universal link color: not available on Saga (client paints links natively)" : "Universal link color (#{self.active_side} side): #{self.active_link_color || 'default (Links color)'}")
   if self.active_char_color
     lines << "Character default color (#{self.active_side} side): #{self.active_char_color}"
     lines << "  - All character names use this color instead of link default"
@@ -343,6 +528,13 @@ def self.setup_color_defaults
     UserVars.types_to_color_gsl = XML_DEFAULT_COLORS.select { |_type, color| !self.gsl_color_codes(color).nil? }
     UserVars.save
   end
+
+  # Seed Saga side with the full defaults (all 5 default colors render on Saga)
+  UserVars.types_to_color_saga ||= {}
+  if UserVars.types_to_color_saga.empty?
+    UserVars.types_to_color_saga = XML_DEFAULT_COLORS.dup
+    UserVars.save
+  end
 end
 
 #------------------------------------------------------------------------------#
@@ -368,7 +560,8 @@ def self.show_color_examples
   lines << "=== High Type Color Examples (#{self.active_side} side - #{Frontend.client}) ==="
   lines << ""
   # Each active-side color rendered inline with its label
-  %w[monsterbold speech whisper thought link selectedlink bold].each { |color_name|
+  display_list = @saga_mode ? @saga_valid_colors : %w[monsterbold speech whisper thought link selectedlink bold]
+  display_list.each { |color_name|
     next unless self.active_valid_colors.include?(color_name)
     lines << "  #{(color_name + ':').ljust(14)} #{self.ht_color(sample_text, color_name)}"
   }
@@ -385,8 +578,9 @@ def self.show_all_colors
   lines = []
   lines << "=== High Type All Colors (#{self.active_side} side - #{Frontend.client}) ==="
   lines << ""
-  lines << "Standard colors (work on both frontends):"
-  %w[monsterbold speech whisper thought link selectedlink bold].each { |color_name|
+  lines << (@saga_mode ? "Saga colors:" : "Standard colors (work on both frontends):")
+  standard_list = @saga_mode ? @saga_valid_colors : %w[monsterbold speech whisper thought link selectedlink bold]
+  standard_list.each { |color_name|
     lines << "  #{(color_name + ':').ljust(14)} #{self.ht_color(sample, color_name)}"
   }
   lines << ""
@@ -421,6 +615,7 @@ def self.add_type_color(type_arg, color_arg)
   self.active_types[type_name] = color_name
   UserVars.save
   self.reload_type_data
+  self.persist_profile
   self.ht_echo "Added (#{self.active_side} side): #{type_name} => #{color_name}"
   return true
 end
@@ -429,6 +624,7 @@ def self.reset_config
   self.set_active_types({})
   self.setup_color_defaults
   self.reload_type_data
+  self.persist_profile
 end
 
 #------------------------------------------------------------------------------#
@@ -451,7 +647,7 @@ def self.apply_gsl_colors(game_output)
       # Character names (negative exist IDs) use the character default color
       if self.active_char_color && attrs =~ /exist="-\d+"/
         codes = self.gsl_color_codes(self.active_char_color)
-      elsif attrs =~ /exist="-?\d+" noun="([^"]+)"/
+      elsif attrs =~ /exist="-?\d+".*?noun="([^"]+)"/
         # Item link: resolve type-specific color
         type = self.identify_item_category(text, $1)
         if type
@@ -518,6 +714,13 @@ def self.handle_runtime_command(args, running=true)
     lines << "  ;high_type clearcharcolor  - Clear character color (use link default)"
     lines << "  ;high_type setlinkcolor <color> - Set universal link color"
     lines << "  ;high_type clearlinkcolor  - Clear link color (use default)"
+    lines << "  ;high_type profile          - Show active profile and list all"
+    lines << "  ;high_type profile <name>   - Switch profile (new = created from current config)"
+    lines << ""
+    lines << "PROFILES: named config sets shared across characters. Everyone starts"
+    lines << "on 'default'. Once you assign a profile it auto-loads every session"
+    lines << "until you switch back. Edits change the ACTIVE profile - editing on"
+    lines << "'default' affects every character using 'default'."
     lines << ""
     lines << "Script continues running after commands."
     lines << "=== End Runtime Help ==="
@@ -554,8 +757,9 @@ def self.handle_runtime_command(args, running=true)
       if self.active_types.key?(type_name)
         self.active_types.delete(type_name)
         UserVars.save
-        self.ht_echo "Removed (#{self.active_side} side): #{type_name}"
         self.reload_type_data
+        self.persist_profile
+        self.ht_echo "Removed (#{self.active_side} side): #{type_name}"
         self.ht_echo "Configuration updated (script continues running)"
       else
         self.ht_echo "Type '#{type_name}' not found in the #{self.active_side} side configuration"
@@ -571,6 +775,7 @@ def self.handle_runtime_command(args, running=true)
       if self.active_valid_colors.include?(color_name)
         self.set_active_char_color(color_name)
         UserVars.save
+        self.persist_profile
         self.ht_echo "Character default color (#{self.active_side} side) set to: #{color_name}"
         self.ht_echo "All character names will now use #{color_name} color"
       else
@@ -585,16 +790,20 @@ def self.handle_runtime_command(args, running=true)
   when "clearcharcolor"
     self.set_active_char_color(nil)
     UserVars.save
+    self.persist_profile
     self.ht_echo "Character default color (#{self.active_side} side) cleared - characters will use link default"
 
   when "setlinkcolor"
-    if args[1]
+    if @saga_mode
+      self.ht_echo "setlinkcolor is not available on Saga - the client paints link elements natively"
+    elsif args[1]
       color_name = args[1].gsub(/["']/, '')
       excluded = @gsl_mode ? %w[bold monsterbold] : %w[monsterbold]
       if self.active_valid_colors.include?(color_name) && !excluded.include?(color_name)
         self.set_active_link_color(color_name)
         UserVars.save
         self.refresh_link_color_cache
+        self.persist_profile
         self.ht_echo "Universal link color (#{self.active_side} side) set to: #{color_name}"
         self.ht_echo "All links now use #{color_name} unless a type color overrides them"
       else
@@ -607,10 +816,26 @@ def self.handle_runtime_command(args, running=true)
     end
 
   when "clearlinkcolor"
-    self.set_active_link_color(nil)
-    UserVars.save
-    self.refresh_link_color_cache
-    self.ht_echo "Universal link color (#{self.active_side} side) cleared - using the default link color"
+    if @saga_mode
+      self.ht_echo "setlinkcolor/clearlinkcolor are not available on Saga"
+    else
+      self.set_active_link_color(nil)
+      UserVars.save
+      self.refresh_link_color_cache
+      self.persist_profile
+      self.ht_echo "Universal link color (#{self.active_side} side) cleared - using the default link color"
+    end
+
+  when "profile"
+    if args[1]
+      self.switch_profile(args[1])
+    else
+      all = @ht_profiles || {}
+      self.ht_echo "Active profile: #{@active_profile} (#{Char.name} auto-loads it each session)"
+      self.ht_echo "Available profiles: #{all.keys.sort.join(', ')}"
+      self.ht_echo "Switch with ;ht profile <name> - a new name is created from your current config"
+      self.ht_echo "NOTE: edits while on 'default' change 'default' for ALL characters using it"
+    end
 
   else
     # Default to showing configuration
@@ -625,6 +850,7 @@ end
 self.setup_color_defaults
 self.reload_type_data
 self.refresh_link_color_cache
+self.init_profiles
 
 # Precompute the byte-strip pattern for bold-section exclusion in GSL mode
 # (the highlight byte globals are populated by Lich core before scripts start).
@@ -644,6 +870,7 @@ if script.vars[0]
 
   case args[0].downcase
   when "quiet"
+    @quiet_start = true
     echo "High Type loaded silently - #{self.active_types.keys.size} item types configured (#{self.active_side} side)"
   when "reset"
     echo "Resetting #{self.active_side} side configuration to defaults..."
@@ -665,6 +892,7 @@ if script.vars[0]
     lines = []
     lines << "=== High Type v#{@version} Debug Info ==="
     lines << "Frontend: #{Frontend.client} (#{@gsl_mode ? 'GSL' : 'XML preset'} mode) - #{self.active_side} config side"
+    lines << "Active profile: #{@active_profile}"
     lines << "Configured types (#{self.active_side}): #{self.active_types.keys.join(', ')}"
     lines << ""
     lines << "GameObj type data loaded for:"
@@ -695,9 +923,18 @@ if script.vars[0]
     lines << ""
     lines << "PER-FRONTEND CONFIG:"
     lines << "  Commands edit the config side matching your frontend:"
-    lines << "  - Wrayth/Stormfront -> XML side (all 7 colors)"
-    lines << "  - Wizard/Avalon     -> GSL side (speech, link, selectedlink, bold, monsterbold)"
+    lines << "  - Wrayth/Stormfront -> XML side (7 standard colors)"
+    lines << "  - Wizard/Avalon     -> GSL side (7 standard + 30 palette names)"
+    lines << "  - Saga              -> SAGA side (speech whisper thought watching"
+    lines << "                         roomname roomdesc bold monsterbold nonhostile)"
     lines << "  Current: #{Frontend.client} -> #{self.active_side} side"
+    lines << ""
+    lines << "PROFILES:"
+    lines << "  Configs live in named profiles shared across characters; every"
+    lines << "  character starts on 'default'. ';ht profile <name>' assigns this"
+    lines << "  character a profile (new names are created from your current config)"
+    lines << "  and it auto-loads every session until you switch back to default."
+    lines << "  Current: #{Char.name} -> profile '#{@active_profile}'"
     lines << ""
     lines << "STARTUP COMMANDS:"
     lines << "  quiet             Load silently with item count (script keeps running)"
@@ -721,6 +958,7 @@ if script.vars[0]
     lines << "  ;high_type clearcharcolor    Clear character color (use link default)"
     lines << "  ;high_type setlinkcolor <color> Set universal link color"
     lines << "  ;high_type clearlinkcolor    Clear link color (use default)"
+    lines << "  ;high_type profile [name]    Show or switch profiles"
     lines << ""
     lines << "FEATURES:"
     lines << "  - Frontend-aware: XML presets on Wrayth/Stormfront, GSL codes on Wizard/Avalon"
@@ -751,7 +989,8 @@ end
 # hook proc
 #------------------------------------------------------------------------------#
 @match_patterns = Hash.new
-@match_patterns[:item_link] = /<a exist="(?<id>-?\d+)" noun="(?<noun>[^"]+)">(?<name>[^<]+)<\/a>/;
+# [^>]* between attributes: Saga links carry coord="x,y" between exist and noun
+@match_patterns[:item_link] = /<a exist="(?<id>-?\d+)"[^>]*noun="(?<noun>[^"]+)">(?<name>[^<]+)<\/a>/;
 
 # Main processing pipeline for game output colorization
 # GSL front-ends: single-pass byte colorization; XML front-ends: 3-phase preset tagging
@@ -761,7 +1000,8 @@ apply_type_colors = proc {|game_output|
   else
     # Phase 1: Universal link enhancement - Apply base coloring to all link elements
     # (wrap tag comes from the link-color cache so setlinkcolor is honored)
-    if UserVars.color_all_links && game_output =~ /<[ad](?: [^>]*)?>.*?<\/[ad]>/
+    # Skipped on Saga: the link preset is dead there; Saga paints links natively
+    if !@saga_mode && UserVars.color_all_links && game_output =~ /<[ad](?: [^>]*)?>.*?<\/[ad]>/
       game_output = game_output.gsub(/(<[ad](?: [^>]*)?>.*?<\/[ad]>)/, "#{@xml_link_open}\\1</preset>")
 
       # Bold text exclusion: Remove link coloring from bold sections to prevent conflicts
@@ -779,12 +1019,14 @@ apply_type_colors = proc {|game_output|
     # Strips any Phase 1 link-preset wrapper first to avoid nested presets
     if self.active_char_color && game_output =~ /<[ad] exist="-\d+"/
       game_output = game_output.gsub(/(?:#{Regexp.escape(@xml_link_open)})?(<([ad]) exist="-\d+"[^>]*>[^<]+<\/\2>)(?:<\/preset>)?/) do
-        "<preset id='#{self.active_char_color}'>#{$1}</preset>"
+        # ht_color handles the wrap per-FE (also fixes monsterbold char colors on XML)
+        # Saga: strip the link so the color shows (link paint beats presets there)
+        self.ht_color(@saga_mode ? $1.gsub(/<[^>]+>/, '') : $1, self.active_char_color, true)
       end
     end
 
     # Phase 3: Type-specific colorization - Override colors based on GameObj classification
-    if game_output =~ /<a exist="(?:-?\d+)" noun="(?:[^"]+)">(?:[^<]+)<\/a>/
+    if game_output =~ /<a exist="(?:-?\d+)"[^>]*noun="(?:[^"]+)">(?:[^<]+)<\/a>/
       color_queue = []
       game_output.scan(@match_patterns[:item_link]).each { |id,noun,name|
         type = self.identify_item_category(name,noun)
@@ -801,7 +1043,13 @@ apply_type_colors = proc {|game_output|
         color_queue.each { |id,color_type|
           # Remove any existing preset wrapper and apply type-specific color
           item_pattern = /(#{Regexp.escape(@xml_link_open)})?(<a exist="#{id}".*?<\/a>)(<\/preset>)?/
-          game_output.gsub!(item_pattern, self.ht_color('\\2', color_type, true))
+          if @saga_mode
+            # Saga paints link elements over any enclosing preset - strip the link
+            # (colored items are not clickable there, by design) and color the text
+            game_output.gsub!(item_pattern) { self.ht_color($2.gsub(/<[^>]+>/, ''), color_type, true) }
+          else
+            game_output.gsub!(item_pattern, self.ht_color('\\2', color_type, true))
+          end
         }
       end
     end
@@ -843,9 +1091,29 @@ UpstreamHook.add('high_type_commands', proc { |cmd|
 before_dying{
   DownstreamHook.remove('high_type')
   UpstreamHook.remove('high_type_commands')
+  # Catch changes made within the last second before a kill
+  self.flush_profiles if @profile_dirty
 }
 
-echo "High Type v#{@version} fully active - #{@gsl_mode ? 'GSL highlight codes' : 'link coloring and type highlighting'} enabled (#{Frontend.client}, #{self.active_side} config side)"
+echo "High Type v#{@version} fully active - #{@gsl_mode ? 'GSL highlight codes' : (@saga_mode ? 'Saga type highlighting' : 'link coloring and type highlighting')} enabled (#{Frontend.client}, #{self.active_side} config side)"
 echo "Runtime commands available: ;high_type (or ;ht) help, ;high_type add <type> <color>, ;high_type reset, etc."
 
-while true;sleep 1;end
+# Companion script: auto-start htsorter when it isn't running (banner suppressed on quiet)
+unless Script.running?('htsorter')
+  unless @quiet_start
+    banner = []
+    banner << self.ht_color('==============================================', 'monsterbold')
+    banner << self.ht_color('  HIGH_TYPE: htsorter was not running', 'monsterbold')
+    banner << self.ht_color('  Starting it now - sorted, colorized bags', 'monsterbold')
+    banner << self.ht_color('==============================================', 'monsterbold')
+    self.ht_block(banner, true)
+  end
+  start_script 'htsorter'
+end
+
+# Main loop doubles as the persistence pump: Settings/CharSettings writes must
+# happen on the script thread (they scope by Script.current, nil in hooks)
+while true
+  self.flush_profiles if @profile_dirty
+  sleep 1
+end
