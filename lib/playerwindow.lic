@@ -1,4 +1,5 @@
 =begin
+  Works in Saga FE!
   Player Window - Real-Time Player Display & Spam Filter
 
   Creates a dedicated window to display other players in the room with
@@ -26,16 +27,25 @@
     *pwcol7                      - Use a 7-column layout
     *pwcol8                      - Use an 8-column layout
     *pwbuttons                   - Hide/show filter buttons
+    *pwstatus                    - Cycle Saga status display: text -> unicode -> emoji -> text
     *pwmove                      - Toggle player movement filtering
     *pwflare                     - Toggle flare-message filtering
     *pwcombat                    - Toggle AS/CS/SMR/SSR line filtering
     *pwclaim                     - Hide/show claim status
     *pwgtk                       - Enable GTK window
+    *filterspam                  - Toggle spam filtering
+    *filteranimals               - Toggle animal filtering
+    *pwdebug                     - Toggle filter-debug logging (echoes why a line was/wasn't filtered)
 
   Author: Phocosoen, ChatGPT
   Tags: wrayth, frontend, mod, window, players, spam, filter, group, avalon, wizard, gtk3
-  Version: 1.9.5
+  Version: 2.0.0
   Recently changed:
+    - Column layout extended from 1-4 to 1-8 (*pwcol3 through *pwcol8).
+    - Added a Saga-only status display mode for the player grid, cycled
+      with *pwstatus: text (plain words) -> unicode (special characters)
+      -> emoji -> back to text. Dead players use a tombstone icon, sitting/
+      kneeling/prone get dedicated icons, in emoji mode.
 	  - Added Hidden Player display in PCs.
 	  - Added support for Saga FE.
 	  - Added support for 3 and 4 column layouts.
@@ -58,7 +68,8 @@ module PlayerWindow
   include Lich::Common if defined?(Lich::Common)
   SETTINGS_MUTEX = Mutex.new
   PLAYER_ROW_HEIGHT = 20
-  PLAYER_COLUMN_WIDTH = 130
+  PLAYER_COLUMN_WIDTH = 120
+  PLAYER_HEADER_WIDTH = 200
 
   class << self
     attr_accessor :gtk_available,
@@ -76,7 +87,8 @@ module PlayerWindow
                   :flare_patterns,
                   :hidden_player_detected,
                   :group_dirty,
-                  :group_display
+                  :group_display,
+                  :saga_status_mode
   end
 
   BLOCKED_NOUNS = [
@@ -100,9 +112,12 @@ module PlayerWindow
       "height"               => 370,
       "font_size"            => 17,
       "use_gtk_playerwindow" => true,
-      "palette"              => "White on Black"
+      "palette"              => "White on Black",
+      "saga_status_mode"     => "unicode"
     },
   }.freeze
+
+  SAGA_STATUS_MODES = %w[text unicode emoji].freeze
 
   def load_flare_patterns_file
     scripts_dir = "#{$script_dir}"
@@ -366,6 +381,8 @@ PlayerWindow.single_column = (PlayerWindow.columns == 1)
 PlayerWindow.show_filter_buttons = player_window_settings.fetch("show_filter_buttons", true)
 PlayerWindow.show_claim_status   = player_window_settings.fetch("show_claim_status", true)
 PlayerWindow.show_movement       = player_window_settings.fetch("show_movement", true)
+PlayerWindow.saga_status_mode    = player_window_settings.fetch("saga_status_mode", "unicode")
+PlayerWindow.saga_status_mode    = "unicode" unless PlayerWindow::SAGA_STATUS_MODES.include?(PlayerWindow.saga_status_mode)
 PlayerWindow.debug_filter_enabled = false # Toggle with *pwdebug
 PlayerWindow.flare_patterns = PlayerWindow.load_flare_filter_patterns
 PlayerWindow.hidden_player_detected = false
@@ -807,6 +824,72 @@ def PlayerWindow.player_status_fix(status)
   return nil
 end
 
+# Saga-panel-only status text -> XML numeric character reference. Values are
+# entity references (not raw UTF-8 literals) since raw non-ASCII bytes
+# embedded directly in a dialog control's value='' attribute don't survive
+# Saga's dialog-control rendering intact. "dead" has no unicode-mode glyph
+# (matches creaturewindow's convention) -- it only gets an icon in emoji
+# mode, using the tombstone per-player (vs. creaturewindow's skull, which
+# marks dead creatures).
+PW_SAGA_STATUS_ICONS_UNICODE = {
+  /\bcalmed\b/i   => "&#x262E;",   # U+262E peace symbol
+  /\bfrozen\b/i   => "&#x2744;",   # U+2744 snowflake
+  /\bheld\b/i     => "&#x2327;",   # U+2327 x in a rectangle box
+  /\bsleeping\b/i => "&#x1DBB;&#x1DBB;&#x1DBB;", # U+1DBB x3 modifier letter small z
+  /\bwebbed\b/i   => "&#x203B;",   # U+203B reference mark
+  /\bstunned\b/i  => "&#x2739;",   # U+2739 six pointed black star
+  /\bprone\b/i    => "&#x21D3;"    # U+21D3 downwards double arrow
+}.freeze
+
+PW_SAGA_STATUS_ICONS_EMOJI = {
+  /\bcalmed\b/i   => "&#x1F60C;",         # U+1F60C relieved face
+  /\bfrozen\b/i   => "&#x2744;&#xFE0F;",  # U+2744 snowflake
+  /\bheld\b/i     => "&#x26D3;&#xFE0F;",  # U+26D3 chains
+  /\bsleeping\b/i => "&#x1F4A4;",         # U+1F4A4 zzz
+  /\bwebbed\b/i   => "&#x1F578;&#xFE0F;", # U+1F578 spider web
+  /\bstunned\b/i  => "&#x26A1;",          # U+26A1 high voltage
+  /\bprone\b/i    => "&#x1F6CC;",         # U+1F6CC person in bed (lying down)
+  /\bsitting\b/i  => "&#x1FA91;",         # U+1FA91 chair
+  /\bkneeling\b/i => "&#x1F9CE;",         # U+1F9CE person kneeling
+  /\bdead\b/i     => "&#x1FAA6;"          # U+1FAA6 tombstone
+}.freeze
+
+def PlayerWindow.saga_status_icon_table
+  case PlayerWindow.saga_status_mode
+  when "emoji"
+    PW_SAGA_STATUS_ICONS_EMOJI
+  when "unicode"
+    PW_SAGA_STATUS_ICONS_UNICODE
+  else
+    nil
+  end
+end
+
+# Saga-panel-only status text -> symbol substitution, gated by
+# PlayerWindow.saga_status_mode ("text"/"unicode"/"emoji", cycled via
+# *pwstatus). GTK keeps the plain text from PlayerWindow.player_status_fix
+# untouched.
+def PlayerWindow.saga_status_display(status_text)
+  return status_text if status_text.nil? || $frontend != 'saga'
+
+  table = PlayerWindow.saga_status_icon_table
+  return status_text unless table
+
+  display = status_text.dup
+  table.each { |pattern, icon| display.gsub!(pattern, icon) }
+  display
+end
+
+# Builds "name (status)" normally, but drops the parentheses when the Saga
+# panel is about to render status as a unicode/emoji symbol instead of a
+# word.
+def PlayerWindow.saga_wrap_status(name, status)
+  return name.to_s if status.nil?
+  return "#{name} #{status}" if $frontend == 'saga' && PlayerWindow.saga_status_mode != 'text'
+
+  "#{name} (#{status})"
+end
+
 def PlayerWindow.oak_wand_check
   wands = {}
   GameObj.containers.each do |container|
@@ -953,7 +1036,7 @@ def PlayerWindow.push_players_to_window(pcs, group_display = nil)
 
   group_display ||= PlayerWindow.group_display
   if group_display
-    group_width = cols * col_width
+    group_width = [cols * col_width, PlayerWindow::PLAYER_HEADER_WIDTH].min
     chars_per_row = [(group_width / 7), 1].max
     group_rows = [(group_display.length.to_f / chars_per_row).ceil, 1].max
     group_height = group_rows * row_height
@@ -964,7 +1047,7 @@ def PlayerWindow.push_players_to_window(pcs, group_display = nil)
   # Second row: PCs label
   player_count = sorted_pcs.size + (PlayerWindow.hidden_player_detected ? 1 : 0)
   total_value = "PCs: #{player_count}#{PlayerWindow.claim_status_text}"
-  total_width = cols * col_width
+  total_width = [cols * col_width, PlayerWindow::PLAYER_HEADER_WIDTH].min
   total_chars_per_row = [(total_width / 7), 1].max
   total_rows = [(total_value.length.to_f / total_chars_per_row).ceil, 1].max
   total_height = total_rows * row_height
@@ -984,7 +1067,7 @@ def PlayerWindow.push_players_to_window(pcs, group_display = nil)
   sorted_pcs.each do |pc|
     noun = PlayerWindow.extract_noun(pc)
     status = (pc.respond_to?(:status) && pc.status) ? PlayerWindow.player_status_fix(pc.status) : nil
-    label_value = status ? "#{noun} (#{status})" : noun
+    label_value = PlayerWindow.saga_wrap_status(noun, status)
     player_rows << {
       label: label_value,
       cmd: PlayerWindow.action_for_status(status, pc)
@@ -996,10 +1079,11 @@ def PlayerWindow.push_players_to_window(pcs, group_display = nil)
       left = col * col_width
       top = row_height * (row + top_offset)
 
+      label = PlayerWindow.saga_status_display(entry[:label])
       if entry[:cmd]
-        output += "<link id='player_#{row}_#{col}' value='#{entry[:label]}' cmd=\"#{entry[:cmd]}\" echo=\"#{entry[:cmd]}\" justify='bottom' left='#{left}' top='#{top}' width='#{col_width}' height='#{row_height}' />"
+        output += "<link id='player_#{row}_#{col}' value='#{label}' cmd=\"#{entry[:cmd]}\" echo=\"#{entry[:cmd]}\" justify='bottom' left='#{left}' top='#{top}' width='#{col_width}' height='#{row_height}' />"
       else
-        output += "<label id='player_#{row}_#{col}' value='#{entry[:label]}' justify='bottom' left='#{left}' top='#{top}' width='#{col_width}' height='#{row_height}' />"
+        output += "<label id='player_#{row}_#{col}' value='#{label}' justify='bottom' left='#{left}' top='#{top}' width='#{col_width}' height='#{row_height}' />"
       end
     end
   end
@@ -1103,6 +1187,23 @@ upstream_proc = proc do |command|
     # Classic single/double toggle (drops back to 1/2 even from 3/4).
     n = PlayerWindow.apply_column_setting(PlayerWindow.columns == 2 ? 1 : 2)
     respond "Column Layout: #{n == 1 ? 'Single' : 'Double'} (#{n} column#{n == 1 ? '' : 's'})"
+    nil
+
+  when /\*pwstatus/i
+    modes = PlayerWindow::SAGA_STATUS_MODES
+    next_mode = modes[(modes.index(PlayerWindow.saga_status_mode).to_i + 1) % modes.size]
+    PlayerWindow.saga_status_mode = next_mode
+    PlayerWindow.update_player_setting("saga_status_mode", next_mode)
+
+    label = {
+      "text"    => "TEXT (plain status words)",
+      "unicode" => "UNICODE (\u{262E} \u{2744} \u{2327} \u{1DBB}\u{1DBB}\u{1DBB} \u{203B} \u{2739} \u{21D3})",
+      "emoji"   => "EMOJI (\u{1F60C} \u{2744}\u{FE0F} \u{26D3}\u{FE0F} \u{1F4A4} \u{1F578}\u{FE0F} \u{26A1} \u{1F6CC} \u{1FA91} \u{1F9CE} \u{1FAA6})"
+    }[next_mode]
+    respond "Playerwindow Saga status display: #{label}"
+
+    pcs = GameObj.pcs.reject { |pc| pc.name == Char.name }
+    PlayerWindow.push_players_to_window(pcs)
     nil
 
   when /\*pwmove/i
@@ -1522,7 +1623,7 @@ downstream_proc = proc { |line, _server_string|
   end
 
   # CUSTOM SPELL PREP
-  if line =~ /rips the ethereal image asunder\, the motes coalescing at the tips of|rests a hand on .* chest\, eyes closed\, as a faint hum slowly builds in the air nearby\.|begins to make sinuous gestures with both hands\.|^Weaving .* hands in a complicated pattern\,|.* murmurs words of power into the air, summoning the elements to do .* bidding\.|.* intones a mystical orison, petitioning for the aid of .* patron\.|.* murmurs soft words into the air, the liquid syllables summoning the spirits to .* aid\.|.* traces a burning rune into the air, melding the spiritual and elemental powers by sheer force of will\.|.* whispers quietly into the wind, summoning the forces of nature to .* call\.|.* raises .* voice in rhythmic song, commanding the aid of the elements\.|.* lifts .* voice in a rallying cry, calling confidently on the power of .* patron for aid\.|.* weaves .* hands through the air, streamers of elemental mana twisting between .* fingers\.|.* raises .* clasped hands, fervently calling on the guidance of .* patron\.|.* outlines a luminous rune in the air, summoning the spirits to .* aid\.|.* scribes a hazy, dark sigil into the air, fusing elemental and spiritual power\.|.* casts .* voice into the air, causing the spirits to swirl around (?:him|her|them) with a sound like rustling leaves\.|.* lifts .* voice in song, skillfully twining elemental mana into .* harmony\.|.* traces .* patron's holy symbol in the air, using it to focus .* invocation\.|.* quickly intones a battle chant, imploring .* patron to lend (?:him|her|them) aid\.|.* melds a climactic chord into .* melody, .* voice rising in a crescendo\.|.* murmurs a twisting phrase, commanding both the elements and spirits together\.|.* invokes a short blessing, .* hands clasped in prayer\.|.* chants a short phrase, embers leaping from .* fingertips, as .* clenches .* hand into a smoke-shrouded fist\.|.* intones a mystical phrase, .* words flowing in a burst of speed, as .* hands move rapidly\.|.* chants a reverent prayer, imploring .* patron for aid in restoring the fallen to life\.|.* whispers a mystical phrase, as a nebulous haze shimmers into view around .* hands, casting them in murky shadows\.|.* whispers a mystical phrase, as pearlescent energy builds around .* hands, casting them in an opalescent silhouette\.|.* utters a sharp phrase, tiny thorns rippling across .* arms in a wave that moves toward .* hands\.|.* tucks .* hand behind .* back for a moment before moving it back to .* side\.|.* shower of sparks cascade from .* hands as .* intones a few words\.|.* gallimaufry of sounds pours from .* mouth as .* stumbles over some words\.|.* utters a plaintive plea to .*\.|.* lips move soundlessly\.|.* whispers a short prayer to .* followed by a soft incantation\.|.* fingertips momentarily glow a deep sanguine red as .* murmurs a few words\.|Looking bored, .* drones out a few words in a monotone\.|.* steeples .* fingers together and touches .* forehead to .* thumbs as .* prepares a spell\.|.* makes small, intricately twisting movements with .* hands at .* chest before projecting them outward abruptly\.|Inky shadows and twinkling lights commix around .* in a hypnotic eddy\.|.* rasps out a few words as tendrils of white smoke slither from .* mouth\.|Seven phantom tentacles sprout from the base of .* spine, wrapping .* in a binding embrace\.|.* gestures and quietly utters a phrase of magic\.|.* whispers something softly, and a whirlwind of flower petals envelops (?:him|her|them) before fading away into nothingness\.|Crystalline snowflakes drift softly down upon .* as .* says a few words\.|The scent of mournblooms fills the air as .* speaks a few words\.|A loud ticking sound emanates from .* as .* murmurs a short phrase\.|.* invokes the fury of a storm as .* prepares a spell\.|Anguished whispers amplify into a cacophony of sound that nearly drowns out .* attempts to prepare a spell\.|.* sketches a tart symbol and mutters an invocation to an unintelligible arkati followed by cheerful recitation\.|As .* slowly chants, swirls of tea-scented steam twist about .* before fading to nothingness\.|hands over the ground\, and a sudden chill fills the air as shadows rise to|chants in an arcane language which causes|face suddenly darkens as a ghostly death mask pinches|calling the forces of nature to aid|A swarm of ethereal crimson butterflies circle around|Polychromatic tentacles wrap about .* as .* chants a magical phrase\.|wrists and condenses into thrice\-wrapped coils as|face twisted with pain as if .* very bones are aflame|upturned palms and drift upwards as they build in intensity|traces a series of glowing runes along|whispers a quiet invocation\.|intones a sonorous mantra and shifts|Reciting the mystical phrases of|skin is suffused with a subtle gold glow as|pulses with a white-blue light\!|murmurs a brief incantation with a casual gesture\.|A soft\, white glow briefly surrounds|A strange cracking noise cuts across|hums an ancient hymnal that causes the shadows to strectch towards|intones a soft prayer and the patterns, which now dance like eels beneath waves|Calling out to the powers of chaos and life|Mystical phrases fill the air|whispers and a strawberry-hued wisp is summoned, flitting around|sending the cat back down its awkward perch as it accepts its bounty|murmurs a prayer to the spirits of the|eyes to the heavens as the fading image of Liabo appears behind|quickly growing in size as numerous sinuous misty tentacles reach out from within their untold depths|Someone begins singing|As someone sings|Someone unseen begins singing|eyes in concentration\, the runes on|murmurs a prayer to the dead that is an entreaty for aid|renews .* songs|stops singing\.|shaped vortex of air moves|releases upon .* a flurry of abjurations|Suddenly, a small bolt of energy arcs between them|eyes, looking slightly drained\.|strains, but nothing happens\.|The powerful look leaves|The light blue glow leaves|The very powerful look leaves|The white light leaves|The deep blue glow leaves|an eerie white glow blurring the outline of the bones beneath|Grating out an incomprehensible phrase|asking to be empassioned and have his desires fulfilled\.|fingers weave gossamer threads of energy into a weblike sigil\.|quickly intones a battle chant\, imploring|beseeches a reverent phrase while manifesting the elements\.|beseeches a reverent phrase while manifesting the elements\.|eyes flare and then emanate an amalgamation of elemental energy|With a sudden burst of enthusiasm, the sparks jump into .*? seems to glow with power\.|A vibrant stream of rainbow colors burst forth\, streaming alongside .*? motions before dispersing into an imperceptible mist\.|languidly traces a rune in the air\.|patron as sunlit gold radiance begins to take form\, swirling violently around|removes one of the chords from .*? harmony while maintaining the symmetry of those that remain\.|fingers\.\.\. but little else happens\.|gestures discreetly while murmuring a quiet incantation|stirring fingers through the ephemeral wings on|plucks two illusory strands out of the air and knots them together\.|gestures and utters a phrase of magic\.|prepares to sing\.|skillfully begins to weave another verse into|sings\, a squall of wind briefly swirls about|gestures while calling upon the lesser spirits for aid|A caliginous power manifests around|completes several complex gestures while an incantation tumbles from|intonation carrying a somber but determined quality\.|hums an ancient hymnal that causes the shadows to stretch towards|A salty sea breeze stirs as .* chants an old sailor's ditty|invokes the spirits of the harvest|sings a melody\, directing the sound of|hums a nearly inaudible tune\.|hand through the air\, cutting invisible runes\.|skillfully weaves another verse into|hisses a magical phrase at an incomprehensibly rapid pace\.|^Flickers of verdant green light emanate from|whispers arcane incantations\, and the air about|eyes glow crimson as a swarm of ethereal crimson\-eyed scarabs envelop|invokes the virtues of the stars, swirls of constellations appearing momentarily beneath|^The branches of .* sprout fresh green leaves in harmony with .* magical incantations\.|^The folds of .* float for a moment\, drifting in the currents of a phantom wind as .* calls the spirits to his aid\.|^As .* begins .* incantations\, the .* encircling .* begin to brighten as the fire lashes out\, engulfing|head\, reciting a quiet prayer of reverence as divine energy radiates from|^A vereri mirage briefly materializes to embrace|ripples with multihued elemental mana\, slowly unfurling into wispy tendrils of colorful light|liltingly begins to sing a sea chanty|you hear a number of ingredients being listed with a count of outstretched fingers|Wisps of .* light begin to swirl around|the drifting grains briefly sketching runes in the air\.|whispers something softly\, and a whirlwind of flower petals envelops|hands like effervescent cyclones before abruptly popping in unison\./i
+  if line =~ /rips the ethereal image asunder\, the motes coalescing at the tips of|rests a hand on .* chest\, eyes closed\, as a faint hum slowly builds in the air nearby\.|begins to make sinuous gestures with both hands\.|^Weaving .* hands in a complicated pattern\,|.* murmurs words of power into the air, summoning the elements to do .* bidding\.|.* intones a mystical orison, petitioning for the aid of .* patron\.|.* murmurs soft words into the air, the liquid syllables summoning the spirits to .* aid\.|.* traces a burning rune into the air, melding the spiritual and elemental powers by sheer force of will\.|.* whispers quietly into the wind, summoning the forces of nature to .* call\.|.* raises .* voice in rhythmic song, commanding the aid of the elements\.|.* lifts .* voice in a rallying cry, calling confidently on the power of .* patron for aid\.|.* weaves .* hands through the air, streamers of elemental mana twisting between .* fingers\.|.* raises .* clasped hands, fervently calling on the guidance of .* patron\.|.* outlines a luminous rune in the air, summoning the spirits to .* aid\.|.* scribes a hazy, dark sigil into the air, fusing elemental and spiritual power\.|.* casts .* voice into the air, causing the spirits to swirl around (?:him|her|them) with a sound like rustling leaves\.|.* lifts .* voice in song, skillfully twining elemental mana into .* harmony\.|.* traces .* patron's holy symbol in the air, using it to focus .* invocation\.|.* quickly intones a battle chant, imploring .* patron to lend (?:him|her|them) aid\.|.* melds a climactic chord into .* melody, .* voice rising in a crescendo\.|.* murmurs a twisting phrase, commanding both the elements and spirits together\.|.* invokes a short blessing, .* hands clasped in prayer\.|.* chants a short phrase, embers leaping from .* fingertips, as .* clenches .* hand into a smoke-shrouded fist\.|.* intones a mystical phrase, .* words flowing in a burst of speed, as .* hands move rapidly\.|.* chants a reverent prayer, imploring .* patron for aid in restoring the fallen to life\.|.* whispers a mystical phrase, as a nebulous haze shimmers into view around .* hands, casting them in murky shadows\.|.* whispers a mystical phrase, as pearlescent energy builds around .* hands, casting them in an opalescent silhouette\.|.* utters a sharp phrase, tiny thorns rippling across .* arms in a wave that moves toward .* hands\.|.* tucks .* hand behind .* back for a moment before moving it back to .* side\.|.* shower of sparks cascade from .* hands as .* intones a few words\.|.* gallimaufry of sounds pours from .* mouth as .* stumbles over some words\.|.* utters a plaintive plea to .*\.|.* lips move soundlessly\.|.* whispers a short prayer to .* followed by a soft incantation\.|.* fingertips momentarily glow a deep sanguine red as .* murmurs a few words\.|Looking bored, .* drones out a few words in a monotone\.|.* steeples .* fingers together and touches .* forehead to .* thumbs as .* prepares a spell\.|.* makes small, intricately twisting movements with .* hands at .* chest before projecting them outward abruptly\.|Inky shadows and twinkling lights commix around .* in a hypnotic eddy\.|.* rasps out a few words as tendrils of white smoke slither from .* mouth\.|Seven phantom tentacles sprout from the base of .* spine, wrapping .* in a binding embrace\.|.* gestures and quietly utters a phrase of magic\.|.* whispers something softly, and a whirlwind of flower petals envelops (?:him|her|them) before fading away into nothingness\.|Crystalline snowflakes drift softly down upon .* as .* says a few words\.|The scent of mournblooms fills the air as .* speaks a few words\.|A loud ticking sound emanates from .* as .* murmurs a short phrase\.|.* invokes the fury of a storm as .* prepares a spell\.|Anguished whispers amplify into a cacophony of sound that nearly drowns out .* attempts to prepare a spell\.|.* sketches a tart symbol and mutters an invocation to an unintelligible arkati followed by cheerful recitation\.|As .* slowly chants, swirls of tea-scented steam twist about .* before fading to nothingness\.|hands over the ground\, and a sudden chill fills the air as shadows rise to|chants in an arcane language which causes|face suddenly darkens as a ghostly death mask pinches|calling the forces of nature to aid|A swarm of ethereal crimson butterflies circle around|Polychromatic tentacles wrap about .* as .* chants a magical phrase\.|wrists and condenses into thrice\-wrapped coils as|face twisted with pain as if .* very bones are aflame|upturned palms and drift upwards as they build in intensity|traces a series of glowing runes along|whispers a quiet invocation\.|intones a sonorous mantra and shifts|Reciting the mystical phrases of|skin is suffused with a subtle gold glow as|pulses with a white-blue light\!|murmurs a brief incantation with a casual gesture\.|A soft\, white glow briefly surrounds|A strange cracking noise cuts across|hums an ancient hymnal that causes the shadows to strectch towards|intones a soft prayer and the patterns, which now dance like eels beneath waves|Calling out to the powers of chaos and life|Mystical phrases fill the air|whispers and a strawberry-hued wisp is summoned, flitting around|sending the cat back down its awkward perch as it accepts its bounty|murmurs a prayer to the spirits of the|eyes to the heavens as the fading image of Liabo appears behind|quickly growing in size as numerous sinuous misty tentacles reach out from within their untold depths|Someone begins singing|As someone sings|Someone unseen begins singing|eyes in concentration\, the runes on|murmurs a prayer to the dead that is an entreaty for aid|renews .* songs|stops singing\.|shaped vortex of air moves|releases upon .* a flurry of abjurations|Suddenly, a small bolt of energy arcs between them|eyes, looking slightly drained\.|strains, but nothing happens\.|The powerful look leaves|The light blue glow leaves|The very powerful look leaves|The white light leaves|The deep blue glow leaves|an eerie white glow blurring the outline of the bones beneath|Grating out an incomprehensible phrase|asking to be empassioned and have his desires fulfilled\.|fingers weave gossamer threads of energy into a weblike sigil\.|quickly intones a battle chant\, imploring|beseeches a reverent phrase while manifesting the elements\.|beseeches a reverent phrase while manifesting the elements\.|eyes flare and then emanate an amalgamation of elemental energy|With a sudden burst of enthusiasm, the sparks jump into .*? seems to glow with power\.|A vibrant stream of rainbow colors burst forth\, streaming alongside .*? motions before dispersing into an imperceptible mist\.|languidly traces a rune in the air\.|patron as sunlit gold radiance begins to take form\, swirling violently around|removes one of the chords from .*? harmony while maintaining the symmetry of those that remain\.|fingers\.\.\. but little else happens\.|gestures discreetly while murmuring a quiet incantation|stirring fingers through the ephemeral wings on|plucks two illusory strands out of the air and knots them together\.|gestures and utters a phrase of magic\.|prepares to sing\.|skillfully begins to weave another verse into|sings\, a squall of wind briefly swirls about|gestures while calling upon the lesser spirits for aid|A caliginous power manifests around|completes several complex gestures while an incantation tumbles from|intonation carrying a somber but determined quality\.|hums an ancient hymnal that causes the shadows to stretch towards|A salty sea breeze stirs as .* chants an old sailor's ditty|invokes the spirits of the harvest|sings a melody\, directing the sound of|hums a nearly inaudible tune\.|hand through the air\, cutting invisible runes\.|skillfully weaves another verse into|hisses a magical phrase at an incomprehensibly rapid pace\.|^Flickers of verdant green light emanate from|whispers arcane incantations\, and the air about|eyes glow crimson as a swarm of ethereal crimson\-eyed scarabs envelop|invokes the virtues of the stars, swirls of constellations appearing momentarily beneath|^The branches of .* sprout fresh green leaves in harmony with .* magical incantations\.|^The folds of .* float for a moment\, drifting in the currents of a phantom wind as .* calls the spirits to his aid\.|^As .* begins .* incantations\, the .* encircling .* begin to brighten as the fire lashes out\, engulfing|head\, reciting a quiet prayer of reverence as divine energy radiates from|^A vereri mirage briefly materializes to embrace|ripples with multihued elemental mana\, slowly unfurling into wispy tendrils of colorful light|liltingly begins to sing a sea chanty|you hear a number of ingredients being listed with a count of outstretched fingers|Wisps of .* light begin to swirl around|the drifting grains briefly sketching runes in the air\.|whispers something softly\, and a whirlwind of flower petals envelops|hands like effervescent cyclones before abruptly popping in unison\.|releases an audible breath of air\, something between a gasp and a sigh\.|^Rivulets of glowing mana trickle from/i
     PlayerWindow.debug_filter("CUSTOM SPELL PREP (...)", line)
     next nil
   end
