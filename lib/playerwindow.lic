@@ -36,11 +36,39 @@
     *filterspam                  - Toggle spam filtering
     *filteranimals               - Toggle animal filtering
     *pwdebug                     - Toggle filter-debug logging (echoes why a line was/wasn't filtered)
+    *pwprofession                - Toggle profession icons next to player names (Saga only)
+    *pwprofession <profs...>      - Show icons for only the listed professions, e.g.
+                                    "*pwprofession warrior cleric" -- everyone else parsed via
+                                    *pwparse stays tracked but hidden until you switch back
+    *pwprofession all             - Clear the filter, showing every parsed profession again
+    *pwparse <profession>        - Look up who's currently playing a profession (via WHO PROFESSION)
+                                    and remember it for the icon display, e.g. "*pwparse warrior"
+    *pwparse all                  - Queue all 10 professions for lookup, one per loop tick, in
+                                    order, so the window stays responsive between them
 
   Author: Phocosoen, ChatGPT
   Tags: wrayth, frontend, mod, window, players, spam, filter, group, avalon, wizard, gtk3
-  Version: 2.0.0
+  Version: 2.3.0
   Recently changed:
+    - Added "*pwprofession <profs...>" (e.g. "*pwprofession warrior
+      cleric"), which narrows the icon display to just the listed
+      professions regardless of what's been *pwparse'd -- everyone else
+      stays tracked in the roster, just hidden, so switching filters back
+      and forth doesn't require re-parsing. "*pwprofession all" clears the
+      filter; bare "*pwprofession" still just toggles icons on/off as
+      before.
+    - Added "*pwparse all", which queues all 10 professions for lookup at
+      once instead of running *pwparse once per profession by hand.
+      Processed one profession per loop tick (not all in one blocking
+      burst), so the window and other commands stay responsive across the
+      up-to-10 "who profession" round trips.
+    - Added Saga-only profession icons next to player names, toggled with
+      *pwprofession. Since the game doesn't expose another player's
+      profession directly, the roster is built by running *pwparse
+      <profession> (e.g. "*pwparse bard"), which issues WHO PROFESSION and
+      remembers the returned names -- run it once per profession you want
+      icons for. Covers all ten professions (Bard/Cleric/Empath/Monk/
+      Paladin/Ranger/Rogue/Sorcerer/Warrior/Wizard).
     - Column layout extended from 1-4 to 1-8 (*pwcol3 through *pwcol8).
     - Added a Saga-only status display mode for the player grid, cycled
       with *pwstatus: text (plain words) -> unicode (special characters)
@@ -88,7 +116,11 @@ module PlayerWindow
                   :hidden_player_detected,
                   :group_dirty,
                   :group_display,
-                  :saga_status_mode
+                  :saga_status_mode,
+                  :show_profession_icons,
+                  :profession_display_filter,
+                  :profession_map,
+                  :pending_parse_queue
   end
 
   BLOCKED_NOUNS = [
@@ -113,11 +145,14 @@ module PlayerWindow
       "font_size"            => 17,
       "use_gtk_playerwindow" => true,
       "palette"              => "White on Black",
-      "saga_status_mode"     => "unicode"
+      "saga_status_mode"     => "unicode",
+      "show_profession_icons" => false,
+      "profession_display_filter" => nil
     },
   }.freeze
 
   SAGA_STATUS_MODES = %w[text unicode emoji].freeze
+  PROFESSION_NAMES = %w[Warrior Rogue Wizard Cleric Empath Sorcerer Ranger Bard Monk Paladin].freeze
 
   def load_flare_patterns_file
     scripts_dir = "#{$script_dir}"
@@ -383,6 +418,16 @@ PlayerWindow.show_claim_status   = player_window_settings.fetch("show_claim_stat
 PlayerWindow.show_movement       = player_window_settings.fetch("show_movement", true)
 PlayerWindow.saga_status_mode    = player_window_settings.fetch("saga_status_mode", "unicode")
 PlayerWindow.saga_status_mode    = "unicode" unless PlayerWindow::SAGA_STATUS_MODES.include?(PlayerWindow.saga_status_mode)
+PlayerWindow.show_profession_icons = player_window_settings.fetch("show_profession_icons", false)
+PlayerWindow.profession_display_filter = begin
+  saved = player_window_settings["profession_display_filter"]
+  if saved.is_a?(Array)
+    filtered = saved.select { |p| PlayerWindow::PROFESSION_NAMES.include?(p) }
+    filtered.empty? ? nil : filtered
+  end
+end
+PlayerWindow.profession_map = {}
+PlayerWindow.pending_parse_queue = []
 PlayerWindow.debug_filter_enabled = false # Toggle with *pwdebug
 PlayerWindow.flare_patterns = PlayerWindow.load_flare_filter_patterns
 PlayerWindow.hidden_player_detected = false
@@ -398,7 +443,7 @@ end
 
 if Frontend.supports_room_window?
   # Open the players window using Wrayth's dynamic dialog.
-  _respond("<closeDialog id='PlayerWindow'/><openDialog type='dynamic' id='PlayerWindow' title='Players' target='PlayerWindow' scroll='manual' location='main' justify='3' height='160' resident='true'><dialogData id='PlayerWindow'></dialogData></openDialog>")
+  _respond("<closeDialog id='PlayerWindow'/><openDialog type='dynamic' id='PlayerWindow' title='Players' target='PlayerWindow' resident='true'><dialogData id='PlayerWindow'></dialogData></openDialog>")
 end
 
 @pw_last_pcs = []
@@ -854,6 +899,76 @@ PW_SAGA_STATUS_ICONS_EMOJI = {
   /\bdead\b/i     => "&#x1FAA6;"          # U+1FAA6 tombstone
 }.freeze
 
+# Profession icons are emoji-only (no unicode/text alternative was given),
+# so they're gated by their own PlayerWindow.show_profession_icons toggle
+# rather than saga_status_mode. Values are XML numeric character references
+# for the same reason as the status icons above.
+PW_PROFESSION_ICONS = {
+  "Bard"     => "&#x1F3B5;",                   # U+1F3B5 musical note
+  "Cleric"   => "&#x1F64F;",                   # U+1F64F folded hands
+  "Empath"   => "&#x2764;&#xFE0F;&#x200D;&#x1FA79;", # U+2764 mending heart (heart + VS16 + ZWJ + adhesive bandage)
+  "Monk"     => "&#x1F44A;",                   # U+1F44A oncoming fist
+  "Paladin"  => "&#x1F6E1;&#xFE0F;",           # U+1F6E1 shield
+  "Ranger"   => "&#x1F3F9;",                   # U+1F3F9 bow and arrow
+  "Rogue"    => "&#x1F5E1;&#xFE0F;",           # U+1F5E1 dagger
+  "Sorcerer" => "&#x1F52E;",                   # U+1F52E crystal ball
+  "Warrior"  => "&#x2694;&#xFE0F;",            # U+2694 crossed swords
+  "Wizard"   => "&#x1FA84;"                    # U+1FA84 magic wand
+}.freeze
+
+# Blocking: issues "who profession X" and captures the roster. Must only be
+# called from the main script thread (e.g. the main loop below), never from
+# inside an UpstreamHook callback -- those run in the client's send
+# pipeline and can't sit around waiting several seconds on game output.
+# Detects the response purely structurally (a header line ending in ':',
+# then name rows, then "Total: N") since the exact header wording isn't
+# documented and may vary by profession.
+def PlayerWindow.fetch_profession_roster(profession, timeout: 6)
+  names = []
+  state = :before
+  invalid = false
+  ttl = Time.now + timeout
+
+  hook_name = "playerwindow_who_#{Time.now.to_f}"
+  DownstreamHook.add(hook_name, proc { |line|
+    # Names in this response are clickable links (<a exist="..."
+    # noun="...">Name</a>), so strip tags before matching/collecting --
+    # otherwise raw tag fragments end up in the roster instead of names.
+    clean = strip_xml(line).to_s
+    case state
+    when :before
+      if clean =~ /^Valid options:/i
+        invalid = true
+        state = :done
+        nil
+      elsif clean =~ /:\s*$/
+        state = :capturing
+        nil
+      else
+        line
+      end
+    when :capturing
+      if clean =~ /^Total:\s*\d+/i
+        state = :done
+        nil
+      else
+        names.concat(clean.scan(/\S+/))
+        nil
+      end
+    else
+      line
+    end
+  }, persist: false)
+
+  fput "who profession #{profession.downcase}"
+  sleep 0.05 until state == :done || Time.now > ttl
+
+  DownstreamHook.remove(hook_name)
+  return :invalid if invalid
+
+  names
+end
+
 def PlayerWindow.saga_status_icon_table
   case PlayerWindow.saga_status_mode
   when "emoji"
@@ -888,6 +1003,27 @@ def PlayerWindow.saga_wrap_status(name, status)
   return "#{name} #{status}" if $frontend == 'saga' && PlayerWindow.saga_status_mode != 'text'
 
   "#{name} (#{status})"
+end
+
+# Returns "<icon> " for a player whose profession is known from a prior
+# *pwparse lookup, or "" otherwise. Saga-only, and gated separately from
+# saga_status_mode since profession icons have no unicode/text alternative.
+# Takes the bare noun, not pc.name -- pc.name can carry an earned title
+# (e.g. "Chaos Lord Kighte"), but the WHO PROFESSION roster (and the noun
+# players are actually addressed by) is just the bare name ("Kighte").
+# If profession_display_filter is set (via "*pwprofession <profs...>"),
+# only those professions get an icon -- everyone else in profession_map
+# is still tracked, just not shown, so switching the filter back doesn't
+# require re-parsing.
+def PlayerWindow.saga_profession_icon(pc_noun)
+  return "" unless $frontend == 'saga' && PlayerWindow.show_profession_icons
+
+  profession = PlayerWindow.profession_map[pc_noun.to_s.downcase]
+  return "" unless profession
+  return "" if PlayerWindow.profession_display_filter && !PlayerWindow.profession_display_filter.include?(profession)
+
+  icon = PW_PROFESSION_ICONS[profession]
+  icon ? "#{icon} " : ""
 end
 
 def PlayerWindow.oak_wand_check
@@ -1065,7 +1201,8 @@ def PlayerWindow.push_players_to_window(pcs, group_display = nil)
   end
 
   sorted_pcs.each do |pc|
-    noun = PlayerWindow.extract_noun(pc)
+    base_noun = PlayerWindow.extract_noun(pc)
+    noun = "#{PlayerWindow.saga_profession_icon(base_noun)}#{base_noun}"
     status = (pc.respond_to?(:status) && pc.status) ? PlayerWindow.player_status_fix(pc.status) : nil
     label_value = PlayerWindow.saga_wrap_status(noun, status)
     player_rows << {
@@ -1204,6 +1341,67 @@ upstream_proc = proc do |command|
 
     pcs = GameObj.pcs.reject { |pc| pc.name == Char.name }
     PlayerWindow.push_players_to_window(pcs)
+    nil
+
+  when /\*pwprofession(?:\s+(.+))?/i
+    args = $1.to_s.strip
+
+    if args.empty?
+      # Bare toggle -- unchanged from before, doesn't touch the filter.
+      PlayerWindow.show_profession_icons = !PlayerWindow.show_profession_icons
+      PlayerWindow.update_player_setting("show_profession_icons", PlayerWindow.show_profession_icons)
+      filter_note = PlayerWindow.profession_display_filter ? " (currently filtered to: #{PlayerWindow.profession_display_filter.join(', ')})" : ""
+      respond "Playerwindow profession icons are now #{PlayerWindow.show_profession_icons ? 'ENABLED' : 'DISABLED'}#{filter_note}#{PlayerWindow.show_profession_icons && PlayerWindow.profession_map.empty? ? ' (use *pwparse <profession> to populate the roster, e.g. *pwparse warrior)' : ''}."
+    elsif args.casecmp?('all')
+      # Clears the filter -- every parsed profession shows its icon again.
+      PlayerWindow.profession_display_filter = nil
+      PlayerWindow.update_player_setting("profession_display_filter", nil)
+      PlayerWindow.show_profession_icons = true
+      PlayerWindow.update_player_setting("show_profession_icons", true)
+      respond "Playerwindow: profession icon filter cleared -- showing all parsed professions."
+    else
+      requested = args.split(/\s+/)
+      invalid = requested.reject { |r| PlayerWindow::PROFESSION_NAMES.any? { |p| p.casecmp?(r) } }
+      if !invalid.empty?
+        respond "Playerwindow: invalid profession(s): #{invalid.join(', ')}. Choose from #{PlayerWindow::PROFESSION_NAMES.join(', ')}, or 'all'."
+      else
+        filter = requested.map { |r| PlayerWindow::PROFESSION_NAMES.find { |p| p.casecmp?(r) } }.uniq
+        PlayerWindow.profession_display_filter = filter
+        PlayerWindow.update_player_setting("profession_display_filter", filter)
+        PlayerWindow.show_profession_icons = true
+        PlayerWindow.update_player_setting("show_profession_icons", true)
+        respond "Playerwindow: now only displaying icons for #{filter.join(', ')} (still tracking everyone parsed -- switch back with *pwprofession all)."
+      end
+    end
+
+    pcs = GameObj.pcs.reject { |pc| pc.name == Char.name }
+    if PlayerWindow.show_profession_icons && !pcs.empty?
+      matches = pcs.select { |pc| PlayerWindow.profession_map[PlayerWindow.extract_noun(pc).downcase] }
+      if matches.empty?
+        respond "Playerwindow: none of the #{pcs.size} player(s) currently visible are on record yet."
+      else
+        respond "Playerwindow: #{matches.size} of #{pcs.size} visible player(s) matched: #{matches.map { |pc| noun = PlayerWindow.extract_noun(pc); "#{noun} (#{PlayerWindow.profession_map[noun.downcase]})" }.join(', ')}"
+      end
+    end
+    PlayerWindow.push_players_to_window(pcs)
+    nil
+
+  when /\*pwparse\s*(\S+)?/i
+    requested = $1.to_s.strip
+    if requested.empty?
+      respond "Usage: *pwparse <profession>|all -- profession is one of #{PlayerWindow::PROFESSION_NAMES.join(', ')}"
+    elsif requested.casecmp?('all')
+      PlayerWindow.pending_parse_queue.concat(PlayerWindow::PROFESSION_NAMES - PlayerWindow.pending_parse_queue)
+      respond "Playerwindow: queued all #{PlayerWindow::PROFESSION_NAMES.size} professions for lookup, in order (#{PlayerWindow::PROFESSION_NAMES.join(', ')})."
+    elsif !PlayerWindow::PROFESSION_NAMES.any? { |p| p.casecmp?(requested) }
+      respond "Playerwindow: '#{requested}' isn't a valid profession. Choose one of #{PlayerWindow::PROFESSION_NAMES.join(', ')}, or 'all'."
+    else
+      profession = PlayerWindow::PROFESSION_NAMES.find { |p| p.casecmp?(requested) }
+      unless PlayerWindow.pending_parse_queue.include?(profession)
+        PlayerWindow.pending_parse_queue << profession
+      end
+      respond "Playerwindow: looking up the #{profession} roster..."
+    end
     nil
 
   when /\*pwmove/i
@@ -1934,6 +2132,26 @@ loop do
   if defined?(PlayerWindowGtk) && PlayerWindowGtk.pending_command
     fput PlayerWindowGtk.pending_command
     PlayerWindowGtk.pending_command = nil
+  end
+
+  # Dequeues one profession per loop tick (rather than draining the whole
+  # queue in one go) so *pwparse all -- which can involve up to 10 blocking
+  # "who profession" round trips -- doesn't stall the window/other commands
+  # for the entire run in a single tick.
+  if (profession = PlayerWindow.pending_parse_queue.shift)
+    roster = PlayerWindow.fetch_profession_roster(profession)
+    if roster == :invalid
+      respond "Playerwindow: the game rejected '#{profession}' as a profession."
+    else
+      PlayerWindow.profession_map.delete_if { |_name, prof| prof == profession }
+      roster.each { |name| PlayerWindow.profession_map[name.downcase] = profession }
+      remaining = PlayerWindow.pending_parse_queue.size
+      remaining_note = remaining > 0 ? " (#{remaining} more queued: #{PlayerWindow.pending_parse_queue.join(', ')})" : ""
+      respond "Playerwindow: #{profession} roster updated (#{roster.size} player#{roster.size == 1 ? '' : 's'})#{remaining_note}."
+
+      pcs = GameObj.pcs.reject { |pc| pc.name == Char.name }
+      PlayerWindow.push_players_to_window(pcs)
+    end
   end
 
   sleep 0.1
