@@ -43,6 +43,8 @@
     *cwstatus                    - Cycle Saga status display: text -> unicode -> emoji -> text
     *cwtargetnext                - Cycle target-next mode: off -> numbers -> no_numbers
     *cwtargetnext off            - Jump directly to a specific mode (off/numbers/no_numbers)
+    *cwhp                        - Cycle target HP display: off -> text -> bar
+    *cwtargetid                  - Cycle the target marker icon (Saga emoji mode only)
     *cwgtk                       - Enable GTK window
     *cwherb                      - Run the herb bounty workflow (also triggered by clicking the bounty action link)
     *cwgem                       - Run the gem bounty workflow (also triggered by clicking the bounty action link)
@@ -53,8 +55,27 @@
 
   Author: Phocosoen, ChatGPT
   Tags: wrayth, frontend, mod, window, target, creature, mob, bounty, advguild, avalon, wizard, gtk3
-  Version: 1.8.0
+  Version: 1.13.0
   Recently changed:
+    - Added *cwtargetid: cycles a target marker icon (circled-times, circled-
+      plus, direct-hit) shown to the left of the current target's name in
+      Saga emoji mode, replacing the "**name**" bolding used in text/unicode
+      mode for that mode specifically (single icon on the left only, not
+      wrapped on both sides).
+    - Statuses are now sourced from Creature[id]'s crtrStatus flags (multiple
+      simultaneous statuses, e.g. stunned+prone, now display together) with
+      the old room-text parsing kept as a fallback for "held"/"frozen", which
+      crtrStatus doesn't track. Added a "kneeling" status/icon (emoji only,
+      matching playerwindow's kneeling handling).
+    - *cwhp text/bar modes now show live current/max HP instead of a static
+      max-only snapshot. Turning *cwhp to text or bar auto-enables the
+      shared Combat::Tracker damage feed (lib/gemstone/combat, also used by
+      eo_creaturebar.lic) if it isn't already running, so damage isn't
+      tracked unless *cwhp is actually in use. Combat::Tracker is a single
+      per-character toggle other scripts may also rely on, so cycling *cwhp
+      back to off does not turn it back off. The bar (10-segment red/black)
+      and the "###/### hp" text render together on one line, shrunk with
+      font='small'.
     - Column layout extended from 1-4 to 1-8 (*cwcol1 through *cwcol8).
     - Added a Saga-only status display mode for the creature grid and dead-
       creature list, cycled with *cwstatus: text (plain words) -> unicode
@@ -101,17 +122,53 @@ module CreatureWindow
   TARGET_NEXT_MODES = %w[off numbers no_numbers].freeze
   HAZARD_DISPLAY_MODES = %w[above between below_dead off].freeze
   SAGA_STATUS_MODES = %w[text unicode emoji].freeze
+  # Translates Creature[]'s crtrStatus-driven canonical status names (see
+  # CRTR_STATUS_FLAGS in lib/common/creature/creature_base.rb) to the words
+  # creature_status_fix has always used for its icon-table lookups, so a
+  # single label vocabulary works for both. Names absent here (disoriented,
+  # kneeling, sitting, hovering, hidden) pass through unchanged -- there's no
+  # icon for them, so they render as plain text.
+  CRTR_STATUS_DISPLAY_MAP = {
+    "immobilized" => "frozen",
+    "sleeping"    => "unconscious",
+    "calm"        => "calmed"
+  }.freeze
+  # *cwhp cycles through these modes in order:
+  #   off  - no target HP display
+  #   text - live "###/### hp" readout (current/max, via Combat::Tracker)
+  #   bar  - a 10-segment bar (filled = remaining HP) plus the "###/### hp"
+  #          readout on the same line
+  TARGET_HP_MODES = %w[off text bar].freeze
+  # XML numeric character references, not raw UTF-8 literals -- raw non-ASCII
+  # bytes don't reliably survive a dialog control's value='' attribute (see
+  # CW_SAGA_STATUS_ICONS_UNICODE/_EMOJI above for the same pattern).
+  TARGET_HP_BAR_SEGMENT = "&#x1F7E5;" # U+1F7E5 red square (remaining HP)
+  TARGET_HP_BAR_EMPTY_SEGMENT = "&#x2B1B;" # U+2B1B black large square (lost HP)
+  TARGET_HP_BAR_SEGMENTS = 10
+  # *cwtargetid cycles through these. Emoji-mode only: marks the current
+  # target with one icon to its left (not wrapped on both sides like the
+  # "**name**" bolding used in text/unicode mode).
+  TARGET_MARKER_ICONS = [
+    "&#x2297;",  # U+2297 circled times
+    "&#x2A01;",  # U+2A01 n-ary circled plus operator
+    "&#x1F3AF;"  # U+1F3AF direct hit (target)
+  ].freeze
   HAZARD_TARGET_PATTERN = /cloud|sandstorm|vine|web|whirlwind|unearthly silvery blue globe|spiraling ghostly rift|pale hovering runestone/i
   CREATURE_ROW_HEIGHT = 20
-  CREATURE_COLUMN_WIDTH = 120
+  CREATURE_COLUMN_WIDTH = 130
   HAZARD_COLUMN_WIDTH = 170
-  BOUNTY_ROW_WIDTH = 300
+  # Wide enough that the longest bounty action line ("Task Complete - Go to
+  # AdvGuard and Ask About Bounty", 53 chars) fits on one line at the default
+  # font size instead of wrapping -- wrapped text still only gets a single
+  # CREATURE_ROW_HEIGHT of vertical space (fixed top='' positioning doesn't
+  # account for wrap), so a wrap here overlaps whatever renders next.
+  BOUNTY_ROW_WIDTH = 460
 
   class << self
     attr_accessor :settings, :window_settings, :use_gtk_window,
                   :display_bounty, :display_avg_ttk, :display_last_ttk, :display_kpm,
                   :display_claim, :target_next_mode, :hazard_display_mode, :saga_status_mode,
-                  :gtk_available, :single_column, :columns
+                  :target_hp_mode, :target_marker_index, :gtk_available, :single_column, :columns
   end
 end
 
@@ -162,6 +219,8 @@ CW_DEFAULT_WINDOW_SETTINGS = {
     "target_next_mode"       => "off",
     "hazard_display_mode"    => "above",
     "saga_status_mode"       => "unicode",
+    "target_hp_mode"         => "off",
+    "target_marker_index"    => 0,
     "x"                      => 1440,
     "y"                      => 1600,
     "width"                  => 420,
@@ -204,6 +263,19 @@ def CreatureWindow.sanitize_window_settings(settings)
 
   cw["saga_status_mode"] = cw["saga_status_mode"].to_s
   cw["saga_status_mode"] = "unicode" unless CreatureWindow::SAGA_STATUS_MODES.include?(cw["saga_status_mode"])
+
+  # Target HP mode: migrate the old boolean (display_target_hp true/false)
+  # to the new three-way string, then make sure whatever's left is known.
+  case cw["target_hp_mode"]
+  when true
+    cw["target_hp_mode"] = "text"
+  when false, nil
+    cw["target_hp_mode"] = cw.key?("display_target_hp") ? (cw["display_target_hp"] ? "text" : "off") : "off"
+  end
+  cw["target_hp_mode"] = "off" unless CreatureWindow::TARGET_HP_MODES.include?(cw["target_hp_mode"])
+  cw.delete("display_target_hp")
+
+  cw["target_marker_index"] = CreatureWindow.coerce_integer(cw["target_marker_index"], min: 0, max: CreatureWindow::TARGET_MARKER_ICONS.size - 1, allow_nil: true) || 0
 
   # Column count (1-4). Fall back to the legacy single_column boolean, then keep
   # the two in sync so old configs migrate cleanly.
@@ -359,6 +431,8 @@ CreatureWindow.display_claim    = CreatureWindow.window_settings.fetch("display_
 CreatureWindow.target_next_mode = CreatureWindow.window_settings.fetch("target_next_mode", "off")
 CreatureWindow.hazard_display_mode = CreatureWindow.window_settings.fetch("hazard_display_mode", "above")
 CreatureWindow.saga_status_mode = CreatureWindow.window_settings.fetch("saga_status_mode", "unicode")
+CreatureWindow.target_hp_mode = CreatureWindow.window_settings.fetch("target_hp_mode", "off")
+CreatureWindow.target_marker_index = CreatureWindow.window_settings.fetch("target_marker_index", 0)
 CreatureWindow.columns          = CreatureWindow.window_settings.fetch("columns", CreatureWindow.window_settings.fetch("single_column", false) ? 1 : 2)
 CreatureWindow.single_column    = (CreatureWindow.columns == 1)
 
@@ -960,23 +1034,48 @@ def CreatureWindow.creature_status_fix(status, name = nil, id = nil)
     end
   end
 
-  standard_status = case status
-                    when /calmed|calm/i then "calmed"
-                    when /frozen|immobilized|terrified/i then "frozen"
-                    when /held/i then "held"
-                    when /rooted/i then "rooted"
-                    when /unconscious|slumber|sleeping/i then "unconscious"
-                    when /webbed|webbing/i then "webbed"
-                    when /stunned/i then "stunned"
-                    when /prone|lying down|knocked to the ground/i then "prone"
-                    when /flying/i then "flying"
-                    else nil
-                    end
+  # Text-parsed fallback (GameObj's "that appears X" room text). Still needed
+  # for "held" and "frozen"/"terrified", which crtrStatus and the combat
+  # message parser don't currently track under any canonical name -- but this
+  # can only ever surface ONE word, since the room text itself only ever
+  # names one status even when several are simultaneously active.
+  text_status = case status
+                when /calmed|calm/i then "calmed"
+                when /frozen|immobilized|terrified/i then "frozen"
+                when /held/i then "held"
+                when /rooted/i then "rooted"
+                when /unconscious|slumber|sleeping/i then "unconscious"
+                when /webbed|webbing/i then "webbed"
+                when /stunned/i then "stunned"
+                when /prone|lying down|knocked to the ground/i then "prone"
+                when /flying/i then "flying"
+                when /kneeling/i then "kneeling"
+                else nil
+                end
 
-  all_statuses = []
-  all_statuses << standard_status if standard_status
+  # crtrStatus-driven statuses (Creature[id].statuses) can hold several
+  # simultaneously-true flags at once (e.g. stunned AND prone), unlike the
+  # room text above which only ever mentions one. This is the primary,
+  # multi-value source; text_status only adds words it can't otherwise cover.
+  crtr_statuses = CreatureWindow.crtr_status_list(id)
+
+  all_statuses = crtr_statuses.dup
+  all_statuses << text_status if text_status
   all_statuses.concat(custom_statuses)
-  all_statuses.empty? ? nil : all_statuses.join(", ")
+  all_statuses = all_statuses.compact.uniq
+  all_statuses.empty? ? nil : all_statuses.join(" ")
+end
+
+# Live crtrStatus-driven status list for a creature (see
+# CRTR_STATUS_DISPLAY_MAP), translated to creature_status_fix's icon-table
+# vocabulary. Returns [] when there's no id or no matching Creature record.
+def CreatureWindow.crtr_status_list(id)
+  return [] unless id
+
+  creature = Creature[id] rescue nil
+  return [] unless creature
+
+  (creature.statuses || []).map { |s| CreatureWindow::CRTR_STATUS_DISPLAY_MAP[s] || s }
 end
 
 # Values are XML numeric character references (not raw UTF-8 literals).
@@ -1006,10 +1105,11 @@ CW_SAGA_STATUS_ICONS_EMOJI = {
   /\bwebbed\b/i      => "&#x1F578;&#xFE0F;",   # U+1F578 spider web
   /\bstunned\b/i     => "&#x26A1;",            # U+26A1 high voltage
   /\bprone\b/i       => "&#x2B07;&#xFE0F;",    # U+2B07 down arrow
-  /\bflying\b/i      => "&#x1FABD;"            # U+1FABD wing
+  /\bflying\b/i      => "&#x1FABD;",           # U+1FABD wing
+  /\bkneeling\b/i    => "&#x1F9CE;"            # U+1F9CE person kneeling (from playerwindow)
 }.freeze
 
-CW_SAGA_DEAD_ICON_EMOJI = "&#x1F480; " # U+1F480 skull
+CW_SAGA_DEAD_ICON_EMOJI = "&#x1F480;" # U+1F480 skull
 
 def CreatureWindow.saga_status_icon_table
   case CreatureWindow.saga_status_mode
@@ -1035,6 +1135,14 @@ def CreatureWindow.saga_status_display(sanitized_text)
 
   display = sanitized_text.dup
   table.each { |pattern, icon| display.gsub!(pattern, icon) }
+  # Word-separating spaces survive substitution as gaps in front of and
+  # between the now-adjacent icons (name-to-first-icon, and icon-to-icon for
+  # multiple simultaneous statuses); collapse any whitespace that sits
+  # directly in front of an entity reference so icons sit flush against the
+  # name and each other. Only matches whitespace immediately before "&#x", so
+  # a plain-text status word with no icon (e.g. custom_statuses) keeps its
+  # separating space either side, since nothing after it is an entity.
+  display.gsub!(/\s+&#x/, '&#x')
   display
 end
 
@@ -1049,14 +1157,119 @@ def CreatureWindow.saga_dead_label(sanitized_text)
   "#{CW_SAGA_DEAD_ICON_EMOJI}#{sanitized_text}"
 end
 
+# Enables the shared Combat::Tracker damage feed (lib/gemstone/combat) when
+# *cwhp needs it, so current_hp/hp_percent actually reflect damage instead of
+# always reading full health. Combat::Tracker is a single per-character
+# toggle shared with other scripts (e.g. eo_creaturebar.lic), so this only
+# turns it ON when needed -- it's never turned back off from here, since
+# other scripts/windows may also depend on it staying enabled.
+def CreatureWindow.ensure_hp_tracking!
+  return unless defined?(Combat::Tracker)
+  return if Combat::Tracker.enabled?
+
+  Combat::Tracker.enable!
+  respond "Creaturewindow: enabled Combat::Tracker damage tracking (needed for *cwhp)."
+rescue StandardError => e
+  respond "Creaturewindow: could not enable Combat::Tracker (#{e.message})."
+end
+
+# `gameobj` is a GameObj entry (from GameObj.targets), which has no HP data
+# of its own, so this looks up the matching Creature[] record.
+def CreatureWindow.target_hp_creature(gameobj)
+  return nil unless gameobj
+
+  Creature[gameobj.id] rescue nil
+end
+
+# Live "###/### hp" readout (current/max) for the current target, driven by
+# Combat::Tracker's damage tracking (see ensure_hp_tracking!). Returns nil
+# when there's no Creature record or its max_hp isn't known.
+def CreatureWindow.target_hp_line(gameobj)
+  creature = CreatureWindow.target_hp_creature(gameobj)
+  max_hp = creature&.max_hp
+  return nil unless max_hp && max_hp > 0
+
+  "#{creature.current_hp}/#{max_hp} hp"
+end
+
+# 10-segment HP bar for the current target, filled left-to-right by
+# hp_percent (red = remaining, black = lost). Returns nil under the same
+# conditions as target_hp_line.
+def CreatureWindow.target_hp_bar(gameobj)
+  creature = CreatureWindow.target_hp_creature(gameobj)
+  max_hp = creature&.max_hp
+  return nil unless max_hp && max_hp > 0
+
+  filled = ((creature.hp_percent || 0) / 100.0 * CreatureWindow::TARGET_HP_BAR_SEGMENTS).round
+  filled = filled.clamp(0, CreatureWindow::TARGET_HP_BAR_SEGMENTS)
+  empty = CreatureWindow::TARGET_HP_BAR_SEGMENTS - filled
+
+  (CreatureWindow::TARGET_HP_BAR_SEGMENT * filled) + (CreatureWindow::TARGET_HP_BAR_EMPTY_SEGMENT * empty)
+end
+
+# Appends a single target-HP row (bar segments + "###/### hp" text, both on
+# one line when target_hp_mode is "bar"; just the text in "text" mode) to
+# `output` at `left`/`top`, returning the updated [output, top] so callers
+# can keep advancing their own layout. No-op (output/top unchanged) when the
+# mode is "off" or there's no target/HP data.
+#
+# font='small' is the only working size lever here -- a numeric fontSize
+# attribute exists on these dialog labels but is inert (confirmed unused by
+# Saga's dialog renderer); font='small'/'normal' is the keyword attribute
+# this codebase already relies on elsewhere (see exitwindow.lic's trash
+# labels) for actually shrinking a label's text.
+def CreatureWindow.append_target_hp_rows(output, target_creature, left, top, width, row_height)
+  return [output, top] if CreatureWindow.target_hp_mode == "off" || !target_creature
+
+  hp_line = CreatureWindow.target_hp_line(target_creature)
+  return [output, top] unless hp_line
+
+  parts = []
+  if CreatureWindow.target_hp_mode == "bar" && (bar = CreatureWindow.target_hp_bar(target_creature))
+    parts << bar
+  end
+  parts << CreatureWindow.sanitize_xml(hp_line)
+
+  output += "<label id='target_creature_hp' value='#{parts.join(' ')}' justify='left' left='#{left}' top='#{top}' width='#{width * 2}' height='#{row_height}' font='small' />"
+  top += row_height
+
+  [output, top]
+end
+
 # Builds "name (status)" normally, but drops the parentheses when the Saga
 # panel is about to render status as a unicode/emoji symbol instead of a
-# word -- "Rat" plus the symbol reads better than "Rat (symbol)".
+# word -- "Rat" plus the symbol reads better than "Rat (symbol)". The space
+# kept here (rather than joining flush) is required for saga_status_display's
+# \b word-boundary icon matching to find the first status word -- "Ratstunned"
+# has no boundary between the two words, so the icon substitution would
+# silently fail and leave the literal word behind. saga_status_display strips
+# this space back out once it's confirmed an icon actually replaced the word.
 def CreatureWindow.saga_wrap_status(name, status)
   return name.to_s if status.nil?
   return "#{name} #{status}" if $frontend == 'saga' && CreatureWindow.saga_status_mode != 'text'
 
   "#{name} (#{status})"
+end
+
+# Builds the final <link> value='' contents for a creature label: applies
+# saga status-icon substitution, then (when is_target) marks it as the
+# current target -- "**label**" bolding in text/unicode mode, or a single
+# left-side icon (*cwtargetid) in Saga emoji mode instead of wrapping both
+# sides. The icon has to be added AFTER sanitize_xml/status-icon
+# substitution, since it's an XML numeric entity that sanitize_xml would
+# otherwise escape (same reason saga_status_display runs post-sanitize).
+def CreatureWindow.finalize_creature_label(label_value, is_target)
+  emoji_target = is_target && $frontend == 'saga' && CreatureWindow.saga_status_mode == 'emoji'
+  label_value = "**#{label_value}**" if is_target && !emoji_target
+
+  display = CreatureWindow.saga_status_display(CreatureWindow.sanitize_xml(label_value))
+
+  if emoji_target
+    icon = CreatureWindow::TARGET_MARKER_ICONS[CreatureWindow.target_marker_index] || CreatureWindow::TARGET_MARKER_ICONS.first
+    display = "#{icon}#{display}"
+  end
+
+  display
 end
 
 def CreatureWindow.calculate_avg_ttk
@@ -2418,19 +2631,32 @@ def CreatureWindow.push_creatures_to_window(targets)
         status = CreatureWindow.creature_status_fix(creature.status, creature.name, creature.id)
         base_label = CreatureWindow.saga_wrap_status(creature.noun, status)
         label_value = CreatureWindow.with_sequence_number(base_label, creature.id)
-        label_value = "**#{label_value}**" if creature.id == curr_target_id
         label_id = "creature_#{row}_#{col}"
 
         left = col * col_width
         top = row_height * (row + top_offset)
 
         cmd = "target ##{creature.id}"
-        output += "<link id='#{label_id}' value='#{CreatureWindow.saga_status_display(CreatureWindow.sanitize_xml(label_value))}' cmd='#{cmd}' echo='Targeting #{CreatureWindow.sanitize_xml(creature.name)}' justify='bottom' left='#{left}' top='#{top}' width='#{col_width}' height='#{row_height}' />"
+        display = CreatureWindow.finalize_creature_label(label_value, creature.id == curr_target_id)
+        output += "<link id='#{label_id}' value='#{display}' cmd='#{cmd}' echo='Targeting #{CreatureWindow.sanitize_xml(creature.name)}' justify='bottom' left='#{left}' top='#{top}' width='#{col_width}' height='#{row_height}' />"
       end
     end
 
     grid_rows = (ordered_creatures.size.to_f / cols).ceil
-    current_top = row_height * (grid_rows + top_offset) + row_height
+    current_top = row_height * (grid_rows + top_offset)
+
+    # Target-next inline mode has no dedicated row for the current target
+    # (it stays in place within the grid), so the HP readout is placed below
+    # the whole grid (to avoid overlapping the next grid row) but horizontally
+    # aligned under the target's own column, not centered under the grid.
+    if target_creature
+      target_index = ordered_creatures.index { |t| t.id == target_creature.id }
+      target_col = target_index ? target_index % cols : 0
+      hp_left = target_col * col_width
+      output, current_top = CreatureWindow.append_target_hp_rows(output, target_creature, hp_left, current_top, col_width, row_height)
+    end
+
+    current_top += row_height # Add a little extra space before the dead-creature list
   else
     # Separate and render current target first
     target_creature = targets.find { |t| t.id == curr_target_id }
@@ -2439,7 +2665,6 @@ def CreatureWindow.push_creatures_to_window(targets)
     if target_creature
       status = CreatureWindow.creature_status_fix(target_creature.status, target_creature.name, target_creature.id)
       label_value = CreatureWindow.saga_wrap_status(target_creature.noun, status)
-      label_value = "**#{label_value}**"
 
       unless @cw_creature_targeted[target_creature.id]
         @cw_creature_timestamps[target_creature.id] = Time.now
@@ -2447,8 +2672,13 @@ def CreatureWindow.push_creatures_to_window(targets)
       end
 
       cmd = "target ##{target_creature.id}"
-      output += "<link id='target_creature' value='#{CreatureWindow.saga_status_display(CreatureWindow.sanitize_xml(label_value))}' cmd='#{cmd}' echo='Targeting #{CreatureWindow.sanitize_xml(target_creature.name)}' justify='bottom' left='0' top='#{current_top}' width='#{col_width}' height='#{row_height}' />"
-      current_top += row_height # Add a little extra space after target for clarity
+      display = CreatureWindow.finalize_creature_label(label_value, true)
+      output += "<link id='target_creature' value='#{display}' cmd='#{cmd}' echo='Targeting #{CreatureWindow.sanitize_xml(target_creature.name)}' justify='bottom' left='0' top='#{current_top}' width='#{col_width}' height='#{row_height}' />"
+      current_top += row_height
+
+      output, current_top = CreatureWindow.append_target_hp_rows(output, target_creature, 0, current_top, col_width, row_height)
+
+      current_top += row_height # Add a little extra space after target (and hp, if shown) for clarity
     end
 
     # Creature grid
@@ -2466,7 +2696,8 @@ def CreatureWindow.push_creatures_to_window(targets)
         top = row_height * (row + top_offset)
 
         cmd = "target ##{creature.id}"
-        output += "<link id='#{label_id}' value='#{CreatureWindow.saga_status_display(CreatureWindow.sanitize_xml(label_value))}' cmd='#{cmd}' echo='Targeting #{CreatureWindow.sanitize_xml(creature.name)}' justify='bottom' left='#{left}' top='#{top}' width='#{col_width}' height='#{row_height}' />"
+        display = CreatureWindow.finalize_creature_label(label_value, false)
+        output += "<link id='#{label_id}' value='#{display}' cmd='#{cmd}' echo='Targeting #{CreatureWindow.sanitize_xml(creature.name)}' justify='bottom' left='#{left}' top='#{top}' width='#{col_width}' height='#{row_height}' />"
       end
     end
     # After rendering all creatures, bump spacing by one row before starting dead creature block
@@ -2697,6 +2928,35 @@ UpstreamHook.add(upstream_hook_id, proc do |command|
     respond "Creaturewindow target-next mode: #{label}"
     nil
 
+  when /\*cwhp/i
+    modes = CreatureWindow::TARGET_HP_MODES
+    next_mode = modes[(modes.index(CreatureWindow.target_hp_mode).to_i + 1) % modes.size]
+    CreatureWindow.target_hp_mode = next_mode
+    window_settings["creaturewindow"]["target_hp_mode"] = next_mode
+    CreatureWindow.save_window_settings(window_settings)
+    CreatureWindow.ensure_hp_tracking! unless next_mode == "off"
+    CreatureWindow::CMD_QUEUE.push("update_window")
+
+    label = {
+      "off"  => "OFF",
+      "text" => "TEXT (###/### hp)",
+      "bar"  => "BAR (10-segment bar + ###/### hp)"
+    }[next_mode]
+    respond "Creaturewindow target HP display: #{label}"
+    nil
+
+  when /\*cwtargetid/i
+    icons = CreatureWindow::TARGET_MARKER_ICONS
+    next_index = (CreatureWindow.target_marker_index + 1) % icons.size
+    CreatureWindow.target_marker_index = next_index
+    window_settings["creaturewindow"]["target_marker_index"] = next_index
+    CreatureWindow.save_window_settings(window_settings)
+    CreatureWindow::CMD_QUEUE.push("update_window")
+
+    preview = ["\u{2297}", "\u{2A01}", "\u{1F3AF}"][next_index]
+    respond "Creaturewindow target marker icon: #{preview} (Saga emoji mode only)"
+    nil
+
   when /\*cwherb/i
     CreatureWindow::CMD_QUEUE.push("run_herb_bounty_workflow")
     nil
@@ -2774,6 +3034,7 @@ end
 
 echo "Creaturewindow is active." if Frontend.supports_room_window?
 
+CreatureWindow.ensure_hp_tracking! unless CreatureWindow.target_hp_mode == "off"
 CreatureWindow.capture_bounty_origin_context
 CreatureWindow.parse_bounty_from_checkbounty
 @cw_last_bounty_signature = CreatureWindow.bounty_state_signature
