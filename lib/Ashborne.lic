@@ -5,7 +5,7 @@ Please adhere to POLICY 18 & 19.
 Owner and maintainer: NecroDeus
 author: NecroDeus
 game: Gemstone
-version: 0.4.0-rc72
+version: 0.4.0-rc74
 tags: hunting, combat, group, gui, utility, automation
 required: Lich >= 5.17.1
 
@@ -13,7 +13,20 @@ Ashborne is a mixed-class solo and group hunting coordinator with per-character
 combat styles, safety checks, loot rotation, town services, and repeat hunts.
 Requires intel_ashborne.lic. Group mode also requires Borg, Drone, and Queen.
 
-Recent updates (0.4.0-rc72 - 2026-08-18):
+Recent updates (0.4.0-rc74 - 2026-08-19):
+- Physical burst priority now favors Shield Throw against crowds and the
+  character's learned Assault technique against a focused target.
+- Shield Strike is a fallback when neither preferred burst option is ready.
+  Standalone Shield Bash is reserved for reactive disruption and is no longer
+  spent as an ordinary damage-loop attack.
+- Low stamina no longer ends a hunt. Ashborne now protects the configured
+  stamina reserve, suppresses optional stamina abilities while recovering,
+  and continues with ordinary attacks instead of returning to town.
+- Stamina spending now uses conservation, standard, and burst bands. Assaults,
+  MSTRIKE, and crowd shield skills require burst stamina; direct Shield Strike
+  and Paladin finishers stop before they can consume the protected reserve.
+- Ashborne pauses its owned Reactive helper during stamina conservation so a
+  late Clobber cannot spend the retreat reserve, then resumes it after recovery.
 - Immobilization and terror can no longer make a failed emergency departure
   shut Ashborne and Intel down while hostile creatures continue attacking.
 - Failed movement readiness is retained as an `unable to move` blocker;
@@ -2897,6 +2910,61 @@ module Ashborne_toolkit
   def stamina_reserve
     value = defined?($ashborne_stamina_reserve) ? $ashborne_stamina_reserve : 20
     [[value.to_i, 0].max, 95].min
+  end
+
+  def stamina_conservation_floor
+    [Ashborne_toolkit.stamina_reserve + 15, 95].min
+  end
+
+  def stamina_standard_floor
+    [Ashborne_toolkit.stamina_reserve + 25, 95].min
+  end
+
+  def stamina_burst_floor
+    [Ashborne_toolkit.stamina_reserve + 45, 95].min
+  end
+
+  def stamina_allows?(level = :standard)
+    floor = case level
+            when :burst
+              Ashborne_toolkit.stamina_burst_floor
+            when :conserve
+              Ashborne_toolkit.stamina_conservation_floor
+            else
+              Ashborne_toolkit.stamina_standard_floor
+            end
+    percentstamina.to_i >= floor
+  rescue
+    false
+  end
+
+  def manage_stamina_conservation
+    stamina = percentstamina.to_i
+    conserve_at = Ashborne_toolkit.stamina_conservation_floor
+    recover_at = [conserve_at + 10, 95].min
+
+    if stamina <= conserve_at
+      unless $ashborne_stamina_conserving == "1"
+        respond "Ashborne stamina conservation: #{stamina}%; using ordinary attacks until #{recover_at}%."
+      end
+      $ashborne_stamina_conserving = "1"
+      if defined?($ashborne_owned_scripts) && $ashborne_owned_scripts.key?("reactive")
+        $ashborne_reactive_paused_for_stamina = "1"
+        Ashborne_toolkit.stop_owned_script("reactive")
+      end
+    elsif stamina >= recover_at
+      if $ashborne_stamina_conserving == "1"
+        respond "Ashborne stamina recovered to #{stamina}%; optional physical abilities are available again."
+      end
+      $ashborne_stamina_conserving = "0"
+      if $ashborne_reactive_paused_for_stamina == "1" && $ashborne_my_style.to_s =~ /\A[1-8]\z/
+        Ashborne_toolkit.start_owned_script("reactive")
+        $ashborne_reactive_paused_for_stamina = "0"
+      end
+    end
+    $ashborne_stamina_conserving == "1"
+  rescue
+    false
   end
 
   def health_floor
@@ -6613,27 +6681,78 @@ module Ashborne_toolkit
   def shield_control
     return false if $ashborne_no_shield_control == "1"
     return false unless checkleft.to_s =~ /shield/i
+    return false unless Ashborne_toolkit.stamina_allows?(:standard)
 
     target = GameObj.target
     return false if target.nil? || target.status == "dead"
 
-    targets = GameObj.targets.reject { |creature| creature.status == "dead" }
-    choices = []
-    if targets.length >= 3
-      choices << "Shield Throw"
-      choices << "Shield Trample"
-    end
-    choices.concat(["Shield Strike", "Shield Bash", "Shield Pin", "Shield Charge"])
-
-    technique = choices.find { |name| Shield.available?(name) && Shield.affordable?(name) }
-    return false if technique.nil?
+    return false unless Shield.available?("Shield Strike") && Shield.affordable?("Shield Strike")
 
     Ashborne_toolkit.waitcast_waitrt
     Ashborne_toolkit.stance_offensive
-    result = Shield.use(technique, target)
+    result = Shield.use("Shield Strike", target)
     Ashborne_toolkit.waitcast_waitrt
     Ashborne_toolkit.stance_guarded
     !result.nil?
+  rescue NameError, KeyError
+    false
+  end
+
+  def preferred_shield_throw
+    return false if $ashborne_no_shield_control == "1"
+    return false unless checkleft.to_s =~ /shield/i
+    return false unless GameObj.targets.reject { |creature| creature.status == "dead" }.length >= 3
+    return false unless Ashborne_toolkit.stamina_allows?(:burst)
+    return false unless Shield.available?("Shield Throw") && Shield.affordable?("Shield Throw")
+    return false if $ashborne_group_ai != "0" && !Ashborne_toolkit.group_spell_claim("shield_throw", true)
+
+    target = GameObj.target
+    return false if target.nil? || target.status == "dead"
+
+    Ashborne_toolkit.waitcast_waitrt
+    Ashborne_toolkit.stance_offensive
+    result = Shield.use("Shield Throw", target)
+    Ashborne_toolkit.waitcast_waitrt
+    Ashborne_toolkit.stance_guarded
+    !result.nil?
+  rescue NameError, KeyError
+    false
+  end
+
+  def preferred_assault_control
+    return false if $ashborne_no_weapon_control == "1"
+    return false unless Ashborne_toolkit.stamina_allows?(:burst)
+
+    target = GameObj.target
+    return false if target.nil? || target.status == "dead"
+
+    assault = case $ashborne_weapon_attune.to_s
+              when /brawling/i
+                ["Fury", "fury"] if Skills.brawling >= 25
+              when /blunt/i
+                ["Pummel", "pummel"] if Skills.bluntweapons >= 50
+              when /edged/i
+                ["Flurry", "flurry"] if Skills.edgedweapons >= 50
+              when /polearm/i
+                ["Guardant Thrusts", "gthrusts"] if Skills.polearmweapons >= 25
+              when /ranged/i
+                ["Barrage", "barrage"] if Skills.rangedweapons >= 50
+              when /2hw/i
+                ["Thrash", "thrash"] if Skills.twohandedweapons >= 25
+              end
+    return false if assault.nil?
+    return false unless Weapon.available?(assault[0]) && Weapon.affordable?(assault[0])
+
+    Ashborne_toolkit.waitcast_waitrt
+    Ashborne_toolkit.stance_offensive
+    dothistimeout(
+      "weapon #{assault[1]} ##{target.id}",
+      15,
+      /assault complete|complete your assault|final snap of your wrist|last (?:arrow|bolt)|final, explosive breath|recentering yourself|still in cooldown|may not be activated|what\?|already dead|could not find|can't reach/i
+    )
+    Ashborne_toolkit.waitcast_waitrt
+    Ashborne_toolkit.stance_guarded
+    true
   rescue NameError, KeyError
     false
   end
@@ -6643,6 +6762,7 @@ module Ashborne_toolkit
     return false if $ashborne_no_shield_control == "1"
     return false unless checkleft.to_s =~ /shield/i
     return false unless GameObj.targets.length >= 3
+    return false unless Ashborne_toolkit.stamina_allows?(:burst)
     return false unless Shield.available?("Shield Throw") && Shield.affordable?("Shield Throw")
     return false unless Ashborne_toolkit.group_spell_claim("shield_throw", true)
 
@@ -7062,6 +7182,7 @@ module Ashborne_toolkit
     return if Ashborne_toolkit.medical_retreat_if_needed
     return if Ashborne_toolkit.post_fight_sanity_sweep
     return if Ashborne_toolkit.group_danger_status_check
+    Ashborne_toolkit.manage_stamina_conservation
     if Ashborne_toolkit.occupied_room_players.any?
       Ashborne_toolkit.leave_occupied_room
       return nil
@@ -7093,9 +7214,12 @@ module Ashborne_toolkit
     return if !noise_lockdown && Ashborne_toolkit.bind_undead_before_weapon_attack
 
     # Paladin Stamina Recover
-    Spell[1607].cast() if !noise_lockdown && Spell[1607].known? && Stats.level >= 7 && Spell[1607].affordable? && percentstamina <= 50 && !Spell.active?("1607")
+    Spell[1607].cast() if !noise_lockdown && Spell[1607].known? && Stats.level >= 7 && Spell[1607].affordable? && percentstamina <= Ashborne_toolkit.stamina_conservation_floor && !Spell.active?("1607")
 
-    Ashborne_toolkit.group_shield_throw_opener
+    preferred_burst_used = Ashborne_toolkit.preferred_shield_throw
+    if !preferred_burst_used && Ashborne_toolkit.ensure_fresh_attack_target
+      preferred_burst_used = Ashborne_toolkit.preferred_assault_control
+    end
 
     if $ashborne_group_ai != "0" && !noise_lockdown
       if $ashborne_no_crowd_control == "1"
@@ -7105,9 +7229,14 @@ module Ashborne_toolkit
       end
     end
 
-    Ashborne_toolkit.shield_control if Ashborne_toolkit.ensure_fresh_attack_target
-    Ashborne_toolkit.feat_control unless noise_lockdown
-    Ashborne_toolkit.weapon_control if Ashborne_toolkit.ensure_fresh_attack_target
+    shield_fallback_used = false
+    if !preferred_burst_used && Ashborne_toolkit.ensure_fresh_attack_target
+      shield_fallback_used = Ashborne_toolkit.shield_control
+    end
+    Ashborne_toolkit.feat_control if !noise_lockdown && !preferred_burst_used && !shield_fallback_used && Ashborne_toolkit.stamina_allows?(:standard)
+    if !preferred_burst_used && !shield_fallback_used && Ashborne_toolkit.ensure_fresh_attack_target && Ashborne_toolkit.stamina_allows?(:burst)
+      Ashborne_toolkit.weapon_control
+    end
 
     if $ashborne_group_ai == "0" && !noise_lockdown
       if $ashborne_no_crowd_control == "1"
@@ -7120,7 +7249,7 @@ module Ashborne_toolkit
     if $ashborne_no_cman_control == "1"
       nil
     else
-      Ashborne_toolkit.cman_control if $ashborne_cman_control == "1"
+      Ashborne_toolkit.cman_control if $ashborne_cman_control == "1" && Ashborne_toolkit.stamina_allows?(:burst)
     end
 
     if noise_lockdown
@@ -14561,7 +14690,7 @@ module Ashborne_toolkit
       if Spell.active? "9005"
         nil
       else
-        if percentstamina >= 50
+        if Ashborne_toolkit.stamina_allows?(:burst)
           if GameObj.targets.length >= 2 && $ashborne_my_mstrike_focus == 0 && $ashborne_my_mstrike_open >= 1
             Ashborne_toolkit.stance_offensive
             # respond "Debug Output - Open Mstrike"
@@ -17645,6 +17774,8 @@ $ashborne_role_preference = "auto"
 $ashborne_job_coordinator = "1"
 $ashborne_mana_reserve = 40
 $ashborne_stamina_reserve = 20
+$ashborne_stamina_conserving = "0"
+$ashborne_reactive_paused_for_stamina = "0"
 $ashborne_health_floor = 70
 $ashborne_anti_caster_hook_name = nil
 $ashborne_environmental_danger_hook_name = nil
@@ -24263,6 +24394,7 @@ ashborne_zone_reset_check = proc {
 ashborne_status_check = proc {
   Ashborne_toolkit.publish_group_state
   Ashborne_toolkit.clear_stale_wrong_equipment_return_if_combat_progress
+  Ashborne_toolkit.manage_stamina_conservation
   next if Ashborne_toolkit.medical_retreat_if_needed
   next if Ashborne_toolkit.critical_mana_retreat_if_needed
   next if Ashborne_toolkit.solo_swarm_retreat_if_needed
@@ -24473,15 +24605,8 @@ ashborne_status_check = proc {
     end
   end
 
-  if percentstamina <= $ashborne_value_stamina.to_i
-    if ashborne_setting_disable_stamina != "0"
-      nil
-    else
-      $ashborne_return_why = "You have low stamina."
-      $ashborne_action = 99
-    end
-
-  end
+  # Low stamina changes the attack budget; it never ends the hunt.
+  Ashborne_toolkit.manage_stamina_conservation if percentstamina <= Ashborne_toolkit.stamina_conservation_floor
 
   if percentspirit <= 10
     $ashborne_return_why = "You have low spirit."
@@ -24655,14 +24780,7 @@ ashborne_group_status_check = proc {
 
 
 
-    if percentstamina <= $ashborne_value_stamina.to_i
-      if ashborne_setting_disable_stamina != "0"
-        nil
-      else
-        Ashborne_toolkit.publish_group_danger("low stamina")
-        sleep 10
-      end
-    end
+    Ashborne_toolkit.manage_stamina_conservation if percentstamina <= Ashborne_toolkit.stamina_conservation_floor
 
     if percentspirit <= 10
       Ashborne_toolkit.publish_group_danger("low spirit")
@@ -25537,11 +25655,7 @@ ashborne_setup = proc {
     respond "You will continue to hunt while encumbered."
   end
 
-  if ashborne_setting_disable_stamina == "0"
-    nil
-  else
-    respond "You will continue to hunt with low stamina."
-  end
+  respond "Low stamina never ends a hunt; Ashborne conserves the protected reserve and continues with ordinary attacks."
 
   if ashborne_setting_disable_mana == "0"
     nil
@@ -25798,7 +25912,7 @@ ashborne_setup = proc {
 
   respond "Ashborne role preference: #{ashborne_setting_role}."
   respond "Group job coordinator: #{ashborne_setting_job_coordinator == '0' ? 'disabled' : 'enabled'}."
-  respond "Resource reserves: #{ashborne_setting_mana_reserve}% mana, #{ashborne_setting_stamina_reserve}% stamina."
+  respond "Resource reserves: #{ashborne_setting_mana_reserve}% mana; #{ashborne_setting_stamina_reserve}% protected stamina."
   respond "Group health floor: #{ashborne_setting_health_floor}%."
 
   if ashborne_setting_noise_lockdown == "0"
@@ -26221,6 +26335,8 @@ end
 if script.vars[1].downcase =~ /update/
   Ashborne_toolkit.top_menu
   respond "Ashborne #{ashborne_version} is installed."
+  respond "Combat priority: Shield Throw for crowds, learned Assaults for focused targets, and Shield Strike as fallback."
+  respond "Combat fix: low stamina now conserves abilities and never ends the hunt."
   respond "Latest safety fix: immobilization no longer shuts Ashborne down during emergency retreat."
   respond "Compatibility fix: SAGA frontend details are included in diagnostics."
   respond "Pathing fix: wlvereri stays inside the bounded temple catalog."
@@ -26586,7 +26702,7 @@ module AshborneGui
     "ashborne_setting_mana_reserve" =>
       "Ashborne avoids optional spell spending below this mana percentage.",
     "ashborne_setting_stamina_reserve" =>
-      "Ashborne avoids optional physical abilities below this stamina percentage.",
+      "Protected stamina reserve. Ashborne stops optional physical abilities before reaching it and keeps hunting with ordinary attacks; low stamina never sends you home.",
     "ashborne_setting_anti_caster" =>
       "Allows one elected group member to interrupt a dangerous casting creature.\n" \
       "The coordinator prevents every character from stopping at once.",
@@ -27017,7 +27133,7 @@ module AshborneGui
 
       stamina, getter = spin(settings["ashborne_setting_stamina_reserve"], 0, 95)
       bindings["ashborne_setting_stamina_reserve"] = getter
-      add_row(group, "General stamina reserve %", stamina, tooltip_for("ashborne_setting_stamina_reserve"))
+      add_row(group, "Protected stamina reserve %", stamina, tooltip_for("ashborne_setting_stamina_reserve"))
 
       rotation, getter = check("Rotate group looter", settings["ashborne_setting_loot_rotation"])
       bindings["ashborne_setting_loot_rotation"] = getter
