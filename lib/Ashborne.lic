@@ -5,7 +5,7 @@ Please adhere to POLICY 18 & 19.
 Owner and maintainer: NecroDeus
 author: NecroDeus
 game: Gemstone
-version: 0.4.0-rc74
+version: 0.4.0-rc76
 tags: hunting, combat, group, gui, utility, automation
 required: Lich >= 5.17.1
 
@@ -13,7 +13,18 @@ Ashborne is a mixed-class solo and group hunting coordinator with per-character
 combat styles, safety checks, loot rotation, town services, and repeat hunts.
 Requires intel_ashborne.lic. Group mode also requires Borg, Drone, and Queen.
 
-Recent updates (0.4.0-rc74 - 2026-08-19):
+Recent updates (0.4.0-rc76 - 2026-08-21):
+- Weapon Fire (915) now interrupts the affected character's combat and looting,
+  drops the burning weapon immediately, waits defensively for it to return to
+  normal, recovers that exact item, and restores combat gear with GIRD.
+- A Weapon Fire stun no longer masquerades as an ordinary group medical retreat;
+  unaffected group members remain available to defend while the victim disarms.
+- Group telemetry now reports Weapon Fire recovery so movement cannot abandon a
+  character while their weapon is safely cooling on the ground.
+- Removed an obsolete character-name exception from Empath 1106 casting; all
+  Empaths now use the same public, capability-based combat path.
+- The runtime version used by `/ashborne`, help, update, doctor, and support
+  reports now matches the repository header instead of displaying stale rc60.
 - Physical burst priority now favors Shield Throw against crowds and the
   character's learned Assault technique against a focused target.
 - Shield Strike is a fallback when neither preferred burst option is ready.
@@ -188,7 +199,7 @@ begin
 rescue
   nil
 end
-ashborne_version = "0.4.0-rc60"
+ashborne_version = "0.4.0-rc76"
 ashborne_last_update = "8/16/2026"
 # Hide Command Inputs
 silence_me
@@ -5638,6 +5649,7 @@ module Ashborne_toolkit
   end
 
   def loot_safe_to_start?(urgent = false)
+    return false if Ashborne_toolkit.weapon_fire_recovery_pending?
     return true if urgent
     return false unless GameObj.targets.empty?
 
@@ -5677,6 +5689,12 @@ module Ashborne_toolkit
         held_state = nil
         held_since = nil
         while Script.running?(scriptname.to_s)
+          if Ashborne_toolkit.weapon_fire_recovery_pending?
+            respond "Ashborne interrupted #{scriptname} to neutralize Weapon Fire."
+            Script.kill(scriptname.to_s)
+            break
+          end
+
           storage_failed, held_state, held_since = Ashborne_toolkit.loot_storage_failure_detected?(scriptname, held_state, held_since)
           if storage_failed
             respond "Ashborne detected #{scriptname} is stuck with loot in hand; returning to town to sell."
@@ -7175,6 +7193,7 @@ module Ashborne_toolkit
   end
 
   def combat_unique_to_ashborne
+    return if Ashborne_toolkit.handle_weapon_fire_recovery
     return if Ashborne_toolkit.critical_mana_retreat_if_needed
     return if Ashborne_toolkit.solo_swarm_retreat_if_needed
     return if Ashborne_toolkit.recover_disarmed_item_if_needed
@@ -9058,16 +9077,9 @@ module Ashborne_toolkit
         $ashborne_empath_primary_spell = 1700
 
       elsif $ashborne_empath_primary_spell == 1106
-        if Char.name =~ /Jara|Jarcation/
-          fput "incant 1106" if Spell[1106].known? && Spell[1106].affordable?
-          sleep 0.25
-          Ashborne_toolkit.true_stance_guarded
-          $ashborne_empath_primary_spell = 1700
-        else
-          Spell[1106].cast() if Spell[1106].known? && Spell[1106].affordable?
-          Ashborne_toolkit.true_stance_guarded
-          $ashborne_empath_primary_spell = 1700
-        end
+        Spell[1106].cast() if Spell[1106].known? && Spell[1106].affordable?
+        Ashborne_toolkit.true_stance_guarded
+        $ashborne_empath_primary_spell = 1700
 
       elsif $ashborne_empath_primary_spell == 111
 
@@ -10134,6 +10146,7 @@ module Ashborne_toolkit
     flags << "bound" if bound?
     flags << "disarmed" if defined?($ashborne_disarm_recovery_needed) && $ashborne_disarm_recovery_needed == "1"
     flags << "recovering" if defined?($ashborne_disarm_recovery_active) && $ashborne_disarm_recovery_active == "1"
+    flags << "weapon_fire" if Ashborne_toolkit.weapon_fire_recovery_pending?
     if $ashborne_looting_active == "1" ||
         ($ashborne_loot_script.to_s != "" && Script.running?($ashborne_loot_script.to_s))
       flags << "looting"
@@ -11357,9 +11370,141 @@ module Ashborne_toolkit
     nil
   end
 
+  def weapon_fire_item_from_line(line)
+    text = line.to_s
+    return Regexp.last_match(1).to_s.strip if text =~ /Your (.+?) is struck with .+? cast\.?$/i
+
+    nil
+  rescue
+    nil
+  end
+
+  def weapon_fire_clear_line?(line)
+    return false unless defined?($ashborne_weapon_fire_active) && $ashborne_weapon_fire_active == "1"
+
+    text = line.to_s
+    noun = $ashborne_weapon_fire_item.to_s.split.last.to_s
+    return false if noun.empty?
+
+    text =~ /\b#{Regexp.escape(noun)}\b.*returns to normal\.?/i ? true : false
+  rescue
+    false
+  end
+
+  def weapon_fire_hand_object(item_name = $ashborne_weapon_fire_item)
+    wanted = item_name.to_s.downcase
+    [GameObj.right_hand, GameObj.left_hand].compact.find do |item|
+      name = item.name.to_s.downcase
+      noun = item.noun.to_s.downcase
+      wanted.empty? || wanted.include?(noun) || name.include?(wanted) || wanted.include?(name)
+    end
+  rescue
+    nil
+  end
+
+  def weapon_fire_recovery_pending?
+    (defined?($ashborne_weapon_fire_active) && $ashborne_weapon_fire_active == "1") ||
+      (defined?($ashborne_weapon_fire_recover_ready) && $ashborne_weapon_fire_recover_ready == "1")
+  rescue
+    false
+  end
+
+  def observe_weapon_fire_line(line)
+    item_name = Ashborne_toolkit.weapon_fire_item_from_line(line)
+    unless item_name.nil? || item_name.empty?
+      held = Ashborne_toolkit.weapon_fire_hand_object(item_name)
+      $ashborne_weapon_fire_item = item_name
+      $ashborne_weapon_fire_item_id = held && held.id ? held.id.to_s : ""
+      $ashborne_weapon_fire_active = "1"
+      $ashborne_weapon_fire_recover_ready = "0"
+      $ashborne_weapon_fire_dropped = "0"
+      $ashborne_weapon_fire_seen_at = Time.now.to_f
+      $ashborne_weapon_fire_drop_attempt_at = 0.0
+      respond "Weapon Fire struck #{item_name}; Ashborne is stopping attacks and dropping it immediately."
+      Ashborne_toolkit.publish_group_state(true) if defined?($ashborne_group_ai) && $ashborne_group_ai != "0"
+      return line
+    end
+
+    if Ashborne_toolkit.weapon_fire_clear_line?(line)
+      $ashborne_weapon_fire_active = "0"
+      $ashborne_weapon_fire_recover_ready = "1"
+      respond "Weapon Fire has ended; Ashborne will recover the dropped weapon."
+      Ashborne_toolkit.publish_group_state(true) if defined?($ashborne_group_ai) && $ashborne_group_ai != "0"
+    end
+    line
+  rescue
+    line
+  end
+
+  def weapon_fire_item_held?
+    item_id = $ashborne_weapon_fire_item_id.to_s
+    [GameObj.right_hand, GameObj.left_hand].compact.any? do |item|
+      (!item_id.empty? && item.id.to_s == item_id) ||
+        item.name.to_s.downcase.include?($ashborne_weapon_fire_item.to_s.downcase)
+    end
+  rescue
+    !checkright.nil? || !checkleft.nil?
+  end
+
+  def handle_weapon_fire_recovery
+    return false unless Ashborne_toolkit.weapon_fire_recovery_pending?
+
+    if $ashborne_loot_script.to_s != "" && Script.running?($ashborne_loot_script.to_s)
+      Script.kill($ashborne_loot_script.to_s)
+      $ashborne_looting_active = "0"
+    end
+
+    if $ashborne_weapon_fire_active == "1"
+      if Ashborne_toolkit.weapon_fire_item_held?
+        now = Time.now.to_f
+        if now - $ashborne_weapon_fire_drop_attempt_at.to_f >= 0.5
+          reference = $ashborne_weapon_fire_item_id.to_s.empty? ?
+            "my #{$ashborne_weapon_fire_item}" : "##{$ashborne_weapon_fire_item_id}"
+          put "drop #{reference}"
+          $ashborne_weapon_fire_drop_attempt_at = now
+        end
+        sleep 0.1
+        return true
+      elsif $ashborne_weapon_fire_dropped != "1"
+        $ashborne_weapon_fire_dropped = "1"
+        respond "Ashborne dropped #{$ashborne_weapon_fire_item}; leaving it down until Weapon Fire ends."
+        Ashborne_toolkit.publish_group_state(true) if $ashborne_group_ai != "0"
+      end
+      Ashborne_toolkit.stance_defensive
+      sleep 0.1
+      return true
+    end
+
+    Ashborne_toolkit.stance_defensive
+    waitrt? if checkrt.to_f > 0
+    item_id = $ashborne_weapon_fire_item_id.to_s
+    reference = item_id.empty? ? $ashborne_weapon_fire_item.to_s : "##{item_id}"
+    result = dothistimeout "get #{reference}", 5,
+      /You (?:pick up|remove|get)|already holding|Could not find|What were you referring to|You need a free hand/i
+    unless result.to_s =~ /You (?:pick up|remove|get)|already holding/i
+      fput "stow left" if checkleft && checkright
+      fput "get #{reference}"
+    end
+    fput "gird"
+    $ashborne_weapon_fire_active = "0"
+    $ashborne_weapon_fire_recover_ready = "0"
+    $ashborne_weapon_fire_dropped = "0"
+    $ashborne_weapon_fire_item = ""
+    $ashborne_weapon_fire_item_id = ""
+    Ashborne_toolkit.publish_group_state(true) if $ashborne_group_ai != "0"
+    respond "Ashborne recovered the cooled weapon and restored combat gear."
+    true
+  rescue => error
+    Ashborne_toolkit.stance_defensive
+    respond "Weapon Fire recovery warning: #{error.message}" if $ashborne_qc_debug == "1"
+    true
+  end
+
   def observe_self_danger_line(line)
+    Ashborne_toolkit.observe_weapon_fire_line(line)
     reason = Ashborne_toolkit.self_danger_line_reason(line)
     return line unless reason
+    return line if reason == "stunned" && Ashborne_toolkit.weapon_fire_recovery_pending?
 
     now = Time.now.to_f
     return line if now - $ashborne_last_self_danger_at.to_f < 1.0
@@ -17781,6 +17926,13 @@ $ashborne_anti_caster_hook_name = nil
 $ashborne_environmental_danger_hook_name = nil
 $ashborne_self_danger_hook_name = nil
 $ashborne_last_self_danger_at = 0.0
+$ashborne_weapon_fire_active = "0"
+$ashborne_weapon_fire_recover_ready = "0"
+$ashborne_weapon_fire_dropped = "0"
+$ashborne_weapon_fire_item = ""
+$ashborne_weapon_fire_item_id = ""
+$ashborne_weapon_fire_seen_at = 0.0
+$ashborne_weapon_fire_drop_attempt_at = 0.0
 $ashborne_last_emergency_struggle_at = 0.0
 $ashborne_disarm_recovery_hook_name = nil
 $ashborne_disarm_recovery_needed = "0"
@@ -26335,6 +26487,7 @@ end
 if script.vars[1].downcase =~ /update/
   Ashborne_toolkit.top_menu
   respond "Ashborne #{ashborne_version} is installed."
+  respond "Display fix: in-game version output now matches the installed release."
   respond "Combat priority: Shield Throw for crowds, learned Assaults for focused targets, and Shield Strike as fallback."
   respond "Combat fix: low stamina now conserves abilities and never ends the hunt."
   respond "Latest safety fix: immobilization no longer shuts Ashborne down during emergency retreat."
@@ -28835,6 +28988,7 @@ loop {
   # respond "Debug Output - Loop starting."
   # respond "Debug Output - Intel Check."
   Ashborne_toolkit.ashborne_intel_service_check
+  next if Ashborne_toolkit.handle_weapon_fire_recovery
   Ashborne_toolkit.infomon_check
   # respond "Debug Output - Setup Call."
   ashborne_setup.call if $ashborne_consider_setup == "1"
@@ -29115,6 +29269,7 @@ loop {
   # respond "I'm in tailmode"
   sleep 0.1
   Ashborne_toolkit.process_follower_control_requests_rc15
+  next if Ashborne_toolkit.handle_weapon_fire_recovery
   Ashborne_toolkit.publish_group_state
   Ashborne_toolkit.upkeep_quartz
   Ashborne_toolkit.ashborne_intel_service_check
@@ -29204,6 +29359,7 @@ Ashborne_toolkit.follower_status_notice_rc18
 loop {
   begin
   Ashborne_toolkit.process_follower_control_requests_rc15
+  next if Ashborne_toolkit.handle_weapon_fire_recovery
   Ashborne_toolkit.publish_group_state
   ashborne_group_status_check.call
   Ashborne_toolkit.group_danger_retreat_if_needed
