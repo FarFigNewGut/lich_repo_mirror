@@ -1,0 +1,329 @@
+=begin
+  arenasquat.lic
+
+  Duskruin Arena combat-log harvester. Rotates WATCH between arena
+  combatants so the session log captures as many fighters (and fighting
+  styles) as possible. Fairness policy: never-watched names first, then
+  least-watched, then least-recently-watched, so new entrants always get
+  the camera but everyone gets re-visited when nobody new arrives.
+
+  Watch stats persist across sessions (per character) until reset, so
+  coverage fairness carries over between runs.
+
+  usage: ;arenasquat           - start rotating watches
+         ;arenasquat next      - stop current watch, pick someone new
+         ;arenasquat reset     - wipe the accumulated stats
+         ;arenasquat summary   - echo the accumulated stats
+         ;arenasquat ignore {person}   - never watch them; applies
+                                         immediately, rotates if current
+         ;arenasquat unignore {person} - forgive them
+         ;arenasquat ignored   - show the ignore list
+
+  The same ;arenasquat commands work whether or not the script is
+  running: while running, an UpstreamHook claims them before Lich's
+  script dispatch; otherwise they run as normal one-shot invocations.
+
+  Watches each combatant until their run ends (they die, win, or leave
+  and the arena kicks us off the watch) or the 5-minute per-person cap
+  hits, then rotates to the next - one marathon runner must not hog the
+  camera while the roster waits. Manually typed WATCH commands are
+  respected: if you watch someone yourself, the script adopts your
+  choice (the cap applies to them too, restarted from the adoption).
+  Stop with ;kill arenasquat.
+=end
+
+module ArenaSquat
+  WATCH_LIMIT = 300 # seconds on one person before rotating regardless
+  LIST_CMD = 'watch list'
+  LIST_RE  = /^You glance around the arena .*?combatants within:\s*(?<names>.+)$/
+  BEGIN_RE = /^You begin to watch (?<name>[A-Z][a-z]+) in the arena/
+  # Watch can end on its own: target dies/leaves ("stop observing") or we
+  # issue WATCH STOP ("stop watching").
+  END_RE   = /^You stop (?:observing|watching) (?<name>[A-Z][a-z]+)/
+  FAIL_RE  = /^Usage:|^You don't see|is not currently|no combatant/i
+
+  def self.parse_list(line)
+    match = LIST_RE.match(line)
+    return nil unless match
+
+    match[:names].split(',').map { |entry|
+      # Strip annotations like "Fulmen (watching)".
+      entry.gsub(/\([^)]*\)/, '').strip
+    }.reject(&:empty?)
+  end
+end
+
+# ---- persistent stats -------------------------------------------------
+CharSettings['watch_counts']  ||= {}
+CharSettings['watch_seconds'] ||= {}
+CharSettings['last_watched']  ||= {} # name => epoch float
+CharSettings['ignore']        ||= [] # capitalized names, never watched
+
+watch_counts  = Hash.new(0).merge(CharSettings['watch_counts'])
+watch_seconds = Hash.new(0.0).merge(CharSettings['watch_seconds'])
+last_watched  = Hash.new(0.0).merge(CharSettings['last_watched'])
+
+save_stats = proc {
+  CharSettings['watch_counts']  = watch_counts.reject { |_, v| v.zero? }
+  CharSettings['watch_seconds'] = watch_seconds.reject { |_, v| v.zero? }
+  CharSettings['last_watched']  = last_watched.reject { |_, v| v.zero? }
+}
+
+reset_stats = proc {
+  watch_counts.clear
+  watch_seconds.clear
+  last_watched.clear
+  save_stats.call
+}
+
+echo_summary = proc {
+  if watch_counts.empty?
+    respond '[arenasquat] no watch stats recorded yet.'
+  else
+    respond '[arenasquat] accumulated watch stats (all sessions since last reset):'
+    watch_counts.sort_by { |name, _| -watch_seconds[name] }.each { |name, count|
+      respond "[arenasquat]   #{name}: #{count} watch(es), #{watch_seconds[name].round}s"
+    }
+  end
+}
+
+# ---- standalone subcommands (script not running) -----------------------
+if (subcommand = script.vars[1]&.downcase)
+  case subcommand
+  when 'reset'
+    reset_stats.call
+    echo 'watch stats reset.'
+  when 'summary'
+    echo_summary.call
+  when 'ignore', 'unignore'
+    name = script.vars[2].to_s.strip.capitalize
+    if name.empty?
+      echo "usage: ;arenasquat #{subcommand} {person}"
+    else
+      list = CharSettings['ignore']
+      subcommand == 'ignore' ? (list |= [name]) : list.delete(name)
+      CharSettings['ignore'] = list
+      echo "#{name} #{subcommand == 'ignore' ? 'added to' : 'removed from'} the ignore list."
+    end
+  when 'ignored'
+    list = CharSettings['ignore']
+    echo(list.empty? ? 'ignore list is empty.' : "ignoring: #{list.sort.join(', ')}")
+  else
+    echo "unknown subcommand '#{subcommand}'."
+    echo 'standalone: reset, summary, ignore {person}, unignore {person}, ignored'
+    echo 'while running, type at the game prompt: arenasquat next|reset|summary|ignore ...|unignore ...|ignored'
+  end
+  exit
+end
+
+# ---- logging: the whole point is the captured log -----------------------
+# A watch session with no logger running records nothing, so make sure
+# both are up before the first WATCH goes out.
+unless Script.running?("logxml")
+  Script.start("logxml", "--timestamp=\"%T\" --lines=50000")
+end
+unless Script.running?("log")
+  Script.start("log", "--timestamp=\"%T\" --lines=50000")
+end
+
+# ---- upstream hook: ";arenasquat ..." commands while running -----------
+# UpstreamHook.run fires in do_client BEFORE Lich's ";script" dispatch, so
+# we can claim ";arenasquat <cmd>" while running (a plain second start
+# would be refused as a duplicate). Swallowed commands return nil so
+# neither Lich nor the game ever sees them.
+$arenasquat_command = nil
+UpstreamHook.add('arenasquat_commands', proc { |cmd|
+  # Wizard/Stormfront-style clients prefix typed commands with <c>.
+  if cmd =~ /^(?:<c>)?#{$lich_char_regex}arenasquat(?:\s+(.*))?$/i
+    args = $1.to_s.strip.split
+    case args[0]&.downcase
+    when 'next'    then $arenasquat_command = :next
+    when 'reset'   then $arenasquat_command = :reset
+    when 'summary' then $arenasquat_command = :summary
+    when 'ignored' then $arenasquat_command = :ignored
+    when 'ignore', 'unignore'
+      name = args[1].to_s.capitalize
+      if name.empty?
+        respond "[arenasquat] usage: #{$clean_lich_char}arenasquat #{args[0].downcase} {person}"
+      else
+        $arenasquat_command = [args[0].downcase.to_sym, name]
+      end
+    when nil
+      respond '[arenasquat] already running. commands: next, reset, summary, ignore {person}, unignore {person}, ignored'
+    else
+      respond "[arenasquat] unknown command '#{args[0]}'. commands: next, reset, summary, ignore {person}, unignore {person}, ignored"
+    end
+    nil
+  else
+    cmd
+  end
+})
+
+before_dying {
+  UpstreamHook.remove('arenasquat_commands')
+  fput 'watch stop'
+  save_stats.call
+  echo_summary.call
+}
+
+# Applies any pending typed command except :next (the loops handle that
+# themselves). Returns the name just ignored, so the inner loop can
+# rotate off them if they're the current target; nil otherwise.
+handle_signal = proc {
+  pending = $arenasquat_command
+  case pending
+  when :reset
+    $arenasquat_command = nil
+    reset_stats.call
+    echo 'watch stats reset.'
+    nil
+  when :summary
+    $arenasquat_command = nil
+    echo_summary.call
+    nil
+  when :ignored
+    $arenasquat_command = nil
+    list = CharSettings['ignore']
+    echo(list.empty? ? 'ignore list is empty.' : "ignoring: #{list.sort.join(', ')}")
+    nil
+  when Array
+    $arenasquat_command = nil
+    action, name = pending
+    list = CharSettings['ignore']
+    action == :ignore ? (list |= [name]) : list.delete(name)
+    CharSettings['ignore'] = list
+    echo "#{name} #{action == :ignore ? 'added to' : 'removed from'} the ignore list."
+    action == :ignore ? name : nil
+  end
+}
+
+echo 'rotating arena watches; each combatant is watched until their run ends.'
+echo ";arenasquat next|reset|summary|ignore {person}|unignore {person}|ignored to control it; #{$clean_lich_char}kill arenasquat to stop."
+
+# ---- main loop ---------------------------------------------------------
+unwatchable = {} # name => Time marked; retried after a cooldown
+
+loop do
+  handle_signal.call
+  $arenasquat_command = nil if $arenasquat_command == :next # nothing to skip between watches
+
+  # Refresh the roster.
+  list_line = dothistimeout ArenaSquat::LIST_CMD, 10, ArenaSquat::LIST_RE
+  names = list_line && ArenaSquat.parse_list(list_line)
+
+  if names.nil? || names.empty?
+    echo 'no combatants found (arena empty or list failed); retrying in 30s.'
+    sleep 30
+    next
+  end
+
+  # Forgive watch failures after 5 minutes - the person may have re-entered.
+  unwatchable.delete_if { |_, at| Time.now - at > 300 }
+  candidates = names - [checkname] - unwatchable.keys - CharSettings['ignore']
+  if candidates.empty?
+    echo 'nobody watchable right now; retrying in 30s.'
+    sleep 30
+    next
+  end
+
+  target = candidates.min_by { |name|
+    [watch_counts[name], last_watched[name], rand]
+  }
+
+  result = dothistimeout "watch #{target}", 10,
+                         Regexp.union(ArenaSquat::BEGIN_RE, ArenaSquat::FAIL_RE)
+  unless result =~ ArenaSquat::BEGIN_RE
+    echo "could not watch #{target}; skipping them for a while."
+    unwatchable[target] = Time.now
+    next
+  end
+
+  # The confirmed name can differ from what we sent (partial-name match).
+  watched = ArenaSquat::BEGIN_RE.match(result)[:name]
+  watch_counts[watched] += 1
+  last_watched[watched] = Time.now.to_f
+  started = Time.now
+  echo "watching #{watched} (visit ##{watch_counts[watched]}) until their run ends."
+
+  # Stay on them until the arena ends the watch (death, victory, or the
+  # combatant disappearing), the 5-minute cap hits, or "arenasquat next"
+  # forces a rotation.
+  clear # drop buffered lines so we only scan fresh ones
+  forced = false
+  loop do
+    if Time.now - started > ArenaSquat::WATCH_LIMIT
+      forced = :timed
+      fput 'watch stop'
+      break
+    end
+    if $arenasquat_command == :next
+      $arenasquat_command = nil
+      forced = true
+      fput 'watch stop'
+      break
+    end
+    if (ignored_now = handle_signal.call) && ignored_now == watched
+      forced = true
+      fput 'watch stop'
+      break
+    end
+
+    line = get?
+    if line.nil?
+      sleep 0.25
+      next
+    end
+
+    # A "You begin to watch" we didn't ask for means the user manually
+    # switched targets - adopt their choice instead of fighting it.
+    if (manual = ArenaSquat::BEGIN_RE.match(line)) && manual[:name] != watched
+      watch_seconds[watched] += Time.now - started
+      watched = manual[:name]
+      watch_counts[watched] += 1
+      last_watched[watched] = Time.now.to_f
+      started = Time.now
+      save_stats.call
+      echo "adopted your manual watch of #{watched}; staying on them until their run ends."
+      next
+    end
+
+    ending = ArenaSquat::END_RE.match(line)
+    next unless ending && ending[:name] == watched
+
+    # The watch ended - but if the user is manually switching targets, the
+    # stop line lands just before their "You begin to watch" line. Give the
+    # begin line a moment to arrive before declaring the watch over.
+    adopted = nil
+    grace_until = Time.now + 3
+    while Time.now < grace_until
+      grace_line = get?
+      if grace_line.nil?
+        sleep 0.1
+        next
+      end
+      if (manual = ArenaSquat::BEGIN_RE.match(grace_line))
+        adopted = manual[:name]
+        break
+      end
+    end
+    break unless adopted
+
+    watch_seconds[watched] += Time.now - started
+    watched = adopted
+    watch_counts[watched] += 1
+    last_watched[watched] = Time.now.to_f
+    started = Time.now
+    save_stats.call
+    echo "adopted your manual watch of #{watched}; staying on them until their run ends."
+  end
+
+  watch_seconds[watched] += Time.now - started
+  save_stats.call
+  echo case forced
+       when :timed then "#{ArenaSquat::WATCH_LIMIT / 60}-minute cap reached on #{watched}; rotating."
+       when true   then "rotation forced after #{(Time.now - started).round}s on #{watched}."
+       else "#{watched}'s run ended after #{(Time.now - started).round}s; rotating."
+       end
+
+  sleep 2
+end
