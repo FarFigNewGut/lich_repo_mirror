@@ -1,0 +1,1277 @@
+=begin
+  exp_sagapanel.lic
+
+  Saga-only panel tracking experience and Lumnis statistics in four sections:
+
+    Overall Totals & Planning shows current progression, training points,
+    Lumnis state, Tutelage, and RPA. Daily Grind shows Field Exp, gains,
+    rates, pulses, and ETAs. Exp History shows persisted week/month/year
+    experience, Ascension Exp, and ATP totals. History survives restarts and
+    *exp importlogs can backfill it from prior session logs. Profession
+    Resource shows the same type/weekly/total tracking as
+    professionresource_sagapanel.lic (via Lich::Resources), off by default
+    and toggled with *exp resource since not every character has one.
+
+  Section headers and spacer rows only render when the preceding section has
+  visible content. Both rows can be hidden with *exp ignore.
+
+  Live values come from the native experience dialog. Field Exp deltas feed
+  daily pace, pulse, hourly, and ETA calculations; decreases are ignored.
+  Daily counters reset at 5 AM, and ETAs remain "--" until a gain is measured.
+
+  Experience and Lumnis fields that are not pushed passively are refreshed
+  every 20 minutes or with *exp refresh. Recognized command lines are parsed
+  individually so unrelated game traffic remains untouched.
+
+  RPA remains Active until manually cleared with *exp clearrpa.
+
+  Fash'lo'nae's Tutelage shows Eligible, Active, or Ineligible from the
+  current Lumnis stage and trigger messages. Lumnis Stage displays the
+  active tier number in its row label.
+
+  Red triangles hide individual rows, matching timers_sagapanel's *tm ignore.
+
+  Usage:
+    ;exp_sagapanel.lic   - Start the panel
+
+  Commands:
+    *exp refresh              - Actively re-poll experience + lumnis info
+                                 (queued -- runs on the script's next tick,
+                                 within about a second)
+    *exp importlogs             - Backfill Exp This Week/Month/Year from
+                                 this character's own past session logs
+                                 (see import_history_from_logs! -- day-level
+                                 granularity, safe/idempotent to re-run,
+                                 always skips today's still-open log)
+    *exp ignore <field>       - Hide a row (also: click its red triangle)
+    *exp unignore <field>     - Unhide a row
+    *exp unignore all         - Unhide everything
+    *exp ignored               - List hidden rows
+    *exp tracked                - List currently shown rows
+    *exp clearrpa              - Clear the RPA indicator
+    *exp width <N>              - Set the value column width (gap before
+                                 the red triangle) -- mirrors *tm width in
+                                 timers_sagapanel.lic; entering the same N
+                                 in both gives both panels the same
+                                 gap-before-the-triangle look. Default 75.
+    *exp resource                - Toggle the Profession Resource section
+                                 on/off (off by default). Polls every 30
+                                 seconds via Lich::Resources.check while on.
+
+  Tags: saga, frontend, exp, lumnis, panel, efficiency, resource
+  Author: Claude Code, RuseofFools
+  Version: 1.12.0
+=end
+
+no_kill_all
+
+require 'yaml'
+
+module ExpPanel
+  extend self
+  include Lich::Common if defined?(Lich::Common)
+
+  ROW_HEIGHT = 18
+  LABEL_LEFT = 2
+  LABEL_WIDTH = 134
+  VALUE_LEFT = 142
+  # Same +2 gap-before-the-triangle convention as timers_sagapanel.lic's
+  # REMOVE_LEFT (DURATION_LEFT + DURATION_WIDTH + 2), and now user-facing
+  # the same way too -- *exp width <N> (mirrors *tm width <N>) sets
+  # value_width, which remove_left derives from live rather than a frozen
+  # constant, so entering the same N in both scripts' width commands lines
+  # up the same gap-before-the-triangle look in both, even though each
+  # panel's own VALUE_LEFT/DURATION_LEFT differ. Defaults to 75 (was a
+  # hardcoded constant before this was made adjustable).
+  DEFAULT_VALUE_WIDTH = 77
+  REMOVE_WIDTH = 20
+  REMOVE_ICON = "&#x1F53B;".freeze
+
+  # Gift of Lumnis tier -> stage number, per the user's own numbering.
+  TIER_STAGE = { "doubled" => 2, "tripled" => 3, "quadrupled" => 4, "quintupled" => 5 }.freeze
+
+  ROWS = [
+    [:level,            "Level"],
+    [:experience,       "Exp"],
+    [:ascension_exp,    "Asc Exp"],
+    [:total_exp,        "Total Exp"],
+    [:long_term_exp,    "Long-Term Exp"],
+    [:exp_next_tp,      "Exp to next TP"],
+    [:eta_next_tp,      "ETA to next TP"],
+    [:exp_next_atp,     "Exp to next ATP"],
+    [:eta_next_atp,     "ETA to next ATP"],
+    [:ptps_mtps,        "PTPs/MTPs"],
+    [:atps,             "ATPs"],
+    [:field_exp,        "Field Exp"],
+    [:exp_today,        "Exp Earned Today"],
+    [:avg_exp_hour,     "Avg Exp/Hour"],
+    [:exp_last_hour,    "Exp Last Hour"],
+    [:exp_per_pulse,    "Exp/Pulse"],
+    [:best_pulse,       "Best Pulse"],
+    [:hist_exp_week,    "Exp This Week"],
+    [:hist_exp_month,   "Exp This Month"],
+    [:hist_exp_year,    "Exp This Year"],
+    [:hist_asc_week,    "Asc Exp This Week"],
+    [:hist_asc_month,   "Asc Exp This Month"],
+    [:hist_asc_year,    "Asc Exp This Year"],
+    [:hist_atp_week,    "ATPs Earned This Week"],
+    [:hist_atp_month,   "ATPs Earned This Month"],
+    [:hist_atp_year,    "ATPs Earned This Year"],
+    [:lumnis_donations, "Lumnis Donations"],
+    [:lumnis_stage,     "Lumnis Stage"],
+    [:lumnis_reset,     "Lumnis Reset"],
+    [:fashlonae,        "Fash'lo'nae's Tutelage"],
+    [:rpa, "RPA"],
+    [:resource_type,    "Resource"],
+    [:resource_weekly,  "Resource Weekly"],
+    [:resource_total,   "Resource Total"]
+  ].freeze
+  ROW_KEYS = ROWS.map(&:first).freeze
+  ROW_LABELS = ROWS.to_h.freeze
+
+  # Same 3 fields professionresource_sagapanel.lic tracks (type/weekly/
+  # total, via Lich::Resources -- Infomon's own profession-resource
+  # tracking, e.g. Empath Vitality, Bard Luck Inspiration, etc.), gated
+  # behind *exp resource since not every character has one (Warriors,
+  # say) and polling "resource" for a character that doesn't is pointless
+  # command spam -- off by default, unlike everything else in this panel.
+  RESOURCE_KEYS = [:resource_type, :resource_weekly, :resource_total].freeze
+  RESOURCE_WEEKLY_CAP = 50_000
+  RESOURCE_TOTAL_CAP = 200_000
+  RESOURCE_POLL_SECONDS = 30
+
+  # Three panel sections: overall totals/state useful for planning (where
+  # am I, how long until my next TP/ATP, what's my Lumnis/Tutelage status),
+  # today's pace (how's THIS session/day going -- Field Exp lives here, not
+  # in Planning, since it's a raw moment-to-moment meter rather than a
+  # stable long-term total), and longer-horizon history (week/month/year,
+  # persisted to disk -- see exp_history_path). A section with every one of
+  # its rows hidden via *exp ignore doesn't render its header either --
+  # same "only show what has content" rule timers_sagapanel.lic uses for
+  # its category headers.
+  SECTIONS = [
+    ["Overall Totals & Planning", [
+      :level, :experience, :ascension_exp, :total_exp, :long_term_exp,
+      :exp_next_tp, :eta_next_tp, :exp_next_atp, :eta_next_atp, :ptps_mtps, :atps,
+      :lumnis_donations, :lumnis_stage, :lumnis_reset, :fashlonae, :rpa
+    ]],
+    ["Daily Grind", [
+      :field_exp, :exp_today, :avg_exp_hour, :exp_last_hour, :exp_per_pulse, :best_pulse
+    ]],
+    ["Exp History", [
+      :hist_exp_week, :hist_exp_month, :hist_exp_year,
+      :hist_asc_week, :hist_asc_month, :hist_asc_year,
+      :hist_atp_week, :hist_atp_month, :hist_atp_year
+    ]],
+    ["Profession Resource", RESOURCE_KEYS]
+  ].freeze
+
+  # One blank spacer row after each section except the last, each with its
+  # own red-triangle hide control (*exp ignore spacer_after_N) -- same
+  # ignored-list mechanism as every real row, just not a ROWS entry since
+  # it carries no data. build_dialog only actually renders a given
+  # spacer_after_N if section N itself rendered something -- if section N
+  # is entirely hidden, its trailing spacer has nothing to trail and is
+  # skipped too, regardless of whether it's individually ignored.
+  SPACER_KEYS = (0...(SECTIONS.length - 1)).map { |i| "spacer_after_#{i}" }.freeze
+
+  # ATPs are earned at a fixed 1-per-50,000-Ascension-Exp rate (per the
+  # user), so "ATPs Earned This Week/Month/Year" is purely derived from
+  # the same Ascension Exp history bucket the Ascension Exp rows already
+  # read, not tracked separately.
+  ASCENSION_EXP_PER_ATP = 50_000
+
+  # Rolling exp/hour rate is computed off "today" (resets at the same 5 AM
+  # boundary uberbar_eo.lic uses for its own daily silver/bounty counters),
+  # not off total session time -- so the rate reacts to a play-style change
+  # (e.g. switching from hunting to crafting) within the hour instead of
+  # staying diluted by however long the panel has been open.
+  DAY_BOUNDARY_HOUR = 5
+  # How far back exp_history/asc_history samples are kept -- a little past
+  # 60 minutes so "last hour" always has a clean full window to sum.
+  HISTORY_KEEP_SECONDS = 3660
+  LAST_HOUR_SECONDS = 3600
+
+  @data = {}
+  @exp_history = [] # [[Time, gain], ...] -- fine-grained samples for "Exp Last Hour"
+  @asc_history = [] # same, for ascension exp (drives the ATP-ETA rate)
+  # {"daily" => {"2026-08-23" => {"field"=>N, "asc"=>M}, ...}, "weekly" =>
+  # {...}, "monthly" => {...}, "yearly" => {...}} -- persisted long-term,
+  # unlike @data's today/session counters which live only in memory.
+  @history = { "daily" => {}, "weekly" => {}, "monthly" => {}, "yearly" => {} }
+  @history_dirty = false
+
+  @value_width = DEFAULT_VALUE_WIDTH
+  @resource_enabled = false
+
+  class << self
+    attr_accessor :ignored, :data, :history, :history_dirty, :value_width, :resource_enabled
+  end
+
+  # Derived live from value_width rather than a frozen constant, since
+  # *exp width can change value_width at runtime -- mirrors
+  # timers_sagapanel.lic's REMOVE_LEFT = DURATION_LEFT + DURATION_WIDTH + 2
+  # exactly, just as a method instead of a constant.
+  def self.remove_left
+    VALUE_LEFT + value_width + 2
+  end
+
+  def self.settings_path
+    base_dir = "#{$data_dir}#{XMLData.game}/#{Char.name}"
+    Dir.mkdir("#{$data_dir}#{XMLData.game}") unless File.exist?("#{$data_dir}#{XMLData.game}")
+    Dir.mkdir(base_dir) unless File.exist?(base_dir)
+    File.join(base_dir, "lichwindows.yaml")
+  end
+
+  def self.load_settings
+    filename = settings_path
+    settings_hash = File.exist?(filename) ? YAML.load_file(filename) : {}
+    settings_hash = {} unless settings_hash.is_a?(Hash)
+    settings_hash["exp"] = {} unless settings_hash["exp"].is_a?(Hash)
+    allowed_keys = ROW_KEYS.map(&:to_s) + SPACER_KEYS
+    settings_hash["exp"]["ignored"] = Array(settings_hash["exp"]["ignored"]).map(&:to_s).uniq & allowed_keys
+    width = settings_hash["exp"]["value_width"].to_i
+    settings_hash["exp"]["value_width"] = width.positive? ? width : DEFAULT_VALUE_WIDTH
+    settings_hash["exp"]["resource_enabled"] = !!settings_hash["exp"]["resource_enabled"]
+    settings_hash
+  end
+
+  def self.save_settings(settings)
+    File.write(settings_path, settings.to_yaml)
+  end
+
+  def self.set_value_width!(width)
+    return false unless width.positive?
+
+    settings = load_settings
+    self.value_width = width
+    settings["exp"]["value_width"] = width
+    save_settings(settings)
+    true
+  end
+
+  def self.set_resource_enabled!(enabled)
+    settings = load_settings
+    self.resource_enabled = enabled
+    settings["exp"]["resource_enabled"] = enabled
+    save_settings(settings)
+    enabled
+  end
+
+  # Separate file from lichwindows.yaml (settings) since this is
+  # substantive historical data meant to accumulate indefinitely across
+  # restarts, not a small per-window preferences blob.
+  def self.history_path
+    base_dir = "#{$data_dir}#{XMLData.game}/#{Char.name}"
+    Dir.mkdir("#{$data_dir}#{XMLData.game}") unless File.exist?("#{$data_dir}#{XMLData.game}")
+    Dir.mkdir(base_dir) unless File.exist?(base_dir)
+    File.join(base_dir, "exp_sagapanel_history.yaml")
+  end
+
+  def self.load_history!
+    filename = history_path
+    loaded = File.exist?(filename) ? YAML.load_file(filename) : {}
+    loaded = {} unless loaded.is_a?(Hash)
+    self.history = %w[daily weekly monthly yearly processed_log_files].each_with_object({}) do |bucket, acc|
+      acc[bucket] = loaded[bucket].is_a?(Hash) ? loaded[bucket] : {}
+    end
+    self.history_dirty = false
+  end
+
+  def self.save_history!
+    return unless history_dirty
+
+    File.write(history_path, history.to_yaml)
+    self.history_dirty = false
+  end
+
+  # Restores today's in-memory counters from whatever was already
+  # persisted for today's bucket -- without this, restarting the script
+  # mid-day (e.g. to pick up a fix) would silently reset Exp Earned Today/
+  # Avg Exp/Hour/Exp Last Hour back to 0 even though the day isn't over,
+  # which looked identical to "pulse tracking isn't working."
+  def self.restore_today_from_history!
+    entry = history["daily"][day_key(Time.now)]
+    return unless entry
+
+    @data[:today_exp_gained] = entry["field"].to_i
+    @data[:today_asc_gained] = entry["asc"].to_i
+  end
+
+  # Three independent components per bucket entry, tracked in parallel
+  # rather than one combined total:
+  #   "field" -- Field Exp gained (bounded meter, drives Daily Grind's
+  #              Today/Avg/Last Hour/Pulse/Best Pulse -- see
+  #              record_exp_sample). Not shown anywhere in Exp History.
+  #   "exp"   -- lifetime Experience gained (the "Experience:" counter --
+  #              see record_lifetime_exp_sample!). Drives Experience This
+  #              Week/Month/Year.
+  #   "asc"   -- lifetime Ascension Exp gained. Drives both Ascension Exp
+  #              This Week/Month/Year AND ATPs Earned This Week/Month/Year
+  #              (ASCENSION_EXP_PER_ATP) -- the same number, no separate
+  #              ATP tracking needed since the conversion rate is fixed.
+  def self.record_history_gain!(at:, field: 0, exp: 0, asc: 0)
+    return if field <= 0 && exp <= 0 && asc <= 0
+
+    {
+      "daily"   => day_key(at),
+      "weekly"  => week_key(at),
+      "monthly" => month_key(at),
+      "yearly"  => year_key(at)
+    }.each do |bucket, key|
+      entry = (history[bucket][key] ||= { "field" => 0, "exp" => 0, "asc" => 0 })
+      entry["field"] = entry["field"].to_i + field
+      entry["exp"] = entry["exp"].to_i + exp
+      entry["asc"] = entry["asc"].to_i + asc
+    end
+    self.history_dirty = true
+  end
+
+  def self.history_bucket_component(bucket, key, component)
+    entry = history[bucket][key]
+    return nil unless entry
+
+    entry[component].to_i
+  end
+
+  def self.period_bucket_key(period)
+    case period
+    when :week then ["weekly", week_key(Time.now)]
+    when :month then ["monthly", month_key(Time.now)]
+    when :year then ["yearly", year_key(Time.now)]
+    end
+  end
+
+  def self.history_period_value(period, component)
+    bucket, key = period_bucket_key(period)
+    history_bucket_component(bucket, key, component)
+  end
+
+  # Maps a :hist_exp_week/:hist_asc_month/:hist_atp_year-style row key to
+  # the :week/:month/:year period_bucket_key expects, off the row key's
+  # own trailing word rather than a separate lookup table.
+  def self.hist_period(row_key)
+    row_key.to_s.split("_").last.to_sym
+  end
+
+  # Backfills week/month/year (and past days) from this character's own
+  # plain-text session logs (LOG_DIR/<Game>-<CharName>/**/*.log) by
+  # scanning the same three lines the user pasted from a real "experience"
+  # report -- "Experience:", "Ascension Exp:", and "Total Exp:" -- rather
+  # than Field Exp. Field Exp is right for live pulse tracking (Daily
+  # Grind) but wrong for long-term history: it's a bounded, self-draining
+  # meter, not a record of lifetime progress. Experience/Ascension Exp are
+  # the actual lifetime counters, and Total Exp is documented (and
+  # confirmed against the user's own pasted numbers: 38,595,415 +
+  # 16,981,703 = 55,577,118) to equal their exact sum, which this uses as
+  # a cross-check -- see import_one_log_file. This only reads the .log
+  # files that already exist on disk -- it never re-plays anything through
+  # the game or the live DownstreamHook pipeline.
+  #
+  # Caveats, by design:
+  #  - Day-level granularity only (each gain is bucketed under the
+  #    calendar date in its filename, not the individual in-file
+  #    timestamp) -- fine for week/month/year totals, not meant to
+  #    reconstruct an hour-by-hour history.
+  #  - The single most-recently-modified log file is always skipped, on
+  #    the assumption it's today's still-open session -- that one is
+  #    already covered by live tracking, and importing it too would
+  #    double-count today's numbers.
+  #  - Idempotent/incremental: each file's mtime+size is fingerprinted in
+  #    history["processed_log_files"] once imported, so re-running this
+  #    later only picks up files that are new or have grown since.
+  def self.log_dir_for_character
+    File.join(LOG_DIR, "#{XMLData.game}-#{Char.name}")
+  end
+
+  def self.import_history_from_logs!
+    dir = log_dir_for_character
+    return { total: 0, imported: 0, gained: 0 } unless Dir.exist?(dir)
+
+    files = Dir.glob(File.join(dir, "**", "*.log")).sort_by { |f| File.mtime(f) }
+    files.pop # skip the most recently modified file -- presumed still-open today's session
+
+    processed = history["processed_log_files"]
+    imported = 0
+    total_gained = 0
+
+    files.each do |path|
+      fingerprint = "#{File.mtime(path).to_i}:#{File.size(path)}"
+      next if processed[path] == fingerprint
+
+      file_date = File.basename(path)[/\A(\d{4}-\d{2}-\d{2})/, 1]
+      next unless file_date
+
+      total_gained += import_one_log_file(path, file_date)
+      processed[path] = fingerprint
+      imported += 1
+    end
+
+    self.history_dirty = true if imported > 0
+    { total: files.size, imported: imported, gained: total_gained }
+  end
+
+  # Experience/Ascension Exp/Total Exp always print together as one
+  # 3-line block in a real "experience" report, so gains are accumulated
+  # as "pending" since the last Total Exp line, then only committed to
+  # history once that same block's Total Exp line confirms
+  # pending_exp + pending_asc == its own observed gain -- a mismatch means
+  # a snapshot was missed (e.g. split across a session/log boundary) and
+  # that batch is discarded rather than risk recording a wrong number.
+  def self.import_one_log_file(path, file_date)
+    content = File.read(path, encoding: "UTF-8", invalid: :replace, undef: :replace)
+    prev_exp = nil
+    prev_asc = nil
+    prev_total = nil
+    pending_exp = 0
+    pending_asc = 0
+    gained = 0
+
+    content.each_line do |line|
+      if line =~ /Experience:\s*([\d,]+)/
+        val = Regexp.last_match(1).delete(",").to_i
+        pending_exp += (val - prev_exp) if prev_exp && val > prev_exp
+        prev_exp = val
+      end
+
+      if line =~ /Ascension Exp:\s*([\d,]+)/
+        val = Regexp.last_match(1).delete(",").to_i
+        pending_asc += (val - prev_asc) if prev_asc && val > prev_asc
+        prev_asc = val
+      end
+
+      next unless line =~ /Total Exp:\s*([\d,]+)/
+
+      val = Regexp.last_match(1).delete(",").to_i
+      if prev_total && val > prev_total && (val - prev_total) == (pending_exp + pending_asc)
+        if pending_exp > 0 || pending_asc > 0
+          record_history_gain_for_date!(file_date, exp: pending_exp, asc: pending_asc)
+          gained += pending_exp + pending_asc
+        end
+      end
+      prev_total = val
+      pending_exp = 0
+      pending_asc = 0
+    end
+
+    gained
+  rescue StandardError
+    0
+  end
+
+  # date_string is "YYYY-MM-DD" from a log filename, with no time-of-day
+  # to anchor to -- pinned to noon so it's nowhere near the 5 AM boundary
+  # day_key/week_key/month_key/year_key adjust around, regardless of what
+  # the DAY_BOUNDARY_HOUR constant happens to be.
+  def self.record_history_gain_for_date!(date_string, exp: 0, asc: 0)
+    year, month, day = date_string.split("-").map(&:to_i)
+    at = Time.new(year, month, day, 12, 0, 0)
+    record_history_gain!(exp: exp, asc: asc, at: at)
+  rescue ArgumentError
+    nil
+  end
+
+  def self.add_ignored!(key)
+    key = key.to_s
+    return false if ignored.include?(key)
+
+    settings = load_settings
+    self.ignored |= [key]
+    settings["exp"]["ignored"] = ignored
+    save_settings(settings)
+    true
+  end
+
+  def self.remove_ignored!(key)
+    key = key.to_s
+    return false unless ignored.include?(key)
+
+    settings = load_settings
+    self.ignored -= [key]
+    settings["exp"]["ignored"] = ignored
+    save_settings(settings)
+    true
+  end
+
+  def self.unignore_all!
+    settings = load_settings
+    self.ignored = []
+    settings["exp"]["ignored"] = []
+    save_settings(settings)
+  end
+
+  def self.sanitize_xml(text)
+    text.to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;').gsub("'", '&apos;').gsub('"', '&quot;')
+  end
+
+  # Single dominant unit, same convention as treasurewindow.lic's
+  # TreasureWindow.format_reset_time -- days while > 24h left, hours while
+  # > 60m left, minutes once <= 60m left.
+  def self.format_countdown(seconds_left)
+    return "Ready" if seconds_left.nil? || seconds_left <= 0
+
+    if seconds_left > 86400
+      "#{seconds_left / 86400}d"
+    elsif seconds_left > 3600
+      hours = seconds_left / 3600
+      hours < 24 ? "#{hours}h" : "#{seconds_left / 86400}d"
+    else
+      "#{[seconds_left / 60, 1].max}m"
+    end
+  end
+
+  # Elapsed-since duration, e.g. "1h 42m" / "8m" -- used for "Active
+  # (Xh Ym)" on Fash'lo'nae's Tutelage, which (unlike RPA) has both a
+  # clean on and off trigger message, so this is a real elapsed duration
+  # rather than a since-first-seen guess.
+  def self.format_duration(seconds)
+    total_minutes = (seconds / 60).to_i
+    hours, minutes = total_minutes.divmod(60)
+    hours > 0 ? "#{hours}h #{minutes}m" : "#{minutes}m"
+  end
+
+  def self.commas(n)
+    n.nil? ? "--" : n.with_commas
+  end
+
+  # 5 AM-boundary-adjusted timestamp -- everything that buckets by
+  # calendar period (today/this week/this month/this year) derives its key
+  # from this same adjusted time, so a 2 AM gain consistently counts
+  # toward the previous calendar day/week/month/year across all of them,
+  # not just "today".
+  def self.adjusted_time(time)
+    time.hour < DAY_BOUNDARY_HOUR ? time - 86400 : time
+  end
+
+  def self.day_key(time)
+    adjusted_time(time).strftime("%Y-%m-%d")
+  end
+
+  # ISO year-week (%G/%V), not %Y/%U -- avoids the late-December/
+  # early-January edge case where a plain %Y-%U week number can roll over
+  # a week early or late relative to the actual ISO week boundary.
+  def self.week_key(time)
+    adjusted_time(time).strftime("%G-W%V")
+  end
+
+  def self.month_key(time)
+    adjusted_time(time).strftime("%Y-%m")
+  end
+
+  def self.year_key(time)
+    adjusted_time(time).strftime("%Y")
+  end
+
+  def self.reset_today_if_new_day!(now)
+    key = day_key(now)
+    return if @data[:today_key] == key
+
+    @data[:today_key] = key
+    @data[:today_exp_gained] = 0
+    @data[:today_asc_gained] = 0
+    @data[:today_start_at] = now
+  end
+
+  def self.trim_history!
+    cutoff = Time.now - HISTORY_KEEP_SECONDS
+    @exp_history.reject! { |t, _| t < cutoff }
+    @asc_history.reject! { |t, _| t < cutoff }
+  end
+
+  def self.last_hour_sum(samples)
+    cutoff = Time.now - LAST_HOUR_SECONDS
+    samples.select { |t, _| t >= cutoff }.sum { |_, gain| gain }
+  end
+
+  # elapsed hours since the 5 AM boundary, floored at 1 minute so a
+  # just-opened panel doesn't divide by a near-zero interval and show a
+  # wildly inflated rate.
+  def self.elapsed_hours_today
+    return 1.0 / 60 unless @data[:today_start_at]
+
+    [(Time.now - @data[:today_start_at]) / 3600.0, 1.0 / 60].max
+  end
+
+  def self.avg_exp_per_hour
+    return 0 unless @data[:today_exp_gained]
+
+    (@data[:today_exp_gained] / elapsed_hours_today).to_i
+  end
+
+  def self.avg_asc_per_hour
+    return 0 unless @data[:today_asc_gained]
+
+    (@data[:today_asc_gained] / elapsed_hours_today).to_i
+  end
+
+  def self.eta_string(remaining, rate_per_hour)
+    return "--" if remaining.nil? || rate_per_hour.nil? || rate_per_hour <= 0
+
+    total_minutes = ((remaining.to_f / rate_per_hour) * 60).round
+    hours, minutes = total_minutes.divmod(60)
+    hours > 0 ? "~#{hours}h #{minutes}m" : "~#{minutes}m"
+  end
+
+  # Diff-based pulse/today/session tracking off the shared prev_field_exp/
+  # prev_asc state -- called both from the passive expr-dialog observer
+  # (fine-grained, real per-pulse deltas) and from the active *exp refresh
+  # poll (coarse, but harmless since it diffs off whatever prev_field_exp
+  # already is rather than accumulating independently -- if the passive
+  # hook kept up, the active poll's delta is just ~0). track_pulse is
+  # false for the active-poll call site so a 20-minute gap between polls
+  # never gets misattributed as a single pulse for Exp/Pulse or Best Pulse.
+  #
+  # Driven off Field Exp, NOT the lifetime "Experience"/exp attribute --
+  # same reason uberbar_eo.lic's own pulse tracking is driven off the
+  # rotating TP-cycle counter in XMLData.next_level_text rather than a
+  # lifetime total, and explicitly branches on `capped` (Stats.level ==
+  # 100) to do it. At level 100 the lifetime Experience counter only jumps
+  # in lump sums whenever a TP actually converts, and can sit frozen for a
+  # long stretch in between -- Field Exp is what actually ticks nearly
+  # every pulse regardless of level, so it's the correct always-live
+  # signal. Field Exp also drains back down on its own over time as it
+  # gets absorbed into your permanent pool (not just wrapping at its max),
+  # so a DECREASE is normal and expected, not a "wrapped, reconstruct the
+  # gain" case -- same as the exact skip-on-decrease behavior below.
+  def self.record_exp_sample(new_field_exp, new_asc, track_pulse:)
+    now = Time.now
+    reset_today_if_new_day!(now)
+
+    old_field_exp = @data[:prev_field_exp]
+    old_asc = @data[:prev_asc]
+
+    field_gain = (new_field_exp && old_field_exp && new_field_exp > old_field_exp) ? (new_field_exp - old_field_exp) : 0
+    # Same bounded-meter sanity clamp as import_one_log_file -- Field Exp
+    # can't legitimately jump by more than its own current max in one
+    # tick, unlike Ascension Exp (no clamp below), which just grows.
+    field_max = @data[:field_exp_max]
+    field_gain = 0 if field_max && field_gain > field_max
+    asc_gain = (new_asc && old_asc && new_asc > old_asc) ? (new_asc - old_asc) : 0
+
+    if field_gain > 0
+      @data[:today_exp_gained] = (@data[:today_exp_gained] || 0) + field_gain
+      @exp_history << [now, field_gain]
+    end
+
+    if asc_gain > 0
+      @data[:today_asc_gained] = (@data[:today_asc_gained] || 0) + asc_gain
+      @asc_history << [now, asc_gain]
+    end
+
+    total_gain = field_gain + asc_gain
+    if total_gain > 0
+      record_history_gain!(field: field_gain, asc: asc_gain, at: now)
+      if track_pulse
+        @data[:last_pulse_gain] = total_gain
+        @data[:best_pulse_gain] = [total_gain, @data[:best_pulse_gain] || 0].max
+      end
+    end
+
+    @data[:prev_field_exp] = new_field_exp if new_field_exp
+    @data[:prev_asc] = new_asc if new_asc
+
+    trim_history!
+  end
+
+  # Separate from record_exp_sample -- feeds ONLY the persisted "exp"
+  # history bucket (Experience This Week/Month/Year), never Daily Grind's
+  # in-memory today/last-hour/pulse counters, which stay deliberately
+  # Field-Exp-based. Called from both the passive expr-dialog observer and
+  # the active *exp refresh poll, same as record_exp_sample, but there's
+  # no track_pulse distinction here since nothing here is pulse-grained.
+  def self.record_lifetime_exp_sample!(new_experience)
+    old = @data[:prev_lifetime_exp]
+    if new_experience && old && new_experience > old
+      record_history_gain!(exp: new_experience - old, at: Time.now)
+    end
+    @data[:prev_lifetime_exp] = new_experience if new_experience
+  end
+
+  def self.row_value(key)
+    d = @data
+    case key
+    when :level            then d[:level] ? d[:level].to_s : "--"
+    when :experience       then commas(d[:experience])
+    when :field_exp        then d[:field_exp] ? "#{commas(d[:field_exp])}/#{commas(d[:field_exp_max])}" : "--"
+    when :ascension_exp    then commas(d[:ascension_exp])
+    when :total_exp        then commas(d[:total_exp])
+    when :long_term_exp    then commas(d[:long_term_exp])
+    when :exp_next_tp      then commas(d[:exp_next_tp])
+    when :eta_next_tp      then eta_string(d[:exp_next_tp], avg_exp_per_hour)
+    when :exp_next_atp     then commas(d[:exp_next_atp])
+    when :eta_next_atp     then eta_string(d[:exp_next_atp], avg_asc_per_hour)
+    when :ptps_mtps        then (d[:ptps] || d[:mtps]) ? "#{d[:ptps] || '--'}/#{d[:mtps] || '--'}" : "--"
+    when :atps             then d[:atps] ? d[:atps].to_s : "--"
+    when :exp_today
+      total = (d[:today_exp_gained] || 0) + (d[:today_asc_gained] || 0)
+      (d[:today_exp_gained] || d[:today_asc_gained]) ? commas(total) : "--"
+    when :avg_exp_hour
+      (d[:today_exp_gained] || d[:today_asc_gained]) ? commas(avg_exp_per_hour + avg_asc_per_hour) : "--"
+    when :exp_last_hour    then commas(last_hour_sum(@exp_history) + last_hour_sum(@asc_history))
+    when :exp_per_pulse    then d[:last_pulse_gain] ? commas(d[:last_pulse_gain]) : "--"
+    when :best_pulse       then d[:best_pulse_gain] ? commas(d[:best_pulse_gain]) : "--"
+    when :hist_exp_week, :hist_exp_month, :hist_exp_year
+      v = history_period_value(hist_period(key), "exp")
+      v ? commas(v) : "--"
+    when :hist_asc_week, :hist_asc_month, :hist_asc_year
+      v = history_period_value(hist_period(key), "asc")
+      v ? commas(v) : "--"
+    when :hist_atp_week, :hist_atp_month, :hist_atp_year
+      v = history_period_value(hist_period(key), "asc")
+      v ? (v / ASCENSION_EXP_PER_ATP).to_s : "--"
+    when :lumnis_donations then d[:lumnis_donations] || "Unknown (run *exp refresh)"
+    when :lumnis_stage     then d[:lumnis_stage] || "Unknown (run *exp refresh)"
+    when :lumnis_reset
+      if d[:lumnis_reset_at].nil?
+        "Unknown (run *exp refresh)"
+      else
+        format_countdown((d[:lumnis_reset_at] - Time.now).to_i)
+      end
+    when :fashlonae
+      if d[:lumnis_cycle_active].nil? && d[:fashlonae].nil?
+        "Unknown (run *exp refresh)"
+      elsif d[:lumnis_cycle_active]
+        # Per the user: while Lumnis's own weekly multiplier cycle is
+        # still running (Lumnis Stage shows a tier in progress), Tutelage
+        # isn't actually granting anything yet regardless of what the
+        # fashlonae flag says -- it only starts once that cycle ends, so
+        # this is "lined up for it," not "receiving it."
+        "Eligible"
+      elsif d[:fashlonae] == true
+        # Lumnis is done for the week -- fashlonae now reflects whether
+        # Tutelage is genuinely active for real.
+        d[:fashlonae_since] ? "Active (#{format_duration(Time.now - d[:fashlonae_since])})" : "Active"
+      else
+        "Ineligible"
+      end
+    when :rpa then d[:rpa] ? "Active (*exp clearrpa to reset)" : "--"
+    when :resource_type
+      type = d[:resource_type]
+      (type.nil? || type.to_s.strip.empty?) ? "None detected" : type.to_s
+    when :resource_weekly
+      d[:resource_weekly] ? "#{commas(d[:resource_weekly])}/50k" : "--"
+    when :resource_total
+      d[:resource_total] ? "#{commas(d[:resource_total])}/200k" : "--"
+    end
+  end
+
+  # Only :lumnis_stage's label varies -- "Lumnis Stage x2:" while a tier
+  # is in progress (per the user's own x2/x3/x4/x5 numbering, matching
+  # TIER_STAGE), otherwise the plain "Lumnis Stage:" ROW_LABELS default.
+  def self.row_label(key)
+    if key == :lumnis_stage && @data[:lumnis_stage_num]
+      "Lumnis Stage x#{@data[:lumnis_stage_num]}"
+    else
+      ROW_LABELS[key]
+    end
+  end
+
+  def self.build_dialog
+    out = String.new("<dialogData id='ExpPanel' clear='t'>")
+    top = 0
+    pending_spacer_key = nil
+
+    SECTIONS.each_with_index do |(title, keys), section_idx|
+      visible_keys = keys.reject { |key| ignored.include?(key.to_s) || (RESOURCE_KEYS.include?(key) && !resource_enabled) }
+      next if visible_keys.empty?
+
+      if pending_spacer_key && !ignored.include?(pending_spacer_key)
+        out << "<label id='exp_spc_#{pending_spacer_key}' value='' justify='left' left='0' top='#{top}' width='#{LABEL_WIDTH + value_width}' height='#{ROW_HEIGHT}' />"
+        out << "<link id='exp_spc_x_#{pending_spacer_key}' value='#{REMOVE_ICON}' cmd='*exp ignore #{pending_spacer_key}' justify='left' left='#{remove_left}' top='#{top}' width='#{REMOVE_WIDTH}' height='#{ROW_HEIGHT}' />"
+        top += ROW_HEIGHT
+      end
+      pending_spacer_key = nil
+
+      out << "<link id='exp_hdr_#{section_idx}' value='#{sanitize_xml("-- #{title} --")}' cmd='' justify='left' left='0' top='#{top}' width='#{LABEL_WIDTH + value_width + REMOVE_WIDTH}' height='#{ROW_HEIGHT}' />"
+      top += ROW_HEIGHT
+
+      visible_keys.each do |key|
+        label = row_label(key)
+        out << "<label id='exp_lbl_#{key}' value='#{sanitize_xml("#{label}:")}' justify='left' left='#{LABEL_LEFT}' top='#{top}' width='#{LABEL_WIDTH}' height='#{ROW_HEIGHT}' />"
+        out << "<label id='exp_val_#{key}' value='#{sanitize_xml(row_value(key))}' justify='left' left='#{VALUE_LEFT}' top='#{top}' width='#{value_width}' height='#{ROW_HEIGHT}' />"
+        out << "<link id='exp_x_#{key}' value='#{REMOVE_ICON}' cmd='*exp ignore #{key}' justify='left' left='#{remove_left}' top='#{top}' width='#{REMOVE_WIDTH}' height='#{ROW_HEIGHT}' />"
+        top += ROW_HEIGHT
+      end
+
+      pending_spacer_key = SPACER_KEYS[section_idx]
+    end
+    out << "</dialogData>"
+    out
+  end
+
+  def self.snapshot
+    ROW_KEYS.map { |key| row_value(key) } + [ignored.sort, resource_enabled]
+  end
+
+  # Passive parse of the game's own native experience-bar dialog -- no
+  # command sent, updates whenever the client itself refreshes that
+  # widget (e.g. every pulse while it's open).
+  def self.observe_expr_dialog(server_string)
+    return unless server_string.include?("dialogData id='expr'") || server_string.include?('dialogData id="expr"')
+
+    if server_string =~ /value=['"]Level (\d+)['"]/
+      @data[:level] = Regexp.last_match(1).to_i
+    end
+    if server_string =~ /field_exp=['"](\d+)['"]/
+      @data[:field_exp] = Regexp.last_match(1).to_i
+    end
+    if server_string =~ /max_field_exp=['"](\d+)['"]/
+      @data[:field_exp_max] = Regexp.last_match(1).to_i
+    end
+    if server_string =~ /ascension_exp=['"](\d+)['"]/
+      @data[:ascension_exp] = Regexp.last_match(1).to_i
+    end
+    if server_string =~ /fashlonae=['"](\d+)['"]/
+      new_fashlonae = (Regexp.last_match(1) == "1")
+      # fashlonae_since is only ever stamped by the exact on/off trigger
+      # text (see observe_tutelage_text) -- this attribute alone can arrive
+      # already showing fashlonae='1' on script start (Tutelage was active
+      # before the panel opened), where we genuinely don't know when it
+      # started, so we only ever clear the timestamp here, never set it.
+      @data[:fashlonae_since] = nil unless new_fashlonae
+      @data[:fashlonae] = new_fashlonae
+    end
+    if server_string =~ /\bexp=['"](\d+)['"]/
+      @data[:experience] = Regexp.last_match(1).to_i
+    end
+    if server_string =~ /until_next=['"](\d+)['"]/
+      @data[:exp_next_tp] = Regexp.last_match(1).to_i
+    end
+    record_exp_sample(@data[:field_exp], @data[:ascension_exp], track_pulse: true)
+    record_lifetime_exp_sample!(@data[:experience])
+    @data[:last_updated] = Time.now
+  end
+
+  # Fash'lo'nae's Tutelage has exact, symmetric on/off narrative lines
+  # (confirmed against gswiki.play.net/Fash'lo'nae's_Tutelage), unlike RPA
+  # which only ever announces itself turning on. Checked against every
+  # downstream line, not just expr-dialog ones, since these are plain
+  # narrative text, not part of that dialog.
+  TUTELAGE_ON_RX = /You feel a heightened understanding of events around you\./.freeze
+  TUTELAGE_OFF_RX = /The feeling of heightened understanding departs, leaving behind a cold hunger for forbidden knowledge that is slow to fade\./.freeze
+
+  def self.observe_tutelage_text(server_string)
+    if server_string =~ TUTELAGE_ON_RX
+      @data[:fashlonae] = true
+      @data[:fashlonae_since] = Time.now
+    elsif server_string =~ TUTELAGE_OFF_RX
+      @data[:fashlonae] = false
+      @data[:fashlonae_since] = nil
+    end
+  end
+
+  # Blocks (with a hard timeout, unlike wait_until) until block returns
+  # true, then makes sure hook_id is torn down either way. Used instead of
+  # wait_until because a scoop hook can otherwise sit registered forever
+  # if its anchor line never shows (e.g. the put command got eaten by
+  # roundtime/a lock).
+  def self.wait_for_capture(hook_id, timeout: 15)
+    deadline = Time.now + timeout
+    until yield || Time.now >= deadline
+      sleep 0.25
+    end
+  ensure
+    DownstreamHook.remove(hook_id) rescue nil
+  end
+
+  # Both scoops below extract fields directly off each recognized line as
+  # it arrives, the same way lumnismon.lic's own scoop procs do, rather
+  # than buffering everything from put until the next <prompt> and
+  # regex-scanning the blob afterward. That blob approach used to swallow
+  # (and lose) any unrelated concurrent traffic -- room events, other
+  # players' actions, anything with its own <prompt> -- landing between
+  # our put and the real response, and a busy moment could make that
+  # unrelated prompt arrive FIRST, ending the capture before our
+  # command's actual response ever printed (silent failure, only ever
+  # working while nothing else was happening). Matching on each field's
+  # own distinct wording instead means capture only starts once we've
+  # actually seen real command output, and anything unrecognized always
+  # passes through untouched rather than getting swallowed on a guess.
+  def self.refresh_experience!
+    done = false
+    filter = false
+    hook_id = "exppanel_capture_experience"
+    DownstreamHook.remove(hook_id) rescue nil
+    DownstreamHook.add(hook_id, proc do |server_string|
+      case server_string
+      when /^\s*Level:\s*(\d+)\s+Fame:/
+        filter = true
+        @data[:level] = Regexp.last_match(1).to_i
+        next(nil)
+      when /^\s*$/
+        next(nil) if filter
+      when /Experience:\s*([\d,]+)\s+Field Exp:\s*([\d,]+)\/([\d,]+)/
+        if filter
+          @data[:experience] = Regexp.last_match(1).delete(',').to_i
+          @data[:field_exp] = Regexp.last_match(2).delete(',').to_i
+          @data[:field_exp_max] = Regexp.last_match(3).delete(',').to_i
+        end
+        next(nil) if filter
+      when /Ascension Exp:\s*([\d,]+)/
+        @data[:ascension_exp] = Regexp.last_match(1).delete(',').to_i if filter
+        next(nil) if filter
+      when /Total Exp:\s*([\d,]+)/
+        @data[:total_exp] = Regexp.last_match(1).delete(',').to_i if filter
+        next(nil) if filter
+      when /Long-Term Exp:\s*([\d,]+)/
+        @data[:long_term_exp] = Regexp.last_match(1).delete(',').to_i if filter
+        next(nil) if filter
+      when /Exp to next TP:\s*([\d,]+)\s+Exp to next ATP:\s*([\d,]+)/
+        if filter
+          @data[:exp_next_tp] = Regexp.last_match(1).delete(',').to_i
+          @data[:exp_next_atp] = Regexp.last_match(2).delete(',').to_i
+        end
+        next(nil) if filter
+      when %r{PTPs/MTPs:\s*(\d+)/(\d+)\s+ATPs:\s*(\d+)}
+        if filter
+          @data[:ptps] = Regexp.last_match(1).to_i
+          @data[:mtps] = Regexp.last_match(2).to_i
+          @data[:atps] = Regexp.last_match(3).to_i
+        end
+        next(nil) if filter
+      when /Your recent adventures echo powerfully in your mind\./
+        @data[:rpa] = true if filter
+        next(nil) if filter
+      when /^<prompt time=/
+        if filter
+          DownstreamHook.remove(hook_id)
+          done = true
+        end
+        next(server_string)
+      else
+        next(server_string)
+      end
+      server_string
+    end)
+    silence_me
+    put "experience"
+    silence_me
+    wait_for_capture(hook_id) { done }
+    record_exp_sample(@data[:field_exp], @data[:ascension_exp], track_pulse: false)
+    record_lifetime_exp_sample!(@data[:experience])
+    @data[:last_updated] = Time.now
+  end
+
+  def self.refresh_lumnis!
+    done = false
+    filter = false
+    lumnis_result = nil
+    hook_id = "exppanel_capture_lumnis"
+    DownstreamHook.remove(hook_id) rescue nil
+    DownstreamHook.add(hook_id, proc do |server_string|
+      case server_string
+      # The tier-in-progress/ready/f2p sentence and the "scheduled to
+      # refresh in..." sentence are one combined server line (same as
+      # lumnismon.lic observes) -- stash the whole thing and split it on
+      # "." afterward rather than trying to match both halves as separate
+      # case branches, since only the first match wins in a case/when.
+      when /It is scheduled to refresh|restart as soon as you absorb experience|Because your account is free,/
+        filter = true
+        lumnis_result = server_string
+        next(nil)
+      when /^\s*$/
+        next(nil) if filter
+      when /Your Gift of Lumnis has expired for this week\./
+        if filter
+          @data[:lumnis_stage] = "Expired this week"
+          @data[:lumnis_stage_num] = nil
+          @data[:lumnis_cycle_active] = false
+        end
+        next(nil) if filter
+      when /You have made ([\d,]+) recent donations to the Temple of Lumnis\./
+        @data[:lumnis_donations] = Regexp.last_match(1) if filter
+        next(nil) if filter
+      when /You have not made any recent donations to the Temple of Lumnis\./
+        @data[:lumnis_donations] = "None" if filter
+        next(nil) if filter
+      when /not presently receiving Fash'lo'nae's Tutelage/
+        @data[:fashlonae] = false if filter
+        next(nil) if filter
+      when /Fash'lo'nae's Tutelage/
+        @data[:fashlonae] = true if filter
+        next(nil) if filter
+      when /^<prompt time=/
+        if filter
+          DownstreamHook.remove(hook_id)
+          done = true
+        end
+        next(server_string)
+      else
+        next(server_string)
+      end
+      server_string
+    end)
+    silence_me
+    put "lumnis info"
+    silence_me
+    wait_for_capture(hook_id) { done }
+    parse_lumnis_result!(lumnis_result) if lumnis_result
+    @data[:last_updated] = Time.now
+  end
+
+  # lumnis_result is the single combined sentence captured above, e.g.
+  # "You have 5,713 points of doubled experience remaining. It is
+  # scheduled to refresh in 5 days, 3 hours, 12 minutes." -- split on "."
+  # the same way lumnismon.lic's parse_result_array does.
+  def self.parse_lumnis_result!(lumnis_result)
+    if lumnis_result =~ /restart as soon as you absorb experience/
+      @data[:lumnis_stage] = "Ready (restarts on next exp)"
+      @data[:lumnis_stage_num] = nil
+      @data[:lumnis_cycle_active] = false
+      @data[:lumnis_reset_at] = Time.now
+      return
+    end
+
+    sentences = lumnis_result.split(".")
+
+    if sentences[0] =~ /([\d,]+)\s+points? of (tripled|doubled|quadrupled|quintupled) experience/
+      pts = Regexp.last_match(1)
+      tier = Regexp.last_match(2)
+      # Stage number goes in the row's LABEL ("Lumnis Stage x2:"), not the
+      # value, so the value can just be the pts count instead of repeating
+      # "Stage 2 (doubled)" and stretching the panel wider than it needs.
+      @data[:lumnis_stage_num] = TIER_STAGE[tier]
+      @data[:lumnis_stage] = "#{pts} pts"
+      @data[:lumnis_cycle_active] = true
+    end
+
+    time_part = sentences[1].to_s
+    days = time_part[/(\d+)\s*days?/, 1].to_i
+    hours = time_part[/(\d+)\s*hours?/, 1].to_i
+    minutes = time_part[/(\d+)\s*minutes?/, 1].to_i
+    total_seconds = (days * 86400) + (hours * 3600) + (minutes * 60)
+    @data[:lumnis_reset_at] = Time.now + total_seconds if total_seconds > 0
+  end
+
+  def self.refresh_all!
+    refresh_experience!
+    refresh_lumnis!
+  end
+
+  # Lich::Resources.check (lib/attributes/resources.rb) is
+  # professionresource_sagapanel.lic's own data source -- same
+  # Lich::Util.issue_command-based "resource" scoop that script already
+  # relies on, so this reuses it directly instead of hand-rolling another
+  # capture. Like refresh_experience!/refresh_lumnis!, issue_command reads
+  # Script.current internally, so this can only ever be called from the
+  # script's own thread (main loop), never from inside the UpstreamHook
+  # proc -- same reasoning as manual_refresh_requested below.
+  def self.refresh_resource!
+    Lich::Resources.check(true)
+    @data[:resource_type] = Lich::Resources.type
+    @data[:resource_weekly] = Lich::Resources.weekly
+    @data[:resource_total] = Lich::Resources.total
+  rescue StandardError
+    nil
+  end
+
+  # refresh_experience!/refresh_lumnis!'s put/silence_me/wait_for_capture
+  # all resolve Script.current off the calling thread's identity, which
+  # only ever resolves correctly
+  # from the script's own thread (its top-level body, or the loop at the
+  # bottom of this file) -- NOT from inside an UpstreamHook proc, which
+  # runs on whatever thread is feeding it upstream commands and has no
+  # script identity of its own ("silence_me: cannot identify calling
+  # script."). So *exp refresh can't call refresh_all! directly from the
+  # hook; it just flips this flag, and the script's own main loop (below)
+  # does the actual refresh on its next tick.
+  @manual_refresh_requested = false
+  # Same reasoning as manual_refresh_requested -- *exp importlogs reads
+  # File I/O only (no Script.current dependency), but scanning hundreds of
+  # log files can take a noticeable moment, and running that inline inside
+  # the UpstreamHook proc would stall processing of any other upstream
+  # commands until it finishes. Queued and run from the main loop instead.
+  @log_import_requested = false
+  # Same reasoning again -- set when *exp resource just turned the feature
+  # on, so the main loop polls Lich::Resources.check immediately instead
+  # of leaving the new rows showing "--" for up to RESOURCE_POLL_SECONDS.
+  @resource_poll_requested = false
+
+  class << self
+    attr_accessor :manual_refresh_requested, :log_import_requested, :resource_poll_requested
+  end
+
+  def self.request_manual_refresh!
+    self.manual_refresh_requested = true
+  end
+
+  def self.request_log_import!
+    self.log_import_requested = true
+  end
+
+  def self.request_resource_poll!
+    self.resource_poll_requested = true
+  end
+end
+
+@exp_settings = ExpPanel.load_settings
+ExpPanel.ignored = @exp_settings["exp"]["ignored"]
+ExpPanel.value_width = @exp_settings["exp"]["value_width"]
+ExpPanel.resource_enabled = @exp_settings["exp"]["resource_enabled"]
+
+ExpPanel.load_history!
+# reset_today_if_new_day! must run first to stamp today_key -- otherwise
+# the next real gain event would see today_key unset, treat it as a new
+# day, and immediately zero back out what restore_today_from_history!
+# just restored.
+ExpPanel.reset_today_if_new_day!(Time.now)
+ExpPanel.restore_today_from_history!
+
+exp_downstream_hook_id = "#{Script.current.name}_downstream"
+DownstreamHook.remove(exp_downstream_hook_id) rescue nil
+DownstreamHook.add(exp_downstream_hook_id, proc do |server_string|
+  ExpPanel.observe_expr_dialog(server_string)
+  ExpPanel.observe_tutelage_text(server_string)
+  server_string
+end)
+
+exp_upstream_hook_id = "#{Script.current.name}_upstream"
+UpstreamHook.remove(exp_upstream_hook_id) rescue nil
+UpstreamHook.add(exp_upstream_hook_id, proc do |command|
+  case command.strip
+  when /\*exp\s+refresh\s*\z/i
+    ExpPanel.request_manual_refresh!
+    respond "Exp Panel: refreshing..."
+    nil
+  when /\*exp\s+importlogs\s*\z/i
+    ExpPanel.request_log_import!
+    respond "Exp Panel: scanning your session logs for historical Exp This Week/Month/Year data..."
+    nil
+  when /\*exp\s+ignore\s+(\S+)\s*\z/i
+    key = Regexp.last_match(1).downcase
+    unless (ExpPanel::ROW_KEYS.map(&:to_s) + ExpPanel::SPACER_KEYS).include?(key)
+      respond "Exp Panel: unknown field '#{key}'"
+      next(nil)
+    end
+    if ExpPanel.add_ignored!(key)
+      _respond(ExpPanel.build_dialog)
+      respond "Exp Panel: hiding '#{key}'"
+    else
+      respond "Exp Panel: already hiding '#{key}'"
+    end
+    nil
+  when /\*exp\s+unignore\s+all\s*\z/i
+    ExpPanel.unignore_all!
+    _respond(ExpPanel.build_dialog)
+    respond "Exp Panel: no longer hiding anything"
+    nil
+  when /\*exp\s+unignore\s+(\S+)\s*\z/i
+    key = Regexp.last_match(1).downcase
+    if ExpPanel.remove_ignored!(key)
+      _respond(ExpPanel.build_dialog)
+      respond "Exp Panel: no longer hiding '#{key}'"
+    else
+      respond "Exp Panel: wasn't hiding '#{key}'"
+    end
+    nil
+  when /\*exp\s+ignored\s*\z/i
+    if ExpPanel.ignored.empty?
+      respond "Exp Panel: nothing hidden"
+    else
+      respond "Exp Panel hidden fields: #{ExpPanel.ignored.sort.join(', ')}"
+    end
+    nil
+  when /\*exp\s+tracked\s*\z/i
+    shown = ExpPanel::ROW_KEYS.map(&:to_s) - ExpPanel.ignored
+    if shown.empty?
+      respond "Exp Panel: nothing shown (everything hidden)"
+    else
+      respond "Exp Panel shown fields: #{shown.join(', ')}"
+    end
+    nil
+  when /\*exp\s+clearrpa\s*\z/i
+    ExpPanel.data[:rpa] = false
+    _respond(ExpPanel.build_dialog)
+    respond "Exp Panel: RPA indicator cleared"
+    nil
+  when /\*exp\s+width\s+(\d+)\s*\z/i
+    width = Regexp.last_match(1).to_i
+    if ExpPanel.set_value_width!(width)
+      _respond(ExpPanel.build_dialog)
+      respond "Exp Panel: value column width set to #{width} (mirrors *tm width in timers_sagapanel.lic -- enter the same number there for a matching look)"
+    else
+      respond "Exp Panel: width must be a positive number"
+    end
+    nil
+  when /\*exp\s+resource\s*\z/i
+    enabled = ExpPanel.set_resource_enabled!(!ExpPanel.resource_enabled)
+    _respond(ExpPanel.build_dialog)
+    if enabled
+      ExpPanel.request_resource_poll!
+      respond "Exp Panel: profession resource display on -- polling..."
+    else
+      respond "Exp Panel: profession resource display off"
+    end
+    nil
+  else
+    command
+  end
+end)
+
+_respond("<closeDialog id='ExpPanel'/><openDialog type='dynamic' id='ExpPanel' title='Experience' target='ExpPanel' scroll='manual' location='main' resident='true'><dialogData id='ExpPanel'></dialogData></openDialog>")
+ExpPanel.refresh_all!
+_respond(ExpPanel.build_dialog)
+
+before_dying do
+  ExpPanel.save_history!
+  UpstreamHook.remove(exp_upstream_hook_id) rescue nil
+  DownstreamHook.remove(exp_downstream_hook_id) rescue nil
+  _respond("<closeDialog id='ExpPanel'/>")
+end
+
+echo "Exp Panel is active."
+
+@exp_last_snapshot = ExpPanel.snapshot
+@exp_last_refresh_at = Time.now
+@exp_last_active_poll_at = Time.now
+@exp_last_history_save_at = Time.now
+@exp_last_resource_poll_at = Time.at(0)
+
+loop do
+  if ExpPanel.manual_refresh_requested
+    ExpPanel.manual_refresh_requested = false
+    ExpPanel.refresh_all!
+    @exp_last_active_poll_at = Time.now
+    _respond(ExpPanel.build_dialog)
+    respond "Exp Panel: refreshed"
+  elsif (Time.now - @exp_last_active_poll_at) > (20 * 60)
+    ExpPanel.refresh_all!
+    @exp_last_active_poll_at = Time.now
+  end
+
+  if ExpPanel.resource_enabled &&
+     (ExpPanel.resource_poll_requested || (Time.now - @exp_last_resource_poll_at) > ExpPanel::RESOURCE_POLL_SECONDS)
+    ExpPanel.resource_poll_requested = false
+    ExpPanel.refresh_resource!
+    @exp_last_resource_poll_at = Time.now
+  end
+
+  if ExpPanel.log_import_requested
+    ExpPanel.log_import_requested = false
+    result = ExpPanel.import_history_from_logs!
+    ExpPanel.save_history!
+    _respond(ExpPanel.build_dialog)
+    if result[:imported].zero?
+      respond "Exp Panel: no new/changed log files to import (#{result[:total]} already up to date)"
+    else
+      respond "Exp Panel: imported #{result[:imported]} of #{result[:total]} log file(s), " \
+              "added #{result[:gained].with_commas} exp to history"
+    end
+  end
+
+  # Throttled -- record_exp_sample can flag history dirty on nearly every
+  # pulse, and save_history! itself no-ops when nothing changed, so this
+  # just caps how often that write actually hits disk.
+  if (Time.now - @exp_last_history_save_at) > 60
+    ExpPanel.save_history!
+    @exp_last_history_save_at = Time.now
+  end
+
+  snapshot = ExpPanel.snapshot
+  if snapshot != @exp_last_snapshot || (Time.now - @exp_last_refresh_at) > 30.0
+    @exp_last_snapshot = snapshot
+    @exp_last_refresh_at = Time.now
+    _respond(ExpPanel.build_dialog)
+  end
+  sleep 1
+end
