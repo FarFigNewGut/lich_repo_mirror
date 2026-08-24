@@ -15,9 +15,16 @@
   Section headers and spacer rows only render when the preceding section has
   visible content. Both rows can be hidden with *exp ignore.
 
-  Live values come from the native experience dialog. Field Exp deltas feed
-  daily pace, pulse, hourly, and ETA calculations; decreases are ignored.
-  Daily counters reset at 5 AM, and ETAs remain "--" until a gain is measured.
+  Live values come from the native experience dialog. Daily pace/pulse/
+  hourly/ETA calculations are driven by XMLData.next_level_text (a Lich-
+  core global, same source uberbar_eo.lic uses), NOT Field Exp -- Field
+  Exp isn't reliably pushed for instant-absorb exp sources (a quintuple
+  brooch, turning in a guild bounty), so tracking pulses off it silently
+  missed those gains. The reading-to-reading diff is taken directly
+  (abs value, uberbar_eo.lic's own approach), sanity-clamped only against
+  CAPPED_CYCLE_MAX_GAIN (2499, a TP's fixed cost) once capped -- never
+  against a per-character maximum. Daily counters reset at 5 AM, and ETAs
+  remain "--" until a gain is measured.
 
   Experience and Lumnis fields that are not pushed passively are refreshed
   every 20 minutes or with *exp refresh. Recognized command lines are parsed
@@ -72,7 +79,18 @@
 
   Tags: saga, frontend, exp, lumnis, panel, efficiency, resource
   Author: Claude Code, RuseofFools
-  Version: 1.13.2
+  Version: 1.14.0
+  Recently changed:
+    1.14.0 - Fixed pulse/daily-pace tracking silently missing
+             instant-absorb exp (quintuple brooch, guild bounty
+             turn-ins): switched the source from Field Exp to
+             XMLData.next_level_text, the same Lich-core global
+             uberbar_eo.lic uses, since Field Exp's own tag isn't
+             reliably pushed for those. Also dropped the old
+             per-character field_exp_max sanity clamp in favor of a
+             fixed 2499 (CAPPED_CYCLE_MAX_GAIN) ceiling tied to a TP's
+             actual cost, matching uberbar_eo.lic exactly rather than
+             comparing against a value that varies per character.
 =end
 
 no_kill_all
@@ -634,40 +652,77 @@ module ExpPanel
     hours > 0 ? "~#{hours}h #{minutes}m" : "~#{minutes}m"
   end
 
-  # Diff-based pulse/today/session tracking off the shared prev_field_exp/
-  # prev_asc state -- called both from the passive expr-dialog observer
-  # (fine-grained, real per-pulse deltas) and from the active *exp refresh
-  # poll (coarse, but harmless since it diffs off whatever prev_field_exp
-  # already is rather than accumulating independently -- if the passive
-  # hook kept up, the active poll's delta is just ~0). track_pulse is
-  # false for the active-poll call site so a 20-minute gap between polls
-  # never gets misattributed as a single pulse for Exp/Pulse or Best Pulse.
+  # Whatever a TP costs -- the fixed width of one training-point cycle,
+  # not a per-character value. uberbar_eo.lic hardcodes this same 2499
+  # (calculate_experience_values/check_experience_changes) as a sanity
+  # ceiling on a single reading-to-reading gain once capped.
+  CAPPED_CYCLE_MAX_GAIN = 2499
+
+  def self.character_capped?
+    return false unless defined?(Lich::Gemstone::Stats)
+
+    Lich::Gemstone::Stats.level.to_i >= 100
+  rescue StandardError
+    false
+  end
+
+  # XMLData.next_level_text/next_level_value are Lich-core globals, kept
+  # live by Lich's own XML parser off the native <progressBar
+  # id='nextLvlPB'> tag (part of the same <dialogData id='expr'> widget
+  # Field Exp/Ascension Exp come from) -- no hook of ours needed, just
+  # read it fresh whenever record_exp_sample runs. This is
+  # uberbar_eo.lic's own pulse source (calculate_experience_values), used
+  # here instead of Field Exp for the exact reason the user flagged: an
+  # instant-absorb exp source (a quintuple brooch, turning in a guild
+  # bounty) grants exp immediately rather than through the normal
+  # gradual Field Exp fill, and Field Exp's own progressBar tag isn't
+  # reliably pushed for those -- next_level_text is, since Lich's core
+  # parser already depends on catching every change to it (see the
+  # Gift.pulse hook in lib/common/xmlparser.rb, fired on every text
+  # change). Once capped, this value is documented by uberbar_eo.lic to
+  # cycle every 2500 points (one TP); calculate_experience_values reads
+  # it as "N experience" either way, capped or not.
+  def self.xp_progress_value
+    text = XMLData.next_level_text.to_s
+    return nil unless text =~ /( experience| until next level)/
+
+    text.delete(' experience').delete(' until next level').to_i
+  end
+
+  # Diff-based pulse/today/session tracking off the shared
+  # prev_xp_progress/prev_asc state -- called both from the passive
+  # expr-dialog observer (fine-grained, real per-pulse deltas) and from
+  # the active *exp refresh poll (coarse, but harmless since it diffs off
+  # whatever prev_xp_progress already is rather than accumulating
+  # independently -- if the passive hook kept up, the active poll's delta
+  # is just ~0). track_pulse is false for the active-poll call site so a
+  # 20-minute gap between polls never gets misattributed as a single
+  # pulse for Exp/Pulse or Best Pulse.
   #
-  # Driven off Field Exp, NOT the lifetime "Experience"/exp attribute --
-  # same reason uberbar_eo.lic's own pulse tracking is driven off the
-  # rotating TP-cycle counter in XMLData.next_level_text rather than a
-  # lifetime total, and explicitly branches on `capped` (Stats.level ==
-  # 100) to do it. At level 100 the lifetime Experience counter only jumps
-  # in lump sums whenever a TP actually converts, and can sit frozen for a
-  # long stretch in between -- Field Exp is what actually ticks nearly
-  # every pulse regardless of level, so it's the correct always-live
-  # signal. Field Exp also drains back down on its own over time as it
-  # gets absorbed into your permanent pool (not just wrapping at its max),
-  # so a DECREASE is normal and expected, not a "wrapped, reconstruct the
-  # gain" case -- same as the exact skip-on-decrease behavior below.
-  def self.record_exp_sample(new_field_exp, new_asc, track_pulse:)
+  # Per the user: this diffs the CURRENT reading against the PREVIOUS
+  # reading directly (uberbar_eo.lic's own "old - current, abs, clamp"
+  # approach) -- it does NOT compare against any maximum-capacity value
+  # the way the earlier Field-Exp-based version of this method did
+  # (field_gain rejected if bigger than field_exp_max). That per-character
+  # "maximum" comparison was the wrong idea; the only sanity check that
+  # belongs here is CAPPED_CYCLE_MAX_GAIN, a fixed width tied to the game
+  # mechanic itself (a TP costs 2500), not anything that varies per
+  # character or drifts over time.
+  def self.record_exp_sample(new_asc, track_pulse:)
     now = Time.now
     reset_today_if_new_day!(now)
 
-    old_field_exp = @data[:prev_field_exp]
+    current_xp = xp_progress_value
+    old_xp = @data[:prev_xp_progress]
     old_asc = @data[:prev_asc]
 
-    field_gain = (new_field_exp && old_field_exp && new_field_exp > old_field_exp) ? (new_field_exp - old_field_exp) : 0
-    # Same bounded-meter sanity clamp as import_one_log_file -- Field Exp
-    # can't legitimately jump by more than its own current max in one
-    # tick, unlike Ascension Exp (no clamp below), which just grows.
-    field_max = @data[:field_exp_max]
-    field_gain = 0 if field_max && field_gain > field_max
+    field_gain = 0
+    if current_xp && old_xp
+      diff = old_xp - current_xp
+      diff = -diff if diff.negative?
+      diff = 0 if character_capped? && diff > CAPPED_CYCLE_MAX_GAIN
+      field_gain = diff
+    end
     asc_gain = (new_asc && old_asc && new_asc > old_asc) ? (new_asc - old_asc) : 0
 
     if field_gain > 0
@@ -689,7 +744,7 @@ module ExpPanel
       end
     end
 
-    @data[:prev_field_exp] = new_field_exp if new_field_exp
+    @data[:prev_xp_progress] = current_xp if current_xp
     @data[:prev_asc] = new_asc if new_asc
 
     trim_history!
@@ -880,7 +935,7 @@ module ExpPanel
     if server_string =~ /until_next=['"](\d+)['"]/
       @data[:exp_next_tp] = Regexp.last_match(1).to_i
     end
-    record_exp_sample(@data[:field_exp], @data[:ascension_exp], track_pulse: true)
+    record_exp_sample(@data[:ascension_exp], track_pulse: true)
     record_lifetime_exp_sample!(@data[:experience])
     @data[:last_updated] = Time.now
   end
@@ -990,7 +1045,7 @@ module ExpPanel
     put "experience"
     silence_me
     wait_for_capture(hook_id) { done }
-    record_exp_sample(@data[:field_exp], @data[:ascension_exp], track_pulse: false)
+    record_exp_sample(@data[:ascension_exp], track_pulse: false)
     record_lifetime_exp_sample!(@data[:experience])
     @data[:last_updated] = Time.now
   end
