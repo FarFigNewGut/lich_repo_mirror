@@ -33,6 +33,8 @@
     *pwcombat                    - Toggle AS/CS/SMR/SSR line filtering
     *pwclaim                     - Hide/show claim status
     *pwgtk                       - Enable GTK window
+    *pwgroup                     - Hide/show the group display
+    *pwheaders                   - Hide/show the PCs/Players header
     *filterspam                  - Toggle spam filtering
     *filteranimals               - Toggle animal filtering
     *pwdebug                     - Toggle filter-debug logging (echoes why a line was/wasn't filtered)
@@ -47,9 +49,23 @@
                                     order, so the window stays responsive between them
 
   Author: Phocosoen, ChatGPT
-  Tags: wrayth, frontend, mod, window, players, spam, filter, group, avalon, wizard, gtk3
-  Version: 2.3.0
+  Tags: wrayth, saga, frontend, mod, window, players, spam, filter, group, avalon, wizard, gtk3
+  Version: 2.4.0
   Recently changed:
+    v2.4.0 (2026-08-25) - Added *pwgroup and *pwheaders to toggle the group
+            display and PCs/Players header, both enabled by default.
+    2.3.1 - Fixed the GTK window's font-size A-/A+ buttons and the
+            GTK-unavailable startup fallback silently clobbering any
+            OTHER script's writes to the shared lichwindows.yaml: both
+            saved a `settings`/`window_settings` hash loaded once (at
+            window-open or script-start time) rather than re-reading the
+            file fresh first, so clicking A-/A+ any time after another
+            script had written a newer change would silently erase it
+            from disk -- confirmed as the real cause of a user-reported
+            "my exp_sagapanel change didn't save" report. Both sites now
+            go through update_player_setting (already mutex-guarded and
+            already fresh-reloads before saving), same as every other
+            safe setter in this file.
     - Added "*pwprofession <profs...>" (e.g. "*pwprofession warrior
       cleric"), which narrows the icon display to just the listed
       professions regardless of what's been *pwparse'd -- everyone else
@@ -113,10 +129,12 @@ module PlayerWindow
                   :show_movement,
                   :debug_filter_enabled,
                   :flare_patterns,
-                  :hidden_player_detected,
-                  :group_dirty,
-                  :group_display,
-                  :saga_status_mode,
+                   :hidden_player_detected,
+                   :group_dirty,
+                   :group_display,
+                   :show_group_display,
+                   :show_headers,
+                   :saga_status_mode,
                   :show_profession_icons,
                   :profession_display_filter,
                   :profession_map,
@@ -147,7 +165,9 @@ module PlayerWindow
       "palette"              => "White on Black",
       "saga_status_mode"     => "unicode",
       "show_profession_icons" => false,
-      "profession_display_filter" => nil
+      "profession_display_filter" => nil,
+      "show_group_display"   => true,
+      "show_headers"         => true
     },
   }.freeze
 
@@ -416,6 +436,8 @@ PlayerWindow.single_column = (PlayerWindow.columns == 1)
 PlayerWindow.show_filter_buttons = player_window_settings.fetch("show_filter_buttons", true)
 PlayerWindow.show_claim_status   = player_window_settings.fetch("show_claim_status", true)
 PlayerWindow.show_movement       = player_window_settings.fetch("show_movement", true)
+PlayerWindow.show_group_display  = player_window_settings.fetch("show_group_display", true)
+PlayerWindow.show_headers        = player_window_settings.fetch("show_headers", true)
 PlayerWindow.saga_status_mode    = player_window_settings.fetch("saga_status_mode", "unicode")
 PlayerWindow.saga_status_mode    = "unicode" unless PlayerWindow::SAGA_STATUS_MODES.include?(PlayerWindow.saga_status_mode)
 PlayerWindow.show_profession_icons = player_window_settings.fetch("show_profession_icons", false)
@@ -641,12 +663,12 @@ class PlayerWindowGtk
     end
     dec_btn.signal_connect("clicked") do
       @font_size = [@font_size - 1, 8].max
-      pw["font_size"] = @font_size; PlayerWindow.save_window_settings(settings)
+      PlayerWindow.update_player_setting("font_size", @font_size)
       reload_css
     end
     inc_btn.signal_connect("clicked") do
       @font_size = [@font_size + 1, 30].min
-      pw["font_size"] = @font_size; PlayerWindow.save_window_settings(settings)
+      PlayerWindow.update_player_setting("font_size", @font_size)
       reload_css
     end
 
@@ -774,7 +796,7 @@ class PlayerWindowGtk
     return unless @window
     Gtk.queue do
       # update lone group label
-      if group_display
+      if PlayerWindow.show_group_display && group_display
         @group_label.set_text(group_display)
         @group_label.show
       else
@@ -784,12 +806,14 @@ class PlayerWindowGtk
       # rebuild FlowBox of players
       @flow.max_children_per_line = [PlayerWindow.columns, 1].max
       @flow.children.each { |c| @flow.remove(c) }
-      player_count = pcs.size + (PlayerWindow.hidden_player_detected ? 1 : 0)
-      count_lbl = Gtk::Label.new("Players: #{player_count}#{PlayerWindow.claim_status_text}")
-      count_lbl.set_xalign(0)
-      @flow.add(count_lbl)
-      # Pad the header row with blank cells so it spans all columns.
-      ([PlayerWindow.columns, 1].max - 1).times { @flow.add(Gtk::Label.new("")) }
+      if PlayerWindow.show_headers
+        player_count = pcs.size + (PlayerWindow.hidden_player_detected ? 1 : 0)
+        count_lbl = Gtk::Label.new("Players: #{player_count}#{PlayerWindow.claim_status_text}")
+        count_lbl.set_xalign(0)
+        @flow.add(count_lbl)
+        # Pad the header row with blank cells so it spans all columns.
+        ([PlayerWindow.columns, 1].max - 1).times { @flow.add(Gtk::Label.new("")) }
+      end
 
       if PlayerWindow.hidden_player_detected
         row = Gtk::Box.new(:horizontal, 4)
@@ -845,9 +869,7 @@ if @pw_startup_request_gtk
     Thread.new { PlayerWindow.start_gtk_main_if_needed }
   else
     PlayerWindow.use_gtk_playerwindow = false
-    window_settings["playerwindow"] ||= {}
-    window_settings["playerwindow"]["use_gtk_playerwindow"] = false
-    PlayerWindow.save_window_settings(window_settings)
+    PlayerWindow.update_player_setting("use_gtk_playerwindow", false)
     respond ""
     respond " GTK Playerwindow disabled: gtk3 gem not available."
     respond ""
@@ -1141,6 +1163,7 @@ end
 # Build and push the player list to the window, sorting by noun with dead players on top and arranged in two columns
 def PlayerWindow.push_players_to_window(pcs, group_display = nil)
   group_display ||= PlayerWindow.group_display
+  group_display = nil unless PlayerWindow.show_group_display
   sorted_pcs = pcs.sort_by do |pc|
     status = pc.respond_to?(:status) ? PlayerWindow.player_status_fix(pc.status) : nil
     is_dead = status == "dead" ? 0 : 1
@@ -1170,7 +1193,6 @@ def PlayerWindow.push_players_to_window(pcs, group_display = nil)
     end
   end
 
-  group_display ||= PlayerWindow.group_display
   if group_display
     group_width = [cols * col_width, PlayerWindow::PLAYER_HEADER_WIDTH].min
     chars_per_row = [(group_width / 7), 1].max
@@ -1180,15 +1202,17 @@ def PlayerWindow.push_players_to_window(pcs, group_display = nil)
     current_top += group_height
   end
 
-  # Second row: PCs label
-  player_count = sorted_pcs.size + (PlayerWindow.hidden_player_detected ? 1 : 0)
-  total_value = "PCs: #{player_count}#{PlayerWindow.claim_status_text}"
-  total_width = [cols * col_width, PlayerWindow::PLAYER_HEADER_WIDTH].min
-  total_chars_per_row = [(total_width / 7), 1].max
-  total_rows = [(total_value.length.to_f / total_chars_per_row).ceil, 1].max
-  total_height = total_rows * row_height
-  output += "<label id='total' value='#{total_value}' justify='bottom' left='0' top='#{current_top}' width='#{total_width}' height='#{total_height}' wrap='true'/>"
-  current_top += total_height
+  if PlayerWindow.show_headers
+    # Second row: PCs label
+    player_count = sorted_pcs.size + (PlayerWindow.hidden_player_detected ? 1 : 0)
+    total_value = "PCs: #{player_count}#{PlayerWindow.claim_status_text}"
+    total_width = [cols * col_width, PlayerWindow::PLAYER_HEADER_WIDTH].min
+    total_chars_per_row = [(total_width / 7), 1].max
+    total_rows = [(total_value.length.to_f / total_chars_per_row).ceil, 1].max
+    total_height = total_rows * row_height
+    output += "<label id='total' value='#{total_value}' justify='bottom' left='0' top='#{current_top}' width='#{total_width}' height='#{total_height}' wrap='true'/>"
+    current_top += total_height
+  end
   # Player rows in a cols-wide grid
   top_offset = current_top / row_height
   player_rows = []
@@ -1463,6 +1487,26 @@ upstream_proc = proc do |command|
       end
     end
 
+    nil
+
+  when /\*pwgroup\b/i
+    PlayerWindow.show_group_display = !PlayerWindow.show_group_display
+    PlayerWindow.update_player_setting("show_group_display", PlayerWindow.show_group_display)
+    respond "Playerwindow group display: #{PlayerWindow.show_group_display ? 'SHOWN' : 'HIDDEN'}"
+
+    pcs = GameObj.pcs.reject { |pc| pc.name == Char.name }
+    PlayerWindow.push_players_to_window(pcs)
+    PlayerWindowGtk.update_players(pcs, PlayerWindow.group_display) if defined?(PlayerWindowGtk)
+    nil
+
+  when /\*pwheaders\b/i
+    PlayerWindow.show_headers = !PlayerWindow.show_headers
+    PlayerWindow.update_player_setting("show_headers", PlayerWindow.show_headers)
+    respond "Playerwindow PCs/Players header: #{PlayerWindow.show_headers ? 'SHOWN' : 'HIDDEN'}"
+
+    pcs = GameObj.pcs.reject { |pc| pc.name == Char.name }
+    PlayerWindow.push_players_to_window(pcs)
+    PlayerWindowGtk.update_players(pcs, PlayerWindow.group_display) if defined?(PlayerWindowGtk)
     nil
 
   when /\*pwdebug/i
