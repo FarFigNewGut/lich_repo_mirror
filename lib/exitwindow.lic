@@ -11,6 +11,7 @@
   - Supports ;go2 navigation for Lich exits.
   - Displays trash containers.
   - Displays Lich ID and room UID.
+  - Makes the Lich room ID and room UID clickable for clipboard copying.
 
   References:
     Wrayth FE Window: https://discordapp.com/channels/226045346399256576/1339018254517145681
@@ -24,12 +25,30 @@
     *ewcol                       - Toggle single/double column layout
     *ewcol3                      - Use a 3-column layout
     *ewcol4                      - Use a 4-column layout
+    *ewcopy <lich|u> <number>    - Copy a room number to the clipboard
     *ewheader                    - Hide/show Exits and Lich Exits headers
 
   Author: Phocosoen, ChatGPT
-  Tags: wrayth, frontend, mod, window, paths, navigation, wizard, avalon
-  Version: 1.2.0
-  Recently changed: Added configurable multi-column layout (1-4) matching creaturewindow/playerwindow, and Saga support.
+  Tags: wrayth, saga, frontend, mod, window, paths, navigation, wizard, avalon
+  Version: 1.3
+  Recently changed:
+  v1.3 (2026-08-26)
+    - Made the Lich room ID and room UID clickable in both Wrayth and GTK
+      windows so their numbers can be copied to the clipboard.
+    - Added a native Windows clipboard path so clicks update the system
+      clipboard even when optional clipboard gems are not installed.
+  1.2.1 - Fixed the GTK window's font-size A-/A+ buttons, the dark/light
+  switch, and the *ewgtk command all silently clobbering any OTHER
+  script's writes to the shared lichwindows.yaml -- all three saved a
+  cached settings hash instead of re-reading the file fresh first.
+  *ewgtk was the worst of the three: it saved ExitWindow.settings, a
+  class-level hash loaded once at script STARTUP, so it stayed stale for
+  the entire session, not just since the window was opened. Confirmed
+  as the real cause of a user-reported "my exp_sagapanel change didn't
+  save" report. All three now go through update_setting (already
+  fresh-reloads before saving), same as every other safe setter in this
+  file.
+  1.2.0 - Added configurable multi-column layout (1-4) matching creaturewindow/playerwindow, and Saga support.
 =end
 
 no_kill_all
@@ -47,19 +66,25 @@ end
 
 # Saga dynamic-dialog layout controls.  Adjust these values when changing the
 # panel font or when longer Lich exit labels need more room.
-# Keep the default dialog width compact to avoid horizontal scrolling.
-ExitWindow::EXIT_DIALOG_WIDTH = 260 unless defined?(ExitWindow::EXIT_DIALOG_WIDTH)
-# Bounded width for the Lich exit column. "natural" (nil) FE sizing lets a
-# long ;go2 command push past EXIT_DIALOG_WIDTH with no wrapping (nbsp'd
-# spaces block wrapping outright), which is what forces the horizontal
+#
+# No fixed width/height on the openDialog itself (see the _respond call
+# below) -- Saga sizes the dialog to its content naturally the same way
+# effectsbar_sagapanel.lic/playerwindow.lic/creaturewindow.lic do. A fixed
+# height forces a scrollbar the moment a room has more exits than fit in it;
+# a fixed width does the same horizontally once Lich exit labels overflow it.
+#
+# Bounded width for the Lich exit column specifically. "natural" (nil) FE
+# sizing lets a long ;go2 command push past this with no wrapping (nbsp'd
+# spaces block wrapping outright), which is what forces a horizontal
 # scrollbar at small panel widths. Keep this a concrete number so labels get
 # truncated (see LICH_EXIT_CHAR_WIDTH) instead of overflowing.
-ExitWindow::LICH_EXIT_COLUMN_WIDTH = 140 unless defined?(ExitWindow::LICH_EXIT_COLUMN_WIDTH)
+ExitWindow::LICH_EXIT_COLUMN_WIDTH = 130 unless defined?(ExitWindow::LICH_EXIT_COLUMN_WIDTH)
 # Rough px-per-character used to truncate Lich exit labels to fit within
 # LICH_EXIT_COLUMN_WIDTH. The full command still runs on click; only the
 # displayed label is shortened.
 ExitWindow::LICH_EXIT_CHAR_WIDTH = 6 unless defined?(ExitWindow::LICH_EXIT_CHAR_WIDTH)
 ExitWindow::EXIT_LINK_HEIGHT = 20 unless defined?(ExitWindow::EXIT_LINK_HEIGHT)
+ExitWindow::ROOM_INFO_COLUMN_WIDTH = 110 unless defined?(ExitWindow::ROOM_INFO_COLUMN_WIDTH)
 
 EW_DEFAULT_WINDOW_SETTINGS = {
   "exitwindow" => {
@@ -119,6 +144,144 @@ def ExitWindow.update_setting(key, value)
   ExitWindow.save_window_settings(settings)
 end
 
+def ExitWindow.copy_to_windows_clipboard(text)
+  return false unless Gem.win_platform?
+
+  require 'fiddle'
+
+  user32 = Fiddle.dlopen('user32.dll')
+  kernel32 = Fiddle.dlopen('kernel32.dll')
+  open_clipboard = Fiddle::Function.new(
+    user32['OpenClipboard'],
+    [Fiddle::TYPE_VOIDP],
+    Fiddle::TYPE_INT
+  )
+  close_clipboard = Fiddle::Function.new(
+    user32['CloseClipboard'],
+    [],
+    Fiddle::TYPE_INT
+  )
+  empty_clipboard = Fiddle::Function.new(
+    user32['EmptyClipboard'],
+    [],
+    Fiddle::TYPE_INT
+  )
+  set_clipboard_data = Fiddle::Function.new(
+    user32['SetClipboardData'],
+    [Fiddle::TYPE_UINT, Fiddle::TYPE_VOIDP],
+    Fiddle::TYPE_VOIDP
+  )
+  global_alloc = Fiddle::Function.new(
+    kernel32['GlobalAlloc'],
+    [Fiddle::TYPE_UINT, Fiddle::TYPE_SIZE_T],
+    Fiddle::TYPE_VOIDP
+  )
+  global_free = Fiddle::Function.new(
+    kernel32['GlobalFree'],
+    [Fiddle::TYPE_VOIDP],
+    Fiddle::TYPE_VOIDP
+  )
+  global_lock = Fiddle::Function.new(
+    kernel32['GlobalLock'],
+    [Fiddle::TYPE_VOIDP],
+    Fiddle::TYPE_VOIDP
+  )
+  global_unlock = Fiddle::Function.new(
+    kernel32['GlobalUnlock'],
+    [Fiddle::TYPE_VOIDP],
+    Fiddle::TYPE_INT
+  )
+
+  opened = 5.times.any? do
+    break true if open_clipboard.call(0) != 0
+
+    sleep 0.02
+    false
+  end
+  return false unless opened
+
+  handle = nil
+  transferred = false
+  begin
+    return false if empty_clipboard.call.zero?
+
+    utf16_text = text.to_s.encode('UTF-16LE') + "\x00\x00"
+    handle = global_alloc.call(0x0042, utf16_text.bytesize)
+    return false if handle.to_i.zero?
+
+    locked = global_lock.call(handle)
+    return false if locked.to_i.zero?
+
+    begin
+      Fiddle::Pointer.new(locked.to_i)[0, utf16_text.bytesize] = utf16_text
+    ensure
+      global_unlock.call(handle)
+    end
+
+    transferred = !set_clipboard_data.call(13, handle).to_i.zero?
+    transferred
+  ensure
+    global_free.call(handle) if handle && !transferred
+    close_clipboard.call
+  end
+rescue StandardError
+  false
+end
+
+def ExitWindow.copy_to_clipboard(text)
+  return true if ExitWindow.copy_to_windows_clipboard(text)
+
+  begin
+    require 'copy_to_clipboard'
+    if defined?(CopyToClipboard)
+      CopyToClipboard.copy(text.to_s)
+      return true
+    end
+  rescue LoadError
+    # Try the next available clipboard implementation.
+  rescue StandardError
+    # Try the next available clipboard implementation.
+  end
+
+  begin
+    require 'win32/clipboard'
+    Win32::Clipboard.set_data(text.to_s)
+    return true
+  rescue LoadError
+    # Try the native Windows clipboard command below.
+  rescue StandardError
+    # Try the native Windows clipboard command below.
+  end
+
+  begin
+    IO.popen('clip', 'w') { |io| io.write(text.to_s) }
+    $?.success?
+  rescue StandardError
+    false
+  end
+end
+
+def ExitWindow.room_info
+  [
+    { id: 'room_info', label: 'L#', type: 'lich', value: Room.current.id.to_s },
+    { id: 'room_info_uid', label: 'U#', type: 'u', value: Room.current.uid.to_s.gsub(/[\[\]]/, '') },
+  ]
+end
+
+def ExitWindow.copy_current_room_number(type)
+  info = room_info.find { |entry| entry[:type] == type.to_s }
+  return false unless info
+
+  clipboard_value = info[:type] == 'u' ? "u#{info[:value]}" : info[:value]
+  copied = copy_to_clipboard(clipboard_value)
+  if copied
+    echo "ExitWindow: #{info[:label]} #{info[:value]} copied as #{clipboard_value}."
+  else
+    echo "ExitWindow: unable to copy #{info[:label]} #{info[:value]} to clipboard."
+  end
+  copied
+end
+
 # Set the column count (1-4), persist it, and refresh both the dialog panel
 # and the GTK window. Returns the applied count.
 def ExitWindow.apply_column_setting(n)
@@ -173,7 +336,7 @@ end
 if Frontend.supports_room_window?
 # Open the room info window using Wrayth's dynamic dialog.  The compass
 # occupies the first 3 columns; leave enough room for full Lich exit labels.
-_respond("<closeDialog id='Exits'/><openDialog type='dynamic' id='Exits' title='Exits' target='Exits' resident='true' ><dialogData id='Exits'></dialogData></openDialog>")
+_respond("<closeDialog id='Exits'/><openDialog type='dynamic' id='Exits' title='Exits' target='Exits' location='main' resident='true'><dialogData id='Exits'></dialogData></openDialog>")
 end
 
 @ew_last_room_id = nil
@@ -284,23 +447,23 @@ end
 
 # Push exit and trash container data to the ExitWindow
 def ExitWindow.push_room_info_to_window(standard_exits, lich_exits, trash_containers)
-  output = "<dialogData id='Exits' clear='t' wrap='true'>"
+  output = "<dialogData id='Exits' clear='t'>"
 
   cols = [ExitWindow.columns, 1].max
   col_width = 60
+  room_info_col_width = ExitWindow::ROOM_INFO_COLUMN_WIDTH
   link_height = ExitWindow::EXIT_LINK_HEIGHT
   header_height = ExitWindow.show_headers ? 18 : 0
   section_gap = 18
+  compass_col_width = 34
 
-  room_info = [
-    ["room_info", "L#: #{Room.current.id}"],
-    ["room_info_uid", "U#: #{Room.current.uid.to_s.gsub(/\[|\]/, '')}"],
-  ]
-
-  room_info.each_with_index do |(id, value), index|
+  room_info = ExitWindow.room_info
+  room_info.each_with_index do |info, index|
     col = index % cols
     row = index / cols
-    output += "<label id='#{id}' value='#{value}' left='#{col * col_width}' top='#{row * link_height}' />"
+    value = "#{info[:label]}: #{info[:value]}"
+    cmd = ";e ExitWindow.copy_current_room_number(:#{info[:type]})"
+    output += "<link id='#{info[:id]}' value='#{value}' cmd='#{cmd}' echo='Copying #{value} to clipboard...' justify='left' left='#{col * room_info_col_width}' top='#{row * link_height}' width='#{room_info_col_width}' height='#{link_height}' font='normal' />"
   end
 
   room_info_height = link_height * (room_info.size.to_f / cols).ceil
@@ -308,11 +471,10 @@ def ExitWindow.push_room_info_to_window(standard_exits, lich_exits, trash_contai
   # Standard exits block: compass exits use a fixed 3-column rose.
   standard_exits_header_top = room_info_height # no gap: right after Lid#/Uid#
   if ExitWindow.show_headers
-    output += "<label id='total' value='Exits: #{standard_exits.size}' left='0' top='#{standard_exits_header_top}' />"
+    output += "<label id='total' value='Exits: #{standard_exits.size}' left='0' top='#{standard_exits_header_top}' width='#{compass_col_width * 3}' height='#{header_height}' />"
   end
 
   compass_map = ExitWindow.compass_exit_map(standard_exits)
-  compass_col_width = 34
   lich_col_left = (compass_col_width * 3) + 10
   lich_col_width = ExitWindow::LICH_EXIT_COLUMN_WIDTH
   lich_width_attribute = lich_col_width.to_i > 0 ? " width='#{lich_col_width}'" : ''
@@ -322,7 +484,7 @@ def ExitWindow.push_room_info_to_window(standard_exits, lich_exits, trash_contai
     row_values.each_with_index do |short, col|
       next unless short && (exit = compass_map[short])
 
-      output += "<link id='room_exit_#{short}' value='#{short}' cmd='#{ExitWindow.exit_command(exit)}' echo='#{ExitWindow.exit_command(exit)}' left='#{col * compass_col_width}' top='#{compass_base_top + (link_height * row)}' />"
+      output += "<link id='room_exit_#{short}' value='#{short}' cmd='#{ExitWindow.exit_command(exit)}' echo='#{ExitWindow.exit_command(exit)}' left='#{col * compass_col_width}' top='#{compass_base_top + (link_height * row)}' width='#{compass_col_width}' height='#{link_height}' />"
     end
   end
 
@@ -343,7 +505,7 @@ def ExitWindow.push_room_info_to_window(standard_exits, lich_exits, trash_contai
     col = index % cols
     row = index / cols
     exit_top = non_compass_base_top + (link_height * row)
-    output += "<link id='room_exit_extra_#{index}' value='#{exit}' cmd='#{ExitWindow.exit_command(exit)}' echo='#{ExitWindow.exit_command(exit)}' left='#{col * col_width}' top='#{exit_top}' />"
+    output += "<link id='room_exit_extra_#{index}' value='#{exit}' cmd='#{ExitWindow.exit_command(exit)}' echo='#{ExitWindow.exit_command(exit)}' justify='left' left='#{col * col_width}' top='#{exit_top}' width='#{col_width}' height='#{link_height}' font='small' />"
   end
 
   # Calculate end of standard exits block
@@ -353,13 +515,13 @@ def ExitWindow.push_room_info_to_window(standard_exits, lich_exits, trash_contai
   # Trash containers block, laid out in an N-column grid
   trash_containers_start = standard_exits_block_end + section_gap
   if trash_containers.any?
-    output += "<label id='trash_containers' value='Trash Containers: #{trash_containers.size}' left='0' top='#{trash_containers_start}' />"
+    output += "<label id='trash_containers' value='Trash Containers: #{trash_containers.size}' left='0' top='#{trash_containers_start}' width='#{col_width * cols}' height='#{header_height}' />"
     trash_base_top = trash_containers_start + header_height
     trash_containers.each_with_index do |trash, index|
       col = index % cols
       row = index / cols
       trash_top = trash_base_top + (link_height * row)
-      output += "<label id='trash_#{index}' value='#{trash}' left='#{col * col_width}' top='#{trash_top}' font='small' />"
+      output += "<label id='trash_#{index}' value='#{trash}' justify='left' left='#{col * col_width}' top='#{trash_top}' width='#{col_width}' height='#{link_height}' font='small' />"
     end
   end
 
@@ -449,6 +611,21 @@ class ExitWindowGtk
         color:     #{colors[:fg]};
       }
 
+      window#exitwindow button.room-info-link {
+        font-size:        #{@font_size}px;
+        color:            #{colors[:fg]};
+        background-image: none;
+        background-color: transparent;
+        border:           none;
+        box-shadow:       none;
+        padding:          0px;
+        margin:           0px;
+      }
+
+      window#exitwindow button.room-info-link:hover {
+        color: #0a84ff;
+      }
+
       /* scrolled area & flowbox */
       window#exitwindow GtkScrolledWindow,
       window#exitwindow GtkFlowBox {
@@ -485,12 +662,12 @@ class ExitWindowGtk
     [dec_btn, inc_btn].each { |b| b.style_context.add_class("header-toggle"); header.pack_start(b) }
     dec_btn.signal_connect("clicked") do
       @font_size = [@font_size - 1, 8].max
-      ew["font_size"] = @font_size; ExitWindow.save_window_settings(settings)
+      ExitWindow.update_setting("font_size", @font_size)
       reload_css
     end
     inc_btn.signal_connect("clicked") do
       @font_size = [@font_size + 1, 30].min
-      ew["font_size"] = @font_size; ExitWindow.save_window_settings(settings)
+      ExitWindow.update_setting("font_size", @font_size)
       reload_css
     end
 
@@ -504,7 +681,7 @@ class ExitWindowGtk
       else
         @window.style_context.remove_class("dark")
       end
-      ew["dark_mode"] = sw.active?; ExitWindow.save_window_settings(settings)
+      ExitWindow.update_setting("dark_mode", sw.active?)
       reload_css
     end
     header.pack_end(theme_switch)
@@ -592,13 +769,14 @@ class ExitWindowGtk
       }
 
       # ---- ROOM INFO: Add once at the top! ----
-      [
-        "L#: #{Room.current.id}",
-        "U#: #{Room.current.uid.to_s.gsub(/\[|\]/, '')}",
-      ].each do |text|
-        room_info = Gtk::Label.new(text)
-        room_info.set_xalign(0)
+      ExitWindow.room_info.each do |info|
+        room_info = Gtk::Button.new(label: "#{info[:label]}: #{info[:value]}")
+        room_info.set_halign(Gtk::Align::START)
         room_info.style_context.add_class("room-info")
+        room_info.style_context.add_class("room-info-link")
+        room_info.signal_connect("clicked") do
+          ExitWindow.copy_current_room_number(info[:type])
+        end
         @flow.add(room_info)
       end
       pad_to_next_row.call(2)
@@ -666,12 +844,21 @@ UpstreamHook.remove(upstream_hook_id)   rescue nil
 
 UpstreamHook.add(upstream_hook_id, proc do |command|
   case command.strip.downcase
+  when /\A\*ewcopy\s+(lich|u)\s+(.+)\z/
+    room_type = Regexp.last_match(1)
+    room_number = Regexp.last_match(2).strip
+    clipboard_value = room_type == 'u' ? "u#{room_number}" : room_number
+    if ExitWindow.copy_to_clipboard(clipboard_value)
+      respond "#{room_type.upcase} room #{room_number} copied as #{clipboard_value}."
+    else
+      respond "Unable to copy #{room_type.upcase} room #{room_number} to clipboard."
+    end
+    nil
+
   when /\*ewgtk/
     ExitWindow.use_gtk_window = !ExitWindow.use_gtk_window
     respond "GTK exits window is now #{ExitWindow.use_gtk_window ? 'ENABLED' : 'DISABLED'}."
-    ExitWindow.window_settings["use_gtk_window"] = ExitWindow.use_gtk_window
-
-    ExitWindow.save_window_settings(ExitWindow.settings)
+    ExitWindow.update_setting("use_gtk_window", ExitWindow.use_gtk_window)
     if ExitWindow.use_gtk_window
       Gtk.queue { ExitWindowGtk.create_main_window }
       Thread.new { Gtk.main if Gtk.main_level == 0 }
