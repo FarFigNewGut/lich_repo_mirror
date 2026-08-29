@@ -43,7 +43,7 @@
 
 
 -----------------------------------------------------------------------
-	   OSACombat Version: 4.2.50 (August 22, 2026)
+	   OSACombat Version: 4.2.83 (August 28, 2026)
 	
 	   Usage:
 	   
@@ -199,14 +199,15 @@ def osacombat_help_display
 end
 
 def wait_rt
-	#pause 0.1
+	return if $osa_next_forcert
 	waitrt?
 end
 
 def wait_castrt
-	pause 0.3          # allow cast RT XML tag to arrive from server
-	waitcastrt?        # wait out remaining cast RT
-	waitrt?            # then wait out any combat RT
+	return if $osa_next_forcert
+	pause 0.3
+	waitcastrt?
+	waitrt?
 end
 
 def ship_type
@@ -955,6 +956,7 @@ def healing_stance
 end
 
 def stance_defensive
+	return if $osa_next_forcert # Don't change stance if next entry uses ForceRT
 	if @combat_data["stance_dance"]
 		health_monitor
 		wait_rt
@@ -977,6 +979,7 @@ def stance_defensive
 end
 
 def stance_offensive
+	return if $osa_forcert_active # Don't change stance when firing ForceRT
 	if @combat_data["stance_dance"]
 		health_monitor
 		wait_rt
@@ -1042,23 +1045,6 @@ def hide_time
 	end
 end
 
-def reactive
-	health_monitor
-	return unless @combat_data["use_reactive"]
-	return unless $osa_reactive
-	return if stunned? || webbed? || bound? || checkdead
-	current_target_ids = GameObj.targets.map(&:id)
-	if (current_target_ids & $osa_reactive_creatures).any?
-		wait_rt
-		stance_offensive
-		fput "weapon #{$osa_reactivetype}#{forcert_suffix}"
-		$osa_reactive = false
-		$osa_reactivetype = nil
-		$osa_reactive_creatures = []
-		stance_defensive
-	end
-end
-
 ###### Basic Attack Function
 			
 def chicken_attack
@@ -1113,7 +1099,7 @@ def uac_round
 		elsif result.to_s =~ /followup kick/
 			$osacombat_uac_current_attack = "kick"
 			wait_rt
-			stance_defensive	
+			stance_defensive
 		elsif result.to_s =~ /Roundtime/
 			$osacombat_uac_current_attack = "jab"
 			wait_rt
@@ -1128,18 +1114,25 @@ end
 ####### Mstrike Setup
 
 def mstrike_setup
-	if @combat_data["use_mstrike"]
-		if @combat_data["use_uac"]
-			fput "mstrike set recovery off"	
+	ms_entry = (@living_routine.to_a + @undead_routine.to_a).find { |e| e['type'] == 'Multi-Strike' }
+	if ms_entry
+		fput "mstrike set recovery off"
+		if ms_entry['mstrike_uac']
 			fput "mstrike set default jab"
-
-		elsif @combat_data["osaarcher"]
-			fput "mstrike set recovery off"
+		elsif ms_entry['mstrike_archery']
 			fput "mstrike set default fire"
 		else
-			fput "mstrike set recovery off"
 			fput "mstrike set default attack"
 		end
+	elsif @combat_data["use_uac"]
+		fput "mstrike set recovery off"
+		fput "mstrike set default jab"
+	elsif @combat_data["osaarcher"]
+		fput "mstrike set recovery off"
+		fput "mstrike set default fire"
+	else
+		fput "mstrike set recovery off"
+		fput "mstrike set default attack"
 	end
 	if @combat_data["use_mstrike"]
 		if Skills.multiopponentcombat >= 190
@@ -1742,7 +1735,8 @@ def swiftkick
 end
 
 def tackle_manuever
-	if CMan.available?("Tackle") && (!GameObj.target.nil?) && (GameObj.target.status != "dead")
+	return if GameObj.target.nil? || GameObj.target.status.to_s =~ /lying down|prone/
+	if CMan.available?("Tackle") && (GameObj.target.status != "dead")
 		stance_offensive
 		fput "cman tackle#{forcert_suffix}"
 		stance_defensive
@@ -2080,7 +2074,18 @@ end
 ################# Mstrike Routine	
 def do_mstrike(entry: nil)
 	return if stunned? || webbed? || bound? || checkdead
-	return if Effects::Cooldowns.active?("Multi-Strike")
+	# Cooldown check -- skip if ignore_cooldown is set, otherwise gate on cooldown
+	if entry && entry['mstrike_ignore_cooldown']
+		# Stamina gate using wiki formula: open = 20 + 3*speed, targeted = 30 + 4*speed
+		speed = entry['mstrike_weapon_speed'].to_i
+		speed = 5 if speed == 0
+		open_cost     = 20 + (3 * speed)
+		targeted_cost = 30 + (4 * speed)
+		min_cost = [open_cost, targeted_cost].min
+		return if Char.stamina < min_cost
+	else
+		return if Effects::Cooldowns.active?("Multi-Strike")
+	end
 	return if Skills.multiopponentcombat < 5
 	# Celerity gate -- skip when Celerity is active if user checked that option
 	if entry && entry['mstrike_skip_celerity']
@@ -2315,7 +2320,7 @@ def do_uac_single(attack_cmd)
 	actual_cmd = valid_uac.include?(current) ? current : attack_cmd
 	$osacombat_uac_current_attack = actual_cmd
 	stance_offensive
-	result = dothistimeout actual_cmd, 3, /excellent positioning|followup jab|followup punch|followup grapple|followup kick|Roundtime/
+	result = dothistimeout actual_cmd, 5, /excellent positioning|followup jab|followup punch|followup grapple|followup kick|Roundtime/
 	if result.to_s =~ /excellent positioning/
 		$osacombat_uac_current_attack = "kick"
 	elsif result.to_s =~ /followup jab/
@@ -2327,7 +2332,6 @@ def do_uac_single(attack_cmd)
 	elsif result.to_s =~ /followup kick/
 		$osacombat_uac_current_attack = "kick"
 	else
-		# No followup suggestion -- reset to the entry's base attack next round
 		$osacombat_uac_current_attack = attack_cmd
 	end
 	wait_rt
@@ -2450,20 +2454,11 @@ def living_entry_conditions_met?(entry)
 	tgt = GameObj.target
 	return false unless tgt
 	status = tgt.status.to_s
-	return false if entry['tgt_stunned']     && !(status =~ /stunned/)
-	return false if entry['tgt_not_stunned'] &&  (status =~ /stunned/)
-	return false if entry['tgt_bound']       && !(status =~ /bound/)
-	return false if entry['tgt_not_bound']   &&  (status =~ /bound/)
-	return false if entry['tgt_webbed']      && !(status =~ /webbed/)
-	return false if entry['tgt_not_webbed']  &&  (status =~ /webbed/)
-	return false if entry['tgt_prone']       && !(status =~ /lying|prone/)
-	return false if entry['tgt_not_prone']   &&  (status =~ /lying|prone/)
-	return false if entry['tgt_rooted']      && !(status =~ /rooted/)
-	return false if entry['tgt_not_rooted']  &&  (status =~ /rooted/)
-	return false if entry['tgt_frozen']      && !(status =~ /frozen/)
-	return false if entry['tgt_not_frozen']  &&  (status =~ /frozen/)
-	return false if entry['tgt_calmed']      && !(status =~ /calmed/)
-	return false if entry['tgt_not_calmed']  &&  (status =~ /calmed/)
+	# Target state conditions -- prone covers stunned/webbed/frozen/kneeling/lying down etc.
+	return false if entry['tgt_prone']      && !(status =~ OSA_PRONE)
+	return false if entry['tgt_not_prone']  &&  (status =~ OSA_PRONE)
+	return false if entry['tgt_rooted']     && !(status =~ /rooted/)
+	return false if entry['tgt_not_rooted'] &&  (status =~ /rooted/)
 	# Creature restrictions
 	tgt_noun = tgt.noun.to_s.downcase
 	tgt_name = tgt.name.to_s.downcase
@@ -2491,16 +2486,15 @@ end
 
 def dispatch_attack_entry(entry)
 	uac_attacks = %w[Jab Punch Kick Grapple]
-	last_target_id = nil
 	loop do
 		return if stunned? || webbed? || bound? || checkdead || GameObj.targets.empty?
 		return unless get_target
 		return if excluded_target?
 		return unless living_entry_conditions_met?(entry)
-		# Reset UAC chain if target changed
-		if uac_attacks.include?(entry['type']) && GameObj.target&.id != last_target_id
+		# Reset UAC chain only when target changes, using global to persist across routine cycles
+		if uac_attacks.include?(entry['type']) && GameObj.target&.id != $osa_uac_last_target
 			$osacombat_uac_current_attack = entry['type'].downcase
-			last_target_id = GameObj.target&.id
+			$osa_uac_last_target = GameObj.target&.id
 		end
 		apply_entry_stance(entry)
 		@combat_data["flare_gloves_adj"]  = entry['flare_gloves_adj'].to_s
@@ -2512,17 +2506,89 @@ def dispatch_attack_entry(entry)
 		end
 		fput "kneel" if entry['use_kneel'] && !kneeling?
 		fput "hide"  if entry['use_stealth'] && !hiding?
+		# Re-check target conditions immediately before firing in case status changed
+		return unless living_entry_conditions_met?(entry)
 		if entry['use_quickstrike'] && !entry['quickstrike_value'].to_s.strip.empty?
 			fput "qstrike #{entry['quickstrike_value'].to_s.strip}"
 		end
-		use_forcert = entry['use_forcert'] && can_use_forcert?(entry['type'])
-		dispatch_attack(entry['type'], 0, 0, 0, 99, entry: entry, forcert: use_forcert)
-		consume_forcert_use if use_forcert
+		$osa_forcert_active = entry['use_forcert'] ? true : false
+		dispatch_attack(entry['type'], 0, 0, 0, 99, entry: entry, forcert: $osa_forcert_active)
+		$osa_forcert_active = false
 		health_monitor
-		wait_rt
+		wait_rt unless $osa_next_forcert
 		break unless entry['until_dead']
 		tgt = GameObj.target
 		break if tgt.nil? || tgt.status.to_s =~ /dead|gone/
+	end
+end
+
+def dispatch_support_entry(entry)
+	return if $osa_anti_magic_room
+	return if stunned? || webbed? || bound? || checkdead
+	ability = entry['type'].to_s
+	case ability
+	when "Sign of Warding"       then society_cast("Sign of Warding")
+	when "Sign of Defending"     then society_cast("Sign of Defending")
+	when "Sign of Striking"      then society_cast("Sign of Striking")
+	when "Sign of Smiting"       then society_cast("Sign of Smiting")
+	when "Sign of Deflection"    then sign_of_deflection
+	when "Sign of Shields"
+		spirit_threshold = @combat_data["min_spirit_dissipating"].to_i
+		spirit_threshold = ((Char.max_spirit / 2.0).ceil + 3) if spirit_threshold == 0
+		society_cast("Sign of Shields") if Char.spirit >= spirit_threshold
+	when "Sign of Swords"
+		spirit_threshold = @combat_data["min_spirit_dissipating"].to_i
+		spirit_threshold = ((Char.max_spirit / 2.0).ceil + 3) if spirit_threshold == 0
+		society_cast("Sign of Swords") if Char.spirit >= spirit_threshold
+	when "Sign of Dissipation"   then sign_of_dissipation
+	when "Sign of Wracking"      then sign_of_wracking
+	when "Sigil of Minor Bane"       then society_cast("Sigil of Minor Bane")
+	when "Sigil of Offense"          then society_cast("Sigil of Offense")
+	when "Sigil of Major Bane"       then society_cast("Sigil of Major Bane")
+	when "Sigil of Minor Protection" then society_cast("Sigil of Minor Protection")
+	when "Sigil of Defense"          then society_cast("Sigil of Defense")
+	when "Sigil of Major Protection" then society_cast("Sigil of Major Protection")
+	when "Sigil of Concentration"    then society_cast("Sigil of Concentration")
+	when "Sigil of Power"            then sigil_of_power
+	when "Symbol of Courage"      then society_cast("Symbol of Courage")
+	when "Symbol of Protection"   then society_cast("Symbol of Protection")
+	when "Symbol of Disruption"   then society_cast("Symbol of Disruption")
+	when "Symbol of Mana"         then symbol_of_mana
+	when "Symbol of Retribution"  then society_cast("Symbol of Retribution") if @creature_type == "undead"
+	when "Symbol of Supremacy"    then society_cast("Symbol of Supremacy") if @creature_type == "undead"
+	when "Symbol of Restoration"  then symbol_of_restore
+	when "Symbol of Transcendence" then society_cast("Symbol of Transcendence")
+	when "Seanette's Shout"      then cry_warcry_shout
+	when "Horland's Holler"      then cry_warcry_holler
+	when "Surge of Strength (Cooldown)"    then use_cman_surge_of_strength_cooldown
+	when "Surge of Strength (No Cooldown)" then use_cman_surge_of_strength_no_cooldown
+	when "Wall of Force (140)"       then cast_spell_wall_of_force
+	when "Group Bravery (211)"       then cast_spell_bravery
+	when "Group Heroism (215)"       then cast_spell_heroism
+	when "Group Spell Shield (219)"  then cast_spell_group_spell_shield
+	when "Sanctify Right Hand (330)" then sanctify_right_hand
+	when "Sanctify Left Hand (330)"  then sanctify_left_hand
+	when "Mana Focus (418)"          then cast_spell_mana_focus
+	when "Celerity (506)"            then cast_spell_celerity
+	when "Group Celerity (506)"      then cast_spell_group_celerity
+	when "Rapid Fire (515)"          then cast_spell_rapid_fire
+	when "Barkskin (605)"            then cast_spell_barkskin
+	when "Group Barkskin (605)"      then cast_spell_group_barkskin
+	when "Song of Tonis (1035)"      then sing_song_song_of_tonis
+	when "Mind Over Body (1213)"     then cast_spell_mob
+	when "Focus Barrier (1216)"      then cast_spell_focus
+	when "Beacon of Courage (1608)"  then cast_spell_beacon_of_courage
+	when "Faith Shield (1619)"       then cast_spell_faith_shield
+	when "Divine Incarnation: Armor (1650)" then cast_spell_di_armor
+	when "Divine Incarnation: Zeal (1650)"  then cast_spell_zealot
+	when "Steely Resolve"            then use_shield_steely
+	when "Mystic Focus"              then use_mystic_focus
+	when "Light Wings: Luminous Flight"  then use_light_wings_luminous_flight
+	when "Light Wings: Prismatic Aegis"  then use_light_wings_prismatic_aegis
+	when "Light Wings: Wings of Warding" then use_light_wings_wings_of_warding
+	when "Dark Wings: Shadow Mantle"     then use_dark_wings_shadow_mantle
+	when "Dark Wings: Crawling Shadow"   then use_dark_wings_crawling_shadow
+	when "Dark Wings: Carrion Guard"     then use_dark_wings_carrion_guard
 	end
 end
 
@@ -2596,6 +2662,110 @@ LIVING_ATTACK_OPTIONS = [
 LIVING_STANCE_OPTIONS = ["Default", "Offensive", "Advance", "Forward", "Neutral", "Guarded", "Defensive"].freeze
 end # unless defined?(LIVING_ATTACK_OPTIONS)
 
+unless defined?(SIGNS_OPTIONS)
+SIGNS_OPTIONS = [
+  "Sign of Warding", "Sign of Defending", "Sign of Striking", "Sign of Smiting",
+  "Sign of Deflection", "Sign of Shields", "Sign of Swords", "Sign of Dissipation", "Sign of Wracking"
+].freeze
+
+SIGILS_OPTIONS = [
+  "Sigil of Minor Bane", "Sigil of Offense", "Sigil of Major Bane",
+  "Sigil of Minor Protection", "Sigil of Defense", "Sigil of Major Protection",
+  "Sigil of Concentration", "Sigil of Power"
+].freeze
+
+SYMBOLS_OPTIONS = [
+  "Symbol of Courage", "Symbol of Protection", "Symbol of Disruption",
+  "Symbol of Mana", "Symbol of Retribution", "Symbol of Supremacy",
+  "Symbol of Restoration", "Symbol of Transcendence"
+].freeze
+
+BUFF_OPTIONS = [
+  "Seanette's Shout", "Horland's Holler",
+  "Surge of Strength (Cooldown)", "Surge of Strength (No Cooldown)",
+  "Wall of Force (140)", "Group Bravery (211)", "Group Heroism (215)",
+  "Group Spell Shield (219)", "Sanctify Right Hand (330)", "Sanctify Left Hand (330)",
+  "Mana Focus (418)", "Celerity (506)", "Group Celerity (506)",
+  "Rapid Fire (515)", "Barkskin (605)", "Group Barkskin (605)",
+  "Song of Tonis (1035)", "Mind Over Body (1213)", "Focus Barrier (1216)",
+  "Beacon of Courage (1608)", "Faith Shield (1619)",
+  "Divine Incarnation: Armor (1650)", "Divine Incarnation: Zeal (1650)",
+  "Steely Resolve",
+  "Mystic Focus",
+  "Light Wings: Luminous Flight", "Light Wings: Prismatic Aegis", "Light Wings: Wings of Warding",
+  "Dark Wings: Shadow Mantle", "Dark Wings: Crawling Shadow", "Dark Wings: Carrion Guard"
+].freeze
+end # unless defined?(SIGNS_OPTIONS)
+
+unless defined?(SUPPORT_DESCRIPTIONS)
+SUPPORT_DESCRIPTIONS = {
+  # Signs (Council of Light)
+  "Sign of Warding"       => "+5 to DS. (Cost: 1 mana)",
+  "Sign of Defending"     => "+10 to DS. (Cost: 2 mana)",
+  "Sign of Striking"      => "+5 to AS. (Cost: 1 mana)",
+  "Sign of Smiting"       => "+10 to AS. (Cost: 2 mana)",
+  "Sign of Deflection"    => "Adds +20 to Bolt DS. (Cost: 3 mana, 0 spirit)",
+  "Sign of Shields"       => "Adds +20 to DS. Costs 1 spirit when sign dissipates.",
+  "Sign of Swords"        => "Adds +20 to AS. Costs 1 spirit when sign dissipates.",
+  "Sign of Dissipation"   => "Adds +15 to TD. Costs 1 spirit when sign dissipates. Gated by Minimum Spirit in Support Options.",
+  "Sign of Wracking"      => "Fully regenerates all mana. Costs 5 spirit. Only fires when mana drops below CoL Mana Threshold AND spirit is safely above half max spirit.",
+  # Sigils (Guardians of Sunfist)
+  "Sigil of Minor Bane"       => "Adds +5 AS. Grants heavy damage weighting against hated foes. (Cost: 3 mana, 3 stamina)",
+  "Sigil of Offense"          => "Provides a bonus to AS equal to current rank. (Cost: 5 mana, 5 stamina)",
+  "Sigil of Major Bane"       => "Adds +10 AS. Grants heavy crit weighting against hated foes. (Cost: 10 mana, 10 stamina)",
+  "Sigil of Minor Protection" => "Provides +5 DS. Grants heavy damage padding against hated foes. (Cost: 5 mana, 10 stamina)",
+  "Sigil of Defense"          => "Provides a bonus to DS equal to current rank. (Cost: 5 mana, 5 stamina)",
+  "Sigil of Major Protection" => "Adds +10 DS. Grants heavy critical padding against hated foes. (Cost: 10 mana, 15 stamina)",
+  "Sigil of Concentration"    => "+5 mana per pulse. (Cost: 30 stamina)",
+  "Sigil of Power"            => "Converts 50 stamina into 25 mana.",
+  # Symbols (Order of Voln)
+  "Symbol of Courage"      => "Increases AS +1 per rank (Max +26). Duration 10 seconds per rank. Fear protection.",
+  "Symbol of Protection"   => "Increases DS +1 per rank (Max +26) and TD +1/2 ranks (Max +13). Duration 20 seconds per rank.",
+  "Symbol of Disruption"   => "Aura causes noncorporeal undead to suffer AS/DS/CS/TD/CMAN penalties when struck. Duration 10 seconds per rank.",
+  "Symbol of Mana"         => "Restores 50 mana. No deed cost initially. 5 minute cooldown.",
+  "Symbol of Retribution"  => "Direct attack against undead when member is deceased. Reactively flares when living if struck by undead.",
+  "Symbol of Supremacy"    => "Bonus of +1 per two Voln ranks to AS/CS/CMAN/UAF against undead. Duration 10 seconds per rank.",
+  "Symbol of Restoration"  => "Returns up to half of a member's HP loss. Minimum +10 / Maximum +50 HP recovery per use.",
+  "Symbol of Transcendence"=> "For 30 seconds member takes damage as if incorporeal. 3 minute cooldown (10 minutes if used in emergency).",
+  # War Cries
+  "Seanette's Shout"     => "Empowers warrior and party with +20 AS for 25 stamina.",
+  "Horland's Holler"     => "Room taunt redirecting attacks to the warrior. Grants Boost Health (20) to party. Duration based on Influence bonus.",
+  # CMans
+  "Surge of Strength (Cooldown)"    => "Increases Strength providing AS boost and carrying capacity. Obeys cooldown.",
+  "Surge of Strength (No Cooldown)" => "Increases Strength providing AS boost and carrying capacity. Ignores cooldown.",
+  # Spells
+  "Wall of Force (140)"      => "+100 DS for duration. 270 second cooldown per target. Exempt from spell-removing mechanics.",
+  "Group Bravery (211)"      => "+15 Physical and Bolt AS. Requires 25 ranks Spiritual Lore, Blessings.",
+  "Group Heroism (215)"      => "+25 Physical and Bolt AS, +1 HP/MP regen per minute. Requires 35 ranks Spiritual Lore, Blessings.",
+  "Group Spell Shield (219)" => "+30 Bolt DS and +30 Spiritual TD for 120 seconds. 360 second cooldown. Requires 50 ranks Spiritual Lore, Blessings.",
+  "Sanctify Right Hand (330)"=> "Applies Holy Fire flares and non-corporeal undead anchoring to right hand item for 4 hours.",
+  "Sanctify Left Hand (330)" => "Applies Holy Fire flares and non-corporeal undead anchoring to left hand item for 4 hours.",
+  "Mana Focus (418)"         => "Mana regeneration for caster and group. Pulse rate and amount scale with training.",
+  "Celerity (506)"           => "Reduces or eliminates stamina cost for Quickstrike actions. All offensive actions automatically apply lowest RT possible. 60 second duration.",
+  "Group Celerity (506)"     => "Group version of Celerity. Requires 50 ranks Elemental Lore, Air.",
+  "Rapid Fire (515)"         => "Reduces cast roundtime of all subsequent spells to 1 second. 90 second cooldown after effect ends.",
+  "Barkskin (605)"           => "Absorbs the next successful physical attack, maneuver, bolt, or warding spell. 5 minute cooldown after absorption.",
+  "Group Barkskin (605)"     => "Group version of Barkskin. Requires 50 ranks Spiritual Lore, Blessings.",
+  "Song of Tonis (1035)"     => "+20 Dodge ranks equivalent and -1 second haste for all party members while singing.",
+  "Mind Over Body (1213)"    => "Reduces stamina activation costs by 20% for caster and group. Terminates when caster dies or is stunned.",
+  "Focus Barrier (1216)"     => "+30 DS for caster and group. Terminates when caster dies or is stunned.",
+  "Beacon of Courage (1608)" => "Redirects attacks on party members to the paladin. Allows ignoring Force on Force mechanics for additional targets.",
+  "Faith Shield (1619)"      => "+50 Spiritual TD for up to 70 seconds. 210 second cooldown.",
+  "Divine Incarnation: Armor (1650)" => "50% resistance to all attacks for 30 seconds.",
+  "Divine Incarnation: Zeal (1650)"  => "Deity-specific flares on next 5 successful attacks within 60 seconds.",
+  "Steely Resolve"           => "+15 Block DS per rank and +15% block chance per rank for 60 seconds. 5 minute cooldown.",
+  "Mystic Focus"             => "Rub tattoo to double Stat and Skill bonuses from tattoo for 30 seconds. 3 minute cooldown.",
+  # Wings
+  "Light Wings: Luminous Flight"  => "Temporary flight, ignoring height restrictions. +5% evade chance per Tier for 30 seconds. 90 second cooldown. Activated via TAP.",
+  "Light Wings: Prismatic Aegis"  => "Evasiveness against next incoming attack for 10 seconds. 3 minute cooldown. Activated via PULL.",
+  "Light Wings: Wings of Warding" => "+25 DS, +15 TD, +10 critical padding for 30 seconds for group. 30 minute cooldown. Activated via PUSH.",
+  "Dark Wings: Shadow Mantle"     => "Cloaks in shadows. +5 Stalking/Hiding ranks per Tier, +5% evade chance per Tier. 90 second cooldown. Activated via TAP.",
+  "Dark Wings: Crawling Shadow"   => "Evasiveness against next attack. SMR counter-attack causing Disease. 3 minute cooldown. Activated via PULL.",
+  "Dark Wings: Carrion Guard"     => "+10 Damage Resistance, 5 HP regen, +100 max HP for 60 seconds. 15 minute cooldown. Activated via PUSH."
+}.freeze
+end # unless defined?(SUPPORT_DESCRIPTIONS)
+
+
 # ---------------------------------------------------------------------------
 # Living Routine -- data helpers
 # The routine is stored as living_routine: Array of entry hashes.
@@ -2635,20 +2805,10 @@ def living_routine_default_entry(kind)
     'max_stam'        => 999,
     'min_targets'     => 1,
     'max_targets'     => 99,
-    'tgt_stunned'     => false,
-    'tgt_not_stunned' => false,
-    'tgt_bound'       => false,
-    'tgt_not_bound'   => false,
-    'tgt_webbed'      => false,
-    'tgt_not_webbed'  => false,
     'tgt_prone'       => false,
     'tgt_not_prone'   => false,
     'tgt_rooted'      => false,
     'tgt_not_rooted'  => false,
-    'tgt_frozen'      => false,
-    'tgt_not_frozen'  => false,
-    'tgt_calmed'      => false,
-    'tgt_not_calmed'  => false,
     'use_kneel'       => false,
     'use_stealth'     => false,
     'flare_gloves_adj'  => '',
@@ -2664,10 +2824,12 @@ def living_routine_default_entry(kind)
     'only_use_on'     => '',
     'do_not_use_on'   => '',
     'until_dead'      => false,
-    'mstrike_skip_celerity' => false,
-    'mstrike_uac'           => false,
-    'mstrike_archery'       => false,
-    'mstrike_melee'         => false,
+    'mstrike_skip_celerity'   => false,
+    'mstrike_uac'             => false,
+    'mstrike_archery'         => false,
+    'mstrike_melee'           => false,
+    'mstrike_ignore_cooldown' => false,
+    'mstrike_weapon_speed'    => 5,
     'use_forcert'           => false,
     'use_quickstrike'       => false,
     'quickstrike_value'     => '-2',
@@ -2694,6 +2856,54 @@ end
 def undead_routine_save(routine)
   self.save_script_data("undead_routine", routine)
   @combat_data["undead_routine"] = routine
+end
+
+def signs_routine_load
+  raw = @combat_data["signs_routine"]
+  return [] unless raw.is_a?(Array)
+  raw
+end
+
+def signs_routine_save(routine)
+  self.save_script_data("signs_routine", routine)
+  @combat_data["signs_routine"] = routine
+end
+
+def sigils_routine_load
+  raw = @combat_data["sigils_routine"]
+  return [] unless raw.is_a?(Array)
+  raw
+end
+
+def sigils_routine_save(routine)
+  self.save_script_data("sigils_routine", routine)
+  @combat_data["sigils_routine"] = routine
+end
+
+def symbols_routine_load
+  raw = @combat_data["symbols_routine"]
+  return [] unless raw.is_a?(Array)
+  raw
+end
+
+def symbols_routine_save(routine)
+  self.save_script_data("symbols_routine", routine)
+  @combat_data["symbols_routine"] = routine
+end
+
+def buff_routine_load
+  raw = @combat_data["buff_routine"]
+  return [] unless raw.is_a?(Array)
+  raw
+end
+
+def buff_routine_save(routine)
+  self.save_script_data("buff_routine", routine)
+  @combat_data["buff_routine"] = routine
+end
+
+unless defined?(OSA_PRONE)
+OSA_PRONE = /sleeping|webbed|stunned|kneeling|sitting|lying down|prone|frozen|held in place|entangled/
 end
 
 unless defined?(ROOM_EFFECT_SPELLS)
@@ -2734,7 +2944,7 @@ def can_cast_spell(spell, cast_type, stam_min, mana_min, enemy_min, enemy_max, w
 
 	# 909 (Tremors) - only cast if non-prone targets exist, then follow up
 	if spell == "909"
-		not_prone = GameObj.targets.reject { |npc| npc.status =~ /dead|gone|lying/ }
+		not_prone = GameObj.targets.reject { |npc| npc.status =~ /dead|gone|lying down|prone/ }
 		return if not_prone.empty?
 		if Spell[909].available?
 			fput "incant 909 channel"
@@ -2842,39 +3052,40 @@ def combat
 		can_cast_spell(@opener_spell3, @opener_cast_type3, @opener_spell3_stam_min, @opener_spell3_mana_min, @opener_spell3_enemy_min, @opener_spell3_enemy_max, @opener_spell3_warding, @opener_spell3_open, base_var: (@creature_type == "undead" ? "undead_opener" : "living_opener") + "3")
 		health_monitor
 	end
-	if !$poaching && $osa_reactive
-		reactive
-	end
 	health_monitor
-	wait_rt
+	wait_rt unless $osa_next_forcert
 	check_for_poaching if @combat_data["check_for_group"]
 	# Living routine -- iterate the dynamic array in order
 	if @creature_type == "living"
-		@living_routine.each do |entry|
+		@living_routine.each_with_index do |entry, idx|
 			check_for_poaching if @combat_data["check_for_group"]
 			break if $poaching
 			load_attack_vars
+			next_entry = @living_routine[idx + 1]
+			$osa_next_forcert = next_entry&.dig('use_forcert') ? true : false
 			if entry["kind"] == "attack"
 				dispatch_attack_entry(entry)
 			else
 				dispatch_spell_entry(entry)
 			end
 			health_monitor
-			wait_rt
+			wait_rt unless next_entry&.dig('use_forcert')
 		end
 	end
 	if @creature_type == "undead"
-		@undead_routine.each do |entry|
+		@undead_routine.each_with_index do |entry, idx|
 			check_for_poaching if @combat_data["check_for_group"]
 			break if $poaching
 			load_attack_vars
+			next_entry = @undead_routine[idx + 1]
+			$osa_next_forcert = next_entry&.dig('use_forcert') ? true : false
 			if entry["kind"] == "attack"
 				dispatch_attack_entry(entry)
 			else
 				dispatch_spell_entry(entry)
 			end
 			health_monitor
-			wait_rt
+			wait_rt unless next_entry&.dig('use_forcert')
 		end
 	end
 	if !$poaching
@@ -2889,9 +3100,6 @@ def combat
 	health_monitor
 	wait_rt
 	check_for_poaching if @combat_data["check_for_group"]
-	if !$poaching && $osa_reactive
-		reactive
-	end
 	check_for_poaching if @combat_data["check_for_group"]
 	if !$poaching
 		if @combat_data["use_stealth"]
@@ -2913,12 +3121,8 @@ def combat
 		end
 	end
 	health_monitor
-	wait_rt
 	prep_reset
 	check_for_poaching if @combat_data["check_for_group"]
-	if !$poaching && $osa_reactive
-		reactive
-	end
 	check_for_poaching if @combat_data["check_for_group"]
 	if !$poaching && !@attack_spell1.to_s.empty?
 		load_attack_vars
@@ -2980,9 +3184,6 @@ def combat
 		health_monitor
 	end
 	check_for_poaching if @combat_data["check_for_group"]
-	if !$poaching && $osa_reactive
-		reactive
-	end
 	looter
 	check_for_poaching if @combat_data["check_for_group"]
 end
@@ -3058,57 +3259,27 @@ end
 
 def groupeffects
 	check_dead
-	cast_spell_society if !$society_firstcast && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ }
-	cast_spell_society if $society_firstcast
-	cast_spell_mana_focus if @combat_data["cast_spell_mana_focus"] && (!$mana_focus_first_cast && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	cast_spell_mana_focus if @combat_data["cast_spell_mana_focus"] && $mana_focus_first_cast && !Spell[1018].active?
-	cast_spell_bravery if @combat_data["groupbravery"] && (!$bravery_first_cast && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	cast_spell_bravery if @combat_data["groupbravery"] && $bravery_first_cast
-	cast_spell_group_celerity if @combat_data["cast_spell_group_celerity"] && (!$group_celerity_first_cast && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	cast_spell_group_celerity if @combat_data["cast_spell_group_celerity"] && $group_celerity_first_cast
-	cast_spell_celerity if @combat_data["cast_spell_self_celerity"] && (!$celerity_first_cast && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	cast_spell_celerity if @combat_data["cast_spell_self_celerity"] && $celerity_first_cast
-	cast_spell_rapid_fire if @combat_data["spell_rapid_fire"] && (!$rapid_fire_first_cast && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	cast_spell_rapid_fire if @combat_data["spell_rapid_fire"] && $rapid_fire_first_cast
-	cast_spell_zealot if @combat_data["cast_spell_di_zeal"]
-	cast_spell_wall_of_force if @combat_data["spell_wall_of_force"] && (!$wall_of_force_first_cast && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	cast_spell_wall_of_force if @combat_data["spell_wall_of_force"] && $wall_of_force_first_cast
-	cast_spell_faith_shield if @combat_data["spell_shield_faith"] && (!$faith_shield_first_cast && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	cast_spell_faith_shield if @combat_data["spell_shield_faith"] && $faith_shield_first_cast
-	cast_spell_heroism if @combat_data["spell_heroism"] && (!$heroism_first_cast && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	cast_spell_heroism if @combat_data["spell_heroism"] && $heroism_first_cast
-	cast_spell_group_spell_shield if @combat_data["spell_group_spell_shield"] && (!$group_spell_shield_first_cast && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	cast_spell_group_spell_shield if @combat_data["spell_group_spell_shield"] && $group_spell_shield_first_cast
-	cast_spell_group_barkskin if @combat_data["barkskin_spell_group"] && (!$group_barkskin_first_cast && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	cast_spell_group_barkskin if @combat_data["barkskin_spell_group"] && $group_barkskin_first_cast
-	cast_spell_barkskin if @combat_data["barkskin_spell"] && (!$barkskin_first_cast && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	cast_spell_barkskin if @combat_data["barkskin_spell"] && $barkskin_first_cast
-	cast_spell_beacon_of_courage if @combat_data["spell_beacon_of_courage"] && (!$beacon_of_courage_first_cast && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	cast_spell_beacon_of_courage if @combat_data["spell_beacon_of_courage"] && $beacon_of_courage_first_cast
-	sing_song_song_of_tonis if @combat_data["song_song_of_tonis"] && (!$song_of_tonis_first_cast && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	sing_song_song_of_tonis if @combat_data["song_song_of_tonis"] && $song_of_tonis_first_cast
-	cry_warcry_shout if @combat_data["warcry_shout"] && (!$warcry_shout_first_cry && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	cry_warcry_shout if @combat_data["warcry_shout"] && $warcry_shout_first_cry
-	cry_warcry_holler if @combat_data["warcry_holler"] && (!$warcry_holler_first_cry && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	cry_warcry_holler if @combat_data["warcry_holler"] && $warcry_holler_first_cry
-	use_shield_steely if @combat_data["shield_steely"] && (!$osa_shield_steely_first_use && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	use_shield_steely if @combat_data["shield_steely"] && $osa_shield_steely_first_use	
-	use_cman_surge_of_strength_cooldown if @combat_data["cman_surge_of_strength_cooldown"] && (!$osa_cman_surge_of_strength_cooldown_first_use && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	use_cman_surge_of_strength_cooldown if @combat_data["cman_surge_of_strength_cooldown"] && $osa_cman_surge_of_strength_cooldown_first_use
-	use_cman_surge_of_strength_no_cooldown if @combat_data["cman_surge_of_strength_no_cooldown"] && (!$osa_cman_surge_of_strength_no_cooldown_first_use && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	use_cman_surge_of_strength_no_cooldown if @combat_data["cman_surge_of_strength_no_cooldown"] && $osa_cman_surge_of_strength_no_cooldown_first_use
-	use_light_wings_luminous_flight if @combat_data["wings_light_luminous_flight"] && (!$wings_light_luminous_flight_first_use && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	use_light_wings_luminous_flight if @combat_data["wings_light_luminous_flight"] && $wings_light_luminous_flight_first_use
-	use_light_wings_prismatic_aegis if @combat_data["wings_light_prismatic_aegis"] && (!$wings_light_prismatic_aegis_first_use && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	use_light_wings_prismatic_aegis if @combat_data["wings_light_prismatic_aegis"] && $wings_light_prismatic_aegis_first_use
-	use_light_wings_wings_of_warding if @combat_data["wings_light_wings_of_warding"] && (!$wings_light_wings_of_warding_first_use && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	use_light_wings_wings_of_warding if @combat_data["wings_light_wings_of_warding"] && $wings_light_wings_of_warding_first_use
-	use_dark_wings_shadow_mantle if @combat_data["wings_dark_shadow_mantle"] && (!$wings_dark_shadow_mantle_first_use && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	use_dark_wings_shadow_mantle if @combat_data["wings_dark_shadow_mantle"] && $wings_dark_shadow_mantle_first_use
-	use_dark_wings_crawling_shadow if @combat_data["wings_dark_crawling_shadow"] && (!$wings_dark_crawling_shadow_first_use && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	use_dark_wings_crawling_shadow if @combat_data["wings_dark_crawling_shadow"] && $wings_dark_crawling_shadow_first_use
-	use_dark_wings_carrion_guard if @combat_data["wings_dark_carrion_guard"] && (!$wings_dark_carrion_guard_first_use && GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ })
-	use_dark_wings_carrion_guard if @combat_data["wings_dark_carrion_guard"] && $wings_dark_carrion_guard_first_use
+	has_enemies = GameObj.targets.any? { |n| n.type !~ /passive/ && n.status !~ /dead|gone/ }
+	# Society routine -- dispatch based on character's society
+	society_routine = case Society.status
+		when "Council of Light"     then signs_routine_load
+		when "Guardians of Sunfist" then sigils_routine_load
+		when "Order of Voln"        then symbols_routine_load
+		else []
+	end
+	society_routine.each do |entry|
+		next unless entry['no_wait_for_mob'] || has_enemies || $society_firstcast
+		dispatch_support_entry(entry)
+		wait_castrt
+	end
+	$society_firstcast = true
+	# Buff routine
+	buff_routine_load.each do |entry|
+		next unless entry['no_wait_for_mob'] || has_enemies || $buff_firstcast
+		dispatch_support_entry(entry)
+		wait_castrt
+	end
+	$buff_firstcast = true
 end
 
 def gemstone_effects
@@ -3364,6 +3535,15 @@ def use_shield_steely
 		Shield.use("Steely Resolve")
 		$osa_shield_steely_first_use = true
 	end
+end
+
+def use_mystic_focus
+	return if Effects::Cooldowns.active?("Mystic Focus")
+	adj  = @combat_data["mystic_tattoo_adj"].to_s.strip
+	noun = @combat_data["mystic_tattoo_noun"].to_s.strip
+	return if noun.empty?
+	cmd = adj.empty? ? "rub #{noun}" : "rub #{adj} #{noun}"
+	fput cmd
 end
 
 def use_cman_surge_of_strength_no_cooldown
@@ -4540,123 +4720,276 @@ def self.populate_general(rows)
 end
 
 
-def self.populate_support(rows)
-	add_checks = lambda do |defs, cols: 4, group: :general_checks, spacing: 18|
-		defs.each_slice(cols).with_index do |slice, _row_i|
-			r = ui(rows, :row, spacing: spacing)
-			slice.each_with_index do |d, col|
-				ui(r, :check,
-				label: d[:label],
-				tip: d[:tip].to_s,
-				var: d[:var],
-				default: d.fetch(:default, false),
-				group: group,
-				col: col)
-			end
+def self.refresh_support_routine_display(container, routine, rows, section)
+	return unless container
+	container.children.each { |c| container.remove(c) }
+	if routine.empty?
+		lbl = Gtk::Label.new("No entries yet. Use the button below to add.")
+		lbl.xalign = 0.0
+		container.pack_start(lbl, expand: false, fill: false, padding: 2)
+	else
+		routine.each_with_index do |entry, idx|
+			frame = build_support_entry_row(entry, idx, rows, section)
+			container.pack_start(frame, expand: false, fill: true, padding: 2)
 		end
 	end
+	container.show_all
+end
+
+def self.build_support_entry_row(entry, idx, rows, section)
+	frame = Gtk::Frame.new
+	frame.set_shadow_type(:etched_in)
+	vbox = Gtk::Box.new(:vertical, 2)
+	vbox.set_border_width(4)
+	frame.add(vbox)
+
+	lbl = Gtk::Label.new(entry['type'].to_s)
+	lbl.xalign = 0.0
+	vbox.pack_start(lbl, expand: false, fill: false, padding: 0)
+
+	opt_row = Gtk::Box.new(:horizontal, 8)
+	vbox.pack_start(opt_row, expand: false, fill: false, padding: 0)
+	no_wait_cb = make_check(opt_row, "Cast Without Waiting For Enemy", entry['no_wait_for_mob'], tip: "When checked this ability casts immediately on script start without waiting for a live enemy.")
+	h_no_wait = proc do
+		routine, save_fn, _ = support_routine_accessors(section)
+		routine[idx]['no_wait_for_mob'] = no_wait_cb.active?
+		save_fn.call(routine)
+	end
+	$_osa_gc ||= []
+	$_osa_gc << h_no_wait
+	no_wait_cb.signal_connect("toggled", &h_no_wait)
+
+	btn_row = Gtk::Box.new(:horizontal, 6)
+	vbox.pack_start(btn_row, expand: false, fill: false, padding: 2)
+
+	del_btn  = Gtk::Button.new(label: "Delete")
+	up_btn   = Gtk::Button.new(label: "Move Up")
+	down_btn = Gtk::Button.new(label: "Move Down")
+
+	h_del = proc do
+		routine, save_fn, refresh_fn = support_routine_accessors(section)
+		routine.delete_at(idx)
+		save_fn.call(routine)
+		GLib::Idle.add { refresh_fn.call; false }
+	end
+	$_osa_gc << h_del
+	del_btn.signal_connect("clicked", &h_del)
+
+	h_up = proc do
+		routine, save_fn, refresh_fn = support_routine_accessors(section)
+		if idx > 0
+			routine[idx], routine[idx-1] = routine[idx-1], routine[idx]
+			save_fn.call(routine)
+			GLib::Idle.add { refresh_fn.call; false }
+		end
+	end
+	$_osa_gc << h_up
+	up_btn.signal_connect("clicked", &h_up)
+
+	h_down = proc do
+		routine, save_fn, refresh_fn = support_routine_accessors(section)
+		if idx < routine.length - 1
+			routine[idx], routine[idx+1] = routine[idx+1], routine[idx]
+			save_fn.call(routine)
+			GLib::Idle.add { refresh_fn.call; false }
+		end
+	end
+	$_osa_gc << h_down
+	down_btn.signal_connect("clicked", &h_down)
+
+	[del_btn, up_btn, down_btn].each { |b| btn_row.pack_start(b, expand: false, fill: false, padding: 0) }
+	frame
+end
+
+def self.support_routine_accessors(section)
+	case section
+	when :signs
+		routine = signs_routine_load
+		save_fn = proc { |r| signs_routine_save(r) }
+		refresh_fn = proc { refresh_support_routine_display(@signs_container, signs_routine_load, nil, :signs) }
+	when :sigils
+		routine = sigils_routine_load
+		save_fn = proc { |r| sigils_routine_save(r) }
+		refresh_fn = proc { refresh_support_routine_display(@sigils_container, sigils_routine_load, nil, :sigils) }
+	when :symbols
+		routine = symbols_routine_load
+		save_fn = proc { |r| symbols_routine_save(r) }
+		refresh_fn = proc { refresh_support_routine_display(@symbols_container, symbols_routine_load, nil, :symbols) }
+	when :buff
+		routine = buff_routine_load
+		save_fn = proc { |r| buff_routine_save(r) }
+		refresh_fn = proc { refresh_support_routine_display(@buff_container, buff_routine_load, nil, :buff) }
+	end
+	[routine, save_fn, refresh_fn]
+end
+
+def self.build_support_section(rows, title, options, section, container_var)
+	ui(rows, :header, text: "#{title}:")
+	ui(rows, :blank, height: 4)
+
+	container = Gtk::Box.new(:vertical, 4)
+	instance_variable_set(container_var, container)
+	rows.pack_start(container, expand: false, fill: true, padding: 0)
+
+	routine = case section
+		when :signs   then signs_routine_load
+		when :sigils  then sigils_routine_load
+		when :symbols then symbols_routine_load
+		when :buff    then buff_routine_load
+	end
+	refresh_support_routine_display(container, routine, rows, section)
+
+	ui(rows, :blank, height: 4)
+
+	add_row = Gtk::Box.new(:horizontal, 8)
+	add_row.set_border_width(4)
+
+	combo = Gtk::ComboBoxText.new
+	options.each { |o| combo.append_text(o) }
+	combo.active = 0
+	add_row.pack_start(combo, expand: false, fill: false, padding: 0)
+
+	add_btn = Gtk::Button.new(label: "  + Add  ")
+	h_add = proc do
+		selected = options[combo.active]
+		next unless selected
+		routine, save_fn, _ = support_routine_accessors(section)
+		routine << { 'type' => selected, 'no_wait_for_mob' => false }
+		save_fn.call(routine)
+		GLib::Idle.add {
+			new_routine = case section
+				when :signs   then signs_routine_load
+				when :sigils  then sigils_routine_load
+				when :symbols then symbols_routine_load
+				when :buff    then buff_routine_load
+			end
+			refresh_support_routine_display(instance_variable_get(container_var), new_routine, rows, section)
+			false
+		}
+	end
+	$_osa_gc ||= []
+	$_osa_gc << h_add
+	add_btn.signal_connect("clicked", &h_add)
+	add_row.pack_start(add_btn, expand: false, fill: false, padding: 0)
+	rows.pack_start(add_row, expand: false, fill: false, padding: 0)
+
+	# Description label below the add row -- updates when selection changes
+	desc_lbl = Gtk::Label.new(SUPPORT_DESCRIPTIONS[options[0]].to_s)
+	desc_lbl.xalign = 0.0
+	desc_lbl.set_line_wrap(true)
+	desc_lbl.set_max_width_chars(80)
+	rows.pack_start(desc_lbl, expand: false, fill: false, padding: 2)
+	h_desc = proc {
+		selected = options[combo.active]
+		desc_lbl.text = SUPPORT_DESCRIPTIONS[selected].to_s
+	}
+	$_osa_gc << h_desc
+	combo.signal_connect("changed", &h_desc)
+
 	ui(rows, :blank, height: 10)
-	ui(rows, :header, text: "Society:")
+end
+
+def self.available_signs_options
+	SIGNS_OPTIONS.select { |name| Spell[name].known? rescue true }
+end
+
+def self.available_sigils_options
+	SIGILS_OPTIONS.select { |name| Spell[name].known? rescue true }
+end
+
+def self.available_symbols_options
+	SYMBOLS_OPTIONS.select { |name| Spell[name].known? rescue true }
+end
+
+def self.available_buff_options
+	opts = []
+	BUFF_OPTIONS.each do |name|
+		available = case name
+		when "Seanette's Shout"                  then Warcry.known?("Shout")
+		when "Horland's Holler"                  then Warcry.known?("Holler") || Warcry.known?("Bellow")
+		when "Surge of Strength (Cooldown)",
+		     "Surge of Strength (No Cooldown)"   then CMan.known?("Surge of Strength")
+		when "Wall of Force (140)"               then Spell[140].known?
+		when "Group Bravery (211)"               then Spell[211].known?
+		when "Group Heroism (215)"               then Spell[215].known?
+		when "Group Spell Shield (219)"          then Spell[219].known?
+		when "Sanctify Right Hand (330)",
+		     "Sanctify Left Hand (330)"          then Spell[330].known?
+		when "Mana Focus (418)"                  then Spell[418].known?
+		when "Celerity (506)",
+		     "Group Celerity (506)"              then Spell[506].known?
+		when "Rapid Fire (515)"                  then Spell[515].known?
+		when "Barkskin (605)",
+		     "Group Barkskin (605)"              then Spell[605].known?
+		when "Song of Tonis (1035)"              then Spell[1035].known?
+		when "Mind Over Body (1213)"             then Spell[1213].known?
+		when "Focus Barrier (1216)"              then Spell[1216].known?
+		when "Beacon of Courage (1608)"          then Spell[1608].known?
+		when "Faith Shield (1619)"              then Spell[1619].known?
+		when "Divine Incarnation: Armor (1650)",
+		     "Divine Incarnation: Zeal (1650)"  then Spell[1650].known?
+		when "Steely Resolve"                    then Shield.known?("Steely Resolve")
+		when "Mystic Focus"                      then !@combat_data["mystic_tattoo_noun"].to_s.strip.empty?
+		when "Light Wings: Luminous Flight",
+		     "Light Wings: Prismatic Aegis",
+		     "Light Wings: Wings of Warding"    then !@combat_data["light_wings_pin_noun"].to_s.strip.empty?
+		when "Dark Wings: Shadow Mantle",
+		     "Dark Wings: Crawling Shadow",
+		     "Dark Wings: Carrion Guard"        then !@combat_data["dark_wings_pin_noun"].to_s.strip.empty?
+		else true
+		end
+		opts << name if available
+	end
+	opts
+end
+
+def self.populate_support(rows)
+	# Detect society and show only the matching section
+	society = Society.status.to_s
+	case society
+	when "Council of Light"
+		build_support_section(rows, "Signs (Council of Light)", available_signs_options, :signs, "@signs_container")
+	when "Guardians of Sunfist"
+		build_support_section(rows, "Sigils (Guardians of Sunfist)", available_sigils_options, :sigils, "@sigils_container")
+	when "Order of Voln"
+		build_support_section(rows, "Symbols (Order of Voln)", available_symbols_options, :symbols, "@symbols_container")
+	else
+		# No society or unknown -- show all three
+		build_support_section(rows, "Signs (Council of Light)", available_signs_options, :signs, "@signs_container")
+		build_support_section(rows, "Sigils (Guardians of Sunfist)", available_sigils_options, :sigils, "@sigils_container")
+		build_support_section(rows, "Symbols (Order of Voln)", available_symbols_options, :symbols, "@symbols_container")
+	end
+	build_support_section(rows, "Buffs", available_buff_options, :buff, "@buff_container")
+
 	ui(rows, :blank, height: 6)
-	head = ui(rows, :row, spacing: 40)
-	ui(head, :label, text: "Council of Light", xalign: 0.0, width: 220)
-	ui(head, :label, text: "Guardians of Sunfist", xalign: 0.0, width: 155)
-	ui(head, :label, text: "Order of Voln", xalign: 0.0, width: 220)
-	ui(rows, :blank, height: 6)
-	add_checks.call([
-    { label: "Sign of Warding", tip: "+5 to DS. (Cost: 1 mana)", var: 'sign_of_warding' },
-    { label: "Sigil of Minor Bane", tip: "Adds +5 AS. Also grants heavy damage weighting to melee, ranged and bolt attacks against hated foes. (Cost: 3 mana, 3 stamina)", var: 'sigil_of_minor_bane' },
-    { label: "Symbol of Courage", tip: "Increases member's Attack Strength +1 per rank (Max bonus +26). Duration of 10 seconds per rank (stackable). Fear based attack protection.", var: 'symbol_of_courage'}], cols: 3)
-	add_checks.call([
-    { label: "Sign of Defending", tip: "+10 to DS. (Cost: 2 mana)", var: 'sign_of_defending' },
-    { label: "Sigil of Offense", tip: "Provides a bonus to AS equal to current rank. (Cost: 5 mana, 5 stamina)", var: 'sigil_of_offense' },
-    { label: "Symbol of Protection", tip: "Increases member's Defensive Strength +1 per rank (Max bonus +26). Duration of 20 seconds per rank. Protection also adds a TD boost of 1/2 total ranks. (Max bonus +13) (stackable).", var: 'symbol_of_protection'}], cols: 3)
-	add_checks.call([
-    { label: "Sign of Deflection", tip: "Adds +20 to Bolt DS. (Cost: 3 mana, 0 spirit)", var: 'sign_of_deflection' },
-    { label: "Sigil of Major Bane", tip: "Adds +10 AS. Also grants heavy crit weighting to melee, ranged and bolt attacks against hated foes. (Cost: 10 mana, 10 stamina)", var: 'sigil_of_major_bane' },
-    { label: "Symbol of Disruption", tip: "Casts an aura around user and group members. Any noncorporeal undead struck will sustain penalties to AS/DS,CS/TD,UDF, CMAN. Duration: 10 seconds per rank - (stackable).", var: 'symbol_of_disruption'}], cols: 3)
-	add_checks.call([
-    { label: "Sign of Shields", tip: "Adds +20 to DS. (Cost: 1 spirit)", var: 'sign_of_shields' },
-    { label: "Sigil of Minor Protection", tip: "Provides +5 DS. Also grants heavy damage padding against attacks from hated foes. (Cost: 5 mana, 10 stamina)", var: 'sigil_of_minor_protection' },
-    { label: "Symbol of Mana", tip: "Restores 50 mana. Initially, no deed cost. 5 minute cooldown period.", var: 'symbol_of_mana'}], cols: 3)
-	add_checks.call([
-    { label: "Sign of Striking", tip: "+5 to AS. (Cost: 1 mana)", var: 'sign_of_striking' },
-    { label: "Sigil of Defense", tip: "Provides a bonus to DS equal to current rank. (Cost: 5 mana, 5 stamina)", var: 'sigil_of_defense' },
-    { label: "Symbol of Retribution", tip: "Direct attack against undead when member is deceased. When used while living (self-cast version) will reactively flare if struck by an undead creature. Uses the standard success resolution system.", var: 'symbol_of_retribution'}], cols: 3)
-	add_checks.call([
-    { label: "Sign of Smiting", tip: "+10 to AS. (Cost: 2 mana)", var: 'sign_of_smiting' },
-    { label: "Sigil of Major Protection", tip: "Adds +10 DS. Also grants heavy critical padding against attacks from hated foes. (Cost: 10 mana, 15 stamina)", var: 'sigil_of_major_protection' },
-    { label: "Symbol of Supremacy", tip: "Bonus of +1 per two Voln ranks to AS/CS,CMAN, UAF against undead creatures. Duration: 10 seconds per rank - (stackable).", var: 'symbol_of_supremacy'}], cols: 3)
-	add_checks.call([
-    { label: "Sign of Swords", tip: "Adds +20 to AS. (Cost: 1 spirit)", var: 'sign_of_swords' },
-    { label: "Sigil of Concentration", tip: "+5 mana per pulse. (Cost: 30 stamina)", var: 'sigil_of_concentration' },
-    { label: "Symbol of Restoration", tip: "Returns up to half of a members health point loss. Minimum +10/Maximum +50 HP recovery per use.", var: 'symbol_of_restore'}], cols: 3)
-	add_checks.call([
-    { label: "Sign of Dissipation", tip: "Adds +15 to TD. Costs 1 spirit when sign dissipates. Gated by Minimum Spirit (Dissipating Signs) in Support Options.", var: 'sign_of_dissipation' },
-    { label: "Sigil of Power", tip: "Converts 50 stamina into 25 mana.", var: 'sigil_of_power' },
-    { label: "Symbol of Transcendence", tip: "For 30 seconds member will take damage as if in an incorporeal state. 3 minute cooldown period / 10 minutes if used in emergency.", var: 'symbol_of_transcendance'}], cols: 3)
-	add_checks.call([
-    { label: "Sign of Wracking", tip: "Fully regenerates all mana. Costs 5 spirit. Only fires when mana drops below CoL Mana Threshold (%) in Support Options AND spirit is safely above half max spirit. Characters with max spirit 10 or below cannot safely use this sign.", var: 'sign_of_wracking'}], cols: 1)
-	ui(rows, :header, text: "Buffs:")
-	ui(rows, :blank, height: 6)
-	add_checks.call([
-    { label: "Seanette's Shout", tip: 'Seanette\'s Shout is a supporting war cry that invigorates the warrior and their party and encourages them to strengthen their efforts for 25 stamina. The warrior and all party members are Empowered for a bonus of 20 to all AS attacks.', var: 'warcry_shout' },
-    { label: "Horland's Holler", tip: 'Horland\'s Holler is a room taunt that lasts for a duration based on Influence bonus. Any attacks made in the room have a chance to be redirected back to the warrior. Success of a redirect is based on Multi Opponent Combat training and the Influence bonus of the warrior. In addition, Holler provides the Warrior and Warrior\'s party with a short term Boost Health (20). The success of the taunt is based on the Standard success resolution system, and attackers gain a bonus for every attempt made.', var: 'warcry_holler' },
-    { label: "Surge of Strength (Use Cooldown)", tip: 'Surge of Strength is a commonly used Combat Maneuver due to the strength increase that it provides, increasing a character\'s attack strength and increasing carrying capacity, effectively reducing encumbrance and, therefore, possibly roundtime when attacking. Each bonus point will increase unencumbered carrying capacity 1% of the character\'s body weight with a maximum bonus of 16% at Rank 5. E.g., a character that weighs 200 lbs. with Rank 5 will have an increased carrying capacity of 32 lbs. (200 * .16). Because its effects are treated as an enhancive, it is subject to normal enhancive limits; thus additional ranks of Surge of Strength may net no further bonuses depending on a character\'s existing Strength enhancives (including spells such as Holy Weapon (1625)).', var: 'cman_surge_of_strength_cooldown'}], cols: 3)
-	add_checks.call([
-    { label: "Surge of Strength (Ignore Cooldown)", tip: 'Surge of Strength is a commonly used Combat Maneuver due to the strength increase that it provides, increasing a character\'s attack strength and increasing carrying capacity, effectively reducing encumbrance and, therefore, possibly roundtime when attacking. Each bonus point will increase unencumbered carrying capacity 1% of the character\'s body weight with a maximum bonus of 16% at Rank 5. E.g., a character that weighs 200 lbs. with Rank 5 will have an increased carrying capacity of 32 lbs. (200 * .16). Because its effects are treated as an enhancive, it is subject to normal enhancive limits; thus additional ranks of Surge of Strength may net no further bonuses depending on a character\'s existing Strength enhancives (including spells such as Holy Weapon (1625)).', var: 'cman_surge_of_strength_no_cooldown' },
-    { label: "Wall of Force (140)", tip: 'Wall of Force creates a temporary wall of force that strongly resists attacks. The wall will follow the subject and position itself to fend off attacks while letting outgoing attacks pass without penalty. This spell bestows a +100 to the target\'s Defensive Strength (DS). Wall of Force has a 270 second cooldown per target, beginning when the spell is cast. It is exempt from spell-removing mechanics.', var: 'wallofforce' },
-    { label: "Group Bravery (211)", tip: 'Bravery provides a base bonus of +15 to both physical attack strength, and bolt attack strength. The caster also gains 3 phantom levels against sheer fear attacks. Note: This requires 25 ranks of Spiritual Lore, Blessings.', var: 'groupbravery'}], cols: 3)
-	add_checks.call([
-    { label: "Group Heroism (215)", tip: 'Heroism provides a base bonus of +25 to both physical attack strength, and bolt attack strength and +1 regeneration to both mana (MP) and health point (HP) every minute. The caster also gains 3 phantom levels against sheer fear attacks and an increase to the user\'s defense against a standard maneuver roll if the maneuver is able to be evaded. Note: This requires 35 ranks of Spiritual Lore, Blessings.', var: 'spell_heroism' },
-    { label: "Group Spell Shield (219)", tip: 'Spell Shield (219) provides +30 bolt DS and +30 spiritual TD. The group version is triggered via EVOKE and has a 120 second duration with a 360 second cooldown per target. Requires 50 ranks of Spiritual Lore, Blessings. The EVOKEd version is exempt from spell-removing effects.', var: 'spell_group_spell_shield' },
-    { label: "Sanctify Right Hand (330)", tip: 'This will apply Holy Fire flares and non-corporeal undead anchoring to the item in your right hand. This enhancement, does not apply any of the other 330 benefits, and lasts for 4 hours. At 90 and 180 ranks of Spiritual Lore, Religion clerics gain an extra charge of a Holy Fire flare that is guaranteed to trigger on their next attack.', var: 'sanctrighthand' }], cols: 3)
-	add_checks.call([
-    { label: "Sanctify Left Hand (330)", tip: 'This will apply Holy Fire flares and non-corporeal undead anchoring to the item in your left hand. This enhancement, does not apply any of the other 330 benefits, and lasts for 4 hours. At 90 and 180 ranks of Spiritual Lore, Religion clerics gain an extra charge of a Holy Fire flare that is guaranteed to trigger on their next attack.', var: 'sanctlefthand' },
-    { label: "Mana Focus (418)", tip: 'Mana Focus provides mana regeneration to the caster and their group. Pulse rate and regeneration amount scale with training. Cast untargeted.', var: 'cast_spell_mana_focus' },
-    { label: "Celerity (506)", tip: 'Celerity reduces the stamina cost, possibly to zero, for all Quickstrike actions that reduce combat roundtimes (see QUICKSTRIKE for a full listing). It has a non-stackable 60 second duration. If not natively self-cast, there is a four minute period starting at the time of first application during which Celerity may not be re-applied to the same target. There is no such delay when the spell is natively self-cast. All offensive combat actions automatically apply the lowest RT possible whether or not the Quickstrike ability is explicitly invoked. Users of Celerity need not use Quickstrike to gain the maximum zero-stamina RT reduction, or may use Quickstrike to gain additional RT reduction at a lesser stamina cost than would otherwise be the case.', var: 'cast_spell_self_celerity' }], cols: 3)
-	add_checks.call([
-    { label: "Group Celerity (506)", tip: 'Celerity reduces the stamina cost, possibly to zero, for all Quickstrike actions that reduce combat roundtimes (see QUICKSTRIKE for a full listing). It has a non-stackable 60 second duration. If not natively self-cast, there is a four minute period starting at the time of first application during which Celerity may not be re-applied to the same target. There is no such delay when the spell is natively self-cast. All offensive combat actions automatically apply the lowest RT possible whether or not the Quickstrike ability is explicitly invoked. Users of Celerity need not use Quickstrike to gain the maximum zero-stamina RT reduction, or may use Quickstrike to gain additional RT reduction at a lesser stamina cost than would otherwise be the case. Note: This requires 50 ranks of Elemental Lore, Air.', var: 'cast_spell_group_celerity' },
-    { label: "Rapid Fire (515)", tip: 'While Rapid Fire is active, it will reduce the cast roundtime of all subsequent spells to 1 second. Once the effect ends, there is a short recovery period (i.e. cooldown) of 90 seconds before the spell can be used again without an extra penalty. If the spell is recast during the recovery period, all subsequent spells cast cost an additional 5 mana. Training in Elemental Mana Control will reduce the recovery period.', var: 'spell_rapid_fire' },
-    { label: "Barkskin (605)", tip: 'Barkskin allows the Ranger to surround themselves with a thick layer of bark, which will absorb the next instance of a physical attack, SMRv2 maneuver, bolt spell, or warding spell that would have otherwise successfully struck them. On attacks that would have only moderately been successful, the bark has a 50 + (Spiritual Lore, Blessings ranks / 2) % chance of enduring. Moderate success is defined as a successful endroll threshold of no more than 20 + (Survival skill / 10). Barkskin has a five minute character-specific cooldown after successfully absorbing an effect during which that character may not gain Barkskin again.', var: 'barkskin_spell' }], cols: 3)
-	add_checks.call([
-    { label: "Group Barkskin (605)", tip: 'Barkskin allows the Ranger to surround themselves with a thick layer of bark, which will absorb the next instance of a physical attack, SMRv2 maneuver, bolt spell, or warding spell that would have otherwise successfully struck them. On attacks that would have only moderately been successful, the bark has a 50 + (Spiritual Lore, Blessings ranks / 2) % chance of enduring. Moderate success is defined as a successful endroll threshold of no more than 20 + (Survival skill / 10). Barkskin has a five minute character-specific cooldown after successfully absorbing an effect during which that character may not gain Barkskin again. Note: This requires 50 ranks of Spiritual Lore, Blessings.', var: 'barkskin_spell_group' },
-    { label: "Song of Tonis (1035)", tip: 'While singing this song, a Bard magically imparts all members of his or her party with additional speed, making all of their actions a bit quicker, and giving them an increased chance to dodge incoming attacks. Specifically, Song of Tonis increases the defensive equivalent of the group\'s Dodging skill by +20 ranks as well as adding a -1 second haste effect.', var: 'song_song_of_tonis' },
-    { label: "Mind Over Body (1213)", tip: 'Mind over Body is a group focus spell which decreases stamina activation costs for the caster and group members. The base reduction is 20% and can be further increased with training in Mental Lore, Telepathy. The reduced cost from this spell applies to anything involving stamina usage: GoS sigils, combat maneuvers, warrior and rogue guild skills, etc. The spell will terminate when the caster dies or is sufficiently stunned. Group members who leave the group and the immediate room of the caster will lose the spell effect within approximately 60 seconds. A caster can maintain only one focus spell at a time.', var: 'mob' }], cols: 3)
-	add_checks.call([
-    { label: "Focus Barrier (1216)", tip: 'Focus Barrier is a group focus spell that provides the caster and member\'s of his group a +30 Defensive Strength (DS) bonus. The spell will terminate when the caster dies or is sufficiently stunned. Group members who leave the group and the immediate room of the caster will lose the spell effect within approximately 60 seconds. A caster can maintain only one focus spell at a time', var: 'focus' },
-    { label: "Beacon of Courage (1608)", tip: 'The Beacon of Courage effect will redirect attacks made on the paladin\'s party members to the paladin. Any creature attacking a party member while this effect is active will be subject to hidden warding rolls and failing will redirect attacks for as long as the Beacon of Courage effect lasts. The effect also allows the Paladin to ignore Force on Force mechanics for at least one additional target, the number of targets increasing based on Spiritual Lore, Blessings.', var: 'spell_beacon_of_courage' },
-    { label: "Faith Shield (1619)", tip: 'Provides a base benefit of +50 to Spiritual Target Defense (TD) for 30 seconds. The duration is extended +1 second for every two Paladin Base spell ranks known above rank 19. The maximum duration is 70 seconds at 99 Paladin Base spell ranks. Faith Shield has a 210 second cooldown.', var: 'spell_shield_faith' }], cols: 3)
-	add_checks.call([
-    { label: "Divine Incarnation: Armor (1650) Emergency Use", tip: 'This causes a holy armor to surround the paladin. This grants a 50% resistance to all forms of attack for 30 seconds.Training in Spiritual Lore, Blessings increases the resistance effect of Armor. Divine Incarnation does not need to be active in order to invoke an "emergency" usage of Armor.', var: 'di_armor' },
-    { label: "Divine Incarnation: Zeal (1650)", tip: 'Zeal will cause a divine aura to surround the paladin and trigger deity specific flares upon the next 5 successful attacks made during the next 60 seconds. If time allows, additional flares may be triggered at a cost of 1 divine energy each. Training in Spiritual Lore, Summoning increases the duration of Zeal.', var: 'cast_spell_di_zeal' },
-    { label: "Steely Resolve", tip: 'For 60 seconds, you gain +15 Block DS per rank and a +15% chance per rank to block incoming attacks. There a 5 minute recovery period after using this ability, where it cannot be re-invoked.', var: 'shield_steely'}], cols: 3)
-	add_checks.call([
-    { label: "Light Wings: Luminous Flight (T1)", tip: "Temporary flight, ignoring height restrictions for attacks. Lasts 30 seconds with a 90 second cooldown. While active, grants +5% evade chance per Tier. Activated via TAP.", var: 'wings_light_luminous_flight' },
-    { label: "Light Wings: Prismatic Aegis (T2)", tip: "Grants Evasiveness for the next incoming attack for 10 seconds. 3 minute cooldown. Activated via PULL.", var: 'wings_light_prismatic_aegis' },
-    { label: "Light Wings: Wings of Warding (T3)", tip: "Wings expand outward providing temporary protection for the player's group. +25 DS, +15 TD, and +10 critical padding for 30 seconds. 30 minute cooldown. Cannot stack with other wings. Activated via PUSH.", var: 'wings_light_wings_of_warding' }], cols: 3)
-	add_checks.call([
-    { label: "Dark Wings: Shadow Mantle (T1)", tip: "Wings fold inward, cloaking the wearer in shadows. Grants +5 per Tier in Stalking and Hiding ranks with a 90 second cooldown. While active, grants a +5 evade chance per tier. Activated via TAP.", var: 'wings_dark_shadow_mantle' },
-    { label: "Dark Wings: Crawling Shadow (T2)", tip: "Grants Evasiveness for the next incoming attack for 10 seconds. SMR counter attack to cause Disease effect. 3 minute cooldown. Activated via PULL.", var: 'wings_dark_crawling_shadow' },
-    { label: "Dark Wings: Carrion Guard (T3)", tip: "Draws health from wounds to nearby players or creatures. Temporarily grants +10 Damage Resistance/Padding, 5 HP regen, and +100 max HP for 60 seconds. 15 minute cooldown. Activated via PUSH.", var: 'wings_dark_carrion_guard' }], cols: 3)
-	ui(rows, :blank, height: 10)
 	ui(rows, :header, text: "Support Options:")
 	ui(rows, :blank, height: 6)
 	r_restore = ui(rows, :row)
 	ui(r_restore, :entry, label: "Symbol of Restore Threshold:", tip: 'Will use "Symbol of Restore" when your health percentage drops below this number. Default setting is 65.', var: 'percent_health', width_chars: 4, default: "65", label_width: 200)
 	ui(rows, :blank, height: 4)
 	r_spirit = ui(rows, :row)
-	ui(r_spirit, :entry, label: "Min Spirit (Dissipating Signs):", tip: "Minimum spirit required before using Sign of Dissipation, Sign of Swords, or Sign of Shields. These signs cost 1 spirit when they wear off. Leave 0 to auto-calculate: ceil(max_spirit/2) + 3. For a character with 10 max spirit the auto value is 8, meaning the sign will not be cast unless you have at least 8 spirit.", var: 'min_spirit_dissipating', width_chars: 4, default: "0", label_width: 200, placeholder: "0 = auto")
-	ui(r_spirit, :entry, label: "CoL Mana Threshold (%):", tip: "Sign of Wracking will only fire when your mana drops below this percentage. Default 30%. The sign also requires spirit > ceil(max_spirit/2) + 5 to avoid obvious spirit drain. Characters with 10 or fewer max spirit can never safely use Sign of Wracking.", var: 'col_mana_threshold', width_chars: 4, default: "30", label_width: 200, placeholder: "30")
+	ui(r_spirit, :entry, label: "Min Spirit (Dissipating Signs):", tip: "Minimum spirit required before using Sign of Dissipation, Sign of Swords, or Sign of Shields. Leave 0 to auto-calculate: ceil(max_spirit/2) + 3.", var: 'min_spirit_dissipating', width_chars: 4, default: "0", label_width: 200, placeholder: "0 = auto")
+	ui(r_spirit, :entry, label: "CoL Mana Threshold (%):", tip: "Sign of Wracking will only fire when your mana drops below this percentage. Default 30%.", var: 'col_mana_threshold', width_chars: 4, default: "30", label_width: 200, placeholder: "30")
 	ui(rows, :blank, height: 4)
 	r_wings = ui(rows, :row)
-	ui(r_wings, :entry, label: "Light Wings Pin:", tip: 'Enter the adjective and noun of your Light Energy "Pinions and Pulse" pin e.g. "silver pin". Used for Light Wings buff actions (tap/pull/push).', var: 'light_wings_pin_adj', width_chars: 10, default: "", label_width: 140, placeholder: "adjective")
+	ui(r_wings, :entry, label: "Light Wings Pin:", tip: 'Adjective and noun of your Light Energy pin e.g. "silver pin".', var: 'light_wings_pin_adj', width_chars: 10, default: "", label_width: 140, placeholder: "adjective")
 	ui(r_wings, :entry, label: "", tip: 'Noun of your Light Wings pin.', var: 'light_wings_pin_noun', width_chars: 10, default: "", label_width: 10, placeholder: "noun")
-	ui(r_wings, :entry, label: "Dark Wings Pin:", tip: 'Enter the adjective and noun of your Dark Energy "Pinions and Pulse" pin e.g. "obsidian pin". Used for Dark Wings buff actions (tap/pull/push).', var: 'dark_wings_pin_adj', width_chars: 10, default: "", label_width: 140, placeholder: "adjective")
+	ui(r_wings, :entry, label: "Dark Wings Pin:", tip: 'Adjective and noun of your Dark Energy pin e.g. "obsidian pin".', var: 'dark_wings_pin_adj', width_chars: 10, default: "", label_width: 140, placeholder: "adjective")
 	ui(r_wings, :entry, label: "", tip: 'Noun of your Dark Wings pin.', var: 'dark_wings_pin_noun', width_chars: 10, default: "", label_width: 10, placeholder: "noun")
 	ui(rows, :blank, height: 4)
+	r_tattoo = ui(rows, :row)
+	ui(r_tattoo, :entry, label: "Mystic Tattoo:", tip: 'Enter the adjective and noun of your Mystic Focus tattoo e.g. "serpentine tattoo". Used with RUB to activate Mystic Focus (doubles Stat/Skill tattoo bonuses for 30 seconds).', var: 'mystic_tattoo_adj', width_chars: 10, default: "", label_width: 140, placeholder: "adjective")
+	ui(r_tattoo, :entry, label: "", tip: 'Noun of your Mystic Focus tattoo.', var: 'mystic_tattoo_noun', width_chars: 10, default: "", label_width: 10, placeholder: "noun")
+	ui(rows, :blank, height: 4)
+	add_checks = lambda do |defs, cols: 4, group: :general_checks, spacing: 18|
+		defs.each_slice(cols).with_index do |slice, _row_i|
+			r = ui(rows, :row, spacing: spacing)
+			slice.each_with_index do |d, col|
+				ui(r, :check, label: d[:label], tip: d[:tip].to_s, var: d[:var], default: d.fetch(:default, false), group: group, col: col)
+			end
+		end
+	end
 	add_checks.call([
-    { label: "Cast Buffs Without Waiting For Enemy", tip: 'When checked, all support buffs (spells, songs, war cries, abilities) will cast immediately on script start rather than waiting for a live enemy to be present first. Buffs will still refresh normally after the first cast regardless of this setting.', var: 'buff_no_wait_for_mob', default: false },
     { label: "Enable Unstun", tip: 'Click to enable automatic use of the "Unstun" spell on PCs who are present and stunned.', var: 'use_unstun' },
     { label: "Bless Caster", tip: 'Click to enable casting "Bless" spell or "Symbol of Bless" on others when the commander calls for blessing the crew.', var: 'givebless' },
     { label: "Need Bless", tip: 'Click to indicate need for a blessing when the commander calls for one.', var: 'needbless'}], cols: 4)
@@ -4751,20 +5084,10 @@ def self.build_routine_entry_row(entry, idx, main_rows, creature_type = :living)
 	tgt_parts = []
 	tgt_parts << "Min Targets: #{entry['min_targets']}"   if entry['min_targets'].to_i > 1
 	tgt_parts << "Max Targets: #{entry['max_targets']}"   if entry['max_targets'].to_i < 99
-	tgt_parts << "Target Stunned"      if entry['tgt_stunned']
-	tgt_parts << "Target Not Stunned"  if entry['tgt_not_stunned']
-	tgt_parts << "Target Bound"        if entry['tgt_bound']
-	tgt_parts << "Target Not Bound"    if entry['tgt_not_bound']
-	tgt_parts << "Target Webbed"       if entry['tgt_webbed']
-	tgt_parts << "Target Not Webbed"   if entry['tgt_not_webbed']
-	tgt_parts << "Target Prone"        if entry['tgt_prone']
-	tgt_parts << "Target Not Prone"    if entry['tgt_not_prone']
-	tgt_parts << "Target Rooted"       if entry['tgt_rooted']
-	tgt_parts << "Target Not Rooted"   if entry['tgt_not_rooted']
-	tgt_parts << "Target Calmed"       if entry['tgt_calmed']
-	tgt_parts << "Target Not Calmed"   if entry['tgt_not_calmed']
-	tgt_parts << "Target Frozen"       if entry['tgt_frozen']
-	tgt_parts << "Target Not Frozen"   if entry['tgt_not_frozen']
+	tgt_parts << "Target Prone"      if entry['tgt_prone']
+	tgt_parts << "Target Not Prone"  if entry['tgt_not_prone']
+	tgt_parts << "Target Rooted"     if entry['tgt_rooted']
+	tgt_parts << "Target Not Rooted" if entry['tgt_not_rooted']
 	unless tgt_parts.empty?
 		l4 = Gtk::Label.new("Target Conditions: #{tgt_parts.join(",  ")}")
 		l4.xalign = 0.0
@@ -4782,6 +5105,7 @@ def self.build_routine_entry_row(entry, idx, main_rows, creature_type = :living)
 		opt_parts << "UAC"                if entry['mstrike_uac']
 		opt_parts << "Archery"            if entry['mstrike_archery']
 		opt_parts << "Melee"              if entry['mstrike_melee']
+		opt_parts << "Ignore Cooldown (Speed #{entry['mstrike_weapon_speed']})" if entry['mstrike_ignore_cooldown']
 		opt_parts << "Flare Gloves: #{entry['flare_gloves_adj']} #{entry['flare_gloves_noun']}".strip if !entry['flare_gloves_noun'].to_s.empty?
 		opt_parts << "Wings Pin: #{entry['wings_pin_adj']} #{entry['wings_pin_noun']}".strip if !entry['wings_pin_noun'].to_s.empty?
 		unless opt_parts.empty?
@@ -4992,27 +5316,12 @@ def self.open_living_entry_dialog(main_rows, edit_idx, kind, creature_type = :li
 	tgt_grid.row_spacing    = 4
 	vbox.pack_start(tgt_grid, expand: false, fill: false, padding: 0)
 
-	stunned_cb     = make_check(tgt_grid, "Target Stunned",     entry['tgt_stunned'],     tip: "Only fire if the target is currently stunned.")
-	not_stunned_cb = make_check(tgt_grid, "Target Not Stunned", entry['tgt_not_stunned'], tip: "Only fire if the target is NOT stunned. Useful for opening attacks before applying a stun.")
-	bound_cb       = make_check(tgt_grid, "Target Bound",       entry['tgt_bound'],       tip: "Only fire if the target is currently bound.")
-	not_bound_cb   = make_check(tgt_grid, "Target Not Bound",   entry['tgt_not_bound'],   tip: "Only fire if the target is NOT bound.")
-	[stunned_cb, not_stunned_cb, bound_cb, not_bound_cb].each_with_index { |cb, col| cb.set_size_request(160, -1); tgt_grid.attach(cb, col, 0, 1, 1) }
-
-	webbed_cb      = make_check(tgt_grid, "Target Webbed",     entry['tgt_webbed'],     tip: "Only fire if the target is currently webbed.")
-	not_webbed_cb  = make_check(tgt_grid, "Target Not Webbed", entry['tgt_not_webbed'], tip: "Only fire if the target is NOT webbed.")
-	prone_cb       = make_check(tgt_grid, "Target Prone",      entry['tgt_prone'],      tip: "Only fire if the target is lying prone. Useful for follow-up attacks on downed enemies.")
-	not_prone_cb   = make_check(tgt_grid, "Target Not Prone",  entry['tgt_not_prone'],  tip: "Only fire if the target is NOT prone.")
-	[webbed_cb, not_webbed_cb, prone_cb, not_prone_cb].each_with_index { |cb, col| cb.set_size_request(160, -1); tgt_grid.attach(cb, col, 1, 1, 1) }
-
-	rooted_cb      = make_check(tgt_grid, "Target Rooted",     entry['tgt_rooted'],     tip: "Only fire if the target is currently rooted.")
-	not_rooted_cb  = make_check(tgt_grid, "Target Not Rooted", entry['tgt_not_rooted'], tip: "Only fire if the target is NOT rooted.")
-	calmed_cb      = make_check(tgt_grid, "Target Calmed",     entry['tgt_calmed'],     tip: "Only fire if the target is calmed.")
-	not_calmed_cb  = make_check(tgt_grid, "Target Not Calmed", entry['tgt_not_calmed'], tip: "Only fire if the target is NOT calmed.")
-	[rooted_cb, not_rooted_cb, calmed_cb, not_calmed_cb].each_with_index { |cb, col| cb.set_size_request(160, -1); tgt_grid.attach(cb, col, 2, 1, 1) }
-
-	frozen_cb      = make_check(tgt_grid, "Target Frozen",     entry['tgt_frozen'],     tip: "Only fire if the target is currently frozen.")
-	not_frozen_cb  = make_check(tgt_grid, "Target Not Frozen", entry['tgt_not_frozen'], tip: "Only fire if the target is NOT frozen.")
-	[frozen_cb, not_frozen_cb].each_with_index { |cb, col| cb.set_size_request(160, -1); tgt_grid.attach(cb, col, 3, 1, 1) }
+	# Row 0: Prone | Not Prone | Rooted | Not Rooted
+	prone_cb      = make_check(tgt_grid, "Target Prone",      entry['tgt_prone'],      tip: "Only fire if the target is prone (stunned, webbed, frozen, lying down, kneeling, sleeping, entangled, or held in place).")
+	not_prone_cb  = make_check(tgt_grid, "Target Not Prone",  entry['tgt_not_prone'],  tip: "Only fire if the target is NOT in any prone-like state. Useful for attacks that require a standing target.")
+	rooted_cb     = make_check(tgt_grid, "Target Rooted",     entry['tgt_rooted'],     tip: "Only fire if the target is currently rooted (cannot move).")
+	not_rooted_cb = make_check(tgt_grid, "Target Not Rooted", entry['tgt_not_rooted'], tip: "Only fire if the target is NOT rooted.")
+	[prone_cb, not_prone_cb, rooted_cb, not_rooted_cb].each_with_index { |cb, col| cb.set_size_request(160, -1); tgt_grid.attach(cb, col, 0, 1, 1) }
 
 	# --- Other Options ---
 	sep3 = Gtk::Separator.new(:horizontal)
@@ -5059,13 +5368,47 @@ def self.open_living_entry_dialog(main_rows, edit_idx, kind, creature_type = :li
 		vbox.pack_start(ms_lbl, expand: false, fill: false, padding: 0)
 		ms_row = Gtk::Box.new(:horizontal, 12)
 		vbox.pack_start(ms_row, expand: false, fill: false, padding: 0)
-		ms_uac_cb      = make_check(ms_row, "UAC",                entry['mstrike_uac'],          tip: "Configure mstrike for UAC combat (default: jab).")
-		ms_archery_cb  = make_check(ms_row, "Archery",            entry['mstrike_archery'],      tip: "Configure mstrike for archery combat (default: fire).")
-		ms_melee_cb    = make_check(ms_row, "Melee",              entry['mstrike_melee'],        tip: "Configure mstrike for standard melee weapon combat (default: attack).")
-		celerity_only_cb = make_check(ms_row, "Skip With Celerity", entry['mstrike_skip_celerity'], tip: "Skip Multi-Strike when Celerity (506) is active. Celerity already reduces roundtime on all attacks so mstrike may be redundant.")
+		ms_uac_cb        = make_check(ms_row, "UAC",                entry['mstrike_uac'],             tip: "Configure mstrike for UAC combat (default: jab).")
+		ms_archery_cb    = make_check(ms_row, "Archery",            entry['mstrike_archery'],         tip: "Configure mstrike for archery combat (default: fire).")
+		ms_melee_cb      = make_check(ms_row, "Melee",              entry['mstrike_melee'],           tip: "Configure mstrike for standard melee weapon combat (default: attack).")
+		celerity_only_cb = make_check(ms_row, "Skip With Celerity", entry['mstrike_skip_celerity'],   tip: "Skip Multi-Strike when Celerity (506) is active.")
+		ignore_cd_cb     = make_check(ms_row, "Ignore Cooldown",    entry['mstrike_ignore_cooldown'], tip: "Fire Multi-Strike during the recovery period. Stamina gated: Open = 20 + (3 x Speed), Targeted = 30 + (4 x Speed).")
+
+		ms_speed_row = Gtk::Box.new(:horizontal, 8)
+		vbox.pack_start(ms_speed_row, expand: false, fill: false, padding: 0)
+		speed_chart = "Base Weapon Speed Chart:\n"\
+		              "1 - Handaxe, Light Crossbow\n"\
+		              "2 - Broadsword, Short Sword, Falchion, Heavy Crossbow\n"\
+		              "3 - Longsword, Scimitar, Composite Bow\n"\
+		              "4 - Bastard Sword, Battle Axe, Morning Star, Long Bow\n"\
+		              "5 - Two-Handed Sword, War Hammer, Quarterstaff\n"\
+		              "6 - Two-Handed Axe, Halberd\n"\
+		              "7 - Claidhmore\n"\
+		              "8 - Great Axe\n"\
+		              "9 - Heaviest weapons"
+		ws_lbl = Gtk::Label.new("Base Weapon Speed:")
+		ws_lbl.xalign = 0.0
+		ws_lbl.tooltip_text = speed_chart
+		ms_speed_row.pack_start(ws_lbl, expand: false, fill: false, padding: 0)
+		ws_ent = Gtk::Entry.new
+		ws_ent.text = entry['mstrike_weapon_speed'].to_s
+		ws_ent.set_width_chars(3)
+		ws_ent.tooltip_text = speed_chart
+		ms_speed_row.pack_start(ws_ent, expand: false, fill: false, padding: 0)
+		ws_cost_lbl = Gtk::Label.new("")
+		ws_cost_lbl.xalign = 0.0
+		ms_speed_row.pack_start(ws_cost_lbl, expand: false, fill: false, padding: 4)
+		update_speed_cost = proc {
+			spd = ws_ent.text.to_i
+			ws_cost_lbl.text = spd > 0 ? "Open: #{20 + 3*spd} stamina  |  Targeted: #{30 + 4*spd} stamina" : ""
+		}
+		update_speed_cost.call
+		h_speed = proc { update_speed_cost.call }
+		$_osa_entry_dialog_gc << h_speed
+		ws_ent.signal_connect("changed", &h_speed)
 
 		# Grey out Multi-Strike Options unless Multi-Strike is selected
-		ms_widgets = [ms_sep, ms_lbl, ms_uac_cb, ms_archery_cb, ms_melee_cb, celerity_only_cb]
+		ms_widgets = [ms_sep, ms_lbl, ms_uac_cb, ms_archery_cb, ms_melee_cb, celerity_only_cb, ignore_cd_cb, ws_lbl, ws_ent, ws_cost_lbl]
 		update_ms_sensitivity = proc {
 			is_ms = LIVING_ATTACK_OPTIONS[type_combo.active].to_s == "Multi-Strike"
 			ms_widgets.each { |w| w.sensitive = is_ms }
@@ -5185,9 +5528,12 @@ def self.open_living_entry_dialog(main_rows, edit_idx, kind, creature_type = :li
 			new_entry['use_forcert']           = forcert_cb.active?
 			new_entry['use_quickstrike']       = qs_cb.active?
 			new_entry['quickstrike_value']     = qs_ent.text.to_s.strip
-			new_entry['mstrike_uac']           = ms_uac_cb.active?
-			new_entry['mstrike_archery']       = ms_archery_cb.active?
-			new_entry['mstrike_melee']         = ms_melee_cb.active?
+			new_entry['mstrike_uac']             = ms_uac_cb.active?
+			new_entry['mstrike_archery']          = ms_archery_cb.active?
+			new_entry['mstrike_melee']            = ms_melee_cb.active?
+			new_entry['mstrike_skip_celerity']    = celerity_only_cb.active?
+			new_entry['mstrike_ignore_cooldown']  = ignore_cd_cb.active?
+			new_entry['mstrike_weapon_speed']     = ws_ent.text.to_i
 			new_entry['flare_gloves_adj']  = fg_adj_ent.text.to_s.strip
 			new_entry['flare_gloves_noun'] = fg_noun_ent.text.to_s.strip
 			new_entry['wings_pin_adj']     = wp_adj_ent.text.to_s.strip
@@ -5210,20 +5556,10 @@ def self.open_living_entry_dialog(main_rows, edit_idx, kind, creature_type = :li
 		new_entry['max_stam']        = max_stam_ent.text.to_i
 		new_entry['min_targets']     = min_tgt_ent.text.to_i
 		new_entry['max_targets']     = max_tgt_ent.text.to_i
-		new_entry['tgt_stunned']     = stunned_cb.active?
-		new_entry['tgt_not_stunned'] = not_stunned_cb.active?
-		new_entry['tgt_bound']       = bound_cb.active?
-		new_entry['tgt_not_bound']   = not_bound_cb.active?
-		new_entry['tgt_webbed']      = webbed_cb.active?
-		new_entry['tgt_not_webbed']  = not_webbed_cb.active?
 		new_entry['tgt_prone']       = prone_cb.active?
 		new_entry['tgt_not_prone']   = not_prone_cb.active?
 		new_entry['tgt_rooted']      = rooted_cb.active?
 		new_entry['tgt_not_rooted']  = not_rooted_cb.active?
-		new_entry['tgt_calmed']      = calmed_cb.active?
-		new_entry['tgt_not_calmed']  = not_calmed_cb.active?
-		new_entry['tgt_frozen']      = frozen_cb.active?
-		new_entry['tgt_not_frozen']  = not_frozen_cb.active?
 		new_entry['only_use_on']     = only_ent.text.to_s.strip
 		new_entry['do_not_use_on']   = skip_ent.text.to_s.strip
 
@@ -5485,12 +5821,21 @@ def self.build_combatsetup_window
 		notebook.append_page(page_box, Gtk::Label.new(name))
 		instance_variable_set("@OSA_COM_ROWS#{idx}", rows)
 	end
-	populate_general(@OSA_COM_ROWS1)
-	populate_support(@OSA_COM_ROWS2)
-	populate_living(@OSA_COM_ROWS3)
-	populate_undead(@OSA_COM_ROWS4)
-	populate_gemstones1(@OSA_COM_ROWS5)
-	populate_spell_sever(@OSA_COM_ROWS6)
+	[
+		[:populate_general,    @OSA_COM_ROWS1],
+		[:populate_support,    @OSA_COM_ROWS2],
+		[:populate_living,     @OSA_COM_ROWS3],
+		[:populate_undead,     @OSA_COM_ROWS4],
+		[:populate_gemstones1, @OSA_COM_ROWS5],
+		[:populate_spell_sever,@OSA_COM_ROWS6]
+	].each do |method_name, rows|
+		begin
+			send(method_name, rows)
+		rescue => e
+			respond "--- OSACombat: Error in #{method_name}: #{e.class}: #{e.message}"
+			respond e.backtrace.first(5).join("\n")
+		end
+	end
 	button_row = Gtk::Box.new(:horizontal, 12)
 	button_row.set_halign(:end)
 	save_btn  = Gtk::Button.new(label: "Save")
@@ -5517,6 +5862,7 @@ def self.build_combatsetup_window
 	button_row.pack_start(close_btn, false, false, 0)
 	main_box.pack_start(button_row, false, false, 6)
 	@OSA_COM_WINDOW.show_all
+	@OSA_COM_WINDOW.present
 end
 
 def self.save_script_data(key, value, push: false, path: nil)
@@ -5583,6 +5929,10 @@ def self.cleanup_obsolete_vars
 	obsolete = %w[
 		energy_wings_noun flareglovesnoun noattack nouacweapons
 		pound stomp tap uacweapons use_kneel use_stealth use_waylay
+		tgt_stunned tgt_not_stunned tgt_bound tgt_not_bound
+		tgt_webbed tgt_not_webbed tgt_frozen tgt_not_frozen
+		tgt_calmed tgt_not_calmed
+		society_routine mana_routine
 	]
 	# creature_1 through creature_10 slots from old Creature Exceptions tab
 	(1..10).each do |n|
@@ -5675,7 +6025,7 @@ rescue StandardError
 	{}
 end
 
-self.save_script_data("version", "4.2.50 (August 22, 2026)", push: false)
+self.save_script_data("version", "4.2.83 (August 28, 2026)", push: false)
 #toggle_upstream if !upstream_is_enabled?
 require "yaml"
 require "gtk3"
@@ -5840,13 +6190,14 @@ $osa_expired_gear      = []
 $_osa_gc               = []   # GC anchor for living routine dialog signal handlers
 $osa_status_burst      = false
 $osa_anti_magic_room   = false
+$osa_target_prone      = false
 $poach_strikes         = 0
-$osa_reactive          = false
 $osa_forcert_uses      = 0    # ForceRT uses consumed in current RT cycle
 $osa_forcert_last_rt   = nil  # RT expiry time when uses were last reset
 $osa_forcert_active    = false # Set true just before dispatching a ForceRT attack
-$osa_reactivetype      = nil
-$osa_reactive_creatures = []
+$osa_next_forcert      = false # Set true when the next routine entry uses ForceRT
+$osa_uac_last_target   = nil  # Last target ID for UAC chain continuity
+$buff_firstcast        = false
 if @room_creatures.nil?
 	@room_creatures = Array.new
 end
@@ -5865,7 +6216,10 @@ elsif script.vars[1] == 'undead'
 	respond "Setting Creature Type to Undead"
 	respond ""
 elsif (script.vars[1] =~ /setup/i)
+	self.load_osa_yaml
+	self.cleanup_obsolete_vars
 	self.combatsetup()
+	sleep 0.5 while @OSA_COM_WINDOW
 	exit
 elsif (Script.current.vars[1] =~ /profile/i)
 	self.profile(Script.current.vars)
@@ -5991,6 +6345,13 @@ DownstreamHook.add("osa_downstream_monitor", proc { |line|
 	# 917 Earthen Fury - channel state
 	$earthen_fury_active = true  if line =~ /The ground beneath .+ begins to boil violently/
 	$earthen_fury_active = false if line =~ /The ground beneath .+ suddenly calms/
+	# Target prone status -- set when game confirms lying down, clear when target stands
+	if line =~ /lying down|knocked to the ground|falls? to the ground|is driven to the ground/
+		$osa_target_prone = true
+	end
+	if line =~ /jumps? to (?:his|her|its|their) feet|stands? up|gets? up|rises? to/
+		$osa_target_prone = false
+	end
 	# When a target dies, scrub it from all affected target arrays
 	if line =~ /(?:goes? limp|falls? to the ground|is dead|slumps? to the ground|crumples? to)/
 		npc = GameObj.targets.find { |n| line.include?(n.name) }
@@ -6023,16 +6384,14 @@ DownstreamHook.add("osa_downstream_monitor", proc { |line|
 	if line =~ /You could use this opportunity to (.*)!/
 		if @combat_data["use_reactive"]
 			raw = $1
-			# The game sends XML like: <d cmd='WEAPON radialsweep #112628214'>Radial Sweep</d>
-			# Extract just the command word from the cmd attribute, stripping the target id
+			# Extract the command word from XML cmd attribute or plain text
 			if raw =~ /cmd='WEAPON\s+(\S+?)(?:\s+#\d+)?'/
-				$osa_reactivetype = $1.downcase
+				reactivetype = $1.downcase
 			else
-				# Plain text fallback - strip any remaining XML tags
-				$osa_reactivetype = raw.gsub(/<[^>]+>/, "").strip.downcase
+				reactivetype = raw.gsub(/<[^>]+>/, "").strip.downcase
 			end
-			$osa_reactive_creatures = GameObj.targets.reject { |n| n.status =~ /dead|gone/ }.map(&:id)
-			$osa_reactive         = true
+			# Fire immediately using put (safe from hook thread context)
+			put "weapon #{reactivetype}"
 		end
 	end
 	line
@@ -6061,3 +6420,4 @@ loop {
 	end
 	sleep 0.1
 }
+
