@@ -5,7 +5,7 @@
         game: gemstone
         tags: bounty, adventurer's guild, undead, voln
     requires: Lich > 5.4.0
-     version: 1.0
+     version: 1.5
 
   Want to keep earning favor with Voln while at the same time completing bounties?
 
@@ -49,9 +49,52 @@
   The creature name (if given) is checked against the same undead creature
   list ;ebestiary/gameobj-data.xml uses before the script ever leaves the
   guild - if nothing undead matches, it errors out immediately instead of
-  burning a Bounty Boost.
+  burning a Bounty Boost. A typo gets a distinct error from a real creature
+  that just isn't undead (checked against every known creature name, not
+  only the undead ones).
+
+  Gives up after 25 rerolls without a match, in case of a bad creature name
+  or a bounty that can't be assigned at your level.
+
+  Whenever the script ends - success, failure, or the attempt cap - it takes
+  you back to whatever room you were standing in when you started it.
+
+  Before requesting a new bounty, it also checks whether the CURRENT one is
+  already complete (`bounty` reports "You succeeded in your task and should
+  report back to..."). If so, it turns that one in first - report to the
+  guard, then the taskmaster, then deposits the reward at the bank - before
+  going on to reroll for a new one. Handy if you run this in between hunting
+  runs and don't want to babysit turn-ins yourself.
+
+  It also checks whether your CURRENT in-progress bounty already qualifies
+  (undead, and matches the creature filter if you gave one) before touching
+  anything - if it does, the script leaves it alone and stops immediately
+  instead of tossing out an already-good, partially-completed bounty for a
+  reroll.
+
+  If the taskmaster says there are no tasks of the requested type suitable
+  for you (usually because the hunting ground has become too easy for your
+  level), the script stops with a clear message instead of burning through
+  the attempt cap uselessly.
 
   changelog:
+    1.5
+      - fail gracefully with a clear message when the taskmaster has no
+        suitable tasks left for your level, instead of retrying uselessly
+    1.4
+      - check the current in-progress bounty first: if it already qualifies
+        (undead + matches the filter), leave it alone instead of rerolling
+        over it and losing progress
+    1.3
+      - turn in an already-completed bounty (guard -> taskmaster -> bank
+        deposit) before requesting a new one
+    1.2
+      - go2 back to the room you started in when the script ends, for any
+        reason (success, failure, or hitting the attempt cap)
+    1.1
+      - add a 25-attempt cap to the reroll loop
+      - distinguish "no such creature" (typo) from "known creature, not
+        undead" when validating the optional creature filter
     1.0
       - initial release
 
@@ -62,6 +105,43 @@ module UndeadBounty
   BOUNTY_MASTER_NAME = 'taskmaster'.freeze
   GUARD_NAME_PATTERN = /(?:guard|sergeant|guardsman|sentry|tavernkeeper|alchemist|purser)/i.freeze
   GUARD_NOT_READY_PATTERN = /is in no condition to talk to you/i.freeze
+
+  # debug aid: print every bounty the script received this run, on exit.
+  # on for now while we're still shaking bugs out.
+  LOG_BOUNTY_HISTORY = true
+
+  def self.bounty_history
+    @bounty_history ||= []
+  end
+
+  def self.record_bounty(creature:, number:, type:, location:, verdict:)
+    bounty_history << {
+      creature: creature,
+      number: number,
+      type: type,
+      location: location,
+      verdict: verdict
+    }
+  end
+
+  def self.print_bounty_history
+    return unless LOG_BOUNTY_HISTORY
+    return if bounty_history.empty?
+
+    respond ''
+    respond "UndeadBounty: bounty history for this run (#{bounty_history.length}):"
+    bounty_history.each_with_index do |entry, i|
+      respond format(
+        '  %<n>2d. %<count>3s x %<creature>-24s [%<type>s] near %<location>-20s - %<verdict>s',
+        n: i + 1,
+        count: entry[:number] || '?',
+        creature: entry[:creature] || 'unknown',
+        type: entry[:type] || '?',
+        location: entry[:location] || '?',
+        verdict: entry[:verdict]
+      )
+    end
+  end
 
   def self.find_npc(pattern)
     (GameObj.npcs.to_a + GameObj.room_desc.to_a).find { |n| n.status != 'dead' && n.name =~ pattern }
@@ -96,6 +176,15 @@ module UndeadBounty
       sleep 0.25
     end
     nil
+  end
+
+  # explicitly asks the game for current bounty status instead of trusting
+  # whatever XMLData.bounty_task was last left at (could be stale/unset at
+  # the start of a fresh script run)
+  def self.refresh_bounty_status
+    fput 'bounty'
+    waitrt?
+    wait_for_bounty { true }
   end
 
   # sends a command once (no auto-resend) and watches incoming lines for up
@@ -184,6 +273,7 @@ module UndeadBounty
 
   ALREADY_ASSIGNED_PATTERN = /already been assigned a task/i.freeze
   TASKMASTER_BUSY_PATTERN = /kind of busy right now/i.freeze
+  NO_SUITABLE_TASK_PATTERN = /don't seem to have any tasks that are suitable for you/i.freeze
 
   def self.ask_master_for_bounty(bounty_type, max_attempts: 10)
     go_to_advguild
@@ -192,11 +282,16 @@ module UndeadBounty
     max_attempts.times do
       matched = fput_and_check(
         "ask #{BOUNTY_MASTER_NAME} for bounty #{bounty_type}",
-        [ALREADY_ASSIGNED_PATTERN, TASKMASTER_BUSY_PATTERN]
+        [ALREADY_ASSIGNED_PATTERN, TASKMASTER_BUSY_PATTERN, NO_SUITABLE_TASK_PATTERN]
       )
       waitrt?
 
-      if matched == ALREADY_ASSIGNED_PATTERN
+      if matched == NO_SUITABLE_TASK_PATTERN
+        respond "UndeadBounty: taskmaster has no #{bounty_type} tasks suitable for you here - this hunting"
+        respond 'ground has probably become too easy for your level. Try another town, or a different'
+        respond 'bounty type, stopping.'
+        exit
+      elsif matched == ALREADY_ASSIGNED_PATTERN
         respond 'UndeadBounty: taskmaster says a task is already assigned, requesting removal...'
         ask_master_for_removal
         next
@@ -222,14 +317,107 @@ module UndeadBounty
     end
   end
 
+  GUARD_TASK_COMPLETE_PATTERN = /successfully completed your task/i.freeze
+  TASKMASTER_TURN_IN_PATTERN = /Good job/i.freeze
+
+  # if a previous run already finished killing/gathering/etc. and just never
+  # got turned in, `bounty` reports "You succeeded in your task and should
+  # report back to..." (Bounty.current.type == :guard). Handle that before
+  # starting a new reroll loop: report to the guard, then the taskmaster,
+  # then bank the reward.
+  def self.turn_in_bounty(task)
+    respond 'UndeadBounty: found a completed bounty waiting to be turned in, handling that first...'
+
+    npc = locate_guard(task.town)
+    confirmed = false
+    5.times do
+      wait_for_npc_awake(npc)
+      matched = fput_and_check("ask #{npc.noun} about bounty", [GUARD_TASK_COMPLETE_PATTERN, GUARD_NOT_READY_PATTERN])
+      waitrt?
+
+      if matched == GUARD_NOT_READY_PATTERN
+        respond "UndeadBounty: #{npc.noun} isn't able to talk right now, waiting and retrying..."
+        sleep 5
+        next
+      end
+
+      confirmed = !matched.nil?
+      break
+    end
+
+    unless confirmed
+      respond "UndeadBounty: #{npc.noun} didn't confirm the completed task, stopping so you can check manually."
+      exit
+    end
+
+    go_to_advguild
+    confirmed = false
+    5.times do
+      matched = fput_and_check("ask #{BOUNTY_MASTER_NAME} about bounty", [TASKMASTER_TURN_IN_PATTERN, TASKMASTER_BUSY_PATTERN])
+      waitrt?
+
+      if matched == TASKMASTER_BUSY_PATTERN
+        respond 'UndeadBounty: taskmaster is busy, retrying in 3 seconds...'
+        sleep 3
+        next
+      end
+
+      confirmed = !matched.nil?
+      break
+    end
+
+    unless confirmed
+      respond 'UndeadBounty: taskmaster never confirmed the turn-in, stopping so you can check manually.'
+      exit
+    end
+
+    respond 'UndeadBounty: bounty turned in, depositing at the bank...'
+    Script.run('go2', 'bank')
+    waitrt?
+    fput 'deposit all'
+    waitrt?
+  end
+
+  # checks status ONCE before touching anything, and handles whatever's
+  # already there:
+  #   - a completed task waiting on a guard report -> turn it in
+  #   - an in-progress task that already qualifies (undead + matches the
+  #     filter) -> leave it alone, don't burn it on a reroll
+  #   - anything else (:none, or an in-progress task that doesn't qualify)
+  #     -> nothing to do here, let the normal reroll loop handle it
+  # returns :already_matching if the in-progress bounty already qualifies,
+  # so run() knows to stop instead of starting the reroll loop.
+  def self.handle_existing_bounty(creature_filter)
+    task = refresh_bounty_status
+    return unless task
+
+    if task.type == :guard
+      turn_in_bounty(task)
+      return
+    end
+
+    return unless task.creature
+
+    creature = task.creature
+    return unless creature_undead?(creature) && creature_matches_filter?(creature, creature_filter)
+
+    record_bounty(creature: creature, number: task.number, type: task.type, location: task.location,
+                  verdict: 'UNDEAD - already in progress, left as-is')
+    respond "UndeadBounty: current bounty is already #{task.number || '?'} x #{creature} in/near " \
+            "#{task.location} - UNDEAD#{" and matches '#{creature_filter}'" if creature_filter}, leaving it alone."
+    :already_matching
+  end
+
   # remembers which guard room actually had the guard, per town, so later
   # loop iterations don't have to re-check every candidate room every time
   def self.guard_room_cache
     @guard_room_cache ||= {}
   end
 
-  def self.ask_guard_for_bounty(assignment)
-    town = assignment.town
+  # travels to the given town's guard room(s) (using the cache, then the
+  # generic tag-based search, same as before) and returns the guard npc.
+  # exits if no guard can be found anywhere.
+  def self.locate_guard(town)
     npc = nil
     found_room = nil
     cached_room = guard_room_cache[town]
@@ -270,6 +458,11 @@ module UndeadBounty
 
     # only cache real room ids, not the 'advguard' tag fallback
     guard_room_cache[town] = found_room if found_room.is_a?(Integer)
+    npc
+  end
+
+  def self.ask_guard_for_bounty(assignment)
+    npc = locate_guard(assignment.town)
 
     task = nil
     10.times do
@@ -305,21 +498,37 @@ module UndeadBounty
     fakeobj.type.to_s.split(',').include?('undead')
   end
 
-  # the undead 'name' pattern is one big regex: ^(?:adjective prefixes)?(name1|name2|...)$
+  # each type's 'name' pattern is one big regex: ^(?:adjective prefixes)?(name1|name2|...)$
   # pull the literal creature names out of the middle group so we can search
-  # them, rather than re-parsing data/gameobj-data.xml ourselves.
-  def self.known_undead_creatures
-    return @known_undead_creatures if defined?(@known_undead_creatures)
-
-    GameObj.load_data if GameObj.type_data.nil? || GameObj.type_data.empty?
-    pattern = GameObj.type_data.dig('undead', :name)
+  # them, rather than matching against it directly.
+  def self.creature_names_from_pattern(pattern)
     source = pattern&.source.to_s
+    return [] if source.empty?
 
     boundary = source.index(')?(')
     body = boundary ? source[(boundary + 3)..-1] : source
     body = body.sub(/\)\$\z/, '')
 
-    @known_undead_creatures = body.split('|').map { |n| n.delete('\\') }.reject(&:empty?)
+    body.split('|').map { |n| n.delete('\\') }.reject(&:empty?)
+  end
+
+  def self.known_undead_creatures
+    return @known_undead_creatures if defined?(@known_undead_creatures)
+
+    GameObj.load_data if GameObj.type_data.nil? || GameObj.type_data.empty?
+    @known_undead_creatures = creature_names_from_pattern(GameObj.type_data.dig('undead', :name))
+  end
+
+  # same idea as known_undead_creatures, but across every type (armor, food,
+  # every creature type, etc.) - used only to tell a plain typo apart from a
+  # real, known creature that just isn't undead.
+  def self.known_creatures
+    return @known_creatures if defined?(@known_creatures)
+
+    GameObj.load_data if GameObj.type_data.nil? || GameObj.type_data.empty?
+    names = []
+    GameObj.type_data.each_value { |fields| names.concat(creature_names_from_pattern(fields[:name])) }
+    @known_creatures = names.uniq
   end
 
   # partial, case-insensitive search against the known undead creature list
@@ -330,18 +539,50 @@ module UndeadBounty
     known_undead_creatures.select { |name| name.downcase.include?(q) }
   end
 
+  # same, but against every creature name gameobj-data.xml knows about,
+  # regardless of type - for typo detection
+  def self.find_creature_matches(query)
+    return [] if query.to_s.strip.empty?
+
+    q = query.strip.downcase
+    known_creatures.select { |name| name.downcase.include?(q) }
+  end
+
   def self.creature_matches_filter?(creature_name, filter)
     return true if filter.to_s.strip.empty?
 
     creature_name.to_s.downcase.include?(filter.strip.downcase)
   end
 
+  # max rerolls before giving up - guards against an endless loop if the
+  # creature name has a typo, or it's a bounty that just can't be assigned
+  # (e.g. wrong level range)
+  MAX_ATTEMPTS = 25
+
   def self.run(bounty_type, creature_filter = nil)
+    # module-level state survives across separate script runs in the same
+    # Lich session, so reset it at the start of each run
+    @bounty_history = []
+    start_room = Room.current.id
+
+    return if handle_existing_bounty(creature_filter) == :already_matching
+
+    attempt = 0
+
     loop do
+      attempt += 1
+      if attempt > MAX_ATTEMPTS
+        respond "UndeadBounty: hit the #{MAX_ATTEMPTS}-attempt limit without landing on a match, stopping."
+        respond 'UndeadBounty: double check the creature name/spelling, or this bounty may not be assignable at your level.'
+        return
+      end
+
       assignment = ask_master_for_bounty(bounty_type)
       task = ask_guard_for_bounty(assignment)
 
       unless task.creature
+        record_bounty(creature: nil, number: task.number, type: task.type, location: task.location,
+                       verdict: "couldn't parse creature from guard response")
         respond "UndeadBounty: could not determine the bounty creature from the guard's response, stopping."
         return
       end
@@ -350,13 +591,29 @@ module UndeadBounty
       respond "UndeadBounty: assigned #{task.number || '?'} x #{creature} in/near #{task.location}."
 
       if creature_undead?(creature) && creature_matches_filter?(creature, creature_filter)
+        record_bounty(creature: creature, number: task.number, type: task.type, location: task.location,
+                       verdict: 'UNDEAD - stopped here')
         respond "UndeadBounty: #{creature} is UNDEAD#{" and matches '#{creature_filter}'" if creature_filter} - stopping, take it from here."
         return
       end
 
+      verdict = creature_undead?(creature) ? "undead, but doesn't match filter '#{creature_filter}' - rerolled" : 'not undead - rerolled'
+      record_bounty(creature: creature, number: task.number, type: task.type, location: task.location, verdict: verdict)
+
       respond "UndeadBounty: #{creature} doesn't qualify, requesting removal and rerolling..."
       ask_master_for_removal
     end
+  ensure
+    print_bounty_history
+    return_to_room(start_room)
+  end
+
+  def self.return_to_room(room_id)
+    return if room_id.nil? || Room.current.id == room_id
+
+    respond "UndeadBounty: heading back to your starting room (#{room_id})..."
+    Script.run('go2', room_id.to_s)
+    waitrt?
   end
 
   def self.show_help
@@ -377,6 +634,20 @@ module UndeadBounty
     respond 'Boosts a bounty (if needed), asks the taskmaster for a new task, follows the'
     respond "assignment to the assigned town's guard to learn the creature, and stops as"
     respond 'soon as that creature is undead. Otherwise it requests removal and rerolls.'
+    respond ''
+    respond "Gives up after #{UndeadBounty::MAX_ATTEMPTS} rerolls without a match, in case the"
+    respond 'creature/spelling is wrong or the bounty just cannot be assigned at your level.'
+    respond ''
+    respond 'When the script ends for any reason, it takes you back to the room you started in.'
+    respond ''
+    respond 'If your current bounty is already complete when the script starts, it turns that'
+    respond 'one in first (guard, then taskmaster, then a bank deposit) before requesting a new one.'
+    respond ''
+    respond "If your current bounty is still in progress but already qualifies, it's left alone"
+    respond "instead of being tossed out for a reroll - progress on it isn't lost."
+    respond ''
+    respond 'If the taskmaster has no suitable tasks left for your level (hunting ground got too'
+    respond 'easy), the script stops with a clear message instead of retrying uselessly.'
   end
 end
 
@@ -399,7 +670,15 @@ creature_filter = nil if creature_filter.empty?
 if creature_filter
   matches = UndeadBounty.find_undead_matches(creature_filter)
   if matches.empty?
-    respond "UndeadBounty: no known undead creature matches '#{creature_filter}', stopping."
+    # same technique ;ebestiary uses to look creatures up: if it doesn't
+    # match ANY known creature name, it's probably a typo; if it matches
+    # something that just isn't undead, say so instead
+    any_matches = UndeadBounty.find_creature_matches(creature_filter)
+    if any_matches.empty?
+      respond "UndeadBounty: '#{creature_filter}' doesn't match any known creature name - check your spelling, stopping."
+    else
+      respond "UndeadBounty: '#{creature_filter}' matches #{any_matches.first(5).join(', ')}#{' and others' if any_matches.length > 5}, but none of them are undead, stopping."
+    end
     exit
   end
   respond "UndeadBounty: targeting creatures matching '#{creature_filter}' (e.g. #{matches.first(5).join(', ')})#{' and others' if matches.length > 5}"

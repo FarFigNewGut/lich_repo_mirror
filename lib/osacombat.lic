@@ -43,7 +43,7 @@
 
 
 -----------------------------------------------------------------------
-	   OSACombat Version: 4.2.83 (August 28, 2026)
+	   OSACombat Version: 4.2.140 (August 30, 2026)
 	
 	   Usage:
 	   
@@ -130,6 +130,33 @@
                              Anti-poaching fixed: GameObj.pcs.to_a nil guard prevents false poach on empty rooms; own disk
                              excluded from stranger disk check; solo hunters bypass claim check; check_for_poaching called
                              unconditionally each main loop cycle so group joins clear $poaching immediately.
+          August 28, 2026 - Support tab fully rebuilt as three dynamic routine sections (Signs/Sigils/Symbols by society,
+                             Buffs, and Mana Recovery merged into society section). Society detected via Society.status and
+                             only matching section shown. Buff dropdown filtered by known abilities (Spell[N].known?,
+                             Warcry.known?, CMan.known?, Shield.known?, pin fields for wings/tattoo). SUPPORT_DESCRIPTIONS
+                             constant added with per-ability description label that updates on dropdown selection change.
+                             Per-entry Cast Without Waiting For Enemy checkbox replaces global buff_no_wait_for_mob setting.
+                             Mana recovery abilities (Symbol of Mana, Sigil of Power, Sign of Wracking etc.) merged into
+                             their respective society sections. OSA_PRONE constant added covering all physical debuff states;
+                             target condition grid simplified to Prone/Not Prone and Rooted/Not Rooted only. Jab/Punch/Kick/
+                             Grapple UAC chain fixed: dothistimeout replaced with get loop to capture all lines before
+                             Roundtime; $osa_uac_last_target persists chain across routine cycles without until_dead.
+                             ForceRT fully implemented: $osa_next_forcert flag set before each dispatch; wait_rt and
+                             wait_castrt both skip when flag is true; stance changes suppressed around ForceRT entries;
+                             top-level combat wait_rt also skips; game_put replaced with fput after confirming fput sends
+                             immediately during RT. Quickstrike added as per-entry option (fput qstrike value before attack).
+                             Multi-Strike moved from General tab checkbox to attack option with per-entry UAC/Archery/Melee/
+                             Skip-With-Celerity/Ignore-Cooldown options; base weapon speed field with live stamina cost
+                             calculator and weapon speed chart tooltip; mstrike_setup runs once at startup using first
+                             Multi-Strike entry. Hurl Weapon added as attack option with container draw loop, target location
+                             field, recover-after-hurl option using recover_hurl_sweep helper with room-return logic.
+                             Reactive attacks moved to downstream hook using put for immediate fire without RT wait.
+                             TITLE constant renamed per-script (OSA_COMBAT_TITLE etc.) to prevent cross-script collision.
+                             Mystic Focus buff added (rub tattoo adj+noun, cooldown gated). OSA_COMBAT_TITLE shows character
+                             name. cleanup_obsolete_vars updated with all retired YAML keys.
+          August 30, 2026 - Hurl Weapon logic refined: skip draw if hurling weapon already in hand (auto-return); retarget
+                             after hurl if previous target died; recovery only when all mobs dead or container empty;
+                             recover_hurl_sweep loops until nothing recoverable.
 =end
 
 def osacombat_help_display
@@ -562,6 +589,7 @@ def get_target
 	# Check new living_priority list first
 	priority_nouns.each do |noun|
 		priority_target = GameObj.targets.find do |t|
+			t.status.to_s !~ /dead|gone/ &&
 			!excluded.any? { |e| t.noun.to_s.downcase.include?(e) || t.name.to_s.downcase.include?(e) } &&
 			(t.noun.to_s.downcase.include?(noun) || t.name.to_s.downcase.include?(noun))
 		end
@@ -576,6 +604,7 @@ def get_target
 			next if creature.empty?
 			creature_words = creature.split
 			priority_target = GameObj.targets.find do |t|
+				t.status.to_s !~ /dead|gone/ &&
 				!excluded.any? { |e| t.noun.to_s.downcase.include?(e) } &&
 				(t.noun.to_s.downcase.split.any? { |w| creature_words.include?(w) } ||
 				 t.name.to_s.downcase.split.any? { |w| creature_words.include?(w) })
@@ -590,16 +619,19 @@ def get_target
 		return true
 	end
 	# No priority target - fall back to current target or find a valid one
-	if GameObj.target.nil? || (!excluded.empty? && excluded.any? { |e| GameObj.target.noun.to_s.downcase.include?(e) })
+	current_tgt = GameObj.target
+	if current_tgt.nil? || current_tgt.status.to_s =~ /dead|gone/ ||
+	   (!excluded.empty? && excluded.any? { |e| current_tgt.noun.to_s.downcase.include?(e) })
+		# Find a live valid target explicitly
+		live_targets = GameObj.targets.reject { |t| t.status.to_s =~ /dead|gone/ }
 		if excluded.empty?
-			fput "target random"
-			pause 0.2
+			valid = live_targets.first
 		else
-			valid = GameObj.targets.find { |t| !excluded.any? { |e| t.noun.to_s.downcase.include?(e) || t.name.to_s.downcase.include?(e) } }
-			return false unless valid
-			fput "target ##{valid.id}"
-			pause 0.2
+			valid = live_targets.find { |t| !excluded.any? { |e| t.noun.to_s.downcase.include?(e) || t.name.to_s.downcase.include?(e) } }
 		end
+		return false unless valid
+		fput "target ##{valid.id}"
+		pause 0.2
 	end
 	return false if GameObj.target.nil?
 	true
@@ -1112,6 +1144,102 @@ def uac_round
 end
 
 ####### Mstrike Setup
+
+def do_hurl(entry)
+	return unless GameObj.target
+	return if stunned? || webbed? || bound? || checkdead
+	location      = entry['hurl_location'].to_s.strip
+	recover       = entry['hurl_recover']
+	noun          = entry['hurl_noun'].to_s.strip
+	container     = entry['hurl_container'].to_s.strip
+	use_container = !noun.empty? && !container.empty?
+	origin_room   = Room.current.id
+	# Store for post-loot recovery
+	@hurl_noun           = noun
+	@hurl_container      = container
+	@hurl_use_container  = use_container
+	@hurl_needs_recovery = true
+
+	# Draw logic:
+	# - recover=true + container filled  = normal: draw, hurl, recover
+	# - recover=false + container filled = bandolier: draw, hurl, no recovery
+	# - recover=false + container empty  = returner/bonded: skip draw, just hurl
+	if use_container
+		# Free right hand if occupied with something other than hurling weapon
+		if GameObj.right_hand.id && GameObj.right_hand.noun.to_s.downcase != noun.downcase
+			fput "put #{GameObj.right_hand.noun} in my #{container}"
+		end
+		# Draw weapon (skip if already have one in hand)
+		if GameObj.right_hand.noun.to_s.downcase != noun.downcase
+			waitrt?
+			result = dothistimeout "get #{noun} from my #{container}", 3,
+				/You remove|You get|You reach|Get what\?|I could not find|is empty|free hand/
+			got_weapon = GameObj.right_hand.noun.to_s.downcase == noun.downcase
+			echo "DEBUG draw: result=#{result.inspect} rhand=#{GameObj.right_hand.noun.inspect} got=#{got_weapon} empty_flag=#{@hurl_container_empty}"
+			if !got_weapon
+				echo "DEBUG: setting container empty, starting sweep"
+				@hurl_container_empty = true
+				# Only recover if recover is checked -- bandolier weapons just stop
+				recover_hurl_sweep(noun, container, use_container, origin_room) if recover
+				return
+			end
+		end
+	end
+
+	# Ensure live target
+	tgt = GameObj.target
+	if tgt.nil? || tgt.status.to_s =~ /dead|gone/
+		get_target
+		pause 0.2
+		tgt = GameObj.target
+		if tgt.nil? || tgt.status.to_s =~ /dead|gone/
+			# No live target yet -- return without stowing, weapon stays in hand for next call
+			return
+		end
+	end
+
+	# Hurl
+	cmd = location.empty? ? "hurl ##{tgt.id}" : "hurl ##{tgt.id} #{location}"
+	dothistimeout cmd, 5,
+		/You throw|you deftly send|flies back|nothing recoverable|can't|stunned|You are/
+	waitrt?
+	@hurl_container_empty = false  # successful hurl -- container had ammo
+
+	# Retarget after hurl in case previous target died
+	get_target if GameObj.target.nil? || GameObj.target.status.to_s =~ /dead|gone/
+
+	# Only recover if checked -- bandolier/returner users skip this
+	if recover
+		allgone = GameObj.targets.none? { |n| n.status.to_s !~ /dead|gone/ }
+		recover_hurl_sweep(noun, container, use_container, origin_room) if allgone
+	end
+
+end
+def recover_hurl_sweep(noun, container, use_container, origin_room)
+	# Switch to defensive stance for safety during recovery
+	change_stance('defensive') if @combat_data["stance_dance"] || true
+	# Ensure right hand is free for recovery
+	fput "put #{noun} in my #{container}" if use_container && GameObj.right_hand.id
+	# Recover all weapons until nothing left
+	loop do
+		result = dothistimeout "recover hurl", 5,
+			/You spy .+ and recover it|rises out of the shadows and flies back|You know .+ is around here somewhere|You find nothing recoverable|you'll need to have a free hand/
+		if result.to_s =~ /You find nothing recoverable|you'll need to have a free hand/
+			@hurl_container_empty = false  # all weapons recovered, ready to draw again
+			break
+		end
+		# Stow recovered weapon back into container immediately
+		if use_container && GameObj.right_hand.id
+			fput "put #{noun} in my #{container}"
+			@hurl_container_empty = false  # recovered at least one
+		end
+		sleep 0.5 if result.to_s =~ /You know .+ is around here somewhere/
+	end
+	# Stow anything remaining
+	fput "put #{noun} in my #{container}" if use_container && GameObj.right_hand.id
+	# Return to origin if moved
+	Script.run("go2", origin_room.to_s) if Room.current.id != origin_room
+end
 
 def mstrike_setup
 	ms_entry = (@living_routine.to_a + @undead_routine.to_a).find { |e| e['type'] == 'Multi-Strike' }
@@ -2433,6 +2561,7 @@ def dispatch_attack(atk, stam_min, mana_min, enemy_min, enemy_max, base_var: nil
 	when "Punch"                               then do_uac_single("punch")
 	when "Kick"                                then do_uac_single("kick")
 	when "Grapple"                             then do_uac_single("grapple")
+	when "Hurl Weapon"                         then do_hurl(entry) if entry
 	end
 end
 
@@ -2486,8 +2615,14 @@ end
 
 def dispatch_attack_entry(entry)
 	uac_attacks = %w[Jab Punch Kick Grapple]
+	repeat_count = entry['repeat_count'].to_i
+	repeat_count = 1 if repeat_count < 1
+	until_dead  = entry['until_dead']
+	until_prone = entry['until_prone']
+	reps_done = 0
 	loop do
 		return if stunned? || webbed? || bound? || checkdead || GameObj.targets.empty?
+		return unless GameObj.targets.any? { |t| t.status.to_s !~ /dead|gone/ }
 		return unless get_target
 		return if excluded_target?
 		return unless living_entry_conditions_met?(entry)
@@ -2514,11 +2649,24 @@ def dispatch_attack_entry(entry)
 		$osa_forcert_active = entry['use_forcert'] ? true : false
 		dispatch_attack(entry['type'], 0, 0, 0, 99, entry: entry, forcert: $osa_forcert_active)
 		$osa_forcert_active = false
+		# Break until_dead loop if hurl container ran empty
+		if entry['type'] == 'Hurl Weapon' && @hurl_container_empty
+			echo "DEBUG: hurl container empty flag set, breaking loop"
+			break
+		end
 		health_monitor
 		wait_rt unless $osa_next_forcert
-		break unless entry['until_dead']
-		tgt = GameObj.target
-		break if tgt.nil? || tgt.status.to_s =~ /dead|gone/
+		reps_done += 1
+		# Check exit conditions
+		if until_prone
+			tgt = GameObj.target
+			break if tgt.nil? || tgt.status.to_s =~ OSA_PRONE
+		elsif until_dead
+			tgt = GameObj.target
+			break if tgt.nil? || tgt.status.to_s =~ /dead|gone/
+		else
+			break unless reps_done < repeat_count
+		end
 	end
 end
 
@@ -2593,6 +2741,11 @@ def dispatch_support_entry(entry)
 end
 
 def dispatch_spell_entry(entry)
+	repeat_count = entry['repeat_count'].to_i
+	repeat_count = 1 if repeat_count < 1
+	until_dead  = entry['until_dead']
+	until_prone = entry['until_prone']
+	reps_done = 0
 	loop do
 		spell_num = entry['type'].to_s.strip
 		return if spell_num.empty? || spell_num == '0'
@@ -2604,9 +2757,16 @@ def dispatch_spell_entry(entry)
 		can_cast_spell(spell_num, cast_type, 0, 0, 0, 99, warding, open_cast)
 		health_monitor
 		wait_rt
-		break unless entry['until_dead']
-		tgt = GameObj.target
-		break if tgt.nil? || tgt.status.to_s =~ /dead|gone/
+		reps_done += 1
+		if until_prone
+			tgt = GameObj.target
+			break if tgt.nil? || tgt.status.to_s =~ OSA_PRONE
+		elsif until_dead
+			tgt = GameObj.target
+			break if tgt.nil? || tgt.status.to_s =~ /dead|gone/
+		else
+			break unless reps_done < repeat_count
+		end
 	end
 end
 
@@ -2636,6 +2796,7 @@ LIVING_ATTACK_OPTIONS = [
   "Grapple",
   "Guardant Thrusts (Polearm)",
   "Hamstring", "Haymaker", "Headbutt",
+  "Hurl Weapon",
   "Jab",
   "Kneebash",
   "Kick",
@@ -2824,12 +2985,18 @@ def living_routine_default_entry(kind)
     'only_use_on'     => '',
     'do_not_use_on'   => '',
     'until_dead'      => false,
+    'until_prone'     => false,
+    'repeat_count'    => 1,
     'mstrike_skip_celerity'   => false,
     'mstrike_uac'             => false,
     'mstrike_archery'         => false,
     'mstrike_melee'           => false,
     'mstrike_ignore_cooldown' => false,
     'mstrike_weapon_speed'    => 5,
+    'hurl_location'           => '',
+    'hurl_recover'            => false,
+    'hurl_noun'               => '',
+    'hurl_container'          => '',
     'use_forcert'           => false,
     'use_quickstrike'       => false,
     'quickstrike_value'     => '-2',
@@ -3033,7 +3200,7 @@ end
 def combat	
 	prep_reset
 	get_target
-	return if GameObj.target.nil?
+	return if GameObj.target.nil? || GameObj.target.status.to_s =~ /dead|gone/
 	load_attack_vars
 	check_for_poaching if @combat_data["check_for_group"]
 	# Opener spells - fire before attacks and regular spells each cycle
@@ -3063,6 +3230,8 @@ def combat
 			load_attack_vars
 			next_entry = @living_routine[idx + 1]
 			$osa_next_forcert = next_entry&.dig('use_forcert') ? true : false
+			# Skip hurl weapon if container is known empty
+			next if entry['type'] == 'Hurl Weapon' && @hurl_container_empty
 			if entry["kind"] == "attack"
 				dispatch_attack_entry(entry)
 			else
@@ -3079,6 +3248,8 @@ def combat
 			load_attack_vars
 			next_entry = @undead_routine[idx + 1]
 			$osa_next_forcert = next_entry&.dig('use_forcert') ? true : false
+			# Skip hurl weapon if container is known empty
+			next if entry['type'] == 'Hurl Weapon' && @hurl_container_empty
 			if entry["kind"] == "attack"
 				dispatch_attack_entry(entry)
 			else
@@ -3541,7 +3712,10 @@ def use_mystic_focus
 	return if Effects::Cooldowns.active?("Mystic Focus")
 	adj  = @combat_data["mystic_tattoo_adj"].to_s.strip
 	noun = @combat_data["mystic_tattoo_noun"].to_s.strip
-	return if noun.empty?
+	if noun.empty?
+		respond "--- OSACombat: Mystic Focus is in your buff routine but no tattoo noun is configured. Set it in Support Options."
+		return
+	end
 	cmd = adj.empty? ? "rub #{noun}" : "rub #{adj} #{noun}"
 	fput cmd
 end
@@ -4929,7 +5103,7 @@ def self.available_buff_options
 		when "Divine Incarnation: Armor (1650)",
 		     "Divine Incarnation: Zeal (1650)"  then Spell[1650].known?
 		when "Steely Resolve"                    then Shield.known?("Steely Resolve")
-		when "Mystic Focus"                      then !@combat_data["mystic_tattoo_noun"].to_s.strip.empty?
+		when "Mystic Focus"                      then true  # always show -- gated at dispatch if tattoo not configured
 		when "Light Wings: Luminous Flight",
 		     "Light Wings: Prismatic Aegis",
 		     "Light Wings: Wings of Warding"    then !@combat_data["light_wings_pin_noun"].to_s.strip.empty?
@@ -5099,6 +5273,8 @@ def self.build_routine_entry_row(entry, idx, main_rows, creature_type = :living)
 		opt_parts << "Kneel"              if entry['use_kneel']
 		opt_parts << "Stealth"            if entry['use_stealth']
 		opt_parts << "Until Dead"         if entry['until_dead']
+		opt_parts << "Until Prone"        if entry['until_prone']
+		opt_parts << "Repeat: #{entry['repeat_count']}" if entry['repeat_count'].to_i > 1
 		opt_parts << "ForceRT"            if entry['use_forcert']
 		opt_parts << "QStrike #{entry['quickstrike_value']}" if entry['use_quickstrike'] && !entry['quickstrike_value'].to_s.strip.empty?
 		opt_parts << "Skip With Celerity" if entry['mstrike_skip_celerity']
@@ -5106,6 +5282,12 @@ def self.build_routine_entry_row(entry, idx, main_rows, creature_type = :living)
 		opt_parts << "Archery"            if entry['mstrike_archery']
 		opt_parts << "Melee"              if entry['mstrike_melee']
 		opt_parts << "Ignore Cooldown (Speed #{entry['mstrike_weapon_speed']})" if entry['mstrike_ignore_cooldown']
+		if entry['type'] == 'Hurl Weapon'
+			opt_parts << "Hurl: #{entry['hurl_location'].to_s.empty? ? 'default location' : entry['hurl_location']}"
+			opt_parts << "Noun: #{entry['hurl_noun']}"        unless entry['hurl_noun'].to_s.empty?
+			opt_parts << "From: #{entry['hurl_container']}"   unless entry['hurl_container'].to_s.empty?
+			opt_parts << "Recover After"                      if entry['hurl_recover']
+		end
 		opt_parts << "Flare Gloves: #{entry['flare_gloves_adj']} #{entry['flare_gloves_noun']}".strip if !entry['flare_gloves_noun'].to_s.empty?
 		opt_parts << "Wings Pin: #{entry['wings_pin_adj']} #{entry['wings_pin_noun']}".strip if !entry['wings_pin_noun'].to_s.empty?
 		unless opt_parts.empty?
@@ -5333,10 +5515,99 @@ def self.open_living_entry_dialog(main_rows, edit_idx, kind, creature_type = :li
 		vbox.pack_start(other_lbl, expand: false, fill: false, padding: 0)
 		other_row = Gtk::Box.new(:horizontal, 12)
 		vbox.pack_start(other_row, expand: false, fill: false, padding: 0)
-		kneel_cb          = make_check(other_row, "Use Kneel",          entry['use_kneel'],          tip: "Kneel before executing this attack. Required for some archery attacks and provides a bonus to ranged AS.")
-		stealth_cb        = make_check(other_row, "Use Stealth",        entry['use_stealth'],        tip: "Hide before executing this attack. Required for Waylay and ambush-style attacks. Only fires if you are not already hidden.")
-		until_dead_cb     = make_check(other_row, "Until Dead",         entry['until_dead'],         tip: "Keep repeating this attack until the target is dead or leaves. All conditions are still checked each cycle.")
-		forcert_cb        = make_check(other_row, "Use ForceRT",        entry['use_forcert'],        tip: "Execute this attack during combat roundtime using ForceRT. Requires 10+ MOC ranks and sufficient stamina. The script calculates the stamina cost automatically using the wiki formula and skips the attack if you cannot afford it.")
+		kneel_cb       = make_check(other_row, "Use Kneel",    entry['use_kneel'],   tip: "Kneel before executing this attack. Required for some archery attacks.")
+		stealth_cb     = make_check(other_row, "Use Stealth",  entry['use_stealth'], tip: "Hide before executing this attack. Required for Waylay. Only fires if not already hidden.")
+		until_dead_cb  = make_check(other_row, "Until Dead",   entry['until_dead'],  tip: "Keep repeating until target is dead or leaves. For UAC attacks (Jab/Punch/Kick/Grapple), the chain automatically tiers up through the sequence based on game feedback -- you do not need to add separate entries for each UAC move. Greyed out when Until Prone or Repeat Count > 1.")
+		until_prone_cb = make_check(other_row, "Until Prone",  entry['until_prone'], tip: "Keep repeating until target enters a prone state (stunned, knocked down, webbed, frozen, etc.). For UAC attacks (Jab/Punch/Kick/Grapple), the chain automatically tiers up through the sequence based on game feedback -- you do not need to add separate entries for each UAC move. Greyed out when Until Dead or Repeat Count > 1.")
+		forcert_cb     = make_check(other_row, "Use ForceRT",  entry['use_forcert'], tip: "Execute this attack during combat roundtime using ForceRT. Requires 10+ MOC ranks.")
+
+		rep_row = Gtk::Box.new(:horizontal, 8)
+		vbox.pack_start(rep_row, expand: false, fill: false, padding: 0)
+		rep_lbl = Gtk::Label.new("Repeat Count:")
+		rep_lbl.xalign = 0.0
+		rep_lbl.tooltip_text = "Number of times to perform before moving on. Conditions re-checked each time. Greyed out when Until Dead or Until Prone is checked."
+		rep_row.pack_start(rep_lbl, expand: false, fill: false, padding: 0)
+		rep_ent = Gtk::Entry.new
+		rep_ent.text = [entry['repeat_count'].to_i, 1].max.to_s
+		rep_ent.set_width_chars(4)
+		rep_ent.placeholder_text = "1"
+		rep_ent.tooltip_text = "How many times to fire before moving on. 1 = once. Mutually exclusive with Until Dead and Until Prone."
+		rep_row.pack_start(rep_ent, expand: false, fill: false, padding: 0)
+
+		update_rep_exclusivity = proc {
+			rep_count = rep_ent.text.to_i
+			any_loop = until_dead_cb.active? || until_prone_cb.active?
+			until_dead_cb.sensitive  = !until_prone_cb.active? && rep_count <= 1
+			until_prone_cb.sensitive = !until_dead_cb.active?  && rep_count <= 1
+			rep_ent.sensitive = !any_loop
+			rep_lbl.sensitive = !any_loop
+		}
+		update_rep_exclusivity.call
+		h_until_dead_t  = proc { update_rep_exclusivity.call }
+		h_until_prone_t = proc { update_rep_exclusivity.call }
+		h_rep_changed   = proc { update_rep_exclusivity.call }
+		$_osa_entry_dialog_gc << h_until_dead_t
+		$_osa_entry_dialog_gc << h_until_prone_t
+		$_osa_entry_dialog_gc << h_rep_changed
+		until_dead_cb.signal_connect("toggled",  &h_until_dead_t)
+		until_prone_cb.signal_connect("toggled", &h_until_prone_t)
+		rep_ent.signal_connect("changed",        &h_rep_changed)
+
+		# --- Hurl Options ---
+		hurl_sep = Gtk::Separator.new(:horizontal)
+		vbox.pack_start(hurl_sep, expand: false, fill: true, padding: 2)
+		hurl_lbl = Gtk::Label.new("Hurl Weapon Options:")
+		hurl_lbl.xalign = 0.0
+		hurl_lbl.tooltip_text = "These options only apply when the Hurl Weapon attack type is selected above."
+		vbox.pack_start(hurl_lbl, expand: false, fill: false, padding: 0)
+		hurl_row = Gtk::Box.new(:horizontal, 8)
+		vbox.pack_start(hurl_row, expand: false, fill: false, padding: 0)
+		hurl_loc_lbl = Gtk::Label.new("Target Location:")
+		hurl_loc_lbl.xalign = 0.0
+		hurl_loc_lbl.tooltip_text = "Body part to aim at (e.g. chest, head, right arm). Leave blank for default."
+		hurl_row.pack_start(hurl_loc_lbl, expand: false, fill: false, padding: 0)
+		hurl_loc_ent = Gtk::Entry.new
+		hurl_loc_ent.text = entry['hurl_location'].to_s
+		hurl_loc_ent.set_width_chars(16)
+		hurl_loc_ent.placeholder_text = "blank = default"
+		hurl_loc_ent.tooltip_text = "e.g. chest, head, neck, right arm, left leg"
+		hurl_row.pack_start(hurl_loc_ent, expand: false, fill: false, padding: 0)
+		hurl_recover_cb = make_check(hurl_row, "Recover After Hurl", entry['hurl_recover'], tip: "When checked: draws from container, hurls, then recovers all weapons when room clears. Uncheck for bandolier weapons (draws and hurls but weapons are consumed -- no recovery) or bond-return/auto-returning weapons (weapon returns automatically -- no draw or recovery needed).")
+
+		hurl_supply_row = Gtk::Box.new(:horizontal, 8)
+		vbox.pack_start(hurl_supply_row, expand: false, fill: false, padding: 0)
+		hurl_noun_lbl = Gtk::Label.new("Weapon Noun:")
+		hurl_noun_lbl.xalign = 0.0
+		hurl_noun_lbl.tooltip_text = "The noun of your hurling weapon (e.g. axe, dagger, bolt).\n\nBandolier: Enter noun + container -- script draws each weapon before hurling. No recovery needed.\nNormal container: Enter noun + container + check Recover After Hurl.\nBond-return / Auto-returner: Leave noun AND container blank -- weapon is already in hand and returns automatically."
+		hurl_supply_row.pack_start(hurl_noun_lbl, expand: false, fill: false, padding: 0)
+		hurl_noun_ent = Gtk::Entry.new
+		hurl_noun_ent.text = entry['hurl_noun'].to_s
+		hurl_noun_ent.set_width_chars(12)
+		hurl_noun_ent.placeholder_text = "blank = returner/bonded"
+		hurl_noun_ent.tooltip_text = "Weapon noun to draw before hurling. Leave blank if using a bond-return or auto-returning weapon already in hand."
+		hurl_supply_row.pack_start(hurl_noun_ent, expand: false, fill: false, padding: 0)
+		hurl_cont_lbl = Gtk::Label.new("Container:")
+		hurl_cont_lbl.xalign = 0.0
+		hurl_cont_lbl.tooltip_text = "The name of the container holding your hurling weapons (e.g. bandolier, sack, quiver).\n\nBandolier: Weapons are drawn and consumed -- no recovery.\nNormal container: Weapons are drawn, hurled, and recovered.\nLeave blank for bond-return or auto-returning weapons."
+		hurl_supply_row.pack_start(hurl_cont_lbl, expand: false, fill: false, padding: 4)
+		hurl_cont_ent = Gtk::Entry.new
+		hurl_cont_ent.text = entry['hurl_container'].to_s
+		hurl_cont_ent.set_width_chars(14)
+		hurl_cont_ent.placeholder_text = "blank = returner/bonded"
+		hurl_cont_ent.tooltip_text = "Container name to draw from. Leave blank for bond-return or auto-returning weapons."
+		hurl_supply_row.pack_start(hurl_cont_ent, expand: false, fill: false, padding: 0)
+
+		# Grey out Hurl Options unless Hurl Weapon is selected
+		hurl_widgets = [hurl_sep, hurl_lbl, hurl_loc_lbl, hurl_loc_ent, hurl_recover_cb,
+		                hurl_noun_lbl, hurl_noun_ent, hurl_cont_lbl, hurl_cont_ent, hurl_supply_row]
+		update_hurl_sensitivity = proc {
+			is_hurl = LIVING_ATTACK_OPTIONS[type_combo.active].to_s == "Hurl Weapon"
+			hurl_widgets.each { |w| w.sensitive = is_hurl }
+		}
+		update_hurl_sensitivity.call
+		h_hurl_changed = proc { update_hurl_sensitivity.call }
+		$_osa_entry_dialog_gc << h_hurl_changed
+		type_combo.signal_connect("changed", &h_hurl_changed)
 
 		qs_row = Gtk::Box.new(:horizontal, 8)
 		vbox.pack_start(qs_row, expand: false, fill: false, padding: 0)
@@ -5469,7 +5740,39 @@ def self.open_living_entry_dialog(main_rows, edit_idx, kind, creature_type = :li
 		spell_opt_row.pack_start(cast_combo, expand: false, fill: false, padding: 0)
 		open_cb       = make_check(spell_opt_row, "Open Cast",  entry['open_cast'],  tip: "Cast the spell open (targets all creatures in room) instead of at a single target. Use for AoE spells like 435 or 710.")
 		warding_cb    = make_check(spell_opt_row, "Warding",    entry['warding'],    tip: "Mark this as a warding spell. Warding spells are cast from defensive stance since they are not stance-dependent. Bolt spells should leave this unchecked and are cast from offensive stance.")
-		until_dead_cb = make_check(spell_opt_row, "Until Dead", entry['until_dead'], tip: "Keep casting this spell until the target is dead or leaves. All conditions are still checked each cycle. Useful for warding spells you want to keep casting until the mob falls.")
+		until_dead_cb  = make_check(spell_opt_row, "Until Dead",  entry['until_dead'],  tip: "Keep casting until target is dead or leaves. Greyed out when Until Prone or Repeat Count > 1.")
+		until_prone_cb = make_check(spell_opt_row, "Until Prone", entry['until_prone'], tip: "Keep casting until target enters a prone state (stunned, knocked down, webbed, frozen, etc.). Greyed out when Until Dead or Repeat Count > 1.")
+
+		spell_rep_row = Gtk::Box.new(:horizontal, 8)
+		vbox.pack_start(spell_rep_row, expand: false, fill: false, padding: 0)
+		spell_rep_lbl = Gtk::Label.new("Repeat Count:")
+		spell_rep_lbl.xalign = 0.0
+		spell_rep_lbl.tooltip_text = "Number of times to cast before moving on. Conditions re-checked each cast. Greyed out when Until Dead or Until Prone is checked."
+		spell_rep_row.pack_start(spell_rep_lbl, expand: false, fill: false, padding: 0)
+		spell_rep_ent = Gtk::Entry.new
+		spell_rep_ent.text = [entry['repeat_count'].to_i, 1].max.to_s
+		spell_rep_ent.set_width_chars(4)
+		spell_rep_ent.placeholder_text = "1"
+		spell_rep_row.pack_start(spell_rep_ent, expand: false, fill: false, padding: 0)
+		update_spell_rep = proc {
+			spell_rep_count = spell_rep_ent.text.to_i
+			any_loop = until_dead_cb.active? || until_prone_cb.active?
+			until_dead_cb.sensitive  = !until_prone_cb.active? && spell_rep_count <= 1
+			until_prone_cb.sensitive = !until_dead_cb.active?  && spell_rep_count <= 1
+			spell_rep_ent.sensitive = !any_loop
+			spell_rep_lbl.sensitive = !any_loop
+		}
+		update_spell_rep.call
+		h_spell_ud    = proc { update_spell_rep.call }
+		h_spell_prone = proc { update_spell_rep.call }
+		h_spell_rep   = proc { update_spell_rep.call }
+		$_osa_entry_dialog_gc << h_spell_ud
+		$_osa_entry_dialog_gc << h_spell_prone
+		$_osa_entry_dialog_gc << h_spell_rep
+		until_dead_cb.signal_connect("toggled",  &h_spell_ud)
+		until_prone_cb.signal_connect("toggled", &h_spell_prone)
+		spell_rep_ent.signal_connect("changed",  &h_spell_rep)
+		rep_ent = spell_rep_ent  # alias so h_save can reference same var name
 	end
 
 	# --- Creature Exceptions ---
@@ -5524,6 +5827,8 @@ def self.open_living_entry_dialog(main_rows, edit_idx, kind, creature_type = :li
 			new_entry['use_kneel']             = kneel_cb.active?
 			new_entry['use_stealth']           = stealth_cb.active?
 			new_entry['until_dead']            = until_dead_cb.active?
+			new_entry['until_prone']           = until_prone_cb.active?
+			new_entry['repeat_count']          = rep_ent.text.to_i.clamp(1, 99)
 			new_entry['mstrike_skip_celerity'] = celerity_only_cb.active?
 			new_entry['use_forcert']           = forcert_cb.active?
 			new_entry['use_quickstrike']       = qs_cb.active?
@@ -5534,6 +5839,10 @@ def self.open_living_entry_dialog(main_rows, edit_idx, kind, creature_type = :li
 			new_entry['mstrike_skip_celerity']    = celerity_only_cb.active?
 			new_entry['mstrike_ignore_cooldown']  = ignore_cd_cb.active?
 			new_entry['mstrike_weapon_speed']     = ws_ent.text.to_i
+			new_entry['hurl_location']            = hurl_loc_ent.text.to_s.strip
+			new_entry['hurl_recover']             = hurl_recover_cb.active?
+			new_entry['hurl_noun']                = hurl_noun_ent.text.to_s.strip
+			new_entry['hurl_container']           = hurl_cont_ent.text.to_s.strip
 			new_entry['flare_gloves_adj']  = fg_adj_ent.text.to_s.strip
 			new_entry['flare_gloves_noun'] = fg_noun_ent.text.to_s.strip
 			new_entry['wings_pin_adj']     = wp_adj_ent.text.to_s.strip
@@ -5541,12 +5850,14 @@ def self.open_living_entry_dialog(main_rows, edit_idx, kind, creature_type = :li
 		else
 			new_entry['type']      = type_entry.text.to_s.strip
 			new_entry['cast_type'] = cast_combo.active_text == "(default)" ? '' : cast_combo.active_text.to_s
-			new_entry['open_cast'] = open_cb.active?
-			new_entry['warding']   = warding_cb.active?
-			new_entry['until_dead'] = until_dead_cb.active?
-			new_entry['use_stomp'] = stomp_rb&.active? || false
-			new_entry['use_tap']   = tap_rb&.active?   || false
-			new_entry['use_pound'] = pound_rb&.active?  || false
+			new_entry['open_cast']    = open_cb.active?
+			new_entry['warding']      = warding_cb.active?
+			new_entry['until_dead']   = until_dead_cb.active?
+			new_entry['until_prone']  = until_prone_cb.active?
+			new_entry['repeat_count'] = spell_rep_ent.text.to_i.clamp(1, 99)
+			new_entry['use_stomp']    = stomp_rb&.active? || false
+			new_entry['use_tap']      = tap_rb&.active?   || false
+			new_entry['use_pound']    = pound_rb&.active?  || false
 		end
 
 		new_entry['stance']          = stance_combo.active_text == "Default" ? '' : stance_combo.active_text.to_s
@@ -5793,7 +6104,7 @@ def self.build_combatsetup_window
 	self.load_osa_yaml
 	@OSA_COM_WINDOW = Gtk::Window.new
 	@OSA_COM_WINDOW.set_default_size(1155, 900)
-	@OSA_COM_WINDOW.title = TITLE
+	@OSA_COM_WINDOW.title = OSA_COMBAT_TITLE
 	@OSA_COM_WINDOW.set_border_width(10)
 	@OSA_COM_WINDOW.keep_above = true
 	@OSA_COM_WINDOW.signal_connect("destroy") do
@@ -6025,14 +6336,14 @@ rescue StandardError
 	{}
 end
 
-self.save_script_data("version", "4.2.83 (August 28, 2026)", push: false)
+self.save_script_data("version", "4.2.140 (August 30, 2026)", push: false)
 #toggle_upstream if !upstream_is_enabled?
 require "yaml"
 require "gtk3"
 require "fileutils"
 self.load_osa_yaml
 self.cleanup_obsolete_vars
-TITLE = "OSACombat: v. (#{@combat_data["version"]})" unless defined?(TITLE)
+OSA_COMBAT_TITLE = "OsaCombat: #{Char.name}"
 
 check_dependencies("OSACombat", [
 	{ name: "eherbs",          author: "elanthia-online" },
@@ -6198,6 +6509,9 @@ $osa_forcert_active    = false # Set true just before dispatching a ForceRT atta
 $osa_next_forcert      = false # Set true when the next routine entry uses ForceRT
 $osa_uac_last_target   = nil  # Last target ID for UAC chain continuity
 $buff_firstcast        = false
+@hurl_container_empty  = false
+@hurl_needs_recovery   = false
+@hurl_use_container    = false
 if @room_creatures.nil?
 	@room_creatures = Array.new
 end
@@ -6409,13 +6723,17 @@ loop {
 	gemstone_effects
 	mana_leech
 	looter
+	# Post-loot recovery sweep for any hurled weapons left in room -- runs once per hurl cycle
+	if @hurl_needs_recovery && @hurl_use_container && !@hurl_noun.to_s.empty? && GameObj.targets.none? { |t| t.status.to_s !~ /dead|gone/ }
+		recover_hurl_sweep(@hurl_noun, @hurl_container, @hurl_use_container, Room.current.id)
+		@hurl_needs_recovery = false
+	end
 	infuse_gear if Spell[1604].known? && !$osa_expired_gear.empty?
 	check_dead
 	check_for_poaching if @combat_data["check_for_group"]
-	if GameObj.targets.count > 0 && !checkdead
+	if GameObj.targets.any? { |t| t.status.to_s !~ /dead|gone/ } && !checkdead
 		get_target
 		load_attack_vars
-		reactive
 		combat
 	end
 	sleep 0.1
