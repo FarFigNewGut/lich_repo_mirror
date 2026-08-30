@@ -1,0 +1,1087 @@
+=begin
+  panelcontrol.lic
+
+  A GTK3 control panel for the Saga panel scripts (effectsbar_sagapanel,
+  exp_sagapanel, timers_sagapanel, messaging, creaturewindow, playerwindow,
+  exitwindow, treasurewindow). Two things it does NOT do, on purpose:
+  it does not merge those scripts into one process (they keep running
+  independently, exactly as before -- this is a separate control surface
+  only), and it does not maintain its own copy of each panel's settings.
+  Every control here just fires the exact same command that script's own
+  *cwXXX/*ebar/*tm/*exp/;send interface already expects (see
+  PanelControl.send_command!), the same way as if you'd typed it -- so
+  each panel's own UpstreamHook handler stays the single source of truth,
+  including its own confirmation echo, validation, and settings save.
+
+  Usage:
+    ;panelcontrol                - Open the control panel window.
+
+  Tabs:
+    Scripts    - Shows which of the 8 managed scripts are installed
+                 (checked against $script_dir), their version (parsed from
+                 the file's own header), and whether they're currently
+                 running, with Download/Start/Stop buttons. Download shells
+                 out to the existing ";repository download <file>" command
+                 (repository.lic must be installed and the file must
+                 actually be published there -- this panel doesn't hit the
+                 network itself).
+    <one tab per managed script> - Buttons/dropdowns/spinners for that
+                 script's most common toggles, generated from a plain Ruby
+                 list (MANAGED_SCRIPTS) rather than hand-built one at a
+                 time, plus a free-text "Custom command" box as a catch-all
+                 for anything not explicitly wired up (mainly
+                 timers_sagapanel's macro/gemstone/bonus commands, which
+                 take arbitrary multi-part text). creaturewindow's tab also
+                 has an emoji-picker button for the two Empyrean counter
+                 icons (see *cwicon in creaturewindow.lic), so those can be
+                 changed without typing anything.
+
+  A control here only works while its target script is actually running
+  (this panel doesn't start it for you automatically -- use the Scripts
+  tab first). Nothing here polls or auto-refreshes; use each tab's own
+  Refresh button after installing/starting/stopping a script.
+
+  Author: Claude Code
+  Required: Lich >= 5.20.0, gtk3
+  Tags: saga, frontend, mod, window, gtk3, control panel, installer
+  Version: 1.5.0
+
+  Recently changed:
+    v1.5.0 (2026-08-30) - Dropdowns and number spinners no longer change
+      value when the mouse wheel scrolls over them (GTK's own default
+      behavior otherwise, easy to trigger by accident while scrolling a
+      tab) -- intercepts each widget's own scroll-event and stops it.
+      :stepper controls (Effects Bar's Column/Row/Icon-text spacing) now
+      update their own value label immediately after each +/- click
+      instead of only on the next Refresh Settings/tab switch.
+    v1.4.0 (2026-08-30) - Effects Bar's Column/Row/Icon-text spacing
+      controls are now +/- button pairs with a live current-value readout
+      (a new :stepper control type), instead of an "Increase"/"Decrease"
+      dropdown -- these only ever have relative *ebar ci/cd/ri/rd/si/sd
+      commands, no "set to this exact value" command, so a spinner+Apply
+      wouldn't have anything to apply.
+    v1.3.0 (2026-08-30) - Controls now read their target script's actual
+      saved settings out of the shared lichwindows.yaml and display them,
+      instead of every control being a blind fire-and-forget action:
+      toggle controls with a known settings field are real checkboxes
+      showing ON/OFF as saved, dropdowns preselect the option matching
+      what's actually saved, number spinners preload the saved value, and
+      cycle buttons/emoji-picker labels show the current value as text.
+      Each tab now has its own Refresh Settings button, and re-reads
+      everything automatically every time you switch to that tab (same
+      mechanism as the running-status notice fix below).
+    v1.2.0 (2026-08-30) - Removed the *cwgtk/*pwgtk/*ewgtk/*twgtk "GTK
+      window" toggles from every tab (this panel is for driving the Saga
+      panel, not switching a script into its GTK window). Fixed each
+      script tab's "not currently running" notice going stale the moment
+      you started/stopped it from the Scripts tab without ever rebuilding
+      that tab -- it now recomputes on every tab switch instead of only
+      once at window-open time. Added this window's own Dark/Light and
+      A-/A+ font-size buttons to its header bar (same technique as
+      creaturewindow.lic's own GTK window: a CSS provider scoped to
+      window#panelcontrol), persisted under a new "panelcontrol" key in
+      the shared lichwindows.yaml.
+    v1.1.0 (2026-08-30) - Replaced commspanel_sagapanel and verbwindow with
+      messaging, playerwindow, exitwindow, and treasurewindow, per the
+      user's requested managed-script list.
+    v1.0.0 (2026-08-30) - Initial release.
+=end
+
+no_kill_all
+
+require 'yaml'
+
+begin
+  require 'gtk3'
+rescue LoadError
+  respond ""
+  respond " panelcontrol requires the gtk3 gem, which isn't installed."
+  respond " Install it with: gem install gtk3"
+  respond ""
+  exit
+end
+
+module PanelControl
+  extend self
+
+  # -------------------------------------------------------------------
+  # Managed script registry. Each entry:
+  #   key:         internal identifier, also the Gtk::Notebook tab key
+  #   filename:    exact .lic filename under $script_dir
+  #   script_name:  name Script.start/running?/kill expect (no .lic)
+  #   display:      tab/label title
+  #   summary:      one-line description shown at the top of its tab
+  #   settings_key: this script's own top-level key in the shared
+  #                 lichwindows.yaml (nil if it doesn't persist any
+  #                 settings there, e.g. messaging.lic) -- see
+  #                 PanelControl.read_setting
+  #   controls:     ordered list of control hashes (see build_control!).
+  #                 A control whose current value can be read back from
+  #                 lichwindows.yaml carries a :field (the setting's key
+  #                 within settings_key's block, or an array for a nested
+  #                 path e.g. ["custom_icons", "empyrean"]); one that
+  #                 can't (a one-shot action, a free-text list, an
+  #                 unpersisted debug flag) simply omits :field and stays
+  #                 a plain stateless button. :choice controls that DO
+  #                 have a :field also carry a parallel :values array (one
+  #                 raw stored value per :options entry) so the combo can
+  #                 preselect the entry matching what's actually saved.
+  # -------------------------------------------------------------------
+  MANAGED_SCRIPTS = [
+    {
+      key: :effectsbar,
+      filename: "effectsbar_sagapanel.lic",
+      script_name: "effectsbar_sagapanel",
+      display: "Effects Bar",
+      summary: "Active buffs/debuffs/vitals panel with countdown bars and resource tracking.",
+      settings_key: "effectsbar",
+      controls: [
+        { type: :toggle, label: "Stance display", command: "*ebar stance", field: "stance_enabled" },
+        { type: :toggle, label: "Encumbrance display", command: "*ebar encum", field: "encum_enabled" },
+        { type: :toggle, label: "Shadow Essence display (Sorcerer)", command: "*ebar essence", field: "essence_enabled" },
+        { type: :toggle, label: "Hard RT/Cast RT display", command: "*ebar rt", field: "rt_enabled" },
+        { type: :toggle, label: "Effect names beside icons", command: "*ebar desc", field: "description_enabled" },
+        { type: :toggle, label: "Minimal unscaled layout", command: "*ebar min", field: "minimal_mode" },
+        { type: :cycle, label: "Toggle horizontal/vertical layout", command: "*ebar dir", field: "layout" },
+        { type: :cycle, label: "Cycle Health display", command: "*ebar hp" },
+        { type: :cycle, label: "Cycle Mana display", command: "*ebar mana" },
+        { type: :cycle, label: "Cycle Stamina display", command: "*ebar stamina" },
+        { type: :cycle, label: "Cycle Spirit display", command: "*ebar spirit" },
+        { type: :cycle, label: "Cycle all vitals together", command: "*ebar vitals" },
+        { type: :choice, label: "Vitals value format", field: "vitals_display", values: ["number", "percent"], options: [["Current numbers", "*ebar number"], ["Percent", "*ebar %"]] },
+        { type: :choice, label: "Layout", field: "layout", values: ["vertical", "col2", "horizontal", "row2"], options: [
+          ["1 column", "*ebar col1"], ["2 columns", "*ebar col2"],
+          ["1 row", "*ebar row1"], ["2 rows", "*ebar row2"]
+        ] },
+        { type: :choice, label: "Font size", field: "font_size", values: [12, 24, 36, 48], options: [
+          ["12pt", "*ebar font12"], ["24pt", "*ebar font24"],
+          ["36pt", "*ebar font36"], ["48pt", "*ebar font48"]
+        ] },
+        { type: :stepper, label: "Column spacing", field: "col_scale", default: 1.0, inc_command: "*ebar ci", dec_command: "*ebar cd" },
+        { type: :stepper, label: "Row spacing", field: "row_scale", default: 1.0, inc_command: "*ebar ri", dec_command: "*ebar rd" },
+        { type: :stepper, label: "Icon/text spacing", field: "icon_text_gap", default: 0, inc_command: "*ebar si", dec_command: "*ebar sd" },
+        { type: :number, label: "Leading icon spacing", min: 0, max: 20, default: 0, field: "icon_space", command_template: "*ebar espace %d" },
+        { type: :number, label: "Leading duration/name spacing", min: 0, max: 20, default: 0, field: "text_space", command_template: "*ebar tspace %d" },
+        { type: :toggle, label: "Show every known icon (test grid)", command: "*ebar test" }
+      ]
+    },
+    {
+      key: :exp,
+      filename: "exp_sagapanel.lic",
+      script_name: "exp_sagapanel",
+      display: "Experience",
+      summary: "Experience/Lumnis panel with weekly/monthly/yearly history and profession resources.",
+      settings_key: "exp",
+      controls: [
+        { type: :toggle, label: "Resources section", command: "*exp resource", field: "resource_enabled" },
+        { type: :toggle, label: "Hide-triangle links", command: "*exp hidearrows", field: "hide_arrows" },
+        { type: :toggle, label: "Refresh experience/Lumnis data now", command: "*exp refresh" },
+        { type: :toggle, label: "Clear the RPA indicator", command: "*exp clearrpa" },
+        { type: :toggle, label: "Backfill weekly/monthly/yearly history", command: "*exp importlogs" },
+        { type: :toggle, label: "Save settings now", command: "*exp save" },
+        { type: :toggle, label: "Un-hide ALL rows", command: "*exp unignore all" },
+        { type: :number, label: "Value column width", min: 20, max: 400, default: 60, field: "value_width", command_template: "*exp width %d" },
+        { type: :entry_command, label: "Hide a row", command_template: "*exp ignore %s", placeholder: "field name" },
+        { type: :entry_command, label: "Un-hide a row", command_template: "*exp unignore %s", placeholder: "field name" },
+        { type: :choice, label: "Show lists in main window", options: [
+          ["Visible rows", "*exp tracked"], ["Hidden rows", "*exp ignored"]
+        ] }
+      ]
+    },
+    {
+      key: :timers,
+      filename: "timers_sagapanel.lic",
+      script_name: "timers_sagapanel",
+      display: "Timers",
+      summary: "Active spells/buffs/debuffs/cooldowns with Missing Spells tracking and Grand Totals.",
+      settings_key: "timers",
+      controls: [
+        { type: :toggle, label: "Countdown bars", command: "*tm bars", field: "show_bars" },
+        { type: :toggle, label: "Nonzero bonus details", command: "*tm bonuses", field: "show_bonuses" },
+        { type: :toggle, label: "Category/totals headers", command: "*tm headers", field: "category_headers" },
+        { type: :toggle, label: "Hide-triangle links", command: "*tm hidearrows", field: "hide_arrows" },
+        { type: :toggle, label: "Invoker countdown row", command: "*tm invoker", field: "invoker_enabled" },
+        { type: :toggle, label: "Spell-circle sub-headers", command: "*tm pheaders", field: "panel_headers" },
+        { type: :toggle, label: "From Buffs/Spells + Grand Totals", command: "*tm totals", field: "show_totals" },
+        { type: :toggle, label: "Both category", command: "*tm cat both", field: "cat_both" },
+        { type: :toggle, label: "Defense category", command: "*tm cat defense", field: "cat_defense" },
+        { type: :toggle, label: "Offense category", command: "*tm cat offense", field: "cat_offense" },
+        { type: :choice, label: "Spell display", field: "name_display", values: ["both", "name", "number"], options: [
+          ["Name + number", "*tm display both"], ["Name only", "*tm display name"], ["Number only", "*tm display number"]
+        ] },
+        { type: :choice, label: "Missing Spells position", field: "missing_position", values: ["top", "bottom"], options: [["Top", "*tm missing top"], ["Bottom", "*tm missing bottom"]] },
+        { type: :choice, label: "Category sort", field: "sort_mode", values: ["name_asc", "name_desc", "duration_desc", "duration_asc"], options: [
+          ["A-Z", "*tm sort az"], ["Z-A", "*tm sort za"],
+          ["Duration high-low", "*tm sort dhigh"], ["Duration low-high", "*tm sort dlow"]
+        ] },
+        { type: :number, label: "Duration column width", min: 20, max: 400, default: 60, field: "duration_width", command_template: "*tm width %d" },
+        { type: :number, label: "Weapon enchant (pAS totals)", min: 0, max: 30, default: 0, field: "weapon_enchant", command_template: "*tm enchant %d" },
+        { type: :number, label: "Casting Strength phantom bonus", min: 0, max: 10, default: 0, field: "trandest_rank", command_template: "*tm trandest %d" },
+        { type: :number, label: "Flat Zelnorn bAS/pAS bonus", min: 0, max: 100, default: 0, field: "zelnorn_bonus", command_template: "*tm zelnorn %d" },
+        { type: :entry_command, label: "Track spell (name or #)", command_template: "*tm track %s", placeholder: "spell name or number" },
+        { type: :entry_command, label: "Untrack spell (name or #)", command_template: "*tm untrack %s", placeholder: "spell name or number" },
+        { type: :entry_command, label: "Hide live entry", command_template: "*tm ignore %s", placeholder: "entry name" },
+        { type: :entry_command, label: "Un-hide entry", command_template: "*tm unignore %s", placeholder: "entry name" },
+        { type: :toggle, label: "Track ALL resolvable spells", command: "*tm track all" },
+        { type: :toggle, label: "Untrack ALL spells", command: "*tm untrack all" },
+        { type: :toggle, label: "Un-hide ALL entries", command: "*tm unignore all" },
+        { type: :choice, label: "Show lists in main window", options: [
+          ["Tracked spells", "*tm tracked"], ["Recast macros", "*tm macros"],
+          ["Gemstones", "*tm gemstones"], ["Hidden entries", "*tm ignored"]
+        ] },
+        { type: :toggle, label: "Save settings now", command: "*tm save" },
+        { type: :toggle, label: "Show totals + Casting Strength in Story", command: "*tm totalscheck" }
+      ]
+    },
+    {
+      key: :messaging,
+      filename: "messaging.lic",
+      script_name: "messaging",
+      display: "Messaging",
+      summary: "Transforms death/login/logout/channel/announcement messaging into compact Saga markers and icons.",
+      settings_key: nil,
+      controls: [
+        { type: :toggle, label: "Run a death-message test", command: ";messaging test" },
+        { type: :toggle, label: "Run all channel-icon tests", command: ";messaging esptest" },
+        { type: :toggle, label: "Run an announcement test", command: ";messaging anntest" }
+      ]
+    },
+    {
+      key: :creaturewindow,
+      filename: "creaturewindow.lic",
+      script_name: "creaturewindow",
+      display: "Creature Window",
+      summary: "Real-time creature/bounty display, kill metrics, Gem Onslaught + Empyrean tracking.",
+      settings_key: "creaturewindow",
+      controls: [
+        { type: :toggle, label: "Time-to-kill metrics", command: "*cwttk", field: "display_avg_ttk" },
+        { type: :toggle, label: "Bounty task display", command: "*cwbty", field: "display_bounty" },
+        { type: :toggle, label: "Claim status", command: "*cwclaim", field: "display_claim" },
+        { type: :toggle, label: "Custom layout 1 (*cwcustom1)", command: "*cwcustom1", field: "custom_layout1" },
+        { type: :toggle, label: "Dead creatures inline", command: "*cwdead", field: "dead_inline" },
+        { type: :toggle, label: "Test mode (24 fake creatures)", command: "*cwtest" },
+        { type: :toggle, label: "Onslaught timer display", command: "*cwonslaught timer", field: "onslaught_timer_enabled" },
+        { type: :toggle, label: "Onslaught kill counter display", command: "*cwonslaught counter", field: "onslaught_counter_enabled" },
+        { type: :cycle, label: "Cycle hazard display position", command: "*cwhazard", field: "hazard_display_mode" },
+        { type: :cycle, label: "Cycle count headers (text/emoji/off)", command: "*cwheaders", field: "header_mode" },
+        { type: :cycle, label: "Cycle Saga status style", command: "*cwstatus", field: "saga_status_mode" },
+        { type: :cycle, label: "Cycle target-next mode", command: "*cwtargetnext", field: "target_next_mode" },
+        { type: :cycle, label: "Cycle target HP display", command: "*cwhp", field: "target_hp_mode" },
+        { type: :cycle, label: "Cycle target marker icon", command: "*cwtargetid", field: "target_marker_index" },
+        { type: :cycle, label: "Cycle grid flow (row/col)", command: "*cwflow", field: "grid_flow" },
+        { type: :number, label: "Grid columns", min: 1, max: 10, default: 2, field: "grid_cols", command_template: "*cwcol %d" },
+        { type: :number, label: "Grid rows", min: 1, max: 10, default: 8, field: "grid_rows", command_template: "*cwrow %d" },
+        { type: :choice, label: "Run bounty workflow", options: [
+          ["Herb", "*cwherb"], ["Gem", "*cwgem"], ["Guild", "*cwguild"],
+          ["Guard", "*cwguard"], ["Furrier", "*cwfurrier"], ["Skin", "*cwskin"]
+        ] },
+        { type: :emoji_picker, label: "Empyrean counter icon (alien)", slot: "empyrean", field: ["custom_icons", "empyrean"] },
+        { type: :emoji_picker, label: "Since-captain counter icon (saucer)", slot: "saucer", field: ["custom_icons", "saucer"] }
+      ]
+    },
+    {
+      key: :playerwindow,
+      filename: "playerwindow.lic",
+      script_name: "playerwindow",
+      display: "Player Window",
+      summary: "Real-time player display with spam/animal filtering and profession icons.",
+      settings_key: "playerwindow",
+      controls: [
+        { type: :toggle, label: "Single/double column layout", command: "*pwcol" },
+        { type: :toggle, label: "Filter buttons visibility", command: "*pwbuttons", field: "show_filter_buttons" },
+        { type: :toggle, label: "Player movement filtering", command: "*pwmove", field: "show_movement" },
+        { type: :toggle, label: "Flare-message filtering", command: "*pwflare", field: "filter_flares" },
+        { type: :toggle, label: "AS/CS/SMR/SSR line filtering", command: "*pwcombat", field: "filter_combat_math" },
+        { type: :toggle, label: "Claim status", command: "*pwclaim", field: "show_claim_status" },
+        { type: :toggle, label: "Group display", command: "*pwgroup", field: "show_group_display" },
+        { type: :toggle, label: "PCs/Players header", command: "*pwheaders", field: "show_headers" },
+        { type: :toggle, label: "Spam filtering", command: "*filterspam", field: "filter_spam" },
+        { type: :toggle, label: "Animal filtering", command: "*filteranimals", field: "filter_animals" },
+        { type: :toggle, label: "Filter-debug logging", command: "*pwdebug" },
+        { type: :toggle, label: "Profession icons on/off", command: "*pwprofession", field: "show_profession_icons" },
+        { type: :cycle, label: "Cycle Saga status style", command: "*pwstatus", field: "saga_status_mode" },
+        { type: :choice, label: "Column layout", field: "columns", values: [3, 4, 5, 6, 7, 8], options: [
+          ["3 columns", "*pwcol3"], ["4 columns", "*pwcol4"], ["5 columns", "*pwcol5"],
+          ["6 columns", "*pwcol6"], ["7 columns", "*pwcol7"], ["8 columns", "*pwcol8"]
+        ] },
+        { type: :entry_command, label: "Show icons for only these professions", command_template: "*pwprofession %s", placeholder: "e.g. warrior cleric, or 'all'" },
+        { type: :entry_command, label: "Parse a profession roster (WHO PROFESSION)", command_template: "*pwparse %s", placeholder: "profession or 'all'" }
+      ]
+    },
+    {
+      key: :exitwindow,
+      filename: "exitwindow.lic",
+      script_name: "exitwindow",
+      display: "Exit Window",
+      summary: "Real-time room exit display with clickable Lich exits.",
+      settings_key: "exitwindow",
+      controls: [
+        { type: :toggle, label: "Single/double column layout", command: "*ewcol" },
+        { type: :toggle, label: "Exits/Lich Exits headers", command: "*ewheader", field: "show_headers" },
+        { type: :choice, label: "Column layout", field: "columns", values: [3, 4], options: [["3 columns", "*ewcol3"], ["4 columns", "*ewcol4"]] },
+        { type: :entry_command, label: "Copy a room number to clipboard", command_template: "*ewcopy %s", placeholder: "lich <#> or u <#>, e.g. lich 12345" }
+      ]
+    },
+    {
+      key: :treasurewindow,
+      filename: "treasurewindow.lic",
+      script_name: "treasurewindow",
+      display: "Treasure Window",
+      summary: "Real-time treasure/loot display with killtracker gem output.",
+      settings_key: "treasurewindow",
+      controls: [
+        { type: :toggle, label: "LOOT ROOM/ELOOT clickable links", command: "*click" },
+        { type: :toggle, label: "Single/double column layout", command: "*twcol" },
+        { type: :toggle, label: "Killtracker gem output", command: "*twgem", field: "show_killtracker" },
+        { type: :choice, label: "Column layout", field: "columns", values: [1, 2, 3, 4], options: [
+          ["1 column", "*twcol1"], ["2 columns", "*twcol2"], ["3 columns", "*twcol3"], ["4 columns", "*twcol4"]
+        ] }
+      ]
+    }
+  ].freeze
+
+  # A broad, general-purpose picker grid -- not narrowly Empyrean-themed,
+  # since *cwicon accepts any emoji for either slot. Arranged in the fixed
+  # 8-per-row grid EMOJI_COLUMNS below. Double-quoted \u{} escapes, not raw
+  # literal characters -- keeps this source file itself ASCII-only (same
+  # convention as every icon table in creaturewindow.lic/effectsbar_
+  # sagapanel.lic); each escape still becomes a real UTF-8 character at
+  # runtime, which is what actually needs to reach the GTK button label.
+  # %w[] would NOT work here -- it does not process \u{} escapes at all.
+  EMOJI_PALETTE = [
+    "\u{1F47D}", "\u{1F6F8}", "\u{1F47E}", "\u{1F680}", "\u{1F30C}", "\u{2B50}", "\u{1F4AB}", "\u{1F52E}",
+    "\u{1F480}", "\u{2620}\u{FE0F}", "\u{1F3AF}", "\u{26A1}", "\u{1F525}", "\u{2744}\u{FE0F}", "\u{1F31F}", "\u{1F47B}",
+    "\u{1F409}", "\u{1F98B}", "\u{1F98A}", "\u{1F43A}", "\u{1F985}", "\u{1F989}", "\u{1F984}", "\u{1F40D}",
+    "\u{2764}\u{FE0F}", "\u{1F49C}", "\u{1F499}", "\u{1F49A}", "\u{1F9E1}", "\u{1F5A4}", "\u{26AA}", "\u{26AB}",
+    "\u{1F451}", "\u{1F48E}", "\u{2694}\u{FE0F}", "\u{1F6E1}\u{FE0F}", "\u{1F3F9}", "\u{1F52A}", "\u{1FA84}", "\u{1F3B2}"
+  ].freeze
+  EMOJI_COLUMNS = 8
+
+  # ---------------------------------------------------------------------
+  # Command dispatch -- do_client (lib/global_defs.rb) runs a string
+  # through the exact same UpstreamHook pipeline as if the player had
+  # typed it at the game prompt. This is the established, working pattern
+  # for a GTK script injecting a command on a button click -- confirmed
+  # against grids.lic, an existing Lich script that does the same thing
+  # from its own Gtk::Entry "activate" handler. It is NOT the same as
+  # put/fput, which send straight to the game server and would bypass
+  # every *cwXXX/*ebar/*tm/*exp UpstreamHook entirely.
+  # ---------------------------------------------------------------------
+  def send_command!(text)
+    do_client(text)
+  rescue StandardError => e
+    respond "PanelControl: error sending '#{text}': #{e.message}"
+  end
+
+  def script_installed?(entry)
+    File.exist?(File.join($script_dir, entry[:filename]))
+  end
+
+  def script_running?(entry)
+    running?(entry[:script_name])
+  rescue StandardError
+    false
+  end
+
+  # entry's own top-level block from the shared lichwindows.yaml (e.g.
+  # all["creaturewindow"]), or {} if it has no settings_key (messaging.lic)
+  # or nothing's been saved yet. Reads fresh every call, same "never cache
+  # across calls" rule every managed script's own load_window_settings
+  # already follows -- this panel is reading the SAME file those scripts
+  # write to, potentially seconds after they last saved it.
+  def script_settings(entry)
+    return {} unless entry[:settings_key]
+
+    all = load_all_settings
+    block = all[entry[:settings_key]]
+    block.is_a?(Hash) ? block : {}
+  end
+
+  # Reads one setting out of entry's block. `path` is either a single key
+  # ("display_bounty") or an array for a nested path
+  # (["custom_icons", "empyrean"]). Returns `default` if entry has no
+  # settings_key, the key was never saved, or any intermediate step isn't
+  # actually a Hash (e.g. a corrupt/foreign value on disk).
+  def read_setting(entry, path, default = nil)
+    value = Array(path).reduce(script_settings(entry)) do |hash, key|
+      hash.is_a?(Hash) ? hash[key.to_s] : nil
+    end
+    value.nil? ? default : value
+  end
+
+  # Reads just the header comment block rather than the whole file (some
+  # of these headers run past 6KB with a long Commands:/changelog list, so
+  # this reads the same 20,000 bytes repository.lic's own CommentParser
+  # reads for the same purpose) and pulls the version line. Not every
+  # managed script uses the same "Version:" capitalization/placement
+  # (verbwindow.lic's is a bare lowercase "version: N.N" line deep in its
+  # changelog, not a "Version:" header field), so this matches either.
+  def installed_version(entry)
+    return nil unless script_installed?(entry)
+
+    header = File.open(File.join($script_dir, entry[:filename]), 'rb') { |f| f.read(20_000) }
+    m = header.to_s.match(/^\s*version:\s*([\w.]+)/i)
+    m ? m[1] : "unknown"
+  rescue StandardError
+    nil
+  end
+
+  # Shells out to the already-installed repository.lic rather than
+  # reimplementing its SSL/gzip download protocol here -- mirrors
+  # repository.lic's own GTK "Download selected script" button, which
+  # calls Script.run('repository', ...) directly from a GTK click handler
+  # the same way. Blocks the GTK thread for the duration of the download
+  # (same tradeoff repository.lic's own GUI already accepts).
+  def download_script!(entry)
+    unless File.exist?(File.join($script_dir, "repository.lic"))
+      respond "PanelControl: repository.lic is not installed -- cannot download #{entry[:filename]}."
+      return
+    end
+
+    Script.run('repository', "download #{entry[:filename]}", force: true)
+  rescue StandardError => e
+    respond "PanelControl: error downloading #{entry[:filename]}: #{e.message}"
+  end
+
+  def start_script!(entry)
+    return unless script_installed?(entry)
+    return if script_running?(entry)
+
+    start_script(entry[:script_name])
+  rescue StandardError => e
+    respond "PanelControl: error starting #{entry[:script_name]}: #{e.message}"
+  end
+
+  def stop_script!(entry)
+    target = (Script.running + Script.hidden).find { |s| s.name == entry[:script_name] }
+    target&.kill
+  rescue StandardError => e
+    respond "PanelControl: error stopping #{entry[:script_name]}: #{e.message}"
+  end
+
+  # -------------------------------------------------------------------
+  # This window's OWN dark/light + font-size preference -- stored under a
+  # "panelcontrol" key in the same shared lichwindows.yaml every managed
+  # script already reads/writes (never touching any of THEIR keys), using
+  # the same strict-permitted-classes/rescue-and-rebuild pattern
+  # established across this codebase (see creaturewindow.lic's
+  # load_window_settings for the original).
+  # -------------------------------------------------------------------
+  PALETTES = {
+    "Dark"  => { bg: "#2E2E2E", fg: "#DADADA", btn: "#3E3E3E", border: "#555555" },
+    "Light" => { bg: "#E6E6E6", fg: "#202020", btn: "#D6D6D6", border: "#AAAAAA" }
+  }.freeze
+  PERMITTED_CLASSES = [Hash, Array, String, Integer, Float, TrueClass, FalseClass, NilClass].freeze
+
+  def settings_path
+    base_dir = "#{$data_dir}#{XMLData.game}/#{Char.name}"
+    Dir.mkdir("#{$data_dir}#{XMLData.game}") unless File.exist?("#{$data_dir}#{XMLData.game}")
+    Dir.mkdir(base_dir) unless File.exist?(base_dir)
+    File.join(base_dir, "lichwindows.yaml")
+  end
+
+  def load_all_settings
+    filename = settings_path
+    return {} unless File.exist?(filename)
+
+    parsed = YAML.safe_load(File.read(filename), permitted_classes: PERMITTED_CLASSES, aliases: false)
+    parsed.is_a?(Hash) ? parsed : {}
+  rescue StandardError
+    {}
+  end
+
+  def load_settings
+    pc = load_all_settings["panelcontrol"]
+    pc = {} unless pc.is_a?(Hash)
+    {
+      "palette" => PALETTES.key?(pc["palette"]) ? pc["palette"] : "Dark",
+      "font_size" => pc["font_size"].is_a?(Integer) ? pc["font_size"].clamp(8, 30) : 14
+    }
+  end
+
+  def save_settings(palette:, font_size:)
+    all = load_all_settings
+    all["panelcontrol"] = { "palette" => palette, "font_size" => font_size }
+    File.write(settings_path, all.to_yaml)
+  rescue StandardError => e
+    respond "PanelControl: error saving settings: #{e.message}"
+  end
+end
+
+# ===========================================================================
+# GTK window
+# ===========================================================================
+class PanelControlGtk
+  @css_provider = nil
+  @palette      = nil
+  @font_size    = nil
+
+  # Regenerates and applies this window's own CSS (dark/light palette +
+  # font size) -- same technique as creaturewindow.lic's CreatureWindowGtk
+  # .reload_css, scoped to window#panelcontrol so it can never affect any
+  # OTHER script's GTK window sharing this same process-wide style
+  # provider.
+  def self.reload_css
+    colors = PanelControl::PALETTES[@palette] || PanelControl::PALETTES["Dark"]
+
+    # Broad, deliberately non-exhaustive-looking selector list -- every
+    # widget type actually used anywhere in this window (see
+    # build_scripts_tab/build_control_tab/build_control!/
+    # show_emoji_picker) gets an explicit rule, since GTK's CSS engine
+    # does NOT reliably cascade background-color the way real browser CSS
+    # does (confirmed live: leaving buttons/scrolledwindow/combobox/
+    # spinbutton unstyled kept them on the system's default light theme
+    # even with the top-level window rule in place).
+    css = <<~CSS
+      window#panelcontrol {
+        background-color: #{colors[:bg]};
+        color:            #{colors[:fg]};
+        font-size:        #{@font_size}px;
+      }
+      window#panelcontrol headerbar,
+      window#panelcontrol headerbar:backdrop,
+      window#panelcontrol .titlebar,
+      window#panelcontrol .titlebar:backdrop {
+        background-image: none;
+        background-color: #{colors[:bg]};
+        color:            #{colors[:fg]};
+        box-shadow:        none;
+        border:            none;
+      }
+      window#panelcontrol headerbar .title {
+        color: #{colors[:fg]};
+      }
+      window#panelcontrol headerbar .header-toggle {
+        margin:            0 2px;
+        padding:           2px 6px;
+        background-image:  none;
+        background-color:  transparent;
+        color:             #{colors[:fg]};
+        border:            none;
+        box-shadow:        none;
+      }
+      window#panelcontrol notebook,
+      window#panelcontrol notebook header,
+      window#panelcontrol notebook tab,
+      window#panelcontrol notebook stack {
+        background-color: #{colors[:bg]};
+        color:            #{colors[:fg]};
+      }
+      window#panelcontrol label {
+        color: #{colors[:fg]};
+      }
+      window#panelcontrol frame {
+        background-color: #{colors[:bg]};
+        color:            #{colors[:fg]};
+      }
+      window#panelcontrol frame > label {
+        color: #{colors[:fg]};
+      }
+      window#panelcontrol scrolledwindow,
+      window#panelcontrol viewport,
+      window#panelcontrol box {
+        background-color: #{colors[:bg]};
+        color:            #{colors[:fg]};
+      }
+      window#panelcontrol entry,
+      window#panelcontrol combobox,
+      window#panelcontrol combobox window,
+      window#panelcontrol combobox menu,
+      window#panelcontrol spinbutton,
+      window#panelcontrol popover {
+        background-color: #{colors[:btn]};
+        color:            #{colors[:fg]};
+        border-color:     #{colors[:border]};
+      }
+      window#panelcontrol button {
+        background-image: none;
+        background-color: #{colors[:btn]};
+        color:            #{colors[:fg]};
+        border-color:     #{colors[:border]};
+      }
+      window#panelcontrol button:hover {
+        background-color: shade(#{colors[:btn]}, 1.15);
+      }
+      window#panelcontrol button:active {
+        background-color: shade(#{colors[:btn]}, 0.85);
+      }
+      window#panelcontrol button:disabled {
+        background-color: #{colors[:btn]};
+        color:            shade(#{colors[:fg]}, 0.7);
+      }
+    CSS
+
+    @css_provider.load(data: css)
+  end
+
+  def self.create_main_window
+    settings   = PanelControl.load_settings
+    @palette   = settings["palette"]
+    @font_size = settings["font_size"]
+
+    @window = Gtk::Window.new(:toplevel)
+    @window.set_name("panelcontrol")
+    # Sized to comfortably show a full control tab (e.g. Timers, the
+    # tallest one) without scrolling, per the user's own screenshot of
+    # their preferred window size.
+    @window.set_default_size(950, 1200)
+
+    header = Gtk::HeaderBar.new
+    header.show_close_button = true
+    header.title = "Lich Saga Panel Controls"
+
+    dec_btn   = Gtk::Button.new(label: "A-")
+    inc_btn   = Gtk::Button.new(label: "A+")
+    dark_btn  = Gtk::Button.new(label: "Dark")
+    light_btn = Gtk::Button.new(label: "Light")
+    [dec_btn, inc_btn, dark_btn, light_btn].each do |b|
+      b.style_context.add_class("header-toggle")
+      header.pack_start(b)
+    end
+    dec_btn.signal_connect("clicked") do
+      @font_size = [@font_size - 1, 8].max
+      PanelControl.save_settings(palette: @palette, font_size: @font_size)
+      reload_css
+    end
+    inc_btn.signal_connect("clicked") do
+      @font_size = [@font_size + 1, 30].min
+      PanelControl.save_settings(palette: @palette, font_size: @font_size)
+      reload_css
+    end
+    dark_btn.signal_connect("clicked") do
+      @palette = "Dark"
+      PanelControl.save_settings(palette: @palette, font_size: @font_size)
+      reload_css
+    end
+    light_btn.signal_connect("clicked") do
+      @palette = "Light"
+      PanelControl.save_settings(palette: @palette, font_size: @font_size)
+      reload_css
+    end
+    @window.set_titlebar(header)
+
+    @css_provider = Gtk::CssProvider.new
+    reload_css
+    Gtk::StyleContext.add_provider_for_screen(
+      Gdk::Screen.default,
+      @css_provider,
+      Gtk::StyleProvider::PRIORITY_APPLICATION
+    )
+
+    @notebook = Gtk::Notebook.new
+    @window.add(@notebook)
+
+    @scripts_tab_box = build_scripts_tab
+    @notebook.append_page(@scripts_tab_box, Gtk::Label.new("Scripts"))
+
+    # Parallel to MANAGED_SCRIPTS (index i here <-> MANAGED_SCRIPTS[i]) --
+    # lets switch-page below find the right entry/notice pair without a
+    # separate lookup structure.
+    @tab_notices = []
+    PanelControl::MANAGED_SCRIPTS.each do |entry|
+      tab, notice, populate_controls = build_control_tab(entry)
+      @tab_notices << [entry, notice, populate_controls]
+      @notebook.append_page(tab, Gtk::Label.new(entry[:display]))
+    end
+
+    # Each per-script tab's "not currently running" notice, and every
+    # control's displayed current value, are only ever computed once, when
+    # the tab widget is first built -- both go stale the moment you
+    # start/stop that script or change one of its settings from somewhere
+    # else without ever rebuilding this tab. Recomputing on every tab
+    # switch means both are fresh by the time you're actually looking at
+    # them, without needing to remember to press each tab's own Refresh
+    # button first.
+    @notebook.signal_connect("switch-page") do |_nb, _page, page_num|
+      idx = page_num - 1
+      if idx >= 0 && idx < @tab_notices.size
+        entry, notice, populate_controls = @tab_notices[idx]
+        notice.visible = !PanelControl.script_running?(entry)
+        populate_controls.call
+      end
+    end
+
+    @window.signal_connect("destroy") do
+      # No Gtk.main_quit here -- the GTK main loop is one shared, process-
+      # wide loop (see GtkMainLoopGuards in lib/common/gtk.rb, which
+      # already no-ops a regular script's main_quit call for exactly this
+      # reason), so closing this window must only drop our own reference,
+      # never stop the loop other scripts' GTK windows depend on too.
+      @window = nil
+    end
+
+    @window.show_all
+  end
+
+  # -------------------------------------------------------------------
+  # Scripts tab -- install/run status + Download/Start/Stop, per entry.
+  # Rebuilt from scratch on Refresh rather than trying to update widgets
+  # in place; only 6 rows, so this stays cheap.
+  # -------------------------------------------------------------------
+  def self.build_scripts_tab
+    outer = Gtk::Box.new(:vertical, 6)
+    outer.border_width = 10
+
+    refresh_button = Gtk::Button.new(label: "Refresh Status")
+    outer.pack_start(refresh_button, expand: false, fill: false, padding: 0)
+
+    @scripts_list_box = Gtk::Box.new(:vertical, 4)
+    scroll = Gtk::ScrolledWindow.new
+    scroll.set_policy(Gtk::PolicyType::NEVER, Gtk::PolicyType::AUTOMATIC)
+    scroll.add(@scripts_list_box)
+    outer.pack_start(scroll, expand: true, fill: true, padding: 0)
+
+    refresh_button.signal_connect("clicked") { populate_scripts_list! }
+    populate_scripts_list!
+
+    outer
+  end
+
+  def self.populate_scripts_list!
+    @scripts_list_box.children.each { |c| @scripts_list_box.remove(c) }
+
+    PanelControl::MANAGED_SCRIPTS.each do |entry|
+      frame = Gtk::Frame.new(entry[:display])
+      row = Gtk::Box.new(:horizontal, 8)
+      row.border_width = 6
+      frame.add(row)
+
+      installed = PanelControl.script_installed?(entry)
+      running = installed && PanelControl.script_running?(entry)
+      version = PanelControl.installed_version(entry)
+
+      status_text =
+        if !installed
+          "Missing"
+        elsif running
+          "Installed (v#{version}) -- Running"
+        else
+          "Installed (v#{version}) -- Not running"
+        end
+
+      info = Gtk::Label.new("#{entry[:filename]}\n#{status_text}")
+      info.set_xalign(0)
+      info.set_line_wrap(true)
+      row.pack_start(info, expand: true, fill: true, padding: 0)
+
+      if !installed
+        download_btn = Gtk::Button.new(label: "Download")
+        download_btn.signal_connect("clicked") do
+          PanelControl.download_script!(entry)
+          populate_scripts_list!
+        end
+        row.pack_start(download_btn, expand: false, fill: false, padding: 0)
+      elsif running
+        stop_btn = Gtk::Button.new(label: "Stop")
+        stop_btn.signal_connect("clicked") do
+          PanelControl.stop_script!(entry)
+          populate_scripts_list!
+        end
+        row.pack_start(stop_btn, expand: false, fill: false, padding: 0)
+      else
+        start_btn = Gtk::Button.new(label: "Start")
+        start_btn.signal_connect("clicked") do
+          PanelControl.start_script!(entry)
+          populate_scripts_list!
+        end
+        row.pack_start(start_btn, expand: false, fill: false, padding: 0)
+      end
+
+      @scripts_list_box.pack_start(frame, expand: false, fill: false, padding: 0)
+    end
+
+    @scripts_list_box.show_all
+  end
+
+  # -------------------------------------------------------------------
+  # Per-script control tab -- built from entry[:controls]. Every control
+  # sends its command immediately (no separate "Apply" step for
+  # toggles/cycles/choices); :number and :entry_command have their own
+  # Apply/Send button since they need a value first.
+  # -------------------------------------------------------------------
+  def self.build_control_tab(entry)
+    outer = Gtk::Box.new(:vertical, 6)
+    outer.border_width = 10
+
+    summary = Gtk::Label.new(entry[:summary])
+    summary.set_xalign(0)
+    summary.set_line_wrap(true)
+    outer.pack_start(summary, expand: false, fill: false, padding: 0)
+
+    not_running_notice = Gtk::Label.new("(#{entry[:script_name]} is not currently running -- these will do nothing until it is; use the Scripts tab to start it.)")
+    not_running_notice.set_xalign(0)
+    not_running_notice.visible = !PanelControl.script_running?(entry)
+    outer.pack_start(not_running_notice, expand: false, fill: false, padding: 0)
+
+    refresh_btn = Gtk::Button.new(label: "Refresh Settings")
+    outer.pack_start(refresh_btn, expand: false, fill: false, padding: 0)
+
+    scroll = Gtk::ScrolledWindow.new
+    scroll.set_policy(Gtk::PolicyType::NEVER, Gtk::PolicyType::AUTOMATIC)
+    grid = Gtk::Box.new(:vertical, 4)
+    grid.border_width = 4
+    scroll.add(grid)
+    outer.pack_start(scroll, expand: true, fill: true, padding: 0)
+
+    # Rebuilds every control widget from scratch, re-reading
+    # lichwindows.yaml each time -- called once now to populate the tab,
+    # again from the Refresh button, and again from create_main_window's
+    # notebook "switch-page" handler every time this tab is viewed, so
+    # what's displayed never gets far out of sync with what's actually
+    # saved.
+    populate_controls = lambda do
+      grid.children.each { |c| grid.remove(c) }
+      entry[:controls].each { |control| build_control!(grid, entry, control) }
+      grid.show_all
+    end
+    populate_controls.call
+    refresh_btn.signal_connect("clicked") { populate_controls.call }
+
+    custom_box = Gtk::Box.new(:horizontal, 4)
+    custom_entry = Gtk::Entry.new
+    custom_entry.placeholder_text = "Custom command, e.g. *tm gemstone Ring 10 STR"
+    custom_send = Gtk::Button.new(label: "Send")
+    send_custom = lambda do
+      text = custom_entry.text.to_s.strip
+      next if text.empty?
+
+      PanelControl.send_command!(text)
+      custom_entry.text = ""
+    end
+    custom_send.signal_connect("clicked") { send_custom.call }
+    custom_entry.signal_connect("activate") { send_custom.call }
+    custom_box.pack_start(custom_entry, expand: true, fill: true, padding: 0)
+    custom_box.pack_start(custom_send, expand: false, fill: false, padding: 0)
+    outer.pack_start(Gtk::Label.new("Custom command (anything not listed above):").tap { |l| l.set_xalign(0) }, expand: false, fill: false, padding: 0)
+    outer.pack_start(custom_box, expand: false, fill: false, padding: 0)
+
+    [outer, not_running_notice, populate_controls]
+  end
+
+  # Comboboxes and spin buttons both change their value when the mouse
+  # wheel scrolls over them while focused/hovered -- GTK's own default
+  # behavior, not something either widget can be told not to do via a
+  # property. Easy to trigger by accident while scrolling this tab's
+  # ScrolledWindow past one of them. Intercepting "scroll-event" and
+  # returning true (GDK_EVENT_STOP) stops that default handler from ever
+  # running, without otherwise affecting the widget (dropdown-click,
+  # keyboard, and the panel's own +/- buttons are untouched).
+  def self.disable_scroll!(widget)
+    widget.signal_connect("scroll-event") { true }
+  end
+
+  def self.build_control!(container, entry, control)
+    row = Gtk::Box.new(:horizontal, 6)
+
+    case control[:type]
+    when :toggle
+      if control[:field]
+        # A real checkbox reflecting what's actually saved, not just a
+        # fire-and-forget button -- current = the value read straight out
+        # of lichwindows.yaml. `active =` is set BEFORE signal_connect
+        # below so restoring that saved state never re-sends the command.
+        current = !!PanelControl.read_setting(entry, control[:field], false)
+        # Positional, not label: -- Gtk::CheckButton.new(label: ...) raises
+        # ArgumentError on this gtk3 gem build ("wrong arguments"), unlike
+        # Gtk::Button.new(label: ...) which works fine; confirmed live.
+        check = Gtk::CheckButton.new(control[:label])
+        check.active = current
+        check.signal_connect("toggled") { PanelControl.send_command!(control[:command]) }
+        row.pack_start(check, expand: true, fill: true, padding: 0)
+      else
+        # No known settings field for this one (a one-shot action, or an
+        # unpersisted debug flag) -- stays a plain stateless button.
+        btn = Gtk::Button.new(label: control[:label])
+        btn.signal_connect("clicked") { PanelControl.send_command!(control[:command]) }
+        row.pack_start(btn, expand: true, fill: true, padding: 0)
+      end
+
+    when :cycle
+      # Cycle controls only ever advance to the next state on click, so
+      # there's no natural widget to preset -- instead the button's own
+      # label shows the CURRENT saved value, refreshed every time this tab
+      # rebuilds (populate_controls, see build_control_tab).
+      label_text = control[:label]
+      if control[:field]
+        current = PanelControl.read_setting(entry, control[:field])
+        label_text = "#{control[:label]} (currently: #{current})" unless current.nil?
+      end
+      btn = Gtk::Button.new(label: label_text)
+      btn.signal_connect("clicked") { PanelControl.send_command!(control[:command]) }
+      row.pack_start(btn, expand: true, fill: true, padding: 0)
+
+    when :choice
+      label = Gtk::Label.new(control[:label])
+      label.set_xalign(0)
+      label.set_size_request(220, -1)
+      combo = Gtk::ComboBoxText.new
+      disable_scroll!(combo)
+      control[:options].each { |display, _command| combo.append_text(display) }
+
+      active_index = 0
+      if control[:field] && control[:values]
+        current = PanelControl.read_setting(entry, control[:field])
+        found = control[:values].index(current)
+        active_index = found if found
+      end
+      combo.active = active_index
+      # signal_connect is deliberately AFTER active= above, so that
+      # restoring the saved selection never fires this handler -- only
+      # real user changes do.
+      combo.signal_connect("changed") do
+        _display, command = control[:options][combo.active]
+        PanelControl.send_command!(command) if command
+      end
+      row.pack_start(label, expand: false, fill: false, padding: 0)
+      row.pack_start(combo, expand: true, fill: true, padding: 0)
+
+    when :number
+      label = Gtk::Label.new(control[:label])
+      label.set_xalign(0)
+      label.set_size_request(220, -1)
+      initial = control[:field] ? PanelControl.read_setting(entry, control[:field], control[:default]) : control[:default]
+      initial = control[:default] unless initial.is_a?(Numeric)
+      initial = initial.clamp(control[:min], control[:max])
+      adjustment = Gtk::Adjustment.new(initial, control[:min], control[:max], 1, 1, 0)
+      spin = Gtk::SpinButton.new(adjustment, 1, 0)
+      disable_scroll!(spin)
+      apply = Gtk::Button.new(label: "Apply")
+      apply.signal_connect("clicked") { PanelControl.send_command!(format(control[:command_template], spin.value.to_i)) }
+      row.pack_start(label, expand: false, fill: false, padding: 0)
+      row.pack_start(spin, expand: false, fill: false, padding: 0)
+      row.pack_start(apply, expand: false, fill: false, padding: 0)
+
+    when :stepper
+      # For settings with no "set to this exact value" command -- only a
+      # relative increment/decrement (*ebar ci/cd/ri/rd/si/sd). No Apply/
+      # target value like :number, just +/- buttons either side of a
+      # readout of the current saved value. do_client (send_command!) runs
+      # the command's UpstreamHook synchronously, including its settings
+      # save, so by the time it returns the new value is already on disk
+      # -- each click re-reads it and updates this row's own label
+      # in-place immediately, rather than waiting for the whole tab to
+      # rebuild (Refresh Settings / tab switch still also catch it).
+      label = Gtk::Label.new(control[:label])
+      label.set_xalign(0)
+      label.set_size_request(220, -1)
+      format_value = lambda do |value|
+        value.is_a?(Float) ? format("%.1f", value) : value.to_s
+      end
+      current = control[:field] ? PanelControl.read_setting(entry, control[:field], control[:default]) : control[:default]
+      value_label = Gtk::Label.new(format_value.call(current))
+      value_label.set_size_request(50, -1)
+      refresh_value = lambda do
+        updated = control[:field] ? PanelControl.read_setting(entry, control[:field], control[:default]) : control[:default]
+        value_label.text = format_value.call(updated)
+      end
+      dec_btn = Gtk::Button.new(label: "-")
+      inc_btn = Gtk::Button.new(label: "+")
+      dec_btn.signal_connect("clicked") { PanelControl.send_command!(control[:dec_command]); refresh_value.call }
+      inc_btn.signal_connect("clicked") { PanelControl.send_command!(control[:inc_command]); refresh_value.call }
+      row.pack_start(label, expand: false, fill: false, padding: 0)
+      row.pack_start(dec_btn, expand: false, fill: false, padding: 0)
+      row.pack_start(value_label, expand: false, fill: false, padding: 0)
+      row.pack_start(inc_btn, expand: false, fill: false, padding: 0)
+
+    when :entry_command
+      label = Gtk::Label.new(control[:label])
+      label.set_xalign(0)
+      label.set_size_request(220, -1)
+      field = Gtk::Entry.new
+      field.placeholder_text = control[:placeholder] || ""
+      send_btn = Gtk::Button.new(label: "Send")
+      submit = lambda do
+        value = field.text.to_s.strip
+        next if value.empty?
+
+        PanelControl.send_command!(format(control[:command_template], value))
+      end
+      send_btn.signal_connect("clicked") { submit.call }
+      field.signal_connect("activate") { submit.call }
+      row.pack_start(label, expand: false, fill: false, padding: 0)
+      row.pack_start(field, expand: true, fill: true, padding: 0)
+      row.pack_start(send_btn, expand: false, fill: false, padding: 0)
+
+    when :emoji_picker
+      current_icon = control[:field] ? PanelControl.read_setting(entry, control[:field]) : nil
+      label_text = current_icon ? "#{control[:label]} (current: #{current_icon})" : "#{control[:label]} (default)"
+      label = Gtk::Label.new(label_text)
+      label.set_xalign(0)
+      label.set_size_request(220, -1)
+      label.set_line_wrap(true)
+      choose_btn = Gtk::Button.new(label: "Choose icon...")
+      choose_btn.signal_connect("clicked") { show_emoji_picker(choose_btn, entry, control[:slot]) }
+      reset_btn = Gtk::Button.new(label: "Reset")
+      reset_btn.signal_connect("clicked") { PanelControl.send_command!("*cwicon #{control[:slot]} reset") }
+      row.pack_start(label, expand: true, fill: true, padding: 0)
+      row.pack_start(choose_btn, expand: false, fill: false, padding: 0)
+      row.pack_start(reset_btn, expand: false, fill: false, padding: 0)
+    end
+
+    container.pack_start(row, expand: false, fill: false, padding: 0)
+  end
+
+  # A Gtk::Popover anchored to the button that opened it, containing a
+  # grid of emoji buttons (PanelControl::EMOJI_PALETTE) plus a manual entry
+  # for anything not in the curated list. Clicking a palette button or
+  # submitting the manual entry both send "*cwicon <slot> <emoji>" and
+  # close the popover -- creaturewindow.lic (see *cwicon/set_custom_icon!)
+  # converts whatever raw character(s) arrive into the XML-numeric-entity
+  # form it actually renders with.
+  def self.show_emoji_picker(anchor_widget, _entry, slot)
+    popover = Gtk::Popover.new(anchor_widget)
+    box = Gtk::Box.new(:vertical, 6)
+    box.border_width = 8
+
+    grid = Gtk::Grid.new
+    grid.row_spacing = 2
+    grid.column_spacing = 2
+    PanelControl::EMOJI_PALETTE.each_with_index do |emoji, idx|
+      row = idx / PanelControl::EMOJI_COLUMNS
+      col = idx % PanelControl::EMOJI_COLUMNS
+      btn = Gtk::Button.new(label: emoji)
+      btn.signal_connect("clicked") do
+        PanelControl.send_command!("*cwicon #{slot} #{emoji}")
+        popover.popdown
+      end
+      grid.attach(btn, col, row, 1, 1)
+    end
+    box.pack_start(grid, expand: false, fill: false, padding: 0)
+
+    manual_row = Gtk::Box.new(:horizontal, 4)
+    manual_entry = Gtk::Entry.new
+    manual_entry.placeholder_text = "or paste any emoji"
+    manual_entry.set_size_request(140, -1)
+    manual_send = Gtk::Button.new(label: "Use")
+    submit_manual = lambda do
+      text = manual_entry.text.to_s.strip
+      next if text.empty?
+
+      PanelControl.send_command!("*cwicon #{slot} #{text}")
+      popover.popdown
+    end
+    manual_send.signal_connect("clicked") { submit_manual.call }
+    manual_entry.signal_connect("activate") { submit_manual.call }
+    manual_row.pack_start(manual_entry, expand: true, fill: true, padding: 0)
+    manual_row.pack_start(manual_send, expand: false, fill: false, padding: 0)
+    box.pack_start(manual_row, expand: false, fill: false, padding: 0)
+
+    popover.add(box)
+    popover.show_all
+    popover.popup
+  end
+end
+
+# Gtk.queue (lib/common/gtk.rb) marshals widget construction onto the
+# thread that actually runs the GTK main loop, via a GLib::Timeout --
+# calling GTK APIs from any other thread ("random segfaults", per that
+# file's own comment) is exactly what crashed the client here: this used
+# to call PanelControlGtk.create_main_window directly on this script's own
+# thread, then start Gtk.main on that same thread afterward. Since GTK's
+# main loop is one shared, process-wide loop across every script that uses
+# it (Gtk.main itself is guarded to only actually start once), building a
+# window outside Gtk.queue is a real crash risk the moment any other GTK
+# script (creaturewindow.lic, etc.) is also running. Mirrors
+# creaturewindow.lic's own bootstrap sequence exactly.
+Gtk.queue { PanelControlGtk.create_main_window }
+Thread.new { Gtk.main if Gtk.main_level == 0 }
