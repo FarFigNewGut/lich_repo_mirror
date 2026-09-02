@@ -4,7 +4,7 @@ Please adhere to POLICY 18 & 19.
 Owner and maintainer: NecroDeus
 author: NecroDeus
 game: Gemstone
-version: 0.5.4
+version: 0.5.9
 tags: hunting, combat, group, gui, utility, automation
 required: Lich >= 5.17.1
 
@@ -14,6 +14,37 @@ in; no separate Intel script is required. HuntSuggest is the optional launcher.
 Existing Ashborne character settings take priority. Missing settings and profile
 files may be copied from Uberbeta once; existing profiles are never overwritten.
 Generated data lives under data/ashborne, not in the scripts folder.
+
+Recent updates (0.5.9 - 2026-09-01):
+- The group leader now treats a visible follower's missing Ashborne heartbeat as
+  an emergency while hostiles are present. After an eight-second grace period,
+  the whole group retreats instead of letting a follower continue unprotected
+  after its combat controller exits or fails to restart.
+
+Recent updates (0.5.8 - 2026-09-01):
+- Fixes an endless `go2 town` retry after Ashborne has already reached a mapped
+  town rest hub containing a passive or sleeping creature. Configured rest rooms
+  and Lich node/supernode rooms now complete the retreat before ambient target
+  detection is considered; field rooms still require a clear creature list.
+
+Recent updates (0.5.7 - 2026-09-01):
+- Adds manual leader assist mode. Run ;ashborne manual on the configured group
+  leader, then control that character yourself. Followers remain idle until the
+  leader makes an offensive action, adopt that exact creature ID, and run their
+  own saved combat routines. Creature arrivals, attacks, and opening spells do
+  not independently trigger followers.
+
+Recent updates (0.5.6 - 2026-08-30):
+- A character swallowed by a roa'ter no longer exits Ashborne. The swallowed
+  member finds a carried dagger, attacks the stomach wall until released, then
+  restores combat gear and rejoins the group. Group members outside continue
+  fighting, and normal movement remains held until the group reforms.
+
+Recent updates (0.5.5 - 2026-08-30):
+- Repeat-hunt followers remain active at the reunion hub after town services and
+  continue reporting live mind and mana values while the group rests. The leader
+  can now satisfy the group rest gate, close the completed cycle, and launch the
+  requested next hunt instead of waiting forever on stale follower state.
 
 Recent updates (0.5.4 - 2026-08-29):
 - With post-hunt healing enabled, startup at a verified safe hub now attempts
@@ -53,6 +84,7 @@ Recent updates (0.5.0 - 2026-08-28):
 - Corrects the follower self-healing assignment and stale hazard snapshots.
 
 Usage: ;ashborne STYLE AREA [hunts=COUNT] [solo]
+Manual group assist: ;ashborne manual
 Setup: ;ashborne gui or ;ashborne help
 =end
 require 'yaml'
@@ -124,8 +156,8 @@ begin
 rescue
   nil
 end
-ashborne_version = "0.5.4"
-ashborne_last_update = "8/29/2026"
+ashborne_version = "0.5.9"
+ashborne_last_update = "9/1/2026"
 # Hide Command Inputs
 silence_me
 
@@ -7605,6 +7637,12 @@ module Ashborne_toolkit
     respond "The leader automatically sends ;ashborne auto group to each follower."
     respond "Followers then use their own saved styles, settings, ELoot setup, and ability rules."
     respond
+    respond "MANUAL LEADER ASSIST"
+    respond "Run ;ashborne manual on the configured group leader. Do not start Ashborne on the followers yourself."
+    respond "Ashborne starts the saved followers, but never moves or attacks for the leader in this mode."
+    respond "Play the leader normally. Followers stay idle until the leader attacks, then use their own saved routines on that exact target."
+    respond "A creature entering, attacking, or casting first does not give followers permission to attack."
+    respond
     respond "STARTING WITH HUNTSUGGEST"
     respond "You may use ;huntsuggest instead of typing the hunting area command yourself."
     respond "In the HuntSuggest window, find the Hunting Engine dropdown near the top."
@@ -7618,6 +7656,7 @@ module Ashborne_toolkit
     respond
     respond "USEFUL COMMANDS"
     respond ";ashborne gui                  Beginner setup window"
+    respond ";ashborne manual               Manually play the leader; saved followers assist only its attacked target"
     respond ";ashborne group on|off|status  Toggle or inspect group mode for this character"
     respond ";ashborne styles               Combat style list"
     respond ";ashborne setup capabilities   Scan known spells, skills, and abilities"
@@ -12574,6 +12613,68 @@ module Ashborne_toolkit
     Ashborne_toolkit.ashborne_data_file("#{Ashborne_toolkit.group_bus_leader_name}_ashborne_group_target.txt")
   end
 
+  def clear_group_combat_target
+    return false unless $ashborne_group_ai == "1"
+
+    path = Ashborne_toolkit.group_combat_target_file
+    File.open(path, File::RDWR | File::CREAT, 0644) do |file|
+      file.flock(File::LOCK_EX)
+      file.rewind
+      file.truncate(0)
+      file.flush
+    end
+    $ashborne_last_group_target_signature = nil
+    $ashborne_last_group_target_at = 0.0
+    true
+  rescue => error
+    respond "Group target clear warning: #{error.message}" if $ashborne_qc_debug == "1"
+    false
+  end
+
+  def manual_leader_attack_line?(line)
+    text = line.to_s.gsub(/<[^>]+>/, " ").gsub(/\s+/, " ").strip
+    return false unless text =~ /\AYou (?:swing|attempt|gesture|channel|hurl|fire|shoot|launch|lunge|thrust|punch|kick|jab|grapple|wave|point|direct|command|invoke|cast|trace|rush|charge|mstrike|whirl|bring|lash)/i
+    return false if text =~ /\AYou (?:are now targeting|currently have no valid target)/i
+
+    true
+  end
+
+  def capture_manual_leader_target(line)
+    return false unless $ashborne_manual_leader_mode == "1"
+    return false unless Ashborne_toolkit.manual_leader_attack_line?(line)
+    return false unless Room.current && Ashborne_toolkit.current_room_id
+
+    current_target_id = begin
+      XMLData.current_target_id.to_s
+    rescue
+      ""
+    end
+    target = GameObj.targets.find do |creature|
+      creature.id.to_s == current_target_id &&
+        creature.status.to_s !~ /dead|gone/i &&
+        !Ashborne_toolkit.environmental_hazard_target?(creature)
+    end
+    unless target
+      normalized = line.to_s.downcase
+      target = GameObj.targets
+        .reject { |creature| creature.status.to_s =~ /dead|gone/i || Ashborne_toolkit.environmental_hazard_target?(creature) }
+        .sort_by { |creature| -creature.name.to_s.length }
+        .find do |creature|
+          names = [creature.name, creature.noun].compact.map { |name| name.to_s.downcase }.reject(&:empty?)
+          names.any? { |name| normalized.include?(name) }
+        end
+    end
+    return false unless target
+
+    $ashborne_current_target = target.name
+    $ashborne_id_placeholder = target.id
+    $ashborne_name_placeholder = target.name
+    Ashborne_toolkit.publish_group_combat_target
+  rescue => error
+    respond "Manual assist target warning: #{error.message}" if $ashborne_qc_debug == "1"
+    false
+  end
+
   def publish_group_combat_target
     return false unless $ashborne_group_ai == "1"
     return false unless Room.current && Ashborne_toolkit.current_room_id
@@ -12925,6 +13026,7 @@ module Ashborne_toolkit
     flags << "bound" if bound?
     flags << "disarmed" if defined?($ashborne_disarm_recovery_needed) && $ashborne_disarm_recovery_needed == "1"
     flags << "recovering" if defined?($ashborne_disarm_recovery_active) && $ashborne_disarm_recovery_active == "1"
+    flags << "swallowed" if defined?($ashborne_swallowed_recovery_active) && $ashborne_swallowed_recovery_active == "1"
     flags << "weapon_fire" if Ashborne_toolkit.weapon_fire_recovery_pending?
     if $ashborne_looting_active == "1" ||
         ($ashborne_loot_script.to_s != "" && Script.running?($ashborne_loot_script.to_s))
@@ -13620,6 +13722,128 @@ module Ashborne_toolkit
     []
   end
 
+  ROATER_ESCAPE_DAGGER_REGEX = /alfange|basilard|bodkin|cinquedea|dagger|dirk|knife|kozuka|ice pick|misericord|parazonium|pavade|poignard|pugio|scramasax|sgian achlais|spike|stiletto|tanto|sidearm-of-Onar/i
+
+  def swallowed_by_roater?
+    return true if checkarea.to_s =~ /Belly of the Beast/i
+    return true if XMLData.room_title.to_s =~ /Belly of the Beast/i
+
+    GameObj.loot.any? { |item| item.name.to_s =~ /stomach wall/i }
+  rescue
+    false
+  end
+
+  def roater_escape_dagger?(item)
+    item && item.name.to_s =~ ROATER_ESCAPE_DAGGER_REGEX && Array(item.type).join(" ") =~ /weapon/i
+  rescue
+    false
+  end
+
+  def find_roater_escape_dagger
+    right_hand = GameObj.right_hand
+    return [right_hand, nil] if Ashborne_toolkit.roater_escape_dagger?(right_hand)
+
+    response = Lich::Util.quiet_command_xml(
+      "inventory containers",
+      /You are (?:wearing|holding)/,
+      /<prompt time=/
+    )
+    container_ids = Array(response).flat_map { |line| line.scan(/<a exist=\"([^\"]+)\"/).flatten }.uniq
+    containers = container_ids.map { |id| GameObj[id] rescue nil }.compact
+
+    2.times do |pass|
+      containers.each do |container|
+        if pass == 1 && container.contents.nil?
+          Lich::Util.quiet_command_xml("open ##{container.id}", /<a exist=|You open|already open/i, /<prompt time=/)
+          Lich::Util.quiet_command_xml("look in ##{container.id}", /In the|There is nothing|This/i, /<prompt time=/)
+        end
+        dagger = Array(container.contents).find { |item| Ashborne_toolkit.roater_escape_dagger?(item) }
+        return [dagger, container] if dagger
+      end
+    end
+
+    dagger = Array(GameObj.inv).find { |item| Ashborne_toolkit.roater_escape_dagger?(item) }
+    [dagger, nil]
+  rescue => error
+    respond "Ashborne could not search for a roa'ter escape dagger: #{error.class}: #{error.message}"
+    [nil, nil]
+  end
+
+  def regroup_after_roater_escape
+    Ashborne_toolkit.publish_group_state(true)
+    if $ashborne_group_ai == "2"
+      if checkpcs($ashborne_captain)
+        grouped = Ashborne_toolkit.actual_group_names
+        unless grouped.any? { |name| name.to_s.casecmp($ashborne_captain.to_s).zero? }
+          fput "join #{$ashborne_captain}"
+          sleep 1
+        end
+        respond "#{Char.name} escaped the roa'ter and rejoined #{$ashborne_captain}."
+      else
+        respond "#{Char.name} escaped the roa'ter and is holding position for the group rally."
+      end
+    elsif $ashborne_group_ai == "1" && GameObj.targets.empty?
+      Ashborne_toolkit.rally_and_regroup_for_travel("roa'ter recovery", 60)
+    end
+    true
+  rescue => error
+    respond "Ashborne roa'ter regroup warning: #{error.class}: #{error.message}"
+    false
+  end
+
+  def escape_roater_stomach
+    return false unless Ashborne_toolkit.swallowed_by_roater?
+
+    $ashborne_swallowed_recovery_active = "1"
+    Ashborne_toolkit.publish_group_state(true)
+    respond "#{Char.name} was swallowed. Ashborne is keeping combat active outside while this character cuts through the stomach wall."
+    original_right = GameObj.right_hand
+    dagger, container = Ashborne_toolkit.find_roater_escape_dagger
+
+    unless Ashborne_toolkit.roater_escape_dagger?(GameObj.right_hand)
+      fput "stow right" if checkright
+      fput "stow left" if checkleft
+      dagger, container = Ashborne_toolkit.find_roater_escape_dagger if dagger.nil?
+      if dagger
+        5.times do
+          break if GameObj.right_hand && GameObj.right_hand.id.to_s == dagger.id.to_s
+          fput "_drag ##{dagger.id} right"
+          sleep 0.2
+        end
+      end
+    end
+
+    unless Ashborne_toolkit.roater_escape_dagger?(GameObj.right_hand)
+      respond "No carried dagger could be readied. Ashborne will stay active and wait for the group to kill the roa'ter or for expulsion."
+      sleep 1 while Ashborne_toolkit.swallowed_by_roater? && !checkdead
+    end
+
+    while Ashborne_toolkit.swallowed_by_roater? && !checkdead && Ashborne_toolkit.roater_escape_dagger?(GameObj.right_hand)
+      waitrt? if checkrt.to_f > 0
+      result = fput "attack wall"
+      break if result.to_s =~ /What were you referring to/i
+    end
+
+    return false if checkdead
+
+    if dagger && container && GameObj.right_hand && GameObj.right_hand.id.to_s == dagger.id.to_s
+      fput "_drag ##{dagger.id} ##{container.id}"
+    elsif dagger && (!original_right || original_right.id.to_s != dagger.id.to_s) &&
+          GameObj.right_hand && GameObj.right_hand.id.to_s == dagger.id.to_s
+      fput "stow right"
+    end
+    waitrt? if checkrt.to_f > 0
+    fput "gird"
+    $ashborne_swallowed_recovery_active = "0"
+    Ashborne_toolkit.regroup_after_roater_escape
+    true
+  rescue => error
+    respond "Ashborne roa'ter escape failed: #{error.class}: #{error.message}"
+    false
+  ensure
+    $ashborne_swallowed_recovery_active = "0" unless Ashborne_toolkit.swallowed_by_roater?
+  end
+
   # Obstacles can dissolve the game group even after every account reaches the
   # same room. Trust only live Ashborne session telemetry for this brief regroup
   # gap so anti-poach never treats an active teammate as an outside hunter.
@@ -14010,6 +14234,7 @@ module Ashborne_toolkit
     respond "  Reactive spell reserve: #{Ashborne_toolkit.anti_caster_mana_reserve}% mana"
     respond "  General reserves: #{Ashborne_toolkit.mana_reserve}% mana, #{Ashborne_toolkit.stamina_reserve}% stamina"
     respond "  Group health floor: #{Ashborne_toolkit.health_floor}%"
+    respond "  Manual leader assist: #{$ashborne_manual_leader_mode == '1' ? 'on; followers wait for the leader attack target' : 'off'}"
     respond "  Hunt schedule: #{$ashborne_hunt_cycle} of #{$ashborne_hunt_cycles}; repeat at #{$ashborne_rest_mind}% mind"
     respond "  Rest actions: healing=#{$ashborne_rest_healing == '1' ? 'on' : 'off'}, empath request=#{$ashborne_rest_ask_empath == '1' ? 'on' : 'off'}, selling=#{$ashborne_rest_sell == '1' ? 'on' : 'off'}, ewaggle=#{$ashborne_no_waggle == '0' ? 'on' : 'off'}"
     cleanup_healer = plan.dig("assignments", "healer", "primary").to_s
@@ -16476,6 +16701,31 @@ module Ashborne_toolkit
     false
   end
 
+  def wait_for_follower_cycle_release_rc19
+    return true unless $ashborne_group_ai == "2"
+
+    deadline = Time.now + 2100
+    next_status = Time.now
+    loop do
+      Ashborne_toolkit.publish_group_state(true)
+      Ashborne_toolkit.process_follower_shutdown_request_rc15
+
+      if Time.now >= deadline
+        respond "#{Char.name} stopped waiting because the leader did not close the completed Ashborne cycle within 35 minutes."
+        Ashborne_toolkit.publish_cycle_stopped_rc15(Ashborne_toolkit.current_group_session_id)
+        return false
+      end
+      if Time.now >= next_status
+        respond "#{Char.name} is resting at the group hub and reporting mind and mana for the next hunt."
+        next_status = Time.now + 60
+      end
+      sleep 2
+    end
+  rescue => error
+    respond "Ashborne follower repeat-rest wait failed: #{error.class}: #{error.message}"
+    false
+  end
+
   def group_rank1_heal_request_already_processed?(request)
     receipt = Ashborne_toolkit.current_group_rank1_heal_receipt(Char.name, request["request_id"])
     !receipt.nil?
@@ -16914,6 +17164,34 @@ module Ashborne_toolkit
     end
   end
 
+  def stale_visible_follower_controller
+    return nil unless $ashborne_group_ai == "1"
+    return nil if GameObj.targets.empty?
+
+    session_id = Ashborne_toolkit.current_group_session_id.to_s
+    return nil if session_id.empty?
+
+    session_started_at = session_id.split("-", 2).first.to_i
+    return nil if session_started_at > 0 && Time.now.to_i - session_started_at < 12
+
+    now = Time.now.to_i
+    Ashborne_toolkit.group_session_names.each do |member_name|
+      next if member_name.to_s.casecmp(Char.name.to_s).zero?
+      next unless checkpcs(member_name)
+
+      state = Ashborne_toolkit.read_group_state(member_name)
+      state_is_live = state &&
+        state["session_id"].to_s == session_id &&
+        state["startup_ready"].to_s == "1" &&
+        now - state["timestamp"].to_i <= 8
+      return member_name unless state_is_live
+    end
+
+    nil
+  rescue
+    nil
+  end
+
   def apply_group_danger_abort
     danger = Ashborne_toolkit.current_group_danger
     return false if danger.nil?
@@ -16933,6 +17211,18 @@ module Ashborne_toolkit
       $ashborne_return_why = "Medical retreat: #{danger_reason}."
       $ashborne_action = 99
       return true
+    end
+
+    if $ashborne_group_ai == "1"
+      stale_follower = Ashborne_toolkit.stale_visible_follower_controller
+      if stale_follower
+        $ashborne_group_danger_active = "1"
+        $ashborne_return_why = "Group danger: #{stale_follower}'s Ashborne safety heartbeat stopped during combat."
+        $ashborne_action = 99
+        respond "Follower safety heartbeat lost for #{stale_follower}; retreating the group now."
+        Ashborne_toolkit.emergency_return_to_town_if_needed
+        return true
+      end
     end
 
     if Ashborne_toolkit.apply_group_danger_abort
@@ -17077,7 +17367,8 @@ module Ashborne_toolkit
     Ashborne_toolkit.ashborne_stow_all
     respond "Encumbrance emergency: the group will sell before Ashborne exits." if force_sell
     if $ashborne_group_ai == "2"
-      Ashborne_toolkit.finish_follower_emergency_town_services_rc10
+      services_complete = Ashborne_toolkit.finish_follower_emergency_town_services_rc10
+      Ashborne_toolkit.wait_for_follower_cycle_release_rc19 if services_complete
       exit
     end
     Ashborne_toolkit.finish_safe_return(force_sell)
@@ -17085,7 +17376,6 @@ module Ashborne_toolkit
 
   def safe_retreat_room_reached?
     return false unless Room.current && Ashborne_toolkit.current_room_id
-    return false unless GameObj.targets.empty?
 
     if $ashborne_rest_room.to_s != "0" && Ashborne_toolkit.current_room_id.to_s == $ashborne_rest_room.to_s
       return true
@@ -17093,6 +17383,8 @@ module Ashborne_toolkit
 
     tags = Room.current.respond_to?(:tags) ? Array(Room.current.tags).map { |tag| tag.to_s.downcase } : []
     return true if tags.any? { |tag| tag == "node" || tag == "supernode" }
+
+    return false unless GameObj.targets.empty?
 
     checkarea.to_s =~ /Ta'Illistim|Wehnimer|Icemule|Solhaven|Vaalor|Mist Harbor|Landing|Town|Bank|Hanging Gardens|BriarStone|Shimmarglin|Kaerinar|Moonglae|Portcullis|Gateyard|Sapphire Gate/i
   rescue
@@ -17502,10 +17794,23 @@ module Ashborne_toolkit
     @follower_defense
   end
 
+  def group_captain_swallowed?
+    return false unless $ashborne_group_ai == "2"
+
+    state = Ashborne_toolkit.read_group_state($ashborne_captain)
+    state &&
+      state["session_id"].to_s == Ashborne_toolkit.current_group_session_id.to_s &&
+      Time.now.to_i - state["timestamp"].to_i <= 10 &&
+      state["flags"].to_s.split(",").include?("swallowed")
+  rescue
+    false
+  end
+
   def follower_defense_target
     defense = Ashborne_toolkit.follower_leader_loss_context
     return nil unless defense && $ashborne_group_peace != "1"
-    return nil if Script.running?("go2") || Time.now.to_f - defense[:lost_at] >= 30.0
+    return nil if Script.running?("go2")
+    return nil if Time.now.to_f - defense[:lost_at] >= 30.0 && !Ashborne_toolkit.group_captain_swallowed?
     return nil unless Ashborne_toolkit.occupied_room_players.empty?
     targets = GameObj.targets.reject do |target|
       target.status.to_s =~ /dead|gone/i || Ashborne_toolkit.environmental_hazard_target?(target)
@@ -17535,7 +17840,7 @@ module Ashborne_toolkit
       if !GameObj.dead.empty? && Ashborne_toolkit.occupied_room_players.empty?
         Ashborne_toolkit.loot_script($ashborne_loot_script.to_s)
       end
-    elsif Time.now.to_f - defense[:lost_at] >= 30.0 || $ashborne_group_peace == "1"
+    elsif (Time.now.to_f - defense[:lost_at] >= 30.0 && !Ashborne_toolkit.group_captain_swallowed?) || $ashborne_group_peace == "1"
       Ashborne_toolkit.publish_group_danger("leader unavailable with hostiles; withdrawing")
       Ashborne_toolkit.group_danger_retreat_if_needed
     else
@@ -21054,6 +21359,10 @@ if script.vars[1].to_s.downcase == "bounty"
   script.vars[3] = script.vars[2]
   script.vars[2] = "bounty"
   script.vars[1] = Ashborne_toolkit.default_bounty_style
+elsif script.vars[1].to_s.downcase =~ /\A(?:manual|manualassist|assistleader)\z/
+  script.vars[3] = nil
+  script.vars[2] = "manual"
+  script.vars[1] = "auto"
 end
 $ashborne_original_style = script.vars[1].to_s
 $ashborne_original_area = script.vars[2].to_s
@@ -21069,6 +21378,7 @@ unless ashborne_hunts_argument.to_s.empty?
 end
 $ashborne_hunt_cycles = [$ashborne_hunt_cycles.to_i, $ashborne_hunt_cycle.to_i].max
 $ashborne_group_ai = "0"
+$ashborne_manual_leader_mode = "0"
 $ashborne_group_counter = 0
 $ashborne_captain = "0"
 $ashborne_combat_cleanup = "0"
@@ -23140,7 +23450,7 @@ ashborne_master_hunting_zones = [
   "kfatoll", "kfatemple",
 
   # Misc
-  "placeholder", "group", "bounty", "newbounty", "fastbounty", "quick", "qlite", "grounded", "drarena", "drlite", "patrol", "bandit", "qfollow", "follow"
+  "placeholder", "group", "manual", "bounty", "newbounty", "fastbounty", "quick", "qlite", "grounded", "drarena", "drlite", "patrol", "bandit", "qfollow", "follow"
 
 ]
 
@@ -23205,6 +23515,10 @@ ashborne_load_settings = proc {
 
   $ashborne_my_style = script.vars[1].downcase
   $ashborne_my_area = script.vars[2].downcase
+  if $ashborne_my_area == "manual"
+    $ashborne_manual_leader_mode = "1"
+    $ashborne_qfollow = "0"
+  end
 
   group_mode_enabled = ashborne_setting_group_enabled.to_s != "0"
   imported_group = group_mode_enabled ? Ashborne_toolkit.import_missing_huntpro_group_settings : {}
@@ -23237,7 +23551,7 @@ ashborne_load_settings = proc {
     respond "Ashborne group mode is disabled; running this hunt solo."
   end
 
-  if $ashborne_my_area =~ /\Agroup\z/i
+  if $ashborne_my_area =~ /\A(?:group|manual)\z/i
     $ashborne_my_style = Ashborne_toolkit.group_combat_style(
       ashborne_setting_group_style,
       $ashborne_my_style
@@ -23376,6 +23690,16 @@ ashborne_load_settings = proc {
     else
       $ashborne_group_ai = "2"
     end
+  end
+
+  if $ashborne_manual_leader_mode == "1" && $ashborne_group_ai != "1"
+    Ashborne_toolkit.top_menu
+    respond "Manual assist must be started on the saved group leader."
+    respond "Set this character as Group leader in ;ashborne gui, then run ;ashborne manual again."
+    Ashborne_toolkit.bottom_menu
+    exit
+  elsif $ashborne_manual_leader_mode == "1"
+    respond "Manual leader assist mode activated. You control #{Char.name}; followers attack only your selected target."
   end
 
   $ashborne_additional_group_members = ashborne_setting_group_additional.to_s.split(/[;,\s]+/).reject { |name| name.empty? || name == "0" }
@@ -24621,23 +24945,10 @@ ashborne_zone_reset_check = proc {
 
   # WLWARTROLL
 
-  if checkarea =~ /Belly of the Beast/
-    Ashborne_toolkit.top_menu
-    respond "#{Char.name}, you were eaten by a roa'ter or rift crawler.  Grab a dagger and attack the wall, now!"
-    fput "stow all"
-    Ashborne_toolkit.bottom_menu
-    exit
+  if Ashborne_toolkit.swallowed_by_roater?
+    Ashborne_toolkit.escape_roater_stomach
+    next
   end
-
-  GameObj.loot.each { |i|
-    if i.name =~ /stomach wall/
-      Ashborne_toolkit.top_menu
-      respond "#{Char.name}, you were eaten by a roa'ter or rift crawler.  Grab a dagger and attack the wall, now!"
-      fput "stow all"
-      Ashborne_toolkit.bottom_menu
-      exit
-    end
-  }
 
   if script.vars[2].downcase =~ /quick|qlite|grounded/
     nil
@@ -28364,7 +28675,7 @@ $ashborne_cman_watch = "0"
 
 # Go to the hunting zone and escape from a nil room. Followers stay with the
 # leader instead of pathing to the hunting area on their own.
-unless $ashborne_qfollow == "1" || $ashborne_group_ai == "2"
+unless $ashborne_qfollow == "1" || $ashborne_group_ai == "2" || $ashborne_manual_leader_mode == "1"
   Ashborne_toolkit.with_hunting_travel_guard { ashborne_hunting_zones.call }
 end
 
@@ -28382,7 +28693,7 @@ Ashborne_toolkit.maintain_noise_lockdown if Ashborne_toolkit.noise_lockdown? && 
 
 # Leaders and solo hunters use the main hunting loop. Followers and quick-follow
 # characters continue into their dedicated loops below.
-unless $ashborne_qfollow == "1" || $ashborne_group_ai == "2"
+unless $ashborne_qfollow == "1" || $ashborne_group_ai == "2" || $ashborne_manual_leader_mode == "1"
 loop {
   begin
   Ashborne_toolkit.ashborne_intel_service_check
@@ -28616,6 +28927,44 @@ loop {
     Ashborne_toolkit.runtime_yield
   end
 }
+end
+
+# Manual leader mode leaves movement and attacks under the player's control.
+# It publishes only the leader's real offensive target so followers never
+# engage because a creature entered, cast a spell, or attacked first.
+if $ashborne_manual_leader_mode == "1"
+  Ashborne_toolkit.clear_group_combat_target
+  respond "Manual assist is ready. Control #{Char.name} normally; followers will assist only after your attack."
+  last_room = Ashborne_toolkit.current_room_id.to_s
+  loop {
+    begin
+      Ashborne_toolkit.publish_group_state
+      Ashborne_toolkit.publish_group_leader_room
+      missing = Ashborne_toolkit.configured_followers_missing_in_room
+      Ashborne_toolkit.publish_group_ready_state(missing.empty?)
+      Ashborne_toolkit.group_danger_retreat_if_needed
+
+      current_room = Ashborne_toolkit.current_room_id.to_s
+      if current_room != last_room
+        Ashborne_toolkit.clear_group_combat_target
+        last_room = current_room
+      end
+
+      line = matchtimeout(
+        1,
+        /\AYou (?:swing|attempt|gesture|channel|hurl|fire|shoot|launch|lunge|thrust|punch|kick|jab|grapple|wave|point|direct|command|invoke|cast|trace|rush|charge|mstrike|whirl|bring|lash)/i
+      ).to_s
+      if line.empty?
+        Ashborne_toolkit.clear_group_combat_target if GameObj.targets.empty?
+      else
+        Ashborne_toolkit.capture_manual_leader_target(line)
+      end
+    rescue => error
+      Ashborne_toolkit.handle_runtime_error(error, "manual leader assist loop")
+    ensure
+      Ashborne_toolkit.runtime_yield
+    end
+  }
 end
 
 # Group followers use this loop and react to the leader's attacks.

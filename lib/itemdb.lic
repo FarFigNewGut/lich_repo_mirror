@@ -1,8 +1,10 @@
 =begin
   itemdb.lic -- catalog your enhancive and magic items into a searchable database.
 
-  Reads the loresong off each item in a container, stores what it finds in a YAML database,
-  and lets you search that database by enhancive, flares, worn slot, magic spell, and more.  Run
+  Reads the loresong off each item in a container (and ANALYZEs any book or codex, whose
+  spell-specialization detail the loresong never shows), stores what it finds in a YAML
+  database, and lets you search that database by enhancive, flares, worn slot, magic spell,
+  and more.  Run
   `;itemdb` with no arguments for the full command and query reference.
 
   Examples:
@@ -10,6 +12,10 @@
     ;itemdb neck & (dex | ranged)   find neckworn items that boost Dexterity or Ranged
 
   CHANGELOG
+    1.7.0  catalog spell-specialization books: an item that looks like a book/codex is ANALYZEd
+           (its loresong shows nothing useful), recording which spell it specializes and how
+           many specialization ranks READing it grants; search with spec, spec:<spell|number>,
+           specranks>=N
     1.6.1  get/put items on surface furniture (armor stand, weapon rack, ...) with "on", not
            "in" -- putting a piece back "in" an armor stand failed and left it in hand
     1.6.0  track sighting and the padding/weighting degree (with CER band + service cost),
@@ -27,13 +33,13 @@
   game: gs
   tags: utility, enhancive, inventory
   required: Lich >= 5.0.0
-  version: 1.6.1
+  version: 1.7.0
 =end
 
 require 'yaml'
 
 module ItemDB
-  VERSION = '1.6.1'
+  VERSION = '1.7.0'
 
   # --------------------------------------------------------------------------- taxonomy
 
@@ -384,7 +390,7 @@ module ItemDB
   # work -- no game interaction -- so it can be exercised against a log file.
 
   module Parser
-    def self.parse(recall_lines, inspect_lines = [])
+    def self.parse(recall_lines, inspect_lines = [], analyze_lines = [])
       item = {
         'status'     => 'ok',
         'recall_name' => nil,
@@ -531,6 +537,7 @@ module ItemDB
       end
 
       parse_inspect(item, inspect_lines)
+      parse_analyze(item, analyze_lines)
 
       item['flags'].delete_if { |_k, v| v.nil? }
       item.delete('flags') if item['flags'].empty?
@@ -559,6 +566,24 @@ module ItemDB
         end
       end
       item['flags'] = (item['flags'] || {}).merge('serves_a_purpose' => true) if text =~ /appears? to serve some purpose/
+    end
+
+    # ANALYZE, not the loresong, is where a spell-specialization book keeps its detail: how many
+    # specialization ranks READing it grants, and to which spell (name and number).  The book is
+    # consumed when READ.  A book's recall usually reads as "no loresong", so finding the spec
+    # here is what makes the entry worth having -- its status is set back to ok.
+    def self.parse_analyze(item, lines)
+      text = Array(lines).join(' ')
+      return if text.empty?
+
+      if text =~ /add\s+(\d+)\s+spell\s+specialization\s+ranks?\s+to\s+casting\s+the\s+spell\s+(.+?)\s*\((\d+)\)/i
+        item['spell_spec'] = {
+          'spell'  => Regexp.last_match(2).strip,
+          'number' => Regexp.last_match(3).to_i,
+          'ranks'  => Regexp.last_match(1).to_i
+        }
+        item['status'] = 'ok'
+      end
     end
 
     # Fall back to the item's noun when INSPECT gave us nothing.
@@ -863,6 +888,7 @@ module ItemDB
       /You can't get close enough/,
       /What were you referring to\?/,
       /I could not find what you were referring to/,
+      /\AYou (?:sense|feel) nothing (?:unusual|special)/,
       /\bIt (?:is|has|imparts|appears|could|will|provides)\s/
     ).freeze
 
@@ -876,6 +902,19 @@ module ItemDB
       /You can't get close enough/,
       /What were you referring to\?/,
       /You determine that you could/
+    ).freeze
+
+    # ANALYZE is the only place a spell-specialization book keeps its detail -- its loresong
+    # shows nothing useful -- so a book/codex is analyzed where it sits (no get/put needed, same
+    # as recall).  As with the others, every way the game can decline needs a pattern here or the
+    # capture just times out.
+    ANALYZE_START = Regexp.union(
+      /You analyze/,
+      /You have no idea how to analyze/,
+      /Analyze what\?/,
+      /You can't get close enough/,
+      /What were you referring to\?/,
+      /I could not find what you were referring to/
     ).freeze
 
     # RECALL reads an item where it sits, in a container you're wearing or one standing in the
@@ -927,6 +966,20 @@ module ItemDB
 
     def self.preposition(container)
       ON_SURFACES.include?(container.noun.to_s.downcase) ? 'on' : 'in'
+    end
+
+    # A book/codex keeps its spell-specialization detail where ANALYZE reads it, not the
+    # loresong, so an item that looks like a book is analyzed during the scan.  This wordlist is
+    # a representative sample, not an exhaustive one -- extend it as new book nouns turn up.
+    # Matched against the noun and every word of the name, so "bronze-clasped codex" and an
+    # oddly-nouned "arcane primer of the edge" both qualify.
+    BOOK_WORDS = %w[book codex tome grimoire primer manual folio libram compendium treatise
+                    almanac lexicon spellbook workbook handbook journal ledger booklet
+                    pamphlet volume].freeze
+
+    def self.book_item?(obj)
+      words = "#{obj.noun} #{obj.name}".downcase.scan(/[a-z]+/)
+      (words & BOOK_WORDS).any?
     end
 
     # Lich only knows a container's contents once something has looked inside it, so nudge
@@ -1074,23 +1127,33 @@ module ItemDB
     # an item that couldn't be read is recorded as unreadable with the reason, so `retry`
     # can come back to it and the scan's progress line can say what actually happened.
     def self.examine(obj, container, key)
+      book = book_item?(obj)
+
       # RECALL works on the item where it sits, wherever that is, so the recall itself costs no
       # hand shuffling.  Everything below that returns early is an item there was nothing to
-      # read off -- and nothing to read means nothing worth a get/inspect/put either.
+      # read off -- but a book/codex keeps its real detail in ANALYZE, not the loresong, so none
+      # of those are terminal for one; we go on to analyze it regardless.
       recall = capture("recall ##{obj.id}", RECALL_START)
-      return unreadable_stub(obj, container, key, 'no response to recall') if recall.empty?
-      if Parser.refused?(recall)
-        return unreadable_stub(obj, container, key, "the game refused the recall: #{recall.first}")
+      unless book
+        return unreadable_stub(obj, container, key, 'no response to recall') if recall.empty?
+        if Parser.refused?(recall)
+          return unreadable_stub(obj, container, key, "the game refused the recall: #{recall.first}")
+        end
+        # Nothing to read off an item no bard has sung to yet.
+        return locked_stub(obj, container, key, recall) if Parser.locked?(recall)
       end
 
-      # Nothing to read off an item no bard has sung to yet.
-      return locked_stub(obj, container, key, recall) if Parser.locked?(recall)
+      # ANALYZE reads a book where it sits, exactly as RECALL does, so a book needs no get/put --
+      # its spell-spec detail is all we're after, and books aren't worn, so there's no inspect to
+      # do for one either.
+      analyze = book ? capture("analyze ##{obj.id}", ANALYZE_START, timeout: 3) : []
 
       begin
-        # INSPECT, on the other hand, only works on a held item.  If we can't pick it up, carry
-        # on without it -- worn location falls back to the noun table.
+        # INSPECT is the one thing that needs the item in hand; it only reports where a thing is
+        # worn, so it's skipped for books.  If we can't pick a worn item up, carry on without it
+        # -- worn location falls back to the noun table.
         inspect = []
-        if @inspect
+        if @inspect && !book
           if take(obj, container)
             inspect = capture("inspect ##{obj.id}", INSPECT_START, timeout: 3)
           else
@@ -1098,16 +1161,23 @@ module ItemDB
           end
         end
 
-        entry = Parser.parse(recall, inspect)
+        entry = Parser.parse(recall, inspect, analyze)
         Parser.infer_worn_location(entry, obj.name, obj.noun)
         entry.merge!(identity(obj, container, key))
-        entry['raw'] = "#{recall.join("\n")}\n"
+        entry['raw'] = raw_text(recall, analyze)
         Store.put(key, ItemDB.ordered_entry(entry))
       ensure
         # Back where it came from before the next item is touched, so an interrupted scan
         # leaves at most one thing in your hand.
         stow(obj, container)
       end
+    end
+
+    # Recall is the bulk of an entry's raw text; a book's analyze is appended after it so `show`
+    # and the unparsed-line debugging can see both.  Empty captures drop out.
+    def self.raw_text(recall, analyze)
+      blocks = [recall, analyze].reject { |lines| Array(lines).empty? }
+      "#{blocks.map { |lines| lines.join("\n") }.join("\n\n")}\n"
     end
 
     # The fields every entry carries regardless of what the loresong said.  item_id is the
@@ -1536,6 +1606,21 @@ module ItemDB
         want = Regexp.last_match(1)
         ->(i) { i.dig('magic', 'activator').to_s.start_with?(want) }
 
+      # spell-specialization books:  spec for any, spec:<spell|number> to name one, specranks>=N
+      # for how many ranks it grants.
+      when /\A(?:spec|specialization|specranks?)\s*(#{OPS.join('|')})\s*(\d+)\z/
+        op, val = Regexp.last_match(1), Regexp.last_match(2).to_i
+        ->(i) { (r = i.dig('spell_spec', 'ranks')) && Query.compare(r, op, val) }
+      when /\A(?:spec|specialization|spellspec)[:=]\s*(.+)\z/
+        want = Regexp.last_match(1).strip
+        lambda do |i|
+          ss = i['spell_spec']
+          next false unless ss
+          ss['spell'].to_s.downcase.include?(want) || ss['number'].to_s == want
+        end
+      when /\A(?:spec|specialization|spellspec)\z/
+        ->(i) { !i['spell_spec'].nil? }
+
       # flares and enchant
       when /\Aflares?\z/
         ->(i) { !Array(i['flares']).empty? }
@@ -1758,6 +1843,15 @@ module ItemDB
       "magic: #{parts.join(', ')}"
     end
 
+    # A one-liner for a spell-specialization book:  the spell it specializes, its number, and how
+    # many ranks READing it grants.  nil for anything that isn't one, so callers can .compact.
+    def self.spell_spec_summary(item)
+      ss = item['spell_spec']
+      return nil unless ss
+      spell = [ss['spell'], ss['number'] && "(#{ss['number']})"].compact.join(' ')
+      "spell specialization: +#{ss['ranks']} rank#{'s' if ss['ranks'] != 1} to #{spell} (consumed on READ)"
+    end
+
     # "padded" + the stored degree word => "padded (very heavily)"; a bare `true` (no degree
     # captured) renders just the word.  nil for an absent treatment so callers can `.compact`.
     def self.treatment(word, val)
@@ -1802,6 +1896,8 @@ module ItemDB
       out.concat(wrap(bs, 3).map { |row| "    #{row}" }) unless bs.empty?
       tail = [enhancive_summary(item), magic_summary(item)].compact.join('   ')
       out << "    #{tail}" unless tail.empty?
+      ss = spell_spec_summary(item)
+      out << "    #{ss}" if ss
       ex = extras(item)
       out << "    #{ex}" if ex
       out.join("\n")
@@ -1868,6 +1964,13 @@ module ItemDB
                          b['base_equiv'] && b['type'] == 'bonus' && "= #{b['base_equiv']} base",
                          b['cap'] && "cap #{b['cap']}"].select { |x| x }.join(', '))
         end
+      end
+
+      if (ss = item['spell_spec'])
+        out << '  spell specialization'
+        out << "    spell         #{ss['spell']}#{" (#{ss['number']})" if ss['number']}"
+        out << "    adds          +#{ss['ranks']} specialization rank#{'s' if ss['ranks'] != 1} when READ"
+        out << '    one-time use  READing the book consumes it'
       end
 
       out << "  container       #{item['container']}"
@@ -1993,6 +2096,7 @@ module ItemDB
   def self.boost_summary(entry)
     boosts = Display.boosts(entry)
     return boosts.join(', ') unless boosts.empty?
+    return Display.spell_spec_summary(entry) if entry['spell_spec']
 
     entry['enhancive'] ? 'enhancive, no boosts parsed' : 'not enhancive'
   end
@@ -2026,7 +2130,7 @@ module ItemDB
   # Keeps the YAML in a predictable, readable order with the bulky bits last.
   KEY_ORDER = %w[key name noun status reason worn_location worn_phrase worn_source worth weight_lbs
                  weight_desc enchant max_enchant enchanted_by flares resistances material
-                 loresong_by magic enhancive flags container character item_id scanned_at
+                 loresong_by magic enhancive spell_spec flags container character item_id scanned_at
                  unrecognized raw].freeze
 
   def self.ordered_entry(entry)
@@ -2329,6 +2433,9 @@ module ItemDB
       ;itemdb scan [container] quick  ...and don't hold each item to inspect it
       ;itemdb scan [container] retry  ...and re-check items that had no loresong before
 
+      a book or codex is ANALYZEd for its spell specialization (its loresong shows nothing
+      useful); that happens even on a quick scan, since analyze is the only place its detail lives
+
       containers you're wearing and containers in the room both work, so with the locker
       open:  ;itemdb scan bin  /  ;itemdb scan chest  /  ;itemdb scan wardrobe
 
@@ -2366,6 +2473,7 @@ module ItemDB
                 disruption earth fire firewheel grapple "guiding light" lightning magma
                 mana plasma steam td terror vacuum water xazkruvrixis),
               charges>50 (either kind), echarges<20, mcharges>100, charges:<phrase>, trained<=50,
+              spec, spec:<spell|number>, specranks>=N  (spell-specialization books),
               worn:<slot> (or just neck/finger/...; ear = one ear, 2ear = both),
               container:<name>, char:<name> (or who:<name>),
               material:<name>, name:<word>, holy, unholy, resistant, alterable,
