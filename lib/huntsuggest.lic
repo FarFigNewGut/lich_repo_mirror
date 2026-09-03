@@ -15,14 +15,26 @@
 #   ;huntsuggest scans
 #   ;huntsuggest help
 #   ;huntsuggest styles
+#   ;huntsuggest engine huntpro|ashborne
 #
 #         author: NecroDeus
 #           game: gs
 #           tags: hunting, huntpro, ashborne, recommendations, discovery, map, utility, gui
 #       required: Lich > 5.0.1
-#        version: 2.5.3-beta
+#        version: 2.6.1
 #
 # changelog:
+#   2.6.1 (2026-09-02):
+#     Legacy wlskeletalgiant recommendations launch the fenced skeletal_giant catalog area
+#   2.6.0 (2026-08-28):
+#     Uberbeta is now Ashborne 0.5.4, with Intel and GUI built in
+#     Saved Uberbeta engine selections and text aliases now launch Ashborne
+#     Preserves character styles, Total Hunts, Solo Hunt, and group commands
+#   2.5.4-beta (2026-08-27):
+#     Added Uberbeta (Testing) to the engine selector, quick commands, Solo Hunt, and text commands
+#     Uberbeta launches keep native catalog areas and the selected Total Hunts count
+#     Solo Hunt reads the selected engine's character profile, including first-use Ashborne settings for Uberbeta
+#     Prevents overlapping hunting engines on one character; discovery also follows Uberbeta
 #   2.5.3-beta (2026-07-23):
 #     Added a visible Total Hunts control for Ashborne launches
 #     Ashborne commands now carry the selected hunt count instead of relying on a hidden per-character fallback
@@ -90,6 +102,8 @@ module HuntSuggestCore
   DEFAULT_STYLE = 9
   DEFAULT_RANGE = 5
   DEFAULT_HUNT_CYCLES = 1
+  ENGINES = { 'huntpro' => 'HuntPro', 'ashborne' => 'Ashborne' }.freeze
+  HUNTING_SCRIPTS = (ENGINES.keys + %w[uberbeta ashborne2 beta-ashborne]).freeze
   TEXT_LIMIT = 12
   SETTINGS_FILE = File.join(BASE_DATA_DIR, 'huntsuggest_settings.yaml')
   CACHE_FILE = File.join(BASE_DATA_DIR, 'huntsuggest_cache.csv')
@@ -745,12 +759,10 @@ module HuntSuggestCore
 
   def normalize_settings_hash(data)
     settings = default_settings.merge(data.is_a?(Hash) ? data : {})
-    settings['engine'] = normalize_text(settings['engine']).downcase
-    settings['engine'] = 'ashborne' if settings['engine'] == 'beta-ashborne'
-    settings['engine'] = 'huntpro' unless %w[huntpro ashborne].include?(settings['engine'])
+    settings['engine'] = normalize_engine(settings['engine'])
     settings['style'] = settings['style'].to_i
     settings['style'] = DEFAULT_STYLE unless STYLE_OPTIONS.key?(settings['style'])
-    settings['hunt_cycles'] = normalize_hunt_cycles(settings['hunt_cycles'])
+    settings['hunt_cycles'] = normalize_hunt_cycles(settings['hunt_cycles'], settings['engine'])
     settings['range'] = settings['range'].to_i
     settings['range'] = DEFAULT_RANGE if settings['range'] <= 0
     settings['town_filter'] = normalize_text(settings['town_filter'])
@@ -762,21 +774,48 @@ module HuntSuggestCore
     settings
   end
 
-  def saved_ashborne_hunt_cycles(fallback = DEFAULT_HUNT_CYCLES)
-    root = Lich::Common::Settings.current_script_settings(':', script_name: 'ashborne')
-    character_settings = root[Char.name] || root[Char.name.to_s] || root[Char.name.to_sym] || {}
-    value = character_settings['ashborne_setting_hunt_cycles'] ||
-            character_settings[:ashborne_setting_hunt_cycles]
-    count = value.to_i
+  def normalize_engine(engine, fallback = 'huntpro')
+    name = normalize_text(engine).downcase
+    name = 'ashborne' if %w[uberbeta beta-ashborne beta].include?(name) || name == 'beta ashborne'
+    ENGINES.key?(name) ? name : fallback
+  end
+
+  def ashborne_family?(engine)
+    normalize_engine(engine) == 'ashborne'
+  end
+
+  def saved_engine_setting(engine, setting)
+    script_name = normalize_engine(engine)
+    root = Lich::Common::Settings.current_script_settings(':', script_name: script_name)
+    character_settings = root.is_a?(Hash) ? (root[Char.name.to_s] || root[Char.name.to_sym]) : nil
+    character_settings = {} unless character_settings.is_a?(Hash)
+    key = "#{script_name}_setting_#{setting}"
+    return character_settings[key] if character_settings.key?(key)
+    return character_settings[key.to_sym] if character_settings.key?(key.to_sym)
+
+    # Match Ashborne's missing-only promotion without writing either profile.
+    if script_name == 'ashborne' && !character_settings['ashborne_uberbeta_promotion_seeded'] && !character_settings[:ashborne_uberbeta_promotion_seeded]
+      beta_root = Lich::Common::Settings.current_script_settings(':', script_name: 'uberbeta')
+      beta = beta_root.is_a?(Hash) ? (beta_root[Char.name.to_s] || beta_root[Char.name.to_sym]) : nil
+      beta_key = "uberbeta_setting_#{setting}"
+      return beta[beta_key] if beta.is_a?(Hash) && beta.key?(beta_key)
+      return beta[beta_key.to_sym] if beta.is_a?(Hash) && beta.key?(beta_key.to_sym)
+    end
+  rescue StandardError
+    nil
+  end
+
+  def saved_hunt_cycles(engine = 'ashborne', fallback = DEFAULT_HUNT_CYCLES)
+    count = saved_engine_setting(engine, 'hunt_cycles').to_i
     count = fallback.to_i if count <= 0
     [[count, 1].max, 25].min
   rescue StandardError
     [[fallback.to_i, 1].max, 25].min
   end
 
-  def normalize_hunt_cycles(value)
+  def normalize_hunt_cycles(value, engine = 'ashborne')
     count = value.to_i
-    count = saved_ashborne_hunt_cycles if count <= 0
+    count = saved_hunt_cycles(engine) if count <= 0
     [[count, 1].max, 25].min
   end
 
@@ -1107,9 +1146,18 @@ module HuntSuggestCore
 
   def ashborne_catalog_area_for(hunt)
     target = huntplan_target_for(hunt)
-    return '' if blank_text?(target)
+    return catalog_area_slug(target) unless blank_text?(target)
 
-    catalog_area_slug(target)
+    legacy_aliases = {
+      'wlskeletalgiant' => 'skeletal_giant'
+    }
+    candidates = [hunt&.go2_target, hunt&.area_name].map { |value| catalog_area_slug(value) }
+    candidates.each do |candidate|
+      mapped = legacy_aliases[candidate]
+      return mapped unless blank_text?(mapped)
+    end
+
+    ''
   end
 
   def load_huntplan_hunts
@@ -1264,14 +1312,10 @@ module HuntSuggestCore
   end
 
   def hunting_command(hunt, style_number, engine = 'huntpro', solo = false, hunt_cycles = nil)
-    script_name = case normalize_text(engine).downcase
-                  when 'ashborne' then 'ashborne'
-                  when 'beta-ashborne', 'beta', 'beta ashborne' then 'ashborne'
-                  else 'huntpro'
-                  end
+    script_name = normalize_engine(engine)
     catalog_area = ashborne_catalog_area_for(hunt)
-    launch_area = script_name == 'ashborne' && !blank_text?(catalog_area) ? catalog_area : hunt_area_key(hunt)
-    cycles_argument = script_name == 'ashborne' ? " hunts=#{normalize_hunt_cycles(hunt_cycles)}" : ''
+    launch_area = ashborne_family?(script_name) && !blank_text?(catalog_area) ? catalog_area : hunt_area_key(hunt)
+    cycles_argument = ashborne_family?(script_name) ? " hunts=#{normalize_hunt_cycles(hunt_cycles, script_name)}" : ''
     ";#{script_name} #{style_number} #{launch_area}#{cycles_argument}#{solo ? ' solo' : ''}"
   end
 
@@ -1310,12 +1354,14 @@ module HuntSuggestCore
   end
 
   def saved_combat_style(engine, fallback = DEFAULT_STYLE)
-    script_name = normalize_text(engine).downcase == 'ashborne' ? 'ashborne' : 'huntpro'
-    setting_name = "#{script_name}_setting_group_style"
-    saved = Settings[Char.name][setting_name].to_i
+    saved = saved_engine_setting(engine, 'group_style').to_i
     STYLE_OPTIONS.key?(saved) ? saved : fallback.to_i
   rescue StandardError
     fallback.to_i
+  end
+
+  def running_hunting_scripts
+    HUNTING_SCRIPTS.select { |name| Script.running?(name) }
   end
 
   def stop_idle_hunting_script_for_solo(script_name)
@@ -1343,28 +1389,32 @@ module HuntSuggestCore
     style = style_number.to_i
     area = normalize_text(area_name)
     catalog_area = ashborne_catalog_area_for(hunt)
-    selected_script = case normalize_text(engine).downcase
-                      when 'ashborne' then 'ashborne'
-                      when 'beta-ashborne', 'beta', 'beta ashborne' then 'ashborne'
-                      else 'huntpro'
-                      end
-    script_name = selected_script
-    launch_area = script_name == 'ashborne' && !blank_text?(catalog_area) ? catalog_area : area
+    script_name = normalize_engine(engine)
+    launch_area = ashborne_family?(script_name) && !blank_text?(catalog_area) ? catalog_area : area
     raise "blank #{script_name} area name" if launch_area.empty?
     unless Script.exists?(script_name)
       safe_echo("huntsuggest: #{script_name}.lic is not installed. Install it or select another hunting engine.")
       return false
     end
+    conflicts = running_hunting_scripts - [script_name]
+    unless conflicts.empty?
+      safe_echo("huntsuggest: #{conflicts.join(', ')} is already running on this character. Stop it safely before starting #{script_name}.")
+      return false
+    end
+    if !solo && Script.running?(script_name)
+      safe_echo("huntsuggest: #{script_name} is already running. Finish or stop that hunt before starting another.")
+      return false
+    end
     return false if solo && !stop_idle_hunting_script_for_solo(script_name)
 
-    cycles = normalize_hunt_cycles(hunt_cycles)
-    cycles_argument = script_name == 'ashborne' ? " hunts=#{cycles}" : ''
+    cycles = normalize_hunt_cycles(hunt_cycles, script_name)
+    cycles_argument = ashborne_family?(script_name) ? " hunts=#{cycles}" : ''
     command = ";#{script_name} #{style} #{launch_area}#{cycles_argument}#{solo ? ' solo' : ''}"
     safe_echo("huntsuggest: starting #{command}")
     emit_backup_clickable(command, 'Backup')
 
     args = [style.to_s, launch_area]
-    args << "hunts=#{cycles}" if script_name == 'ashborne'
+    args << "hunts=#{cycles}" if ashborne_family?(script_name)
     args << 'solo' if solo
 
     begin
@@ -1697,14 +1747,14 @@ module HuntSuggestDiscovery
       "huntsuggest: sampling every #{POLL_SECONDS} seconds; changed data checkpoints every " \
       "#{CHECKPOINT_SECONDS / 60} minutes"
     )
-    HuntSuggestCore.safe_echo('huntsuggest: OFF automatically after HuntPro or Ashborne exits, or use ;kill huntsuggest')
-    saw_hunting_script = Script.running?('huntpro') || Script.running?('ashborne')
+    HuntSuggestCore.safe_echo('huntsuggest: OFF automatically after the hunting engine exits, or use ;kill huntsuggest')
+    saw_hunting_script = !HuntSuggestCore.running_hunting_scripts.empty?
 
     begin
       DownstreamHook.add(hook_name, proc { |line| session.observe_line(line) })
       loop do
         session.observe_current
-        running = Script.running?('huntpro') || Script.running?('ashborne')
+        running = !HuntSuggestCore.running_hunting_scripts.empty?
         saw_hunting_script ||= running
         break if saw_hunting_script && !running
         sleep POLL_SECONDS
@@ -1923,12 +1973,11 @@ module HuntSuggest
     when 'styles'
       print_styles
     when 'engine'
-      engine = args[1].to_s.downcase
-      engine = 'ashborne' if engine =~ /\Abeta(?:-ashborne)?\z/
-      raise 'usage: ;huntsuggest engine huntpro|ashborne' unless %w[huntpro ashborne].include?(engine)
+      engine = HuntSuggestCore.normalize_engine(args[1], nil)
+      raise 'usage: ;huntsuggest engine huntpro|ashborne' unless engine
       settings['engine'] = engine
       HuntSuggestCore.save_settings(settings)
-      label = { 'huntpro' => 'HuntPro', 'ashborne' => 'Ashborne' }[engine]
+      label = HuntSuggestCore::ENGINES[engine]
       HuntSuggestCore.safe_echo("huntsuggest will now start #{label}.")
     when 'scan'
       scan_action = args[1].to_s.downcase
@@ -2004,9 +2053,12 @@ module HuntSuggest
     HuntSuggestCore.safe_echo('Built for use with HuntPro or Ashborne.')
     HuntSuggestCore.safe_echo('Manual GTK GUI, saved settings, favorites, blacklist.')
     HuntSuggestCore.safe_echo('Starts the selected hunting engine directly through Lich.')
-    HuntSuggestCore.safe_echo('GUI selector: Hunting Engine = HuntPro or Ashborne.')
+    HuntSuggestCore.safe_echo('GUI selector: Hunting Engine = HuntPro or Ashborne. Saved Uberbeta selections now use Ashborne.')
     HuntSuggestCore.safe_echo('Text command: ;huntsuggest engine huntpro|ashborne')
-    HuntSuggestCore.safe_echo('Imported catalog rows launch clean Ashborne area keys like ;ashborne 3 lesser_burrow_orc.')
+    HuntSuggestCore.safe_echo('Select Ashborne, set Total Hunts, then Start Selected Hunt or Solo Hunt.')
+    HuntSuggestCore.safe_echo('Ashborne 0.5.4 has its GUI and Intel built in. Review character settings with ;ashborne gui.')
+    HuntSuggestCore.safe_echo('Use the new Ashborne on every group account. Stop old hunting engines safely before switching.')
+    HuntSuggestCore.safe_echo('Imported catalog rows use clean area keys, e.g. ;ashborne 3 lesser_burrow_orc hunts=1.')
     HuntSuggestCore.safe_echo("Add hunting grounds in: #{HuntSuggestCore::CUSTOM_FILE}")
     HuntSuggestCore.safe_echo('Local rows override Google Sheet rows with the same Area Name.')
     HuntSuggestCore.safe_echo('Click any Creature, Lvl, Area, Town, Type, Spawn, Bounty, or Flags header to sort.')
@@ -2056,7 +2108,7 @@ module HuntSuggest
     HuntSuggestCore.send_line("Creature Filter: #{creature_filter.empty? ? 'Any' : creature_filter}")
     HuntSuggestCore.send_line("Local Only: #{local_only ? 'Yes' : 'No'}")
     HuntSuggestCore.send_line("Style: #{style}")
-    engine_label = { 'huntpro' => 'HuntPro', 'ashborne' => 'Ashborne' }[engine] || 'HuntPro'
+    engine_label = HuntSuggestCore::ENGINES[HuntSuggestCore.normalize_engine(engine)]
     HuntSuggestCore.send_line("Hunting Engine: #{engine_label}")
     HuntSuggestCore.send_line('')
 
@@ -2068,7 +2120,7 @@ module HuntSuggest
       HuntSuggestCore.send_line("  Type: #{HuntSuggestCore.present_text(hunt.creature_type)}")
       HuntSuggestCore.send_line("  Spawn: #{HuntSuggestCore.present_text(hunt.spawn_rate)}")
       quick = HuntSuggestCore::QUICK_STYLES.map do |label, style_num|
-        cmd = HuntSuggestCore.hunting_command(hunt, style_num, engine)
+        cmd = HuntSuggestCore.hunting_command(hunt, style_num, engine, false, settings['hunt_cycles'])
         HuntSuggestCore.click("#{label}: #{cmd}", cmd)
       end.join('  ')
       HuntSuggestCore.send_line("  Quick: #{quick}")
@@ -2213,11 +2265,11 @@ if defined?(Gtk)
         quick_row.pack_start(label('Hunting Engine:'), false, false, 0)
 
         @engine_combo = Gtk::ComboBoxText.new
-        @engine_combo.append_text('HuntPro')
-        @engine_combo.append_text('Ashborne')
-        @engine_combo.active = { 'huntpro' => 0, 'ashborne' => 1 }[@settings['engine']] || 0
+        HuntSuggestCore::ENGINES.each_value { |name| @engine_combo.append_text(name) }
+        @engine_combo.active = HuntSuggestCore::ENGINES.keys.index(@settings['engine']) || 0
         @engine_combo.set_tooltip_text(
-          'Choose which hunting script HuntSuggest starts. This choice is saved for the next time you open HuntSuggest.'
+          'Choose HuntPro or Ashborne. Ashborne 0.5.4 includes Intel and uses your existing character settings. ' \
+          'Stop your current hunt safely before switching engines. This selection is saved for next time.'
         )
         @engine_combo.signal_connect('changed') do
           persist_settings
@@ -2231,7 +2283,8 @@ if defined?(Gtk)
         cycles_adjustment = Gtk::Adjustment.new(@settings['hunt_cycles'].to_f, 1, 25, 1, 5, 0)
         @hunt_cycles_spin = Gtk::SpinButton.new(cycles_adjustment, 1, 0)
         @hunt_cycles_spin.set_tooltip_text(
-          'Total Ashborne hunts to complete. This number is written into the launch command and preserved through every repeat.'
+          'Total Ashborne hunts to complete. This number is written into the launch command and preserved through every repeat. ' \
+          'Use 1 for a first beta test. HuntPro does not use this control.'
         )
         @hunt_cycles_spin.signal_connect('value-changed') do
           persist_settings
@@ -2342,7 +2395,7 @@ if defined?(Gtk)
         end
         @solo_button = make_button('Solo Hunt')
         @solo_button.set_tooltip_text(
-          "Start the selected hunt with this character's saved Ashborne or HuntPro combat style. " \
+          "Start the selected hunt with this character's saved combat style for the selected engine. " \
           'Saved group settings are ignored for this run only. An idle or group-preflight copy of the selected engine is stopped first.'
         )
         @solo_button.signal_connect('clicked') { send_selected_hunt(true) }
@@ -2524,10 +2577,8 @@ if defined?(Gtk)
       def selected_engine
         return 'huntpro' unless @engine_combo
 
-        case @engine_combo.active
-        when 1 then 'ashborne'
-        else 'huntpro'
-        end
+        index = @engine_combo.active.to_i
+        index >= 0 ? (HuntSuggestCore::ENGINES.keys[index] || 'huntpro') : 'huntpro'
       end
 
       def selected_hunt_cycles
@@ -2732,7 +2783,7 @@ if defined?(Gtk)
         return unless hunt
         command = HuntSuggestCore.hunting_command(hunt, style_num, selected_engine, false, selected_hunt_cycles)
         @status_label.text = "Starting #{command}"
-        HuntSuggestCore.start_hunting_script(
+        started = HuntSuggestCore.start_hunting_script(
           style_num,
           hunt.area_name,
           selected_engine,
@@ -2740,6 +2791,8 @@ if defined?(Gtk)
           false,
           selected_hunt_cycles
         )
+        @status_label.text = 'Not started. Check the game window for details.' unless started
+        started
       end
 
       def send_selected_hunt(solo = false)
@@ -2748,7 +2801,7 @@ if defined?(Gtk)
         style_num = solo ? HuntSuggestCore.saved_combat_style(selected_engine, selected_style) : selected_style
         command = HuntSuggestCore.hunting_command(hunt, style_num, selected_engine, solo, selected_hunt_cycles)
         @status_label.text = "Starting #{command}"
-        HuntSuggestCore.start_hunting_script(
+        started = HuntSuggestCore.start_hunting_script(
           style_num,
           hunt.area_name,
           selected_engine,
@@ -2756,6 +2809,8 @@ if defined?(Gtk)
           solo,
           selected_hunt_cycles
         )
+        @status_label.text = 'Not started. Check the game window for details.' unless started
+        started
       end
 
       def favorite_selected
