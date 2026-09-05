@@ -11,7 +11,7 @@ The following inputs are available:
         Other scripts: Combatical, VolnRestore2, Loresang
         game: gs
         tags: utility, economy, merchant, loresang, sell, pawnshop, shop, item, management
-        version: 1.4.8
+        version: 1.5.5
         required: Lich > 5.0
 
         \Version\
@@ -55,6 +55,21 @@ The following inputs are available:
         1.4.8 09/03/2026 - Sell/Batch Sell now try the gemshop before the pawnshop for
                           gem-eligible items, falling back automatically if declined
                           (toggle in Settings > Options). Fixed several related sale/note bugs.
+        1.5.0 09/04/2026 - Added Shop Inventory Management: scan a player shop's listings
+                          (go2 + tested entry command + compass navigation, since shops
+                          aren't map-tracked), build a sell queue, then List Items For Sale.
+        1.5.1 09/04/2026 - Shop location/entry fields collapse into an expander after a
+                          successful scan; Shop Inventory tab gained bold container names
+                          and a search box that darkens (never removes) non-matching items.
+        1.5.2 09/04/2026 - Scan Shop now reads each room's sign and shows it right under the
+                          room header; click it to edit and save (or clear) the sign, and
+                          the script travels there, updates it, and re-reads it to confirm.
+        1.5.4 09/04/2026 - Items to Sell: duplicates nest under a "(xN)" row, ready rows
+                          highlight, container picks reset on reopen, Scan Container finds held items and auto-opens the tab, each scan replaces the queue instead of accumulating, and multi-container scans nest under a bolded container name.
+        1.5.5 09/04/2026 - Container capacities: Shop Inventory shows room/container fill
+                          ("X of Y", "?" if unknown), learns real capacity from "no more room" at the table, and marks full containers in the sell dropdowns.
+                          Added a Ledger tab: detects items sold to other players (vs. items we
+                          pulled ourselves), with weekly/monthly/yearly totals and a 6-month income-vs-upkeep table.
 
 
 =end
@@ -73,6 +88,7 @@ module Merchantical
   SHOP_EXPORT_FILE = File.join(EDUBARBARIAN_DIR, "merchantical_#{_mc_char}_shop.html")
   SHOP_RTF_FILE    = File.join(EDUBARBARIAN_DIR, "merchantical_#{_mc_char}_shop.rtf")
   SHOP_GSITES_FILE = File.join(EDUBARBARIAN_DIR, "merchantical_#{_mc_char}_gsites.html")
+  SHOP_MGMT_FILE   = File.join(EDUBARBARIAN_DIR, "merchantical_#{_mc_char}_shopmgmt.json")
 
   # Color schemes  -  bg/fg/border/hover values for CSS generation.
   # Pango accent colors (gold, green, blue, purple) are shared across all schemes.
@@ -175,9 +191,39 @@ module Merchantical
       .mc-list { background-color: #{s[:bg]}; }
       .mc-row { background-color: #{s[:bg]}; color: #{s[:fg]}; padding: 1px 2px; }
       .mc-row:hover { background-color: #{s[:hover]}; }
+      #{w} box.mc-sq-ready { background-color: rgba(90, 200, 120, 0.22); }
       #{w} entry { background-color: #{s[:bg2]}; color: #{s[:fg]}; }
       #{w} button { background-color: #{s[:bg3]}; color: #{s[:fg]}; border: 1px solid #{s[:border]}; }
       #{w} button:hover { background-color: #{s[:hover]}; }
+      /* A raised bevel (light top/left, dark bottom/right) that inverts on
+         press, so a primary action button actually reads as depressable
+         instead of the flat solid-border look every other button uses. */
+      #{w} button.mc-primary-btn {
+        border-width: 2px;
+        border-style: solid;
+        border-top-color: rgba(255,255,255,0.35);
+        border-left-color: rgba(255,255,255,0.22);
+        border-bottom-color: rgba(0,0,0,0.55);
+        border-right-color: rgba(0,0,0,0.4);
+        padding: 3px 8px;
+      }
+      #{w} button.mc-primary-btn:active {
+        border-top-color: rgba(0,0,0,0.55);
+        border-left-color: rgba(0,0,0,0.4);
+        border-bottom-color: rgba(255,255,255,0.35);
+        border-right-color: rgba(255,255,255,0.22);
+      }
+      /* Shop Inventory removal-mode mark buttons -- as small as GTK will
+         allow, so a row of them doesn't visibly widen every item line. */
+      #{w} button.mc-x-btn {
+        border: none;
+        padding: 0px;
+        margin: 0px;
+        min-width: 0px;
+        min-height: 0px;
+        background-color: transparent;
+      }
+      #{w} button.mc-x-btn:hover { background-color: transparent; }
       #{w} button#shop_flagged { border: 2px solid #d4af37; }
       #{w} button#batch_queued_sell { border: 2px solid #d4af37; }
       #{w} button#batch_queued_locker { border: 2px solid #d4af37; }
@@ -252,6 +298,251 @@ module Merchantical
   CONTAINER_NOUN_RX = /\b(bag|sack|pouch|pack|backpack|haversack|rucksack|knapsack|
     bundle|basket|box|coffer|chest|case|trunk|bin|satchel|purse|quiver|
     scabbard|sheath|holster|sling|carrier|tote|wallet|ruck|pocketbook)s?\b/xi.freeze
+
+  # Known player-shop furnishing capacities, gathered from the catalog pages
+  # under https://gswiki.play.net/Category:Player_shop_furnishings (Barter
+  # Alley, Cort's Emporium, Decadent Decor, Erantok's Emporium, Henty's Depot,
+  # Isle Designs, Repository, Sutana's Designs, Ta'Vaalorian Merchanting
+  # Warehouse, Trade Alley, Turpin's Merchant Supplies -- 11 shops as of
+  # 09/2026). Keyed by the container's descriptive name with the leading
+  # article stripped (matches how ShopInventory parses "On/In a/an/the/some
+  # <name>..." headers), value is [capacity, preposition]. This only covers
+  # catalog furniture -- GM-granted or player-renamed pieces won't be in here
+  # at all, which is expected; LearnedCapacities (below) fills those in from
+  # observed "no more room" responses instead.
+  KNOWN_CONTAINER_CAPACITIES = {
+    # Barter Alley / Trade Alley (identical catalogs)
+    'rough oak crate'                    => [10, 'in'],
+    'iron-banded wooden chest'           => [10, 'in'],
+    'large brass-bound chest'            => [15, 'in'],
+    'lacquered wooden shelf'             => [15, 'on'],
+    'heavy wooden desk'                  => [20, 'on'],
+    'smooth plaster counter'             => [20, 'on'],
+    'long varnished counter'             => [20, 'on'],
+    'low wrought iron table'             => [25, 'on'],
+    'dovetailed oak table'               => [25, 'on'],
+    'narrow glass-topped table'          => [25, 'on'],
+    # Cort's Emporium
+    'carved stone shelf'                 => [7,  'on'],
+    'invar-braced shelves'               => [20, 'on'],
+    'mithril-braced shelves'             => [16, 'on'],
+    'carved stone cabinet'               => [13, 'in'],
+    'slender silvery glaes display'      => [1,  'on'],
+    'simple faux-wood box'               => [3,  'in'],
+    'massive granite chest'              => [25, 'in'],
+    'giant invar-bound chest'            => [25, 'in'],
+    'small invar-inlaid table'           => [10, 'on'],
+    'twisted invar rack'                 => [15, 'on'],
+    'black wrought iron rack'            => [12, 'on'],
+    # Decadent Decor
+    'glass-covered box case'             => [8,  'in'],
+    'beveled glass-covered case'         => [12, 'in'],
+    'heavy lead glass display case'      => [25, 'in'],
+    'silk-lined display case'            => [25, 'in'],
+    'salt-stained warped fishing crate'  => [15, 'in'],
+    'damaged packing crate'              => [15, 'in'],
+    'cedar and oak footlocker'           => [25, 'in'],
+    'brass treasure chest'               => [25, 'in'],
+    'slender driftwood counter'          => [15, 'on'],
+    'spacious grey slate counter'        => [20, 'on'],
+    'heavy white granite counter'        => [25, 'on'],
+    'plank-covered barrel table'         => [10, 'on'],
+    'painted white oak table'            => [18, 'on'],
+    'vornavian silk-covered table'       => [25, 'on'],
+    'long carved oak counter'            => [20, 'on'],
+    'series of low oak shelves'          => [15, 'on'],
+    'warped driftwood shelves'           => [15, 'on'],
+    'set of carved felwood shelves'      => [25, 'on'],
+    'white marble shelf'                 => [25, 'on'],
+    'steel-banded maoral rack'           => [8,  'on'],
+    'elegant silver jewelry rack'        => [8,  'on'],
+    'long brass clothing rack'           => [15, 'on'],
+    'hammered copper hanging rack'       => [18, 'on'],
+    'variegated copper jewelry tree'     => [6,  'on'],
+    'hammered copper display hooks'      => [25, 'on'],
+    'wrought-iron hooks'                 => [12, 'on'],
+    # Erantok's Emporium
+    'glaes-covered wicker display case'  => [12, 'in'],
+    'glaes-covered ebony display case'   => [12, 'in'],
+    'glaes-covered haon display case'    => [12, 'in'],
+    'open-front willow display case'     => [5,  'in'],
+    'open-front reed display case'       => [5,  'in'],
+    'iron-banded white wicker trunk'     => [17, 'in'],
+    'iron-banded black wicker trunk'     => [17, 'in'],
+    'iron-banded haon chest'             => [17, 'in'],
+    'iron-banded ebonwood chest'         => [17, 'in'],
+    'carved haon armoire'                => [25, 'in'],
+    'small green willow creel'           => [10, 'in'],
+    'large green willow creel'           => [25, 'in'],
+    'small woven reed basket'            => [10, 'in'],
+    'small white wicker basket'          => [10, 'in'],
+    'small black wicker basket'          => [10, 'in'],
+    'large woven reed basket'            => [25, 'in'],
+    'large white wicker basket'          => [25, 'in'],
+    'large black wicker basket'          => [25, 'in'],
+    'small carved haon table'            => [6,  'on'],
+    'small white wicker table'           => [6,  'on'],
+    'small black wicker table'           => [6,  'on'],
+    'large carved haon table'            => [18, 'on'],
+    'large white wicker table'           => [18, 'on'],
+    'large black wicker table'           => [18, 'on'],
+    'small carved haon shelf'            => [6,  'on'],
+    'large carved haon shelf'            => [18, 'on'],
+    'small carved haon rack'             => [6,  'on'],
+    'large carved haon rack'             => [18, 'on'],
+    'small carved haon hooks'            => [6,  'on'],
+    'large carved haon hooks'            => [18, 'on'],
+    'small carved haon display'          => [6,  'on'],
+    'small white wicker display'         => [6,  'on'],
+    'small black wicker display'         => [6,  'on'],
+    'large carved haon display'          => [18, 'on'],
+    'large white wicker display'         => [18, 'on'],
+    'large black wicker display'         => [18, 'on'],
+    'small white wicker counter'         => [6,  'on'],
+    'small black wicker counter'         => [6,  'on'],
+    'small carved haon counter'          => [6,  'on'],
+    'large white wicker counter'         => [18, 'on'],
+    'large black wicker counter'         => [18, 'on'],
+    'large carved haon counter'          => [18, 'on'],
+    'simple cloth mannequin'             => [12, 'on'],
+    'simple wire frame mannequin'        => [12, 'on'],
+    'silk-covered dress mannequin'       => [12, 'on'],
+    # Henty's Depot
+    'wicker basket'                      => [10, 'in'],
+    'flexible willow woven basket'       => [10, 'in'],
+    'etched brass bin'                   => [15, 'in'],
+    'engraved copper bin'                => [15, 'in'],
+    'gilded maple cabinet'               => [25, 'in'],
+    'gold-leafed mistwood cabinet'       => [25, 'in'],
+    'jewel-inlaid caddy'                 => [5,  'in'],
+    'oval-shaped speckled marble counter'=> [20, 'on'],
+    'glass-topped mistwood counter'      => [20, 'on'],
+    'bamboo rack'                        => [15, 'on'],
+    'gilded maple table'                 => [20, 'on'],
+    'vine-carved mahogany table'         => [20, 'on'],
+    # Isle Designs
+    'oversized sea chest'                => [25, 'in'],
+    'wide knotted oak counter'           => [25, 'on'],
+    'warped treasure chest'              => [15, 'in'],
+    'dented iron footlocker'             => [12, 'in'],
+    'fish hook rack'                     => [10, 'on'],
+    'carved haon pegs'                   => [5,  'on'],
+    'rusted metal display rack'          => [12, 'on'],
+    'long mistwood counter'              => [20, 'on'],
+    'heavy ale barrel'                   => [4,  'on'],
+    'stiffened seaweed basket'           => [5,  'in'],
+    'gnarled oak table'                  => [8,  'on'],
+    'splintered cargo crate'             => [15, 'in'],
+    'torn sailcloth hammock'             => [10, 'in'],
+    'woven fishnet basket'               => [8,  'in'],
+    'salt-crusted sandstone case'        => [22, 'in'],
+    'aqua-hued seaglass display'         => [10, 'on'],
+    'pink-edged open clamshell'          => [1,  'in'],
+    'shell-lined bamboo counter'         => [15, 'on'],
+    'floral-etched ceramic case'         => [25, 'in'],
+    'stained driftwood shelves'          => [14, 'on'],
+    # Repository
+    'large oak table'                    => [20, 'on'],
+    'wide faenor-trimmed table'          => [20, 'on'],
+    'long mahogany rack'                 => [10, 'on'],
+    'small brown box'                    => [5,  'in'],
+    'gold-trimmed ebonwood chest'        => [10, 'in'],
+    'ora-bound large walnut trunk'       => [15, 'in'],
+    'painted red cedar rack'             => [13, 'on'],
+    # Sutana's Designs
+    'drab willow plank case'             => [10, 'in'],
+    'woven ribbon grass basket'          => [10, 'in'],
+    'alternating oak and cedar box'      => [10, 'in'],
+    'vine-carved olivewood chest'        => [10, 'in'],
+    'smoothly sanded birch case'         => [15, 'in'],
+    'paint-stained purpleheart box'      => [15, 'in'],
+    'ebon-grained dark zydris chest'     => [15, 'in'],
+    'green-toned golden pyinma basket'   => [15, 'in'],
+    'simple pine plank table'            => [10, 'on'],
+    'lacquered birch bark stand'         => [10, 'on'],
+    'oak and cedar plank counter'        => [10, 'on'],
+    'vine-carved olivewood rack'         => [10, 'on'],
+    'dappled cottonwood table'           => [15, 'on'],
+    'checkered beech and birch counter'  => [15, 'on'],
+    'teak-framed satinwood display'      => [15, 'on'],
+    "green-swept fyrswn'ava display"     => [15, 'on'],
+    # Ta'Vaalorian Merchanting Warehouse
+    'engraved pine case'                 => [10, 'in'],
+    'carved mahogany box'                => [10, 'in'],
+    'iron-bound ebonwood chest'          => [10, 'in'],
+    'carved oak table'                   => [10, 'on'],
+    'polished maoral table'              => [10, 'on'],
+    'large cherrywood cabinet'           => [15, 'in'],
+    'elegantly carved oak armoire'       => [15, 'in'],
+    'twisted dark metal rack'            => [15, 'on'],
+    'intricately carved ebonwood stand'  => [15, 'on'],
+    'gold-veined black marble counter'   => [15, 'on'],
+    # Turpin's Merchant Supplies
+    'sturdy wicker trunk'                => [10, 'in'],
+    'long bamboo counter'                => [10, 'on'],
+    'simple trestle table'               => [10, 'on'],
+    "antique sailor's trunk"             => [10, 'in'],
+    'clawfooted cherrywood table'        => [15, 'on'],
+    'deep brass-bound trunk'             => [15, 'in'],
+    'tall oak and ivory cabinet'         => [15, 'in'],
+    'wide brass-handled cabinet'         => [15, 'in'],
+    'giant willow withy basket'          => [5,  'in'],
+    'badly scarred oak counter'          => [20, 'on'],
+  }.freeze
+
+  # Capacities discovered at the table (from a "shop sell ... There's no more
+  # room" response) for furniture NOT in KNOWN_CONTAINER_CAPACITIES above --
+  # GM-granted pieces, or ones a player has had renamed. One file, shared
+  # across every character and shop this script touches, since a furniture
+  # piece's capacity is a property of the furniture itself, not of who owns
+  # it or which shop it's sitting in.
+  CONTAINER_LEARNED_FILE = File.join(EDUBARBARIAN_DIR, 'merchantical_container_capacities.json').freeze
+
+  module LearnedCapacities
+    def self.load
+      return {} unless File.exist?(CONTAINER_LEARNED_FILE)
+      data = JSON.parse(File.read(CONTAINER_LEARNED_FILE))
+      data.is_a?(Hash) ? data : {}
+    rescue
+      {}
+    end
+
+    def self.get(name)
+      key = name.to_s.downcase
+      entry = load[key]
+      entry.is_a?(Hash) ? entry : nil
+    end
+
+    # Only ever raises the known max, or sets it the first time -- a shop
+    # having fewer items on a container right now doesn't mean it holds less,
+    # it just means it isn't full at the moment.
+    def self.learn(name, capacity, preposition)
+      key = name.to_s.downcase
+      return if capacity.to_i <= 0
+      data = load
+      existing = data[key]
+      if existing && existing['capacity'].to_i >= capacity.to_i
+        return
+      end
+      data[key] = { 'capacity' => capacity.to_i, 'preposition' => preposition.to_s }
+      File.write(CONTAINER_LEARNED_FILE, JSON.generate(data))
+    rescue => e
+      Lich::Messaging.msg("yellow", "[Merchantical] Container capacity save error: #{e.message}")
+    end
+  end
+
+  # [capacity, preposition] for a container name (article stripped, any case)
+  # -- learned (actually observed at the table) takes priority over the
+  # catalog list, since a learned value is directly confirmed reality and the
+  # catalog could be stale or the piece customized. Returns [nil, nil] (shown
+  # as "?" in the UI) if neither source knows about it.
+  def self.container_capacity(name)
+    key = name.to_s.sub(/\A(?:a |an |the |some )/i, '').strip.downcase
+    learned = LearnedCapacities.get(key)
+    return [learned['capacity'], learned['preposition']] if learned
+    known = KNOWN_CONTAINER_CAPACITIES[key]
+    known ? known : [nil, nil]
+  end
 
   def self.pango_escape(str)
     str.to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;')
@@ -474,6 +765,43 @@ module Merchantical
   end
 
   # ---------------------------------------------------------------------------
+  # ShopState  -  Shop Inventory Management: scanned player-shop listings and the
+  # sell queue built from Scan Container. Persisted separately from the main
+  # Loresang item list/settings so the two features can't clobber each other.
+  # ---------------------------------------------------------------------------
+  module ShopState
+    DEFAULTS = {
+      'shop_location'   => '',
+      'shop_name'       => '',
+      'containers_text' => '',
+      'shop_inventory'  => {},
+      'shop_paths'      => {},
+      'sell_queue'      => [],
+      # Persistent record of items that vanished from shop_inventory between
+      # two Scan Shop runs WITHOUT us being the one who pulled them (see
+      # App#detect_shop_sales) -- the game has no "sales report", so this is
+      # the only signal available that something sold to another player.
+      'ledger_events'   => []
+    }.freeze
+
+    def self.load
+      return State.deep_dup(DEFAULTS) unless File.exist?(SHOP_MGMT_FILE)
+      base = State.deep_dup(DEFAULTS)
+      data = JSON.parse(File.read(SHOP_MGMT_FILE))
+      base.merge!(data) if data.is_a?(Hash)
+      base
+    rescue
+      State.deep_dup(DEFAULTS)
+    end
+
+    def self.save(data)
+      File.write(SHOP_MGMT_FILE, JSON.generate(data))
+    rescue => e
+      Lich::Messaging.msg("yellow", "[Merchantical] Shop state save error: #{e.message}")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # MainWindow
   # ---------------------------------------------------------------------------
   class MainWindow < Gtk::Window
@@ -496,13 +824,41 @@ module Merchantical
     LOCKER_ICON      = "\u{1F4E6}".freeze  # \u{1F4E6} locker indicator (display only)
     LOCKER_STORE_BTN = "\u22A1".freeze     # \u22A1 text char  -  responds to Pango foreground=
 
-    def initialize(items, cmd_queue, on_close, state)
+    # Items to Sell row layout: every row (plain or a duplicate-count group
+    # header) packs these same fixed widths for its leading cells, real or
+    # blank, so the container dropdown/price/remove columns always line up.
+    SQ_LEAD_W  = 20
+    SQ_NAME_W  = 380
+    SQ_COUNT_W = 45
+    SQ_QTY_W   = 46
+
+    def initialize(items, cmd_queue, on_close, state, shop_state = nil)
       super()
       @items             = items
       @cmd_queue         = cmd_queue
       @on_close          = on_close
       @state             = state
       @options           = state['options'] || {}
+      @shop_state        = shop_state || Merchantical::ShopState.load
+      @shop_mode         = false
+      @shop_notebook     = nil
+      @shop_inv_box      = nil
+      @sell_queue_box    = nil
+      @ledger_box        = nil
+      @shop_setup_expander   = nil
+      @shop_inv_search_entry = nil
+      @shop_inv_search       = ''
+      @sell_queue_search_entry = nil
+      @sell_queue_search       = ''
+      @shop_location_entry   = nil
+      @shop_name_entry       = nil
+      @shop_containers_entry = nil
+      @list_sale_btn         = nil
+      @removal_commit_btn    = nil
+      @removal_cancel_btn    = nil
+      @removal_mode          = false
+      @removal_marked        = {}
+      @normal_scroll         = nil
       @row_data          = []
       @sell_timers       = {}
       @sell_arm_times    = {}
@@ -564,6 +920,24 @@ module Merchantical
       rebuild_list
     end
 
+    # Pushed from the App thread after Scan Shop / Scan Container / List Items For
+    # Sale finish, so the GTK thread displays the freshly saved shop-management data.
+    def apply_shop_state(new_state)
+      @shop_state = new_state
+      # A successful scan is the signal to tuck the location/entry fields away --
+      # they're "set it and forget it" once they've proven correct. Only auto-
+      # collapses on a real result; leave it alone (e.g. still expanded) if the
+      # scan came back empty, since that likely means something needs fixing.
+      if @shop_setup_expander && !(new_state['shop_inventory'] || {}).empty?
+        @shop_setup_expander.expanded = false
+      end
+      return unless @shop_notebook
+      rebuild_shop_inventory_view
+      rebuild_sell_queue_view
+      rebuild_ledger_view
+      update_list_sale_sensitivity
+    end
+
     def enable_loresang_btn
       if @loresang_timer
         GLib::Source.remove(@loresang_timer) rescue nil
@@ -604,6 +978,973 @@ module Merchantical
       "<span foreground='#{LORESANG_APPEND_COLOR}' weight='bold'> Loresang Append Item</span>"
     end
 
+    def shop_toggle_markup
+      color = @shop_mode ? '#ffdd55' : '#a0c8ff'
+      weight = @shop_mode ? " weight='bold'" : ''
+      "<span foreground='#{color}'#{weight}>#{SHOP_ICON} Shop Inventory Management</span>"
+    end
+
+    def persist_shop_state
+      Merchantical::ShopState.save(@shop_state)
+    end
+
+    def update_list_sale_sensitivity
+      return unless @list_sale_btn
+      ready = (@shop_state['sell_queue'] || []).any? { |q| sell_queue_item_ready?(q) }
+      @list_sale_btn.sensitive = ready
+    end
+
+    def sell_queue_item_ready?(q)
+      q['shop_room'].to_s != '' && q['shop_container'].to_s != '' && q['price'].to_i > 0
+    end
+
+    # [["room_id|container_name", "Room Label / container name", full?], ...]
+    # built from whatever Scan Shop has discovered so far. Used to populate the
+    # sell-queue tab's per-item destination dropdowns. `full?` is true once the
+    # container's last-scanned item count has reached its known/learned
+    # capacity (nil capacity -- unknown -- never counts as full here).
+    def shop_container_options
+      opts = []
+      (@shop_state['shop_inventory'] || {}).each do |room_id, room_data|
+        (room_data['containers'] || []).each do |cont|
+          cap, = Merchantical.container_capacity(cont['name'])
+          full = cap ? (cont['items'] || []).length >= cap : false
+          label = "#{room_data['room_label'] || room_id} / #{cont['name']}#{' (full)' if full}"
+          opts << ["#{room_id}|#{cont['name']}", label, full]
+        end
+      end
+      opts
+    end
+
+    def build_shop_notebook
+      nb = Gtk::Notebook.new
+
+      inv_page     = Gtk::Box.new(:vertical, 0)
+      removal_page = Gtk::Box.new(:vertical, 0)
+
+      # inv_body holds the search row, totals ribbon, and the scrolling item
+      # list -- everything the Shop Inventory view actually is. It's the same
+      # single widget whether you're looking at it from the "Shop Inventory"
+      # tab or the "Remove Items for Sale" tab; switch-page (below) reparents
+      # it between inv_page and removal_page rather than keeping two separate
+      # copies of this view in sync. "Remove Items for Sale" is a real
+      # notebook page for exactly this reason -- a genuine tab gets the same
+      # native selected/depressed look as the other two for free, instead of
+      # a button trying to imitate one.
+      inv_body = Gtk::Box.new(:vertical, 0)
+
+      inv_search_row = Gtk::Box.new(:horizontal, 4)
+      inv_search_row.margin = 6
+      inv_search_row.pack_start(Gtk::Label.new(" Search:"), expand: false, fill: false, padding: 0)
+      @shop_inv_search_entry = Gtk::SearchEntry.new
+      @shop_inv_search_entry.set_tooltip_text(
+        "Filter by item name. Non-matching items are darkened, not removed --\n" \
+        "containers with at least one match auto-expand while searching."
+      )
+      @shop_inv_search_entry.signal_connect('search-changed') do
+        @shop_inv_search = @shop_inv_search_entry.text.strip.downcase
+        rebuild_shop_inventory_view
+      end
+      inv_search_row.pack_start(@shop_inv_search_entry, expand: true, fill: true, padding: 0)
+      inv_body.pack_start(inv_search_row, expand: false, fill: false, padding: 0)
+
+      # Half-height summary ribbon: total items listed across every scanned
+      # room vs. the shop's overall max (25 per room, so 1/2/3 rooms scanned
+      # -> 25/50/75). Filled in by rebuild_shop_inventory_view, which already
+      # computes each room's own total while building the list below.
+      inv_summary_row = Gtk::Box.new(:horizontal, 4)
+      inv_summary_row.margin_start = 6; inv_summary_row.margin_end = 6
+      inv_summary_row.margin_top = 0; inv_summary_row.margin_bottom = 2
+      @shop_inv_summary_lbl = Gtk::Label.new
+      @shop_inv_summary_lbl.markup = "<span size='small' foreground='#888'>0 total items of 0 Maximum.</span>"
+      @shop_inv_summary_lbl.halign = :start
+      @shop_inv_summary_lbl.xalign = 0.0
+      inv_summary_row.pack_start(@shop_inv_summary_lbl, expand: false, fill: false, padding: 0)
+
+      # Spacer pushes Commit removal / Cancel to the far right, separated from
+      # the summary label. Both stay hidden (no_show_all so a window-wide
+      # show_all can't reveal them by accident) until the removal tab is
+      # selected -- but their own label children are shown once right here at
+      # construction, since a child added via .add() is never auto-shown by
+      # GTK the way a stock label: constructor's internal label is, and a
+      # parent that's had no_show_all set skips showing ITS children too, not
+      # just itself, on any later show_all() -- without this the button would
+      # just render as an empty box even once made visible.
+      inv_summary_row.pack_start(Gtk::Label.new, expand: true, fill: true, padding: 0)
+
+      commit_removal_lbl = Gtk::Label.new
+      commit_removal_lbl.markup = "<span foreground='#ff4444' weight='bold'>Commit removal</span>"
+      commit_removal_lbl.show
+      @removal_commit_btn = Gtk::Button.new
+      @removal_commit_btn.add(commit_removal_lbl)
+      @removal_commit_btn.style_context.add_class('mc-primary-btn')
+      @removal_commit_btn.no_show_all = true
+      @removal_commit_btn.visible = false
+      @removal_commit_btn.set_tooltip_text(
+        "Pull and stow every item currently marked red, room by room, and\n" \
+        "update the Shop Inventory tab as each one is confirmed removed."
+      )
+      @removal_commit_btn.signal_connect('clicked') { commit_removal }
+      inv_summary_row.pack_start(@removal_commit_btn, expand: false, fill: false, padding: 4)
+
+      @removal_cancel_btn = Gtk::Button.new(label: "Cancel")
+      @removal_cancel_btn.no_show_all = true
+      @removal_cancel_btn.visible = false
+      @removal_cancel_btn.signal_connect('clicked') { @shop_notebook.page = 0 }
+      inv_summary_row.pack_start(@removal_cancel_btn, expand: false, fill: false, padding: 4)
+
+      inv_body.pack_start(inv_summary_row, expand: false, fill: false, padding: 0)
+
+      inv_scroll = Gtk::ScrolledWindow.new
+      inv_scroll.hscrollbar_policy = :never
+      inv_scroll.vscrollbar_policy = :automatic
+      @shop_inv_box = Gtk::Box.new(:vertical, 4)
+      @shop_inv_box.margin = 10
+      inv_scroll.add(@shop_inv_box)
+      inv_body.pack_start(inv_scroll, expand: true, fill: true, padding: 0)
+
+      inv_page.pack_start(inv_body, expand: true, fill: true, padding: 0)
+      nb.append_page(inv_page, Gtk::Label.new("Shop Inventory"))
+
+      queue_page = Gtk::Box.new(:vertical, 0)
+
+      queue_search_row = Gtk::Box.new(:horizontal, 4)
+      queue_search_row.margin = 6
+      queue_search_row.pack_start(Gtk::Label.new(" Search:"), expand: false, fill: false, padding: 0)
+      @sell_queue_search_entry = Gtk::SearchEntry.new
+      @sell_queue_search_entry.set_tooltip_text(
+        "Filter by item name. Non-matching rows are darkened, not removed."
+      )
+      @sell_queue_search_entry.signal_connect('search-changed') do
+        @sell_queue_search = @sell_queue_search_entry.text.strip.downcase
+        rebuild_sell_queue_view
+      end
+      queue_search_row.pack_start(@sell_queue_search_entry, expand: true, fill: true, padding: 0)
+
+      # Only enabled once at least one queued item has both a destination
+      # container and a price set.
+      list_sale_lbl = Gtk::Label.new
+      list_sale_lbl.markup = "<span foreground='#d4af37' weight='bold'>List Items For Sale</span>"
+      @list_sale_btn = Gtk::Button.new
+      @list_sale_btn.add(list_sale_lbl)
+      @list_sale_btn.style_context.add_class('mc-primary-btn')
+      @list_sale_btn.set_tooltip_text(
+        "Sell every item in the Items to Sell tab that has both a shop container\n" \
+        "and a price set. Groups by room to minimize travel. Fires immediately --\n" \
+        "double check prices and containers before clicking."
+      )
+      @list_sale_btn.signal_connect('clicked') do
+        @list_sale_btn.sensitive = false
+        @cmd_queue.push({ list_items_for_sale: true })
+        GLib::Timeout.add(3000) { @list_sale_btn.sensitive = true; false }
+      end
+      queue_search_row.pack_start(@list_sale_btn, expand: false, fill: false, padding: 0)
+      queue_page.pack_start(queue_search_row, expand: false, fill: false, padding: 0)
+
+      queue_scroll = Gtk::ScrolledWindow.new
+      queue_scroll.hscrollbar_policy = :never
+      queue_scroll.vscrollbar_policy = :automatic
+      @sell_queue_box = Gtk::Box.new(:vertical, 2)
+      @sell_queue_box.margin = 10
+      queue_scroll.add(@sell_queue_box)
+      queue_page.pack_start(queue_scroll, expand: true, fill: true, padding: 0)
+
+      nb.append_page(queue_page, Gtk::Label.new("Items to Sell"))
+
+      # A real page/tab (see the inv_body comment above) -- an actual
+      # Gtk::Notebook page gets the same native selected/"depressed" tab
+      # styling as the other two automatically, which a button dressed up to
+      # look like a tab can't quite reproduce.
+      removal_tab_lbl = Gtk::Label.new("Remove Items for Sale")
+      removal_tab_lbl.set_tooltip_text(
+        "Mark listed items to pull back from the shop. Shows a X next to every\n" \
+        "item -- click one to mark it (red), click again to unmark. Nothing is\n" \
+        "actually removed until you click Commit removal."
+      )
+      nb.append_page(removal_page, removal_tab_lbl)
+
+      nb.signal_connect('switch-page') do |_, _page_widget, page_num|
+        now_removal = (page_num == 2)
+        next if now_removal == @removal_mode
+
+        if now_removal
+          inv_page.remove(inv_body)
+          removal_page.pack_start(inv_body, expand: true, fill: true, padding: 0)
+        else
+          removal_page.remove(inv_body)
+          inv_page.pack_start(inv_body, expand: true, fill: true, padding: 0)
+          @removal_marked = {}
+        end
+        @removal_mode = now_removal
+        inv_body.show_all
+        @removal_commit_btn.visible = now_removal
+        @removal_cancel_btn.visible = now_removal
+        rebuild_shop_inventory_view
+      end
+
+      ledger_page = Gtk::Box.new(:vertical, 0)
+      ledger_scroll = Gtk::ScrolledWindow.new
+      ledger_scroll.hscrollbar_policy = :never
+      ledger_scroll.vscrollbar_policy = :automatic
+      @ledger_box = Gtk::Box.new(:vertical, 4)
+      @ledger_box.margin = 10
+      ledger_scroll.add(@ledger_box)
+      ledger_page.pack_start(ledger_scroll, expand: true, fill: true, padding: 0)
+      ledger_tab_lbl = Gtk::Label.new("Ledger")
+      ledger_tab_lbl.set_tooltip_text(
+        "Items that vanished from Shop Inventory between scans without being\n" \
+        "pulled by Remove Items for Sale -- the closest thing to a sales report\n" \
+        "the game gives us, since it never reports sales directly."
+      )
+      nb.append_page(ledger_page, ledger_tab_lbl)
+
+      rebuild_shop_inventory_view
+      rebuild_sell_queue_view
+      rebuild_ledger_view
+      nb
+    end
+
+    def commit_removal
+      if @removal_marked.empty?
+        Lich::Messaging.msg("yellow", "[Merchantical] Remove items: nothing marked.")
+        return
+      end
+      @cmd_queue.push({ commit_shop_removal: @removal_marked.values })
+      @shop_notebook.page = 0
+    end
+
+    def format_silvers(n)
+      n.to_i.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\1,').reverse
+    end
+
+    # Quick stat rollups (this week/month/year), a 6-month income-vs-expense
+    # table (expense is the game's real 10,000-per-room monthly shop upkeep,
+    # applied at the shop's current room count throughout -- room count
+    # history isn't tracked, so a room added/dropped mid-window won't be
+    # reflected retroactively), and the raw event list, newest first.
+    def rebuild_ledger_view
+      return unless @ledger_box
+      @ledger_box.children.each { |w| @ledger_box.remove(w) }
+
+      events     = @shop_state['ledger_events'] || []
+      room_count = (@shop_state['shop_inventory'] || {}).length
+
+      now          = Time.now
+      week_cutoff  = (now - 7 * 24 * 60 * 60).strftime('%Y-%m-%d')
+      month_prefix = now.strftime('%Y-%m')
+      year_prefix  = now.strftime('%Y')
+
+      stats_row = Gtk::Box.new(:horizontal, 20)
+      stats_row.halign = :start
+      [
+        ['This Week',  events.select { |e| e['date'].to_s >= week_cutoff }],
+        ['This Month', events.select { |e| e['date'].to_s.start_with?(month_prefix) }],
+        ['This Year',  events.select { |e| e['date'].to_s.start_with?(year_prefix) }]
+      ].each do |label, evs|
+        qty   = evs.sum { |e| e['qty'].to_i }
+        total = evs.sum { |e| e['price'].to_i * e['qty'].to_i }
+        lbl = Gtk::Label.new
+        lbl.markup =
+          "<b>#{label}:</b> #{qty} item#{'s' unless qty == 1} / " \
+          "<span foreground='#d4af37'>#{format_silvers(total)} silvers</span>"
+        lbl.halign = :start
+        stats_row.pack_start(lbl, expand: false, fill: false, padding: 0)
+      end
+      @ledger_box.pack_start(stats_row, expand: false, fill: false, padding: 4)
+      @ledger_box.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 6)
+
+      table_hdr = Gtk::Box.new(:horizontal, 8)
+      table_hdr.halign = :start
+      { 'Month' => 120, 'Income' => 100, 'Expense' => 100, 'Net' => 100 }.each do |text, width|
+        h = Gtk::Label.new
+        h.markup = "<b><span size='small' foreground='#888'>#{text}</span></b>"
+        h.width_request = width
+        h.halign = :start
+        h.xalign = 0.0
+        table_hdr.pack_start(h, expand: false, fill: false, padding: 0)
+      end
+      @ledger_box.pack_start(table_hdr, expand: false, fill: false, padding: 0)
+
+      current_month_key = now.strftime('%Y-%m')
+      6.times do |i|
+        y = now.year
+        m = now.month - i
+        while m <= 0
+          m += 12
+          y -= 1
+        end
+        month_key   = format('%04d-%02d', y, m)
+        month_evs   = events.select { |e| e['date'].to_s.start_with?(month_key) }
+        income      = month_evs.sum { |e| e['price'].to_i * e['qty'].to_i }
+        # Upkeep is only ever actually known for the current month -- charging
+        # it against past months too would assume the shop existed, and had
+        # this same room count, the whole time, which we have no data for.
+        expense     = month_key == current_month_key ? room_count * 10_000 : 0
+        net         = income - expense
+        net_color   = net >= 0 ? '#3c9c3c' : '#cc5555'
+
+        row = Gtk::Box.new(:horizontal, 8)
+        row.halign = :start
+        month_lbl = Gtk::Label.new(Time.new(y, m, 1).strftime('%b %Y'))
+        month_lbl.width_request = 120
+        month_lbl.halign = :start
+        month_lbl.xalign = 0.0
+        row.pack_start(month_lbl, expand: false, fill: false, padding: 0)
+
+        [format_silvers(income), expense.zero? ? '0' : "-#{format_silvers(expense)}"].each do |text|
+          l = Gtk::Label.new(text)
+          l.width_request = 100
+          l.halign = :start
+          l.xalign = 0.0
+          row.pack_start(l, expand: false, fill: false, padding: 0)
+        end
+
+        net_lbl = Gtk::Label.new
+        net_lbl.markup = "<span foreground='#{net_color}'>#{net >= 0 ? '' : '-'}#{format_silvers(net.abs)}</span>"
+        net_lbl.width_request = 100
+        net_lbl.halign = :start
+        net_lbl.xalign = 0.0
+        row.pack_start(net_lbl, expand: false, fill: false, padding: 0)
+
+        @ledger_box.pack_start(row, expand: false, fill: false, padding: 0)
+      end
+      @ledger_box.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 6)
+
+      recent_lbl = Gtk::Label.new
+      recent_lbl.markup = "<b>Recent Sales</b>"
+      recent_lbl.halign = :start
+      @ledger_box.pack_start(recent_lbl, expand: false, fill: false, padding: 2)
+
+      if events.empty?
+        empty_lbl = Gtk::Label.new
+        empty_lbl.markup =
+          "<i>No sales detected yet. The game never reports a sale directly -- this\n" \
+          "fills in the next time Scan Shop finds something missing that wasn't\n" \
+          "pulled via Remove Items for Sale.</i>"
+        empty_lbl.halign = :start
+        @ledger_box.pack_start(empty_lbl, expand: false, fill: false, padding: 4)
+      else
+        events.sort_by { |e| e['date'].to_s }.reverse.first(200).each do |e|
+          qty_txt = e['qty'].to_i > 1 ? " x#{e['qty']}" : ''
+          lbl = Gtk::Label.new
+          lbl.markup =
+            "<span foreground='#888'>#{pe(e['date'])}</span>  #{pe(e['item_name'])}#{qty_txt}: " \
+            "<span foreground='#d4af37'>#{format_silvers(e['price'].to_i * e['qty'].to_i)} silvers</span> " \
+            "<span foreground='#666'>(#{pe(e['room_id'])})</span>"
+          lbl.halign = :start
+          @ledger_box.pack_start(lbl, expand: false, fill: false, padding: 0)
+        end
+      end
+
+      @ledger_box.show_all
+    end
+
+    # Room -> Container -> Item, each level collapsible via Gtk::Expander. Read-only;
+    # selling happens from the Items to Sell tab, not by interacting with this one.
+    def rebuild_shop_inventory_view
+      return unless @shop_inv_box
+      @shop_inv_box.children.each { |w| @shop_inv_box.remove(w) }
+
+      search = @shop_inv_search.to_s
+      inv = @shop_state['shop_inventory'] || {}
+      total_items = 0
+      if inv.empty?
+        lbl = Gtk::Label.new
+        lbl.markup = "<i>No shop data yet. Enter room(s) above and click Scan Shop.</i>"
+        lbl.halign = :start
+        @shop_inv_box.pack_start(lbl, expand: false, fill: false, padding: 4)
+      else
+        inv.each do |room_id, room_data|
+          room_exp = Gtk::Expander.new
+          room_exp.expanded = true
+
+          containers = room_data['containers'] || []
+          # Room total: current items vs. summed capacity of its containers,
+          # capped at 25 -- a player shop room can't actually list more than
+          # 25 items for sale no matter how much container capacity sits in
+          # it. If any container's capacity is unknown, the known sum is only
+          # a floor -- shown as "known+?" unless that floor already hits the
+          # 25 hard cap, at which point the unknown no longer matters.
+          room_count      = containers.sum { |c| (c['items'] || []).length }
+          total_items    += room_count
+          room_caps       = containers.map { |c| Merchantical.container_capacity(c['name']).first }
+          known_cap_sum   = room_caps.compact.sum
+          room_cap_txt    = if room_caps.all?
+                              [known_cap_sum, 25].min.to_s
+                            elsif known_cap_sum >= 25
+                              "25"
+                            else
+                              "#{known_cap_sum}+?"
+                            end
+
+          # Room id, its actual name (when known -- older scans predating this
+          # may only have the id duplicated here, so skip the parens rather
+          # than show it twice), and the room's fill total, as the expander's
+          # own plain-text label. The sign button used to live inside a custom
+          # label_widget alongside this, but GtkExpander can swallow clicks on
+          # a widget in its label area for its own toggle regardless -- so the
+          # sign now sits as a separate sibling next to the expander instead,
+          # in room_row below, fully outside its click handling.
+          room_label = room_data['room_label']
+          name_part  = (room_label && room_label.to_s != room_id.to_s) ? "  (#{pe(room_label)})" : ''
+          room_exp.use_markup = true
+          room_exp.label =
+            "<b><span foreground='#e0a84a'>#{pe(room_id)}#{name_part}</span></b>" \
+            "  <span foreground='#888'>#{room_count} of #{room_cap_txt}</span>"
+
+          room_row = Gtk::Box.new(:horizontal, 8)
+          room_row.halign = :start
+          room_row.pack_start(room_exp, expand: false, fill: false, padding: 0)
+
+          sign_text = room_data['sign_text']
+          sign_lbl = Gtk::Label.new
+          sign_lbl.markup = sign_text.to_s.strip.empty? ?
+            "<i><span foreground='#888'>(no sign -- click to set one)</span></i>" :
+            "<span foreground='#a0c8ff'>#{pe(sign_text.to_s.gsub("\n", '  /  '))}</span>"
+          sign_btn = Gtk::Button.new
+          sign_btn.add(sign_lbl)
+          sign_btn.relief = :none
+          sign_btn.set_tooltip_text(
+            "Click to edit this room's shop sign (SHOP SIGN). The script will travel\n" \
+            "here, update it, and re-read it to confirm."
+          )
+          sign_btn.signal_connect('clicked') { open_shop_sign_dialog(room_id, sign_text) }
+          room_row.pack_start(sign_btn, expand: false, fill: false, padding: 0)
+
+          room_vbox = Gtk::Box.new(:vertical, 2)
+          room_vbox.margin_start = 14
+          room_exp.add(room_vbox)
+
+          if containers.empty?
+            empty_lbl = Gtk::Label.new("(no containers found on last scan)")
+            empty_lbl.halign = :start
+            room_vbox.pack_start(empty_lbl, expand: false, fill: false, padding: 2)
+          end
+
+          containers.each do |cont|
+            items = cont['items'] || []
+            has_match = !search.empty? && items.any? { |i| i['name'].to_s.downcase.include?(search) }
+
+            cap, = Merchantical.container_capacity(cont['name'])
+            cap_txt = cap ? "#{items.length} of #{cap}" : "#{items.length} of ?"
+
+            cont_exp = Gtk::Expander.new
+            cont_exp.use_markup = true
+            cont_exp.label =
+              "#{pe(cont['preposition'].to_s.capitalize)} <b>#{pe(cont['name'])}</b>  " \
+              "<span foreground='#{cap && items.length >= cap ? '#cc5555' : '#888888'}'>(#{cap_txt} items)</span>"
+            # Auto-expand a container while searching if it holds a match, so results
+            # are visible without hunting through every container by hand. Also
+            # forced open for the whole removal-mode session -- marking an X
+            # calls this rebuild again, and since a container's own expanded
+            # state isn't otherwise persisted across rebuilds, it would
+            # collapse right back on every single click without this.
+            cont_exp.expanded = @removal_mode || (!search.empty? && has_match)
+            cont_vbox = Gtk::Box.new(:vertical, 0)
+            cont_vbox.margin_start = 14
+            cont_exp.add(cont_vbox)
+
+            if items.empty?
+              none_lbl = Gtk::Label.new("(empty)")
+              none_lbl.halign = :start
+              cont_vbox.pack_start(none_lbl, expand: false, fill: false, padding: 0)
+            end
+
+            items.each do |item|
+              formatted = item['price'].to_i.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\1,').reverse
+              # Items aren't otherwise identified beyond name/price/qty, so
+              # this composite key (room + container + item name) is what
+              # removal-mode marks toggle against and what commit_removal
+              # eventually acts on.
+              removal_key = "#{room_id}|#{cont['name']}|#{item['name']}"
+              marked = @removal_marked.key?(removal_key)
+
+              item_row = Gtk::Box.new(:horizontal, 4)
+              item_row.halign = :start
+
+              item_lbl = Gtk::Label.new
+              name_markup = marked ? "<span foreground='#cc5555'>#{pe(item['name'])}</span>" : pe(item['name'])
+              item_lbl.markup =
+                "#{name_markup}: <span foreground='#d4af37'>#{formatted} silvers</span> " \
+                "<span foreground='#888'>(#{item['qty']})</span>"
+              item_lbl.halign = :start
+              # Darken (don't remove) items that don't match an active search.
+              matches = search.empty? || item['name'].to_s.downcase.include?(search)
+              item_lbl.opacity = matches ? 1.0 : 0.35
+              item_row.pack_start(item_lbl, expand: false, fill: false, padding: 0)
+
+              if @removal_mode
+                x_lbl = Gtk::Label.new
+                x_lbl.markup = "<span size='x-small' foreground='#cc5555'>\u{2715}</span>"
+                x_btn = Gtk::Button.new
+                x_btn.add(x_lbl)
+                x_btn.relief = :none
+                x_btn.style_context.add_class('mc-x-btn')
+                x_btn.set_tooltip_text("Mark/unmark this item for removal")
+                x_btn.signal_connect('clicked') do
+                  if @removal_marked.key?(removal_key)
+                    @removal_marked.delete(removal_key)
+                  else
+                    @removal_marked[removal_key] = {
+                      'room_id'        => room_id,
+                      'container_name' => cont['name'],
+                      'item_name'      => item['name']
+                    }
+                  end
+                  rebuild_shop_inventory_view
+                end
+                item_row.pack_start(x_btn, expand: false, fill: false, padding: 0)
+              end
+
+              cont_vbox.pack_start(item_row, expand: false, fill: false, padding: 0)
+            end
+
+            room_vbox.pack_start(cont_exp, expand: false, fill: false, padding: 1)
+          end
+
+          @shop_inv_box.pack_start(room_row, expand: false, fill: false, padding: 3)
+        end
+      end
+      if @shop_inv_summary_lbl
+        max_total = inv.length * 25
+        @shop_inv_summary_lbl.markup =
+          "<span size='small' foreground='#888'>#{total_items} total items of #{max_total} Maximum.</span>"
+      end
+      @shop_inv_box.show_all
+    end
+
+    # One row per sell-queue item: name, destination dropdown (built from scanned
+    # shop containers), price entry, remove button. Edits save immediately.
+    def rebuild_sell_queue_view
+      return unless @sell_queue_box
+      # Reentrancy guard: destroying a group header's price/qty field while it
+      # still has focus (e.g. pressing Enter, which commits via 'activate' but
+      # doesn't blur the widget) makes GTK fire an implicit focus-out as that
+      # widget is removed below -- and since the same commit handler is also
+      # wired to 'focus-out-event', that fires this method again from inside
+      # its own @sell_queue_box.children.each, mid-teardown. Without this guard
+      # that cascades into a full rebuild-storm (widget churn + a JSON save)
+      # per keystroke-commit, which is what was making the UI feel frozen.
+      return if @rebuilding_sell_queue
+      @rebuilding_sell_queue = true
+      begin
+        rebuild_sell_queue_view_now
+      ensure
+        @rebuilding_sell_queue = false
+      end
+    end
+
+    def rebuild_sell_queue_view_now
+      @sell_queue_box.children.each { |w| @sell_queue_box.remove(w) }
+
+      queue = @shop_state['sell_queue'] || []
+      if queue.empty?
+        lbl = Gtk::Label.new
+        lbl.markup = "<i>No items scanned yet. Enter container(s) above (worn or held) and click Scan Container.</i>"
+        lbl.halign = :start
+        @sell_queue_box.pack_start(lbl, expand: false, fill: false, padding: 4)
+        @sell_queue_box.show_all
+        return
+      end
+
+      options = shop_container_options
+
+      by_container = queue.group_by { |q| q['source_container'].to_s }
+      if by_container.length > 1
+        # More than one container went into this scan -- nest each container's
+        # items under its own collapsible, bolded header so it's clear where
+        # they came from. Open/closed state persists per container name across
+        # rebuilds; expanded by default since these are usually what you're
+        # actively working through.
+        @sq_container_expanded ||= {}
+        by_container.each do |cname, items|
+          label = cname.empty? ? '(unknown container)' : cname
+
+          cont_exp = Gtk::Expander.new
+          cont_exp.use_markup = true
+          cont_exp.label = "<b><span foreground='#e0a84a'>#{pe(label)}</span></b>"
+          cont_exp.expanded = @sq_container_expanded.fetch(cname, true)
+          cont_exp.signal_connect('notify::expanded') { @sq_container_expanded[cname] = cont_exp.expanded }
+
+          items_box = Gtk::Box.new(:vertical, 2)
+          items_box.margin_start = 14
+          pack_sell_queue_items(items_box, items, options)
+          cont_exp.add(items_box)
+
+          @sell_queue_box.pack_start(cont_exp, expand: false, fill: false, padding: 3)
+        end
+      else
+        pack_sell_queue_items(@sell_queue_box, queue, options)
+      end
+      @sell_queue_box.show_all
+    end
+
+    # Exact-name duplicates within a set of items (a stacked scan of "a black
+    # rock" x3, say) are nested under one "(x3)" row instead of repeating the
+    # same row three times -- see build_sell_queue_group. group_by preserves
+    # first-seen order for both the groups and the items within each one.
+    def pack_sell_queue_items(box, items, options)
+      items.group_by { |q| q['name'] }.each do |name, group|
+        widget = group.length == 1 ?
+          build_sell_queue_row(group.first, options) :
+          build_sell_queue_group(name, group, options)
+        box.pack_start(widget, expand: false, fill: false, padding: group.length == 1 ? 0 : 2)
+      end
+    end
+
+    # One item's own row: name, shop-container picker, price, remove. Shared by
+    # both the flat (single-item) case and the individual rows nested inside a
+    # duplicate-name group's expander.
+    def build_sell_queue_row(q, options)
+      row = Gtk::Box.new(:horizontal, 6)
+      # Without this, a Box defaults to :fill on its cross-axis and stretches to
+      # the full width of the (vertical) list it's packed into -- harmless
+      # normally, but it made the mc-sq-ready highlight below paint clear across
+      # that unused trailing width instead of hugging the row's actual content.
+      row.halign = :start
+      row.margin_top = 2; row.margin_bottom = 2
+      row.style_context.add_class('mc-sq-ready') if sell_queue_item_ready?(q)
+
+      refresh_ready_style = lambda do
+        if sell_queue_item_ready?(q)
+          row.style_context.add_class('mc-sq-ready')
+        else
+          row.style_context.remove_class('mc-sq-ready')
+        end
+      end
+
+      # A blank spacer + blank count gap, sized to match the real arrow-toggle
+      # and count slots in build_sell_queue_group's header. Gtk::Expander's own
+      # arrow reserves space no plain row has, which is what threw the dropdown
+      # column out of alignment for grouped rows -- build_sell_queue_group no
+      # longer uses Expander for exactly this reason, but every row (grouped or
+      # not) still needs the same fixed-width leading cells so the columns line
+      # up regardless of which kind of row it is. Keep these three widths
+      # (SQ_LEAD_W / SQ_NAME_W / SQ_COUNT_W) in sync with build_sell_queue_group.
+      spacer = sq_spacer(SQ_LEAD_W)
+      spacer.valign = :start
+      row.pack_start(spacer, expand: false, fill: false, padding: 0)
+
+      # Full item names (fetched via a LOOK, not just the short inventory name)
+      # can run long -- wrap up to two lines at a smaller size and ellipsize
+      # anything past that, rather than stretching or truncating to one line.
+      name_lbl = Gtk::Label.new
+      name_lbl.markup = "<span size='small'><b>#{pe(q['name'])}</b></span>"
+      name_lbl.width_request = SQ_NAME_W
+      name_lbl.max_width_chars = 46
+      name_lbl.wrap      = true
+      name_lbl.wrap_mode = :word_char
+      name_lbl.lines     = 2
+      name_lbl.ellipsize = :end
+      name_lbl.halign = :start
+      name_lbl.valign = :start
+      name_lbl.xalign = 0.0
+      row.pack_start(name_lbl, expand: false, fill: false, padding: 0)
+
+      count_spacer = sq_spacer(SQ_COUNT_W)
+      count_spacer.valign = :start
+      row.pack_start(count_spacer, expand: false, fill: false, padding: 0)
+
+      combo = Gtk::ComboBoxText.new
+      combo.valign = :start
+      # Swallow scroll events so mousing over the row while scrolling the list
+      # doesn't silently change which container is selected.
+      combo.signal_connect('scroll-event') { true }
+      combo.append('', 'Choose shop container...')
+      full_by_id = {}
+      options.each { |id, label, full| combo.append(id, label); full_by_id[id] = full }
+      current_key = (q['shop_room'] && q['shop_container']) ? "#{q['shop_room']}|#{q['shop_container']}" : ''
+      if !current_key.empty? && options.any? { |id, _, _| id == current_key }
+        combo.active_id = current_key
+      else
+        combo.active = 0
+      end
+      combo.signal_connect('changed') do
+        val = combo.active_id.to_s
+        if full_by_id[val]
+          Lich::Messaging.msg("yellow", "[Merchantical] That container is full -- pick another.")
+          combo.active = 0
+          next
+        end
+        if val.empty?
+          q['shop_room']      = nil
+          q['shop_container'] = nil
+        else
+          room_id, cname = val.split('|', 2)
+          q['shop_room']      = room_id
+          q['shop_container'] = cname
+        end
+        persist_shop_state
+        update_list_sale_sensitivity
+        refresh_ready_style.call
+      end
+      row.pack_start(combo, expand: false, fill: false, padding: 0)
+
+      price_entry = Gtk::Entry.new
+      price_entry.valign = :start
+      price_entry.width_request = 90
+      price_entry.set_placeholder_text("price")
+      price_entry.text = q['price'].to_s if q['price']
+      price_entry.signal_connect('changed') do
+        text = price_entry.text.strip.gsub(',', '')
+        q['price'] = text.empty? ? nil : text.to_i
+        persist_shop_state
+        update_list_sale_sensitivity
+        refresh_ready_style.call
+      end
+      row.pack_start(price_entry, expand: false, fill: false, padding: 0)
+
+      # Blank cell matching build_sell_queue_group's qty field width -- a plain
+      # (non-stacked) row is always qty 1, so there's nothing to type here, but
+      # the remove button still needs to land in the same column either way.
+      qty_spacer = sq_spacer(SQ_QTY_W)
+      qty_spacer.valign = :start
+      row.pack_start(qty_spacer, expand: false, fill: false, padding: 0)
+
+      remove_lbl = Gtk::Label.new
+      remove_lbl.markup = "<span foreground='#cc5555'>\u{2715}</span>"
+      remove_btn = Gtk::Button.new
+      remove_btn.valign = :start
+      remove_btn.add(remove_lbl)
+      remove_btn.relief = :none
+      remove_btn.set_tooltip_text("Remove from sell queue")
+      remove_btn.signal_connect('clicked') do
+        @shop_state['sell_queue'].reject! { |i| i['id'] == q['id'] }
+        persist_shop_state
+        rebuild_sell_queue_view
+        update_list_sale_sensitivity
+      end
+      row.pack_start(remove_btn, expand: false, fill: false, padding: 0)
+
+      row
+    end
+
+    # A fixed-width, unclickable blank cell -- used to keep a plain row's leading
+    # columns the same width as build_sell_queue_group's real arrow/count cells.
+    def sq_spacer(width)
+      lbl = Gtk::Label.new("")
+      lbl.width_request = width
+      lbl
+    end
+
+    # A duplicate-name group: a header row carrying its own container picker/
+    # price/remove-all -- editing those applies to every item in the group at
+    # once ("set all to..."). Deliberately a plain Box with our own toggle
+    # button rather than a Gtk::Expander: Expander reserves its own arrow
+    # width ahead of its label_widget, which shifted every grouped row's
+    # dropdown/price columns out of alignment with plain rows above/below it.
+    # Clicking the arrow reveals each copy on its own row (from
+    # build_sell_queue_row) for individual overrides. Collapsed by default;
+    # @sq_group_expanded remembers open/closed per name across rebuilds.
+    def build_sell_queue_group(name, items, options)
+      @sq_group_expanded ||= {}
+      outer = Gtk::Box.new(:vertical, 0)
+      outer.halign = :start
+
+      header = Gtk::Box.new(:horizontal, 6)
+      # A Box's cross-axis alignment defaults to :fill, so without this, header
+      # stretches to the full width of the (vertical) outer box regardless of
+      # its own content -- harmless for an unstyled box, but the mc-sq-ready
+      # background below was painting clear across that whole extra width.
+      header.halign = :start
+      header.margin_top = 2; header.margin_bottom = 2
+      header.style_context.add_class('mc-sq-ready') if items.all? { |q| sell_queue_item_ready?(q) }
+
+      arrow_lbl = Gtk::Label.new
+      arrow_lbl.width_request = SQ_LEAD_W
+      arrow_lbl.halign = :start
+      arrow_lbl.valign = :start
+      arrow_lbl.xalign = 0.0
+      # EventBox rather than Button: a Button's own theme padding would nudge
+      # its footprint wider than the plain spacer label used in
+      # build_sell_queue_row, drifting the columns again. EventBox adds none.
+      toggle_evbox = Gtk::EventBox.new
+      toggle_evbox.valign = :start
+      toggle_evbox.visible_window = false
+      toggle_evbox.add(arrow_lbl)
+      toggle_evbox.set_tooltip_text("Expand to edit each copy individually")
+      header.pack_start(toggle_evbox, expand: false, fill: false, padding: 0)
+
+      # Count lives in its own fixed-width label, separate from the name, so a
+      # long name (or a large count like "(x25)") can't stretch this row wider
+      # than a single-item row and throw the dropdown/price columns out of
+      # alignment -- the name wraps/ellipsizes instead, and the count is always
+      # visible. Full item names can run long -- wrap up to two lines at a
+      # smaller size rather than stretching or truncating to one line, matching
+      # build_sell_queue_row.
+      name_lbl = Gtk::Label.new
+      name_lbl.markup = "<span size='small'><b>#{pe(name)}</b></span>"
+      name_lbl.width_request = SQ_NAME_W
+      # ellipsize alone doesn't cap the label's natural width in a non-expanding
+      # Box child -- GTK only truncates once the allocation is already smaller
+      # than the natural (full-text) size. max_width_chars forces that natural
+      # size down so long names actually truncate instead of stretching the row.
+      name_lbl.max_width_chars = 46
+      name_lbl.wrap      = true
+      name_lbl.wrap_mode = :word_char
+      name_lbl.lines     = 2
+      name_lbl.ellipsize = :end
+      name_lbl.halign = :start
+      name_lbl.valign = :start
+      name_lbl.xalign = 0.0
+      header.pack_start(name_lbl, expand: false, fill: false, padding: 0)
+
+      count_lbl = Gtk::Label.new
+      count_lbl.markup = "<span foreground='#a0c8ff'>(x#{items.length})</span>"
+      count_lbl.width_request = SQ_COUNT_W
+      count_lbl.halign = :start
+      count_lbl.valign = :start
+      count_lbl.xalign = 0.0
+      header.pack_start(count_lbl, expand: false, fill: false, padding: 0)
+
+      combo = Gtk::ComboBoxText.new
+      combo.valign = :start
+      combo.signal_connect('scroll-event') { true }
+      combo.append('', 'Set all to...')
+      full_by_id = {}
+      options.each { |id, label, full| combo.append(id, label); full_by_id[id] = full }
+      keys = items.map { |q| (q['shop_room'] && q['shop_container']) ? "#{q['shop_room']}|#{q['shop_container']}" : '' }.uniq
+      if keys.length == 1 && !keys.first.empty? && options.any? { |id, _, _| id == keys.first }
+        combo.active_id = keys.first
+      else
+        combo.active = 0
+      end
+      header.pack_start(combo, expand: false, fill: false, padding: 0)
+
+      price_entry = Gtk::Entry.new
+      price_entry.valign = :start
+      price_entry.width_request = 90
+      prices = items.map { |q| q['price'] }.uniq
+      if prices.length == 1 && prices.first
+        price_entry.text = prices.first.to_s
+        price_entry.set_placeholder_text("price")
+      else
+        price_entry.set_placeholder_text("price (mixed)")
+      end
+      header.pack_start(price_entry, expand: false, fill: false, padding: 0)
+
+      # Sell only some of the stack: the first `qty` items (order doesn't matter,
+      # they're identical) get the container/price above; the rest are left
+      # unassigned so they stay in the queue, untouched, for a later batch.
+      # Plain Entry, no +/- steppers -- those were a SpinButton's default
+      # chrome and didn't actually work (their clicks fired 'value-changed',
+      # which rebuilt the whole tab and tore out the very widget mid-click).
+      qty_entry = Gtk::Entry.new
+      qty_entry.valign = :start
+      qty_entry.width_chars   = 4
+      qty_entry.width_request = SQ_QTY_W
+      qty_entry.set_tooltip_text(
+        "Sell how many of these #{items.length}? Leave blank to sell all of them.\n" \
+        "The remainder stays in the queue, unassigned, for a later batch."
+      )
+      qty_entry.set_placeholder_text(items.length.to_s)
+      ready_count = items.count { |q| sell_queue_item_ready?(q) }
+      qty_entry.text = (ready_count > 0 && ready_count < items.length) ? ready_count.to_s : ''
+      header.pack_start(qty_entry, expand: false, fill: false, padding: 0)
+
+      content = Gtk::Box.new(:vertical, 2)
+      content.margin_start = 20
+      # no_show_all keeps a later show_all() on an ancestor (every top-level
+      # rebuild does this) from forcing a collapsed group back open.
+      content.no_show_all = true
+
+      # Rebuilds just the nested per-copy rows from current item state. Cheap
+      # on its own (one stack's rows, not the whole tab), and only actually
+      # called when those rows are visible or about to become visible --
+      # editing the header while collapsed skips this entirely.
+      refresh_content = lambda do
+        content.children.each { |w| content.remove(w) }
+        items.each { |q| content.pack_start(build_sell_queue_row(q, options), expand: false, fill: false, padding: 0) }
+        content.show_all
+      end
+
+      # Applied on commit (Enter/blur), not per keystroke. Shared by the
+      # container dropdown, price, and qty fields so all three always agree on
+      # which items in the stack are actually "selected".
+      apply_group_selection = lambda do
+        val = combo.active_id.to_s
+        if full_by_id[val]
+          Lich::Messaging.msg("yellow", "[Merchantical] That container is full -- pick another.")
+          combo.active = 0
+          next
+        end
+        room_id, cname = val.empty? ? [nil, nil] : val.split('|', 2)
+
+        price_text = price_entry.text.strip.gsub(',', '')
+        price = price_text.empty? ? nil : price_text.to_i
+
+        qty_text = qty_entry.text.strip
+        qty = qty_text.empty? ? items.length : qty_text.to_i
+        qty = items.length if qty <= 0 || qty > items.length
+
+        items.each_with_index do |q, idx|
+          if idx < qty
+            q['shop_room']      = room_id
+            q['shop_container'] = cname
+            q['price']           = price
+          else
+            q['shop_room']      = nil
+            q['shop_container'] = nil
+            q['price']           = nil
+          end
+        end
+        persist_shop_state
+        update_list_sale_sensitivity
+
+        # The header's own combo/price/qty widgets are left exactly as typed --
+        # they are NOT re-read from the (now partially-cleared) item state, so
+        # they never appear to "go blank/mixed" out from under you. Only the
+        # ready-highlight and, if the nested per-copy rows are actually being
+        # shown right now, that nested list get refreshed; a collapsed group
+        # (the common case) touches nothing else at all.
+        if items.first(qty).all? { |q| sell_queue_item_ready?(q) }
+          header.style_context.add_class('mc-sq-ready')
+        else
+          header.style_context.remove_class('mc-sq-ready')
+        end
+        refresh_content.call if content.visible?
+      end
+      combo.signal_connect('changed') { apply_group_selection.call }
+      price_entry.signal_connect('activate') { apply_group_selection.call }
+      price_entry.signal_connect('focus-out-event') { apply_group_selection.call; false }
+      qty_entry.signal_connect('activate') { apply_group_selection.call }
+      qty_entry.signal_connect('focus-out-event') { apply_group_selection.call; false }
+
+      remove_lbl = Gtk::Label.new
+      remove_lbl.markup = "<span foreground='#cc5555'>\u{2715}</span>"
+      remove_btn = Gtk::Button.new
+      remove_btn.valign = :start
+      remove_btn.add(remove_lbl)
+      remove_btn.relief = :none
+      remove_btn.set_tooltip_text("Remove all #{items.length} from sell queue")
+      remove_btn.signal_connect('clicked') do
+        ids = items.map { |q| q['id'] }
+        @shop_state['sell_queue'].reject! { |i| ids.include?(i['id']) }
+        persist_shop_state
+        rebuild_sell_queue_view
+        update_list_sale_sensitivity
+      end
+      header.pack_start(remove_btn, expand: false, fill: false, padding: 0)
+
+      set_expanded = lambda do |on|
+        @sq_group_expanded[name] = on
+        arrow_lbl.markup = "<span foreground='#888'>#{on ? "\u{25BE}" : "\u{25B8}"}</span>"
+        if on
+          # Refresh on open so rows edited while collapsed (header-only, no
+          # content rebuild) are shown accurately rather than stale.
+          refresh_content.call
+        else
+          content.hide
+        end
+      end
+      set_expanded.call(@sq_group_expanded.fetch(name, false))
+      toggle_evbox.signal_connect('button-press-event') { set_expanded.call(!@sq_group_expanded[name]); true }
+
+      outer.pack_start(header, expand: false, fill: false, padding: 0)
+      outer.pack_start(content, expand: false, fill: false, padding: 0)
+      outer
+    end
+
     def current_scheme
       Merchantical::COLOR_SCHEMES[@options['color_scheme'] || 'dark'] ||
         Merchantical::COLOR_SCHEMES['dark']
@@ -632,14 +1973,29 @@ module Merchantical
       repopulate_type_combo
       vbox.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 0)
 
-      scroll = Gtk::ScrolledWindow.new
-      scroll.hscrollbar_policy = :never
-      scroll.vscrollbar_policy = :automatic
-      vbox.pack_start(scroll, expand: true, fill: true, padding: 0)
+      # Normal (Loresang-recalled items) view.
+      @normal_scroll = Gtk::ScrolledWindow.new
+      @normal_scroll.hscrollbar_policy = :never
+      @normal_scroll.vscrollbar_policy = :automatic
+      vbox.pack_start(@normal_scroll, expand: true, fill: true, padding: 0)
 
       @main_box = Gtk::Box.new(:vertical, 0)
-      scroll.add(@main_box)
+      @normal_scroll.add(@main_box)
       build_item_list
+
+      # Shop Inventory Management view -- a sibling of @normal_scroll, not a
+      # replacement for it, so toggling just flips visibility and nothing about
+      # the recalled item list (scroll position, built rows) is ever torn down.
+      @shop_notebook = build_shop_notebook
+      vbox.pack_start(@shop_notebook, expand: true, fill: true, padding: 0)
+      # show_all first so every descendant's own visible flag gets set at least
+      # once; only THEN hide the notebook itself. Setting no_show_all/visible=false
+      # before any show_all would leave children permanently invisible even after
+      # the notebook is toggled back on, since Gtk::Container#show_all is what
+      # actually flips a freshly-built widget's visible flag on in the first place.
+      @shop_notebook.show_all
+      @shop_notebook.no_show_all = true
+      @shop_notebook.visible = false
     end
 
     def build_toolbar
@@ -783,14 +2139,27 @@ module Merchantical
       end
       arow.pack_start(validate_btn, expand: false, fill: false, padding: 4)
 
-      # Gear (settings) button
-      gear_lbl = Gtk::Label.new
-      gear_lbl.markup = "<span size='large'>#{GEAR_ICON}</span>"
-      gear_btn = Gtk::Button.new
-      gear_btn.add(gear_lbl)
-      gear_btn.set_tooltip_text("Settings and help")
-      gear_btn.signal_connect('clicked') { show_gear }
-      arow.pack_start(gear_btn, expand: false, fill: false, padding: 2)
+      # Shop Inventory Management toggle  -  swaps the filter row and the main
+      # content area between the recalled item list and the shop-management view.
+      # Neither is destroyed on toggle; both stay built, only visibility flips.
+      shop_toggle_lbl = Gtk::Label.new
+      shop_toggle_lbl.markup = shop_toggle_markup
+      shop_toggle_btn = Gtk::Button.new
+      shop_toggle_btn.add(shop_toggle_lbl)
+      shop_toggle_btn.set_tooltip_text(
+        "Switch between your recalled item list and Shop Inventory Management\n" \
+        "(scan a player shop's listings, then list your own items for sale there)."
+      )
+      shop_toggle_btn.signal_connect('clicked') do
+        @shop_mode = !@shop_mode
+        shop_toggle_lbl.markup = shop_toggle_markup
+        @normal_frow.visible   = !@shop_mode
+        @shop_frow.visible     = @shop_mode
+        @normal_scroll.visible = !@shop_mode
+        @shop_notebook.visible = @shop_mode
+        update_list_sale_sensitivity
+      end
+      arow.pack_start(shop_toggle_btn, expand: false, fill: false, padding: 2)
 
       # Copy Shop Data button
       copy_lbl = Gtk::Label.new
@@ -805,11 +2174,20 @@ module Merchantical
       copy_btn.signal_connect('clicked') { copy_shop_data }
       arow.pack_start(copy_btn, expand: false, fill: false, padding: 2)
 
-      # ---- Filter row ----
-      frow = Gtk::Box.new(:horizontal, 4)
-      right_vbox.pack_start(frow, expand: false, fill: false, padding: 0)
+      # Gear (settings) button  -  far right of the action row
+      gear_lbl = Gtk::Label.new
+      gear_lbl.markup = "<span size='large'>#{GEAR_ICON}</span>"
+      gear_btn = Gtk::Button.new
+      gear_btn.add(gear_lbl)
+      gear_btn.set_tooltip_text("Settings and help")
+      gear_btn.signal_connect('clicked') { show_gear }
+      arow.pack_start(gear_btn, expand: false, fill: false, padding: 2)
 
-      frow.pack_start(Gtk::Label.new(" Ench:"), expand: false, fill: false, padding: 0)
+      # ---- Filter row ----
+      @normal_frow = Gtk::Box.new(:horizontal, 4)
+      right_vbox.pack_start(@normal_frow, expand: false, fill: false, padding: 0)
+
+      @normal_frow.pack_start(Gtk::Label.new(" Ench:"), expand: false, fill: false, padding: 0)
       ench_combo = Gtk::ComboBoxText.new
       ench_combo.append('', 'Any')
       ENCHANT_RANGES.each { |id, lbl| ench_combo.append(id, lbl) }
@@ -821,9 +2199,9 @@ module Merchantical
         dbg("Filter Enchantment: #{id.empty? ? 'Any' : id}")
         schedule_rebuild
       end
-      frow.pack_start(ench_combo, expand: false, fill: false, padding: 0)
+      @normal_frow.pack_start(ench_combo, expand: false, fill: false, padding: 0)
 
-      frow.pack_start(Gtk::Label.new(" Wt:"), expand: false, fill: false, padding: 0)
+      @normal_frow.pack_start(Gtk::Label.new(" Wt:"), expand: false, fill: false, padding: 0)
       wt_combo = Gtk::ComboBoxText.new
       wt_combo.append('', 'Any')
       WEIGHT_OPTIONS.each { |id, lbl| wt_combo.append(id, lbl) }
@@ -835,9 +2213,9 @@ module Merchantical
         dbg("Filter Weight: #{id.empty? ? 'Any' : id}")
         schedule_rebuild
       end
-      frow.pack_start(wt_combo, expand: false, fill: false, padding: 0)
+      @normal_frow.pack_start(wt_combo, expand: false, fill: false, padding: 0)
 
-      frow.pack_start(Gtk::Label.new(" Chrg:"), expand: false, fill: false, padding: 0)
+      @normal_frow.pack_start(Gtk::Label.new(" Chrg:"), expand: false, fill: false, padding: 0)
       chrg_combo = Gtk::ComboBoxText.new
       chrg_combo.append('', 'Any')
       CHARGES_OPTIONS.each { |id, lbl| chrg_combo.append(id, lbl) }
@@ -849,9 +2227,9 @@ module Merchantical
         dbg("Filter Charges: #{id.empty? ? 'Any' : id}")
         schedule_rebuild
       end
-      frow.pack_start(chrg_combo, expand: false, fill: false, padding: 0)
+      @normal_frow.pack_start(chrg_combo, expand: false, fill: false, padding: 0)
 
-      frow.pack_start(Gtk::Label.new(" Type:"), expand: false, fill: false, padding: 0)
+      @normal_frow.pack_start(Gtk::Label.new(" Type:"), expand: false, fill: false, padding: 0)
       @type_combo = Gtk::ComboBoxText.new
       @type_combo.append('', 'Any')
       @type_combo.active = 0
@@ -863,10 +2241,10 @@ module Merchantical
         dbg("Filter Type: #{id.empty? ? 'Any' : id}")
         schedule_rebuild
       end
-      frow.pack_start(@type_combo, expand: false, fill: false, padding: 0)
+      @normal_frow.pack_start(@type_combo, expand: false, fill: false, padding: 0)
 
       # Value filter with clickable >= / <= toggle
-      frow.pack_start(Gtk::Label.new(" Val"), expand: false, fill: false, padding: 0)
+      @normal_frow.pack_start(Gtk::Label.new(" Val"), expand: false, fill: false, padding: 0)
       val_dir_btn = Gtk::Button.new(label: ">=")
       val_dir_btn.relief = :none
       val_dir_btn.width_request = 32
@@ -882,7 +2260,7 @@ module Merchantical
         dbg("Filter Value direction: #{@filter[:value_dir]}")
         schedule_rebuild
       end
-      frow.pack_start(val_dir_btn, expand: false, fill: false, padding: 0)
+      @normal_frow.pack_start(val_dir_btn, expand: false, fill: false, padding: 0)
       val_entry = Gtk::Entry.new
       val_entry.width_request = 55
       val_entry.set_placeholder_text("silvers")
@@ -893,7 +2271,7 @@ module Merchantical
         dbg("Filter Value: #{text.empty? ? 'cleared' : "#{text} silvers"}")
         schedule_rebuild
       end
-      frow.pack_start(val_entry, expand: false, fill: false, padding: 0)
+      @normal_frow.pack_start(val_entry, expand: false, fill: false, padding: 0)
 
       [
         [:persistent,   "Spl Pers",  "Show only persistent items"],
@@ -911,8 +2289,125 @@ module Merchantical
           dbg("Filter #{label}: #{cb.active?}")
           schedule_rebuild
         end
-        frow.pack_start(cb, expand: false, fill: false, padding: 2)
+        @normal_frow.pack_start(cb, expand: false, fill: false, padding: 2)
       end
+
+      # ---- Shop Inventory Management row (replaces the filter row in shop mode) ----
+      @shop_frow = Gtk::Box.new(:horizontal, 4)
+      right_vbox.pack_start(@shop_frow, expand: false, fill: false, padding: 0)
+
+      # Player shops aren't in Lich's map data (go2 can't route to/from them), so we
+      # only need a real, go2-able room near the shop plus the noun used to enter
+      # it; everything past that door is walked with plain compass directions.
+      # These are "set it and forget it" once a scan has succeeded, so they live
+      # inside a collapsible expander rather than taking up permanent row space --
+      # expanded by default until the first successful scan, then tucked away
+      # (still there, still editable, just out of the way).
+      @shop_setup_expander = Gtk::Expander.new(" Shop location & entry")
+      @shop_setup_expander.expanded = (@shop_state['shop_inventory'] || {}).empty?
+      setup_box = Gtk::Box.new(:horizontal, 4)
+      setup_box.margin_start = 8
+      @shop_setup_expander.add(setup_box)
+      @shop_frow.pack_start(@shop_setup_expander, expand: false, fill: false, padding: 4)
+
+      setup_box.pack_start(Gtk::Label.new(" Shop location:"), expand: false, fill: false, padding: 0)
+      @shop_location_entry = Gtk::Entry.new
+      @shop_location_entry.width_request = 90
+      @shop_location_entry.set_placeholder_text("u739403 or 3871")
+      @shop_location_entry.text = @shop_state['shop_location'].to_s
+      @shop_location_entry.set_tooltip_text(
+        "A real, mapped room near the shop's entrance, as used by ;go2 (the (uNNNNNN)\n" \
+        "id, or the plain room number). Player shop interiors are NOT go2-able."
+      )
+      @shop_location_entry.signal_connect('changed') do
+        @shop_state['shop_location'] = @shop_location_entry.text.strip
+        persist_shop_state
+      end
+      setup_box.pack_start(@shop_location_entry, expand: false, fill: false, padding: 0)
+
+      setup_box.pack_start(Gtk::Label.new(" Enter tested shop entry input:"), expand: false, fill: false, padding: 0)
+      @shop_name_entry = Gtk::Entry.new
+      @shop_name_entry.width_request = 130
+      @shop_name_entry.set_placeholder_text("outpost")
+      @shop_name_entry.text = @shop_state['shop_name'].to_s
+      @shop_name_entry.set_tooltip_text(
+        "Sent as 'go <this text>'. GO tends to want just the bare noun (e.g. \"outpost\"),\n" \
+        "not the full descriptive name (e.g. \"faded beach outpost\") -- results vary by\n" \
+        "shop. Stand at the location above, manually try 'go <word>' until one works,\n" \
+        "then enter that exact tested text here."
+      )
+      @shop_name_entry.signal_connect('changed') do
+        @shop_state['shop_name'] = @shop_name_entry.text.strip
+        persist_shop_state
+      end
+      setup_box.pack_start(@shop_name_entry, expand: false, fill: false, padding: 0)
+
+      scan_shop_lbl = Gtk::Label.new
+      scan_shop_lbl.markup = "<span foreground='#80c8ff' weight='bold'>Scan Shop</span>"
+      scan_shop_btn = Gtk::Button.new
+      scan_shop_btn.add(scan_shop_lbl)
+      scan_shop_btn.set_tooltip_text(
+        "Go2 to the location, enter the shop, and explore its interior (up to 3 rooms,\n" \
+        "plain compass navigation) running 'shop inventory' in each -- building a\n" \
+        "collapsible Room -> Container -> Item tree in the Shop Inventory tab."
+      )
+      scan_shop_btn.signal_connect('clicked') do
+        location  = @shop_location_entry.text.strip
+        shop_name = @shop_name_entry.text.strip
+        if location.empty? || shop_name.empty?
+          dbg("Scan Shop: location and/or shop name not entered")
+        else
+          scan_shop_btn.sensitive = false
+          @cmd_queue.push({ scan_shop: { location: location, shop_name: shop_name } })
+          GLib::Timeout.add(3000) { scan_shop_btn.sensitive = true; false }
+        end
+      end
+      @shop_frow.pack_start(scan_shop_btn, expand: false, fill: false, padding: 4)
+
+      @shop_frow.pack_start(Gtk::Label.new(" Scan Inventory Container(s) for wares to sell:"), expand: false, fill: false, padding: 0)
+      @shop_containers_entry = Gtk::Entry.new
+      @shop_containers_entry.width_request = 180
+      @shop_containers_entry.set_placeholder_text("lootsack, backpack")
+      @shop_containers_entry.text = @shop_state['containers_text'].to_s
+      @shop_containers_entry.set_tooltip_text(
+        "One or more containers (comma-separated) -- worn or held in either hand.\n" \
+        "Scanned items are added to the Items to Sell tab; existing price/container\n" \
+        "picks are kept."
+      )
+      @shop_containers_entry.signal_connect('changed') do
+        @shop_state['containers_text'] = @shop_containers_entry.text.strip
+        persist_shop_state
+      end
+      @shop_frow.pack_start(@shop_containers_entry, expand: false, fill: false, padding: 0)
+
+      scan_cont_lbl = Gtk::Label.new
+      scan_cont_lbl.markup = "<span foreground='#80c8ff' weight='bold'>Scan Container</span>"
+      scan_cont_btn = Gtk::Button.new
+      scan_cont_btn.add(scan_cont_lbl)
+      scan_cont_btn.set_tooltip_text(
+        "Look in the container(s) above (worn or held) and add their contents to\n" \
+        "the Items to Sell tab, ready for you to pick a shop container and price."
+      )
+      scan_cont_btn.signal_connect('clicked') do
+        containers = @shop_containers_entry.text.strip
+        if containers.empty?
+          dbg("Scan Container: no containers entered")
+        else
+          scan_cont_btn.sensitive = false
+          @cmd_queue.push({ scan_containers: { containers_text: containers } })
+          @shop_notebook.page = 1 if @shop_notebook  # Items to Sell tab
+          GLib::Timeout.add(3000) { scan_cont_btn.sensitive = true; false }
+        end
+      end
+      @shop_frow.pack_start(scan_cont_btn, expand: false, fill: false, padding: 4)
+
+      # Same show-then-hide reasoning as @shop_notebook in build_ui: a freshly
+      # built widget's descendants need one show_all pass to pick up a visible
+      # flag at all, before we hide the container itself for the initial
+      # (non-shop-mode) state.
+      @shop_frow.show_all
+      @shop_frow.no_show_all = true
+      @shop_frow.visible = false
 
       outer
     end
@@ -2845,6 +4340,79 @@ module Merchantical
 
       dialog_win.show_all
     end
+
+    # Edit a single room's shop sign. Real newlines in the box are converted to
+    # the ']]' separator GS4's SHOP SIGN command expects on save; displayed text
+    # converts the other way ('read sign' output is stored/shown with ']]' turned
+    # back into real newlines for editing).
+    def open_shop_sign_dialog(room_id, current_text)
+      dialog_win = Gtk::Window.new
+      dialog_win.title = "Shop Sign - Room #{room_id}"
+      dialog_win.name  = 'merchantical_win'
+      dialog_win.set_default_size(420, 260)
+      dialog_win.set_window_position(:center)
+      dialog_win.keep_above = true
+
+      outer_vbox = Gtk::Box.new(:vertical, 6)
+      outer_vbox.border_width = 8
+      dialog_win.add(outer_vbox)
+
+      hint_lbl = Gtk::Label.new
+      hint_lbl.markup =
+        "<i>Enter for a new line. Clear Sign removes it entirely (SHOP SIGN CLEAR).</i>"
+      hint_lbl.wrap = true
+      hint_lbl.set_halign(:start)
+      outer_vbox.pack_start(hint_lbl, expand: false, fill: false, padding: 2)
+
+      buffer = Gtk::TextBuffer.new
+      buffer.text = current_text.to_s.gsub(']]', "\n")
+      text_view = Gtk::TextView.new(buffer)
+      text_view.wrap_mode = :word
+
+      frame = Gtk::Frame.new
+      frame.shadow_type = :in
+      frame.add(text_view)
+      scroll = Gtk::ScrolledWindow.new
+      scroll.add(frame)
+      outer_vbox.pack_start(scroll, expand: true, fill: true, padding: 2)
+
+      status_lbl = Gtk::Label.new("")
+      status_lbl.set_halign(:start)
+      outer_vbox.pack_start(status_lbl, expand: false, fill: false, padding: 2)
+
+      btn_row = Gtk::Box.new(:horizontal, 8)
+
+      clear_btn = Gtk::Button.new(label: "Clear Sign")
+      clear_btn.set_tooltip_text("Sends 'shop sign CLEAR' -- removes the sign entirely.")
+      clear_btn.signal_connect('clicked') do
+        @cmd_queue.push({ set_shop_sign: { room_id: room_id, message: '', clear: true } })
+        status_lbl.markup = "<span foreground='#aaa'>Clearing sign...</span>"
+        GLib::Timeout.add(1200) { dialog_win.destroy; false }
+      end
+
+      cancel_btn = Gtk::Button.new(label: "Cancel")
+      cancel_btn.signal_connect('clicked') { dialog_win.destroy }
+
+      save_btn = Gtk::Button.new(label: "Save")
+      save_btn.signal_connect('clicked') do
+        message = buffer.text.strip.gsub("\n", ']]')
+        if message.empty?
+          status_lbl.markup = "<span foreground='orange'>Empty message -- use Clear Sign instead.</span>"
+          next
+        end
+        @cmd_queue.push({ set_shop_sign: { room_id: room_id, message: message, clear: false } })
+        status_lbl.markup = "<span foreground='#aaa'>Updating sign...</span>"
+        GLib::Timeout.add(1200) { dialog_win.destroy; false }
+      end
+
+      btn_row.pack_start(clear_btn,  expand: false, fill: false, padding: 0)
+      btn_row.pack_start(Gtk::Label.new(""), expand: true, fill: true, padding: 0)
+      btn_row.pack_start(cancel_btn, expand: false, fill: false, padding: 0)
+      btn_row.pack_start(save_btn,   expand: false, fill: false, padding: 0)
+      outer_vbox.pack_start(btn_row, expand: false, fill: false, padding: 4)
+
+      dialog_win.show_all
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -2880,6 +4448,28 @@ module Merchantical
       worthless|wouldn.t\s+give|find\s+a\s+buyer|no\s+thank|
       can.t\s+(accept|use|buy)|don.t\s+want|shakes.*head
     /xi
+
+    # capture_command's end-of-response marker (see below): "look at #0" always
+    # fails instantly, no roundtime, since object id 0 is never a real item --
+    # its failure text is unambiguous and can't appear as legitimate shop/room
+    # content, unlike a bare <prompt/> tag which GS4/Lich can emit for reasons
+    # unrelated to the command in flight.
+    CAPTURE_SENTINEL_CMD = "look at #0"
+    # Confirmed against an actual log: GS4's response is "I could not find
+    # what you were referring to." -- "you were referring", not "were you
+    # referring" (the question-form wording this regex originally guessed at,
+    # copied from a different context, never actually matches this response).
+    CAPTURE_SENTINEL_RX  = /could not find what you were referring to|don.t see|do not see|nothing (?:happens|there)/i
+
+    # LNet/chat channel lines ("[Merchant] Name: "...""), and ambient server
+    # broadcasts ("* Someone's flame just burnt out..."), that can land in the
+    # middle of a capture_command window purely by bad timing -- these have
+    # nothing to do with whatever command is in flight and get filtered out of
+    # any capture regardless of when they arrive, since arrival timing alone
+    # can't be used to keep them out (LNet is async, independent of our own
+    # command's response timing).
+    LNET_LINE_RX      = /\A\[[A-Za-z][\w' -]*\]\s+[A-Za-z][\w' -]*:\s*"/
+    BROADCAST_LINE_RX = /\A\*\s*[A-Za-z].*[.!]\s*\z/
 
     # The gemshop buys gems, jewelry, magic items, etc. for noticeably more than the
     # pawnshop, but has no use for gear it can't resell as-is -- these types skip the
@@ -3021,7 +4611,16 @@ module Merchantical
 
       Thread.new do
         Gtk.queue do
-          @window = MainWindow.new(@items, @cmd_queue, -> { @running = false }, @state)
+          shop_state = ShopState.load
+          # Container assignments are re-derived per session (rooms/containers can
+          # shift between visits) -- price and the rest of the queue still persist,
+          # but every item starts back at "Choose shop container..." on reopen.
+          (shop_state['sell_queue'] || []).each do |q|
+            q['shop_room']      = nil
+            q['shop_container'] = nil
+          end
+          ShopState.save(shop_state)
+          @window = MainWindow.new(@items, @cmd_queue, -> { @running = false }, @state, shop_state)
           @window.show_all
         end
       end
@@ -3043,6 +4642,11 @@ module Merchantical
           elsif task[:msg]              then Lich::Messaging.msg(task[:msg][:color], task[:msg][:text])
           elsif task[:loresang_check_item]         then do_loresang_check_item(task[:loresang_check_item])
           elsif task[:loresang_append_single_item] then do_loresang_append_single_item(task[:loresang_append_single_item])
+          elsif task[:scan_shop]              then do_scan_shop(task[:scan_shop])
+          elsif task[:scan_containers]        then do_scan_containers(task[:scan_containers])
+          elsif task[:list_items_for_sale]    then do_list_items_for_sale
+          elsif task[:set_shop_sign]          then do_set_shop_sign(task[:set_shop_sign])
+          elsif task[:commit_shop_removal]    then do_commit_shop_removal(task[:commit_shop_removal])
           end
         else
           pause 0.1
@@ -5212,6 +6816,685 @@ module Merchantical
     rescue => e
       callback&.call(false)
       Lich::Messaging.msg("yellow", "[Merchantical] Append item error: #{e.message}")
+    end
+
+    # ---------------------------------------------------------------------------
+    # Shop Inventory Management  -  scan a player shop's SHOP INVENTORY output,
+    # scan your own containers (worn or held) for items to sell, and list them there.
+    # ---------------------------------------------------------------------------
+
+    # Travel to a room by go2-compatible id/name and wait for arrival.
+    def go2_to(room)
+      start_script("go2", [room.to_s])
+      while running?("go2"); pause 0.5; end
+      waitrt?
+    end
+
+    OPPOSITE_DIRECTION = {
+      'north' => 'south', 'south' => 'north', 'east' => 'west', 'west' => 'east',
+      'northeast' => 'southwest', 'southwest' => 'northeast',
+      'northwest' => 'southeast', 'southeast' => 'northwest',
+      'up' => 'down', 'down' => 'up', 'in' => 'out', 'out' => 'in'
+    }.freeze
+
+    def opposite_direction(dir)
+      OPPOSITE_DIRECTION[dir.to_s.downcase] || dir.to_s
+    end
+
+    # Player shops are not in Lich's map data -- go2 can't route to or from their
+    # interior rooms at all (confirmed: the room's own title carries no room
+    # number when this is the case). So we go2 to a real, mapped room near the
+    # shop, then take the one manual step across the threshold ourselves.
+    # Returns true if entry looked successful, false if the "go" response reads
+    # like a failure (wrong noun, not close enough, etc.) -- callers should abort
+    # rather than run "shop inventory" from outside the shop.
+    def enter_player_shop(location, shop_name)
+      go2_to(location)
+      pause 0.3
+      go_resp = fput "go #{shop_name}"
+      waitrt?; pause 0.3
+      !(go_resp.to_s =~ /don.t see|can.t go|nothing happens|what were you referring|you can.t/i)
+    end
+
+    def leave_player_shop
+      fput "out"
+      waitrt?; pause 0.3
+    end
+
+    # Explore up to `max_rooms` interconnected rooms via plain compass navigation
+    # (no map data involved), running `shop inventory` in each and recording the
+    # direction-path from the entry room so do_list_items_for_sale can walk back
+    # to any specific room later. Simple depth-first crawl with backtracking --
+    # assumes each exit leads somewhere new (fine for a small player shop) and
+    # deliberately ignores "out" so it doesn't wander back to the street.
+    # Returns [{ room_id => containers }, { room_id => [direction, ...] }].
+    def crawl_shop_rooms(max_rooms: 3)
+      visited_ids = []
+      results     = {}
+      paths       = {}
+      signs       = {}
+      titles      = {}
+
+      crawl = lambda do |path_so_far, came_from_dir|
+        return if visited_ids.length >= max_rooms
+        room_id = ((Map.current_room_id rescue nil) || XMLData.room_id).to_s
+        return if visited_ids.include?(room_id)
+        visited_ids << room_id
+        paths[room_id] = path_so_far.dup
+
+        # "look" first (not just when continuing on to more rooms) so the
+        # room's own title -- e.g. "[Kyrandos's Outfitting]" -- gets captured
+        # even for the last room visited, where exits are never followed.
+        look_lines  = capture_command("look")
+        title_line  = look_lines.find { |l| l =~ /\A\[(.+)\]\s*\z/ }
+        titles[room_id] = title_line ? title_line[/\A\[(.+)\]\s*\z/, 1] : room_id
+
+        results[room_id] = parse_shop_inventory(capture_command("shop inventory"))
+        signs[room_id]   = parse_sign_text(capture_command("read sign"))
+        return if visited_ids.length >= max_rooms
+
+        exit_line = look_lines.join(' ')
+        m = exit_line.match(/Obvious (?:exits|paths):\s*([^\n]+)/i)
+        return unless m
+        exits = m[1].gsub(/\band\b/i, ',').split(',').map { |e| e.strip.downcase }.reject(&:empty?)
+        exits.delete('out')
+        # Skip the direction that leads straight back to the room we just came
+        # from -- we already know it's visited, no point walking there and back
+        # for nothing. (Doesn't catch every possible cross-link in a non-tree
+        # layout, but the "blacklist the just-visited neighbor" case is the one
+        # that was actually costing extra round trips.)
+        exits.delete(opposite_direction(came_from_dir)) if came_from_dir
+
+        exits.each do |dir|
+          break if visited_ids.length >= max_rooms
+          fput dir; waitrt?; pause 0.3
+          crawl.call(path_so_far + [dir], dir)
+          fput opposite_direction(dir); waitrt?; pause 0.3
+        end
+      end
+
+      crawl.call([], nil)
+      [results, paths, signs, titles]
+    end
+
+    # Send a command and capture every downstream line up to the response
+    # settling, tags stripped. Generic enough for anything that doesn't need
+    # the special mid-stream handling the recall/analyze captures elsewhere in
+    # this file use.
+    #
+    # Used to just watch for the next <prompt/> tag, optionally with a quiet
+    # period afterward -- but a bare prompt isn't proof OUR command's response
+    # actually finished (GS4/Lich can emit one for unrelated reasons, like a
+    # roundtime tick), and a quiet-period fix for that made things worse: any
+    # LNet/chat line landing in the quiet window got scooped into the result
+    # (chat text glued onto a shop sign), and a busy area's chatter kept
+    # resetting the timer, sometimes stretching one call out several times
+    # over. Instead: immediately after `cmd`, fire CAPTURE_SENTINEL_CMD, a
+    # command guaranteed to fail instantly with a fixed, unambiguous line
+    # (looking at object id 0, which never exists). GS4 processes a
+    # character's own commands in order, so seeing that failure text proves
+    # `cmd`'s entire response already arrived before it -- no waiting at all
+    # beyond that. LNet lines are filtered out of the result unconditionally
+    # (by shape, not by timing), since an async broadcast can still land in
+    # the gap before the sentinel fires either way.
+    def capture_command(cmd, timeout: 5)
+      lines = []
+      done  = false
+      debug_on = (@state['options'] || {})['debug']
+      hk = "mc_cmd_#{Thread.current.object_id}_#{rand(1_000_000)}"
+      DownstreamHook.add(hk, proc { |s|
+        next s if done
+        # A <prompt/> tag's own leftover text (the literal "&gt;" left behind
+        # once the tag itself is stripped) isn't content either -- it's no
+        # longer used to decide when we're done, but it still isn't something
+        # we want captured.
+        next s if s =~ /<prompt[\s>]/
+        t = s.to_s.gsub(/<[^>]+>/, '')
+        stripped = t.strip
+        if stripped =~ CAPTURE_SENTINEL_RX
+          done = true
+          # Silence the sentinel's own "you don't see that" line -- it's not
+          # real content, just our end-of-response marker -- unless debug is
+          # on, so it's there to inspect if something looks wrong.
+          next(debug_on ? s : '')
+        end
+        unless stripped.empty? || stripped =~ LNET_LINE_RX || stripped =~ BROADCAST_LINE_RX
+          lines << t
+        end
+        s
+      })
+      fput cmd
+      fput CAPTURE_SENTINEL_CMD
+      deadline = Time.now + timeout
+      until done || Time.now > deadline
+        pause 0.05
+      end
+      DownstreamHook.remove(hk) rescue nil
+      waitrt?
+      lines
+    end
+
+    # GameObj#name (from Lich's own XML-driven parsing) is only the short
+    # canonical name ("a sun-bleached satin waistcoat") -- but the game's own
+    # "look in <container>" text already spells out the full flowery
+    # description ("...with an embossed pattern of knotwork") for every item in
+    # one shot, so there's no need to look at each item individually to get it.
+    # Returns the items in listed order, articles stripped, e.g.
+    # ["sun-bleached satin waistcoat with an embossed pattern of knotwork",
+    #  "small statue", "small statue", ...]. Best-effort against the one
+    # example seen -- assumes each item (including duplicates) gets its own
+    # entry in the sentence rather than a collapsed "3 small statues" count.
+    def parse_container_listing(lines)
+      text = lines.join(' ').strip
+      m = text.match(/you see\s+(.+?)\.\s*\z/mi)
+      return [] unless m
+      body = m[1].sub(/,?\s+and\s+/i, ', ')
+      body.split(/,\s+/).map { |s| s.strip.sub(/\A(?:a |an |the |some )/i, '') }.reject(&:empty?)
+    end
+
+    # Parse `shop inventory` output into an array of container hashes:
+    #   [{ 'header' => 'On a rusted metal display rack...', 'preposition' => 'on',
+    #      'name' => 'rusted metal display rack',
+    #      'items' => [{ 'name' => '...', 'price' => 10000, 'qty' => 1 }, ...] }, ...]
+    # Format (observed): a header line "On/In <container>..." introduces a
+    # container; indented "<item>: <price> (<qty>)" lines belong to the most
+    # recent header. Best-effort against the one example seen -- not confirmed
+    # against every possible shop layout (e.g. an explicitly empty container).
+    def parse_shop_inventory(lines)
+      containers = []
+      current = nil
+      lines.each do |raw|
+        line = raw.to_s.strip
+        next if line.empty?
+        next if line =~ /\AINVENTORY\z/i
+        next if line =~ /\Aitem:\s*price\s*\(quantity\)/i
+
+        if line =~ /\A(On|In)\s+(.+?)\.*\z/i
+          full_name = $2.strip
+          current = {
+            'header'      => line,
+            'preposition' => $1.downcase,
+            'name'        => full_name,
+            # SHOP SELL (like GO -- see the shop-entry field) wants the bare noun,
+            # not the full descriptive name; take the last word as a best-effort
+            # noun ("a rusted metal display rack" -> "rack").
+            'noun'        => full_name.sub(/\A(?:a |an |the |some )/i, '').split(/\s+/).last.to_s,
+            'items'       => []
+          }
+          containers << current
+          next
+        end
+
+        if current && (m = line.match(/\A(.+?):\s*([\d,]+)\s*\((\d+)\)\z/))
+          current['items'] << {
+            'name'  => m[1].strip,
+            'price' => m[2].gsub(',', '').to_i,
+            'qty'   => m[3].to_i
+          }
+        end
+      end
+      containers
+    end
+
+    # Parse `read sign` output down to just the message itself. Confirmed format:
+    # a fixed disclaimer banner (asterisk border, "posted by the shop owner..."),
+    # then a blank line, then "In the <language> language, it reads:" followed by
+    # the actual message (which may itself span multiple lines). Returns nil if
+    # there's nothing to show (no sign object here, or an unrecognized response).
+    def parse_sign_text(lines)
+      text = lines.join("\n").strip
+      return nil if text.empty?
+      return nil if text =~ /don.t see|nothing to read|what were you referring/i
+
+      m = text.match(/In the \w+ language, it reads:\s*\n(.*)\z/mi)
+      if m
+        msg = m[1].strip
+        return msg unless msg.empty?
+      end
+
+      # The expected "In the <language> language, it reads:" wrapper didn't match
+      # (or produced nothing) -- that's a parsing gap, NOT proof there's no sign.
+      # A sign that's genuinely absent gets caught by the "don't see" check above;
+      # anything else that reaches here came back with actual content, so show
+      # the raw response rather than silently claiming "no sign" and hiding it.
+      text
+    end
+
+    def do_scan_shop(task)
+      location  = task[:location].to_s.strip
+      shop_name = task[:shop_name].to_s.strip
+      if location.empty? || shop_name.empty?
+        Lich::Messaging.msg("yellow", "[Merchantical] Shop scan: shop location and name are both required.")
+        return
+      end
+
+      shop_state = ShopState.load
+      shop_state['shop_location'] = location
+      shop_state['shop_name']     = shop_name
+
+      origin_room = ((Map.current_room_id rescue nil) || XMLData.room_id).to_s
+
+      Lich::Messaging.msg("yellow", "[Merchantical] Shop scan: traveling to #{location}...")
+      unless enter_player_shop(location, shop_name)
+        Lich::Messaging.msg("yellow",
+          "[Merchantical] Shop scan: could not enter '#{shop_name}' from #{location} -- check the name and try again.")
+        go2_to(origin_room) unless origin_room.empty?
+        return
+      end
+
+      room_results, paths, signs, titles = crawl_shop_rooms(max_rooms: 3)
+
+      # Snapshot what we believed was in the shop BEFORE overwriting it below,
+      # so we can tell what quietly vanished since the last scan -- our own
+      # actions (List Items For Sale, Commit removal) already keep this cache
+      # in sync as they happen, so anything missing now that we didn't just
+      # do ourselves was bought by someone else. Skipped on the very first
+      # scan ever (nothing to compare against yet).
+      old_inventory = shop_state['shop_inventory'] || {}
+
+      shop_state['shop_inventory'] = {}
+      room_results.each do |room_id, containers|
+        item_count = containers.sum { |c| c['items'].length }
+        shop_state['shop_inventory'][room_id] = {
+          'room_label' => titles[room_id] || room_id,
+          'containers' => containers,
+          'sign_text'  => signs[room_id]
+        }
+        Lich::Messaging.msg("yellow",
+          "[Merchantical] Shop scan: #{room_id} -- #{item_count} item(s) across #{containers.length} container(s).")
+      end
+      shop_state['shop_paths'] = paths
+
+      if old_inventory.any?
+        events = detect_shop_sales(old_inventory, shop_state['shop_inventory'])
+        if events.any?
+          shop_state['ledger_events'] = (shop_state['ledger_events'] || []) + events
+          sold_qty   = events.sum { |e| e['qty'] }
+          sold_total = events.sum { |e| e['price'] * e['qty'] }
+          formatted  = sold_total.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\1,').reverse
+          Lich::Messaging.msg("yellow",
+            "[Merchantical] Ledger: #{sold_qty} item(s) sold since last scan for #{formatted} silvers.")
+        end
+      end
+
+      # Deliberately NOT leaving the shop or navigating home here -- stay put in
+      # whichever room the crawl finished in, since the player will likely want
+      # to keep working in the shop right after a scan.
+      ShopState.save(shop_state)
+
+      Gtk.queue { @window&.apply_shop_state(shop_state) } rescue nil
+      Lich::Messaging.msg("yellow",
+        "[Merchantical] Shop scan complete -- #{room_results.length} room(s) explored.")
+    rescue => e
+      Lich::Messaging.msg("yellow", "[Merchantical] Shop scan error: #{e.message}")
+    end
+
+    # Compares two shop_inventory snapshots (old_inv/new_inv, same shape as
+    # shop_state['shop_inventory']: room_id -> {'containers' => [...]}) and
+    # returns one ledger event per item whose quantity dropped -- covers both
+    # a unique item vanishing entirely (qty 1 -> gone) and a stackable one
+    # partially depleting (e.g. a chunk of amber qty 4 -> 2, two sold). Price
+    # is taken from the OLD listing, since that's what it actually sold for.
+    def detect_shop_sales(old_inv, new_inv)
+      events = []
+      today = Time.now.strftime('%Y-%m-%d')
+      old_inv.each do |room_id, room_data|
+        new_containers = (new_inv.dig(room_id, 'containers') || [])
+        (room_data['containers'] || []).each do |old_cont|
+          new_cont  = new_containers.find { |c| c['name'] == old_cont['name'] }
+          new_items = new_cont ? (new_cont['items'] || []) : []
+          (old_cont['items'] || []).each do |old_item|
+            new_item   = new_items.find { |i| i['name'] == old_item['name'] }
+            old_qty    = old_item['qty'].to_i
+            new_qty    = new_item ? new_item['qty'].to_i : 0
+            sold_qty   = old_qty - new_qty
+            next if sold_qty <= 0
+            events << {
+              'date'           => today,
+              'item_name'      => old_item['name'],
+              'price'          => old_item['price'].to_i,
+              'qty'            => sold_qty,
+              'room_id'        => room_id,
+              'container_name' => old_cont['name']
+            }
+          end
+        end
+      end
+      events
+    end
+
+    # Walk to a specific already-scanned room (via its stored path) and set or
+    # clear its shop sign, then re-read it to confirm what actually landed.
+    def do_set_shop_sign(task)
+      room_id = task[:room_id].to_s
+      clear   = !!task[:clear]
+      message = task[:message].to_s
+
+      shop_state = ShopState.load
+      location  = shop_state['shop_location'].to_s
+      shop_name = shop_state['shop_name'].to_s
+      if location.empty? || shop_name.empty?
+        Lich::Messaging.msg("yellow", "[Merchantical] Set sign: run Scan Shop first.")
+        return
+      end
+
+      path = shop_state.dig('shop_paths', room_id) || []
+      origin_room = ((Map.current_room_id rescue nil) || XMLData.room_id).to_s
+
+      Lich::Messaging.msg("yellow", "[Merchantical] Set sign: traveling to #{room_id}...")
+      unless enter_player_shop(location, shop_name)
+        Lich::Messaging.msg("yellow", "[Merchantical] Set sign: could not enter the shop.")
+        return
+      end
+
+      path.each { |dir| fput dir; waitrt?; pause 0.3 }
+
+      fput "shop sign #{clear ? 'CLEAR' : message}"
+      waitrt?; pause 0.3
+
+      shop_state['shop_inventory'][room_id] ||= { 'room_label' => room_id }
+      shop_state['shop_inventory'][room_id]['sign_text'] = parse_sign_text(capture_command("read sign"))
+
+      path.reverse.each { |dir| fput opposite_direction(dir); waitrt?; pause 0.3 }
+      leave_player_shop
+      ShopState.save(shop_state)
+      go2_to(origin_room) unless origin_room.empty?
+
+      Gtk.queue { @window&.apply_shop_state(shop_state) } rescue nil
+      Lich::Messaging.msg("yellow",
+        "[Merchantical] #{clear ? 'Cleared' : 'Updated'} the sign in #{room_id}.")
+    rescue => e
+      Lich::Messaging.msg("yellow", "[Merchantical] Set sign error: #{e.message}")
+    end
+
+    def do_scan_containers(task)
+      containers_text = task[:containers_text].to_s
+      names = containers_text.split(',').map(&:strip).reject(&:empty?)
+      if names.empty?
+        Lich::Messaging.msg("yellow", "[Merchantical] Container scan: no containers entered.")
+        return
+      end
+
+      shop_state = ShopState.load
+      shop_state['containers_text'] = containers_text
+      # Prior scans (and prior *searches* -- different container names entirely)
+      # don't linger: the sell queue is fully replaced by whatever THIS scan
+      # finds. old_by_id below still carries forward price/shop container picks
+      # for items that reappear (same container + name), so re-scanning the same
+      # container(s) doesn't discard work you already did.
+      old_by_id = (shop_state['sell_queue'] || []).to_h { |q| [q['id'], q] }
+
+      # Worn containers plus whatever's actually held in either hand -- a
+      # container doesn't have to be worn to be scanned, just reachable.
+      held_inv   = [GameObj.right_hand, GameObj.left_hand].compact.select { |gi|
+        gi.id.to_s != '' && gi.id.to_s != '0'
+      }
+      worn_inv   = GameObj.inv.to_a + held_inv
+      new_queue  = []
+
+      names.each do |cname|
+        cont = worn_inv.find { |gi| gi.name.to_s.downcase.include?(cname.downcase) }
+        unless cont
+          Lich::Messaging.msg("yellow", "[Merchantical] Container scan: '#{cname}' not found (worn or held).")
+          next
+        end
+
+        lines = capture_command("look in ##{cont.id}")
+
+        cont_id  = cont.id.to_s
+        contents = (GameObj.respond_to?(:containers) &&
+          (GameObj.containers[cont_id] || GameObj.containers[cont.id])) rescue nil
+        contents = contents.to_a
+
+        # The "look in" text already spells out each item's full description in
+        # listed order -- no need to look at items individually to get it.
+        # Falls back to the short name per-item if the listing didn't parse or
+        # its count doesn't match what Lich saw (order/count assumed to agree).
+        full_names = parse_container_listing(lines)
+
+        # id is qualified by container so the same item name in two different
+        # scanned containers doesn't collide into a single sell-queue entry.
+        cont_slug     = cont.name.to_s.gsub(/[^a-zA-Z0-9]/, '-').downcase
+        name_indices  = Hash.new(0)
+        contents.each_with_index do |gi, i|
+          short_name = gi.name.to_s.sub(/\A(?:a |an |the )/i, '').strip
+          full_name  = full_names.length == contents.length ? full_names[i] : short_name
+          base_id   = "#{cont_slug}__#{short_name.gsub(/[^a-zA-Z0-9]/, '-').downcase}"
+          idx       = name_indices[base_id]
+          name_indices[base_id] += 1
+          item_id = idx == 0 ? base_id : "#{base_id}-#{idx}"
+
+          old = old_by_id[item_id]
+          new_queue << {
+            'id'               => item_id,
+            'name'             => full_name,
+            'noun'             => gi.noun.to_s,
+            'gameobj_id'       => gi.id.to_s,
+            'container_id'     => cont.id.to_s,
+            'source_container' => cont.name.to_s,
+            'shop_room'        => old ? old['shop_room']      : nil,
+            'shop_container'   => old ? old['shop_container'] : nil,
+            'price'            => old ? old['price']          : nil
+          }
+        end
+      end
+
+      shop_state['sell_queue'] = new_queue
+      ShopState.save(shop_state)
+      Gtk.queue { @window&.apply_shop_state(shop_state) } rescue nil
+      Lich::Messaging.msg("yellow",
+        "[Merchantical] Container scan complete -- #{shop_state['sell_queue'].length} item(s) in sell queue.")
+    rescue => e
+      Lich::Messaging.msg("yellow", "[Merchantical] Container scan error: #{e.message}")
+    end
+
+    def do_list_items_for_sale
+      shop_state = ShopState.load
+      queue = shop_state['sell_queue'] || []
+      ready = queue.select { |q|
+        q['shop_room'].to_s != '' && q['shop_container'].to_s != '' && q['price'].to_i > 0
+      }
+
+      if ready.empty?
+        Lich::Messaging.msg("yellow", "[Merchantical] List for sale: no items have both a container and a price set.")
+        return
+      end
+
+      location  = shop_state['shop_location'].to_s
+      shop_name = shop_state['shop_name'].to_s
+      if location.empty? || shop_name.empty?
+        Lich::Messaging.msg("yellow",
+          "[Merchantical] List for sale: run Scan Shop first so the shop location/name are known.")
+        return
+      end
+
+      origin_room = ((Map.current_room_id rescue nil) || XMLData.room_id).to_s
+      by_room     = ready.group_by { |q| q['shop_room'] }
+      listed_ids  = []
+
+      Lich::Messaging.msg("yellow", "[Merchantical] List for sale: traveling to #{location}...")
+      unless enter_player_shop(location, shop_name)
+        Lich::Messaging.msg("yellow",
+          "[Merchantical] List for sale: could not enter '#{shop_name}' from #{location} -- check the name and try again.")
+        go2_to(origin_room) unless origin_room.empty?
+        return
+      end
+
+      by_room.each do |room_id, items_for_room|
+        path = shop_state.dig('shop_paths', room_id) || []
+        Lich::Messaging.msg("yellow", "[Merchantical] Listing #{items_for_room.length} item(s) in #{room_id}...")
+        path.each { |dir| fput dir; waitrt?; pause 0.3 }
+
+        # Tracks, per container, how many of ITS items we've successfully
+        # listed so far this run (added to whatever the last scan already
+        # counted on it) -- so if "no more room" comes back, we know exactly
+        # how many it actually holds. full_this_run short-circuits any further
+        # items destined for a container already confirmed full, rather than
+        # repeating the same failed sell for each one.
+        added_counts  = Hash.new(0)
+        full_this_run = {}
+
+        items_for_room.each do |q|
+          container_info = (shop_state.dig('shop_inventory', room_id, 'containers') || [])
+                              .find { |c| c['name'] == q['shop_container'] }
+          preposition    = container_info ? container_info['preposition'] : 'on'
+          # SHOP SELL wants the bare noun ("rack"), not the full descriptive name
+          # ("a rusted metal display rack") used for display/matching above.
+          container_noun = container_info && !container_info['noun'].to_s.empty? ?
+                              container_info['noun'] :
+                              q['shop_container'].to_s.split(/\s+/).last.to_s
+
+          if full_this_run[q['shop_container']]
+            Lich::Messaging.msg("yellow",
+              "[Merchantical] List for sale: #{q['name']} -- #{q['shop_container']} is full, leaving in queue.")
+            next
+          end
+
+          get_resp = if q['container_id'].to_s.empty?
+                       fput("get ##{q['gameobj_id']}")
+                     else
+                       fput("get ##{q['gameobj_id']} from ##{q['container_id']}")
+                     end
+          waitrt?
+
+          if get_resp.to_s =~ /need.*free hand|don.t see|what were you|can.t pick|could not find/i
+            Lich::Messaging.msg("yellow", "[Merchantical] List for sale: #{q['name']} -- could not pick up, skipping.")
+            next
+          end
+
+          # `shop sell` requires the item in the RIGHT hand specifically.
+          if GameObj.right_hand&.id.to_s != q['gameobj_id'].to_s
+            fput "swap"; waitrt?
+          end
+
+          sell_resp = capture_command("shop sell #{q['price'].to_i} #{preposition} #{container_noun}").join(' ')
+          pause 0.3
+
+          if sell_resp =~ /no more room/i
+            baseline = (container_info && container_info['items']) ? container_info['items'].length : 0
+            learned_capacity = baseline + added_counts[q['shop_container']]
+            Merchantical::LearnedCapacities.learn(q['shop_container'], learned_capacity, preposition)
+            full_this_run[q['shop_container']] = true
+            Lich::Messaging.msg("yellow",
+              "[Merchantical] List for sale: #{q['shop_container']} is full (holds #{learned_capacity}) -- #{q['name']} left in queue.")
+            fput "stow my #{q['noun']}"; waitrt?; pause 0.1
+            next
+          end
+
+          still_in_hand = GameObj.right_hand&.id.to_s == q['gameobj_id'].to_s ||
+                          GameObj.left_hand&.id.to_s  == q['gameobj_id'].to_s
+          if still_in_hand
+            Lich::Messaging.msg("yellow",
+              "[Merchantical] List for sale: #{q['name']} -- listing failed (still in hand), leaving in queue.")
+            fput "stow my #{q['noun']}"; waitrt?; pause 0.1
+          else
+            Lich::Messaging.msg("yellow", "[Merchantical] Listed #{q['name']} for #{q['price'].to_i} silvers.")
+            added_counts[q['shop_container']] += 1
+            listed_ids << q['id']
+          end
+        end
+
+        # Refresh this room's Shop Inventory tab data now that new listings exist.
+        lines      = capture_command("shop inventory")
+        containers = parse_shop_inventory(lines)
+        shop_state['shop_inventory'][room_id] ||= { 'room_label' => room_id }
+        shop_state['shop_inventory'][room_id]['containers'] = containers
+
+        path.reverse.each { |dir| fput opposite_direction(dir); waitrt?; pause 0.3 }
+      end
+
+      leave_player_shop
+      shop_state['sell_queue'].reject! { |q| listed_ids.include?(q['id']) }
+      ShopState.save(shop_state)
+      go2_to(origin_room) unless origin_room.empty?
+
+      Gtk.queue { @window&.apply_shop_state(shop_state) } rescue nil
+      Lich::Messaging.msg("yellow",
+        "[Merchantical] List for sale complete -- #{listed_ids.length}/#{ready.length} item(s) listed.")
+    rescue => e
+      Lich::Messaging.msg("yellow", "[Merchantical] List for sale error: #{e.message}")
+    end
+
+    # Pulls each marked item back from its shop container and stows it,
+    # room by room. marked_items: [{'room_id', 'container_name', 'item_name'}, ...]
+    # from MainWindow#commit_removal.
+    def do_commit_shop_removal(marked_items)
+      return if marked_items.to_a.empty?
+
+      shop_state = ShopState.load
+      location  = shop_state['shop_location'].to_s
+      shop_name = shop_state['shop_name'].to_s
+      if location.empty? || shop_name.empty?
+        Lich::Messaging.msg("yellow",
+          "[Merchantical] Remove items: run Scan Shop first so the shop location/name are known.")
+        return
+      end
+
+      origin_room  = ((Map.current_room_id rescue nil) || XMLData.room_id).to_s
+      by_room      = marked_items.group_by { |m| m['room_id'] }
+      removed_count = 0
+
+      Lich::Messaging.msg("yellow", "[Merchantical] Remove items: traveling to #{location}...")
+      unless enter_player_shop(location, shop_name)
+        Lich::Messaging.msg("yellow",
+          "[Merchantical] Remove items: could not enter '#{shop_name}' from #{location} -- check the name and try again.")
+        go2_to(origin_room) unless origin_room.empty?
+        return
+      end
+
+      by_room.each do |room_id, items_for_room|
+        path = shop_state.dig('shop_paths', room_id) || []
+        Lich::Messaging.msg("yellow", "[Merchantical] Removing #{items_for_room.length} item(s) in #{room_id}...")
+        path.each { |dir| fput dir; waitrt?; pause 0.3 }
+
+        items_for_room.each do |m|
+          item_name = m['item_name'].to_s
+          # Confirmed against an actual log: PULL/STOW want the short noun
+          # ("stat" matched "a small statue"), not the full descriptive name
+          # -- sending the full name is what "What were you referring to?"
+          # was actually complaining about.
+          noun = item_name.split(/\s+/).last.to_s.gsub(/[^a-zA-Z'-]/, '')
+
+          pull_resp = capture_command("pull #{noun}").join(' ')
+          pause 0.2
+          if pull_resp =~ /don.t see|what were you referring|can.t find|nothing happens/i
+            Lich::Messaging.msg("yellow", "[Merchantical] Remove items: #{item_name} -- couldn't pull it, skipping.")
+            next
+          end
+
+          fput "stow #{noun}"; waitrt?; pause 0.2
+          removed_count += 1
+          Lich::Messaging.msg("yellow", "[Merchantical] Removed #{item_name}.")
+
+          # Update the cached data immediately -- rather than waiting for the
+          # room's own re-scan below -- so the Shop Inventory tab reflects
+          # each removal as it happens, not just once the whole room is done.
+          cont_data = (shop_state.dig('shop_inventory', room_id, 'containers') || [])
+                        .find { |c| c['name'] == m['container_name'] }
+          cont_data['items']&.reject! { |i| i['name'] == item_name } if cont_data
+          ShopState.save(shop_state)
+          Gtk.queue { @window&.apply_shop_state(shop_state) } rescue nil
+        end
+
+        # Authoritative refresh in case anything else about this room's
+        # containers changed underneath the optimistic updates above.
+        lines      = capture_command("shop inventory")
+        containers = parse_shop_inventory(lines)
+        shop_state['shop_inventory'][room_id] ||= { 'room_label' => room_id }
+        shop_state['shop_inventory'][room_id]['containers'] = containers
+        ShopState.save(shop_state)
+        Gtk.queue { @window&.apply_shop_state(shop_state) } rescue nil
+
+        path.reverse.each { |dir| fput opposite_direction(dir); waitrt?; pause 0.3 }
+      end
+
+      leave_player_shop
+      go2_to(origin_room) unless origin_room.empty?
+
+      Lich::Messaging.msg("yellow",
+        "[Merchantical] Remove items complete -- #{removed_count}/#{marked_items.length} item(s) pulled and stowed.")
+    rescue => e
+      Lich::Messaging.msg("yellow", "[Merchantical] Remove items error: #{e.message}")
     end
 
     def save_final_state
