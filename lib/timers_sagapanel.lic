@@ -44,6 +44,8 @@
     *tm sort dhigh              - Sort categories by duration, highest first.
     *tm sort dlow               - Sort categories by duration, lowest first.
     *tm sort za                 - Sort categories Z-A.
+    *tm stop                    - Send "stop <#>" for every active spell
+                                whose number isn't on the tracked list.
     *tm totals                  - Toggle From Buffs/Spells and Grand Totals.
     *tm totalscheck             - Show totals and Casting Strength in Story.
     *tm track <name or #>       - Watch a spell for Missing Spells.
@@ -60,9 +62,21 @@
   Author: Claude Code(Creator and Feature Additions), Codex(Bug Fixes and Review), RuseofFools (Very Little)
   Required: Lich >= 5.20.0
   Tags: saga, frontend, mod, window, spells, buffs, debuffs, cooldowns, timers
-  Version: 1.12
+  Version: 1.16
 
   Recently changed:
+    v1.16 (2026-09-06) - Added *tm stop: cancels every currently active
+      spell whose number isn't on the tracked list, one "stop <#>" at a
+      time (via SubScript, with a brief pause between each) rather than
+      firing them all back-to-back from the command hook.
+    v1.15 (2026-09-04) - Added a built-in 606 scroll lookup that checks
+      reserve scrolls first, then the eLoot-configured scroll containers,
+      except for Rangers.
+    v1.14 (2026-09-04) - Added the same reserve-item handling for spell 509
+      using a white crystal, except for Wizards.
+    v1.13 (2026-09-04) - Added a built-in 1712 click/missing-spell action
+      that manages a small statue and restores it to a reserve slot when
+      needed.
     v1.12 (2026-08-26) - Made every tracked missing spell clickable with a
       default `incant <spell#>` command; registered recast macros still take
       precedence for spells that have one.
@@ -207,6 +221,12 @@ module Timers
   BARS_RED_ICON    = "&#x1F7E5;".freeze # <= 1:40 left
   BARS_YELLOW_THRESHOLD_SECONDS = 10 * 60       # 10 min -- yellow tier's own refill window
   BARS_RED_THRESHOLD_SECONDS    = (1 * 60) + 40 # 1:40 -- red tier's own refill window
+  RESERVE_ITEM_SPELLS = {
+    1712 => /\bsmall statue\b/i,
+    509 => /\bwhite crystal\b/i
+  }.freeze
+  SCROLL_SPELL = 606
+  SCROLL_REGEX = /\b(?:scroll|parchment|papyrus|vellum)\b/i
 
   # No "unless defined?" guard -- this module persists in Lich's Ruby
   # process across script restarts (only killing Lich itself clears it), so
@@ -1768,6 +1788,8 @@ module Timers
   # same network burst. Returns false if nothing is registered for num.
   def self.run_macro(num)
     chain = macros[num]
+    return run_reserve_item_default(num) if chain.nil? && reserve_item_spell?(num)
+    return run_606_default if chain.nil? && default_action_spell?(num) && num.to_i == SCROLL_SPELL
     return false unless chain
 
     chain.split(/\s*>\s*/).each do |step|
@@ -1778,6 +1800,19 @@ module Timers
       sleep 0.3
     end
     true
+  end
+
+  # UpstreamHook callbacks are not executed with Script.current set.  Run
+  # commands that wait for game output in an anonymous script so fput,
+  # dothistimeout, and Lich::Util.issue_command have the context they require.
+  def self.start_macro(num)
+    return false unless defined?(SubScript)
+    return false unless macros.key?(num.to_i) || reserve_item_spell?(num) ||
+                        (default_action_spell?(num) && num.to_i == SCROLL_SPELL)
+
+    SubScript.start(parent: nil, quiet: true) { run_macro(num) }
+  rescue StandardError
+    false
   end
 
   # Spell circle number for a spell number, e.g. 1109 -> 11 (Empath) -- the
@@ -1884,6 +1919,47 @@ module Timers
     self.tracked = []
     settings["timers"]["tracked"] = []
     save_window_settings(settings)
+  end
+
+  # *tm stop -- bulk-cancels every currently active spell whose number
+  # isn't on the tracked (watch) list, via the same "stop <#>" command
+  # every other script in this codebase already uses to cancel a spell
+  # (disarmed.lic/bigshot.lic/tpick.lic/1status.lic). Reads Spell.active
+  # directly rather than any of the category helpers above, since those
+  # all build DISPLAY lists (ignored-filtered, bucket-classified, etc.) --
+  # this needs the raw set of genuinely active spells with real numbers.
+  # SPELL_COOLDOWN_NUMBERS entries are skipped since "stop" doesn't apply
+  # to those (they're cooldown timers, not toggleable spell effects).
+  # Pure computation only -- no fput here. See send_stop_commands! for why
+  # the actual commands can't be sent from this same call.
+  def self.untracked_active_spell_numbers
+    Spell.active.each_with_object([]) do |spell, nums|
+      next unless spell&.num
+      next if SPELL_COOLDOWN_NUMBERS.include?(spell.num)
+      next if tracked.include?(spell.num)
+
+      nums << spell.num
+    end
+  rescue StandardError
+    []
+  end
+
+  # Sends "stop <#>" for each number in nums, one at a time with a brief
+  # pause between each -- firing them back-to-back with no pause is what
+  # produced a "waitfor: Unable to identify calling script" line per
+  # command. Same underlying cause and same fix as start_macro above:
+  # UpstreamHook callbacks run with no Script.current, so fput (which
+  # waits for the command's own echo) needs a real script context --
+  # hence SubScript, not a direct call from the hook.
+  def self.send_stop_commands!(nums)
+    return if nums.empty? || !defined?(SubScript)
+
+    SubScript.start(parent: nil, quiet: true) do
+      nums.each do |num|
+        fput "stop #{num}"
+        sleep 0.3
+      end
+    end
   end
 
   # Same source as category_entries, but WITHOUT the ignored-list filter --
@@ -2134,7 +2210,255 @@ module Timers
   end
 
   def self.missing_spell_command(num)
-    macros.key?(num) ? "*tm run #{num}" : "incant #{num}"
+    return "*tm run #{num}" if macros.key?(num)
+    return "*tm run #{num}" if default_action_spell?(num)
+
+    "incant #{num}"
+  end
+
+  def self.character_wizard?
+    character_profession.to_s.casecmp?("Wizard")
+  rescue StandardError
+    false
+  end
+
+  def self.character_ranger?
+    character_profession.to_s.casecmp?("Ranger")
+  rescue StandardError
+    false
+  end
+
+  def self.character_profession
+    return nil unless defined?(Lich::Gemstone::Stats)
+
+    if Lich::Gemstone::Stats.respond_to?(:profession)
+      Lich::Gemstone::Stats.profession
+    elsif Lich::Gemstone::Stats.respond_to?(:prof)
+      Lich::Gemstone::Stats.prof
+    end
+  rescue StandardError
+    nil
+  end
+
+  def self.reserve_item_spell?(num)
+    spell_num = num.to_i
+    return false unless RESERVE_ITEM_SPELLS.key?(spell_num)
+    return false if spell_num == 509 && character_wizard?
+
+    true
+  rescue StandardError
+    false
+  end
+
+  def self.default_action_spell?(num)
+    reserve_item_spell?(num) || (num.to_i == SCROLL_SPELL && !character_ranger?)
+  end
+
+  def self.reserve_item?(object, item_regex)
+    [object&.name, object&.noun].compact.join(" ") =~ item_regex
+  end
+
+  def self.reserve_item_in_slot?(item_regex)
+    Array(GameObj.reserve).any? { |object| reserve_item?(object, item_regex) }
+  rescue StandardError
+    false
+  end
+
+  def self.held_reserve_item(item_regex)
+    [GameObj.right_hand, GameObj.left_hand].compact.find { |object| reserve_item?(object, item_regex) }
+  rescue StandardError
+    nil
+  end
+
+  def self.refresh_reserve_for_item_action
+    dothistimeout(
+      "reserve list",
+      5,
+      /RESERVE|reserved for use in combat|Nothing is currently reserved|You currently have/i
+    )
+    sleep 0.2
+  end
+
+  def self.run_reserve_item_default(num)
+    item_regex = RESERVE_ITEM_SPELLS[num.to_i]
+    return false unless reserve_item_spell?(num)
+
+    item_name = num.to_i == 1712 ? "small statue" : "white crystal"
+    fput "stow all"
+    refresh_reserve_for_item_action
+    fput "get my #{item_name}" unless reserve_item_in_slot?(item_regex)
+    fput "rub my #{item_name}"
+
+    if (item = held_reserve_item(item_regex))
+      fput "reserve ##{item.id}"
+      return true
+    end
+
+    reserve_result = fput "reserve my #{item_name}"
+    return true if reserve_result.to_s =~ /You reserve your .* for use in combat\./i
+
+    refresh_reserve_for_item_action
+    return true if reserve_item_in_slot?(item_regex)
+
+    unless reserve_item_in_slot?(item_regex)
+      fput "stow my #{item_name}" if held_reserve_item(item_regex)
+      refresh_reserve_for_item_action
+    end
+
+    unless reserve_item_in_slot?(item_regex)
+      fput "get my #{item_name}"
+      item = held_reserve_item(item_regex)
+      fput(item&.id ? "reserve ##{item.id}" : "reserve my #{item_name}")
+    end
+    true
+  rescue StandardError => e
+    echo "Timers: #{num} reserve-item action failed (#{e.class}: #{e.message})"
+    false
+  end
+
+  def self.eloot_setting(name)
+    return nil unless defined?(ELoot) && ELoot.respond_to?(:data) && ELoot.data
+
+    settings = ELoot.data.settings
+    settings[name] || settings[name.to_s]
+  rescue StandardError
+    nil
+  end
+
+  def self.scroll_container_names
+    names = %i[scrollbag scrollsack].map { |key| eloot_setting(key) }
+    names += begin
+      [Vars.scrollbag, Vars.scrollsack]
+    rescue StandardError
+      []
+    end
+    names = Array(names).flat_map { |value| value.is_a?(Array) ? value : [value] }
+                   .map { |value| value.to_s.strip }
+                   .reject(&:empty?)
+                   .uniq
+  rescue StandardError
+    []
+  end
+
+  def self.scroll_container?(object, configured_name)
+    target = configured_name.to_s.strip
+    return false if target.empty?
+
+    pattern = Regexp.new(Regexp.escape(target).gsub('\\ ', '\\s+'), Regexp::IGNORECASE)
+    [object&.name, object&.noun].compact.any? { |value| value.to_s =~ pattern }
+  end
+
+  def self.configured_scroll_containers
+    scroll_container_names.filter_map do |configured_name|
+      object = configured_name.to_i.to_s == configured_name ? GameObj[configured_name.to_i] : nil
+      object ||= GameObj.inv.to_a.find { |item| scroll_container?(item, configured_name) }
+      object
+    end.uniq { |object| object.id.to_s }
+  rescue StandardError
+    []
+  end
+
+  def self.scroll_object?(object)
+    [object&.name, object&.noun, object&.type].compact.join(" ") =~ SCROLL_REGEX
+  end
+
+  def self.refresh_scroll_container(container)
+    if defined?(ELoot::Inventory) && ELoot::Inventory.respond_to?(:container_contents)
+      ELoot::Inventory.container_contents(container)
+    elsif defined?(Lich::Util)
+      Lich::Util.issue_command(
+        "look in ##{container.id}",
+        /./,
+        /<prompt/,
+        include_end: false,
+        timeout: 5,
+        silent: true,
+        usexml: true,
+        quiet: true
+      )
+    end
+  rescue StandardError
+    nil
+  end
+
+  def self.read_scroll(item)
+    return [] unless item&.id && defined?(Lich::Util)
+
+    Lich::Util.issue_command(
+      "read ##{item.id}",
+      /./,
+      /<prompt/,
+      include_end: false,
+      timeout: 5,
+      silent: true,
+      usexml: true,
+      quiet: true
+    )
+  rescue StandardError
+    []
+  end
+
+  def self.scroll_contains_spell?(item, spell_num)
+    read_scroll(item).any? { |line| line.to_s =~ /\b#{spell_num}\b/ }
+  end
+
+  def self.invoke_scroll_spell(item, container: nil)
+    if container
+      fput "get ##{item.id} from ##{container.id}"
+    else
+      fput "get ##{item.id}"
+    end
+    sleep 0.3
+    return false unless scroll_contains_spell?(item, SCROLL_SPELL)
+
+    fput "invoke #{SCROLL_SPELL}"
+    fput "cast"
+    if container
+      fput "put ##{item.id} in ##{container.id}"
+    else
+      fput "reserve ##{item.id}"
+    end
+    true
+  end
+
+  def self.find_606_scroll_in_reserve
+    refresh_reserve_for_item_action
+    Array(GameObj.reserve).select { |item| scroll_object?(item) }.each do |scroll|
+      if invoke_scroll_spell(scroll)
+        return true
+      end
+
+      fput "reserve ##{scroll.id}"
+      refresh_reserve_for_item_action
+    end
+    false
+  end
+
+  def self.find_606_scroll_in_containers
+    configured_scroll_containers.each do |container|
+      refresh_scroll_container(container)
+      contents = Array(GameObj.containers[container.id] || container.contents)
+      contents.select { |item| scroll_object?(item) }.each do |scroll|
+        if invoke_scroll_spell(scroll, container: container)
+          return true
+        end
+
+        fput "put ##{scroll.id} in ##{container.id}"
+      end
+    end
+    false
+  end
+
+  def self.run_606_default
+    return false if character_ranger?
+    return true if find_606_scroll_in_reserve
+    return true if find_606_scroll_in_containers
+
+    echo "Timers: no scroll containing spell #{SCROLL_SPELL} found in reserve or configured scroll containers"
+    true
+  rescue StandardError => e
+    echo "Timers: #{SCROLL_SPELL} scroll action failed (#{e.class}: #{e.message})"
+    false
   end
 
   def self.snapshot
@@ -2204,7 +2528,12 @@ module Timers
     render_missing.call if Timers.missing_position == "top"
 
     render_row = lambda do |category, name, duration, secs, row_id|
-      track_cmd = "*tm track #{Timers.sanitize_xml(name)}"
+      spell = Spell[name]
+      track_cmd = if spell && (Timers.macros.key?(spell.num.to_i) || Timers.default_action_spell?(spell.num))
+                    "*tm run #{spell.num}"
+                  else
+                    "*tm track #{Timers.sanitize_xml(name)}"
+                  end
       ignore_cmd = "*tm ignore #{Timers.sanitize_xml(Timers.key(name))}"
       # :society has no single fixed icon (CATEGORY_ICONS omits it on
       # purpose) -- each row resolves its own, zombie/troll/vampire
@@ -2370,6 +2699,15 @@ UpstreamHook.add(tm_upstream_hook_id, proc do |command|
     Timers.untrack_all!
     _respond(Timers.build_dialog)
     respond "Timers: no longer watching anything"
+    nil
+  elsif command.strip =~ /\*tm\s+stop\b/i
+    nums = Timers.untracked_active_spell_numbers
+    if nums.empty?
+      respond "Timers: nothing active to stop (everything active is tracked)"
+    else
+      Timers.send_stop_commands!(nums)
+      respond "Timers: sending stop for #{nums.size} spell(s), one at a time: #{nums.join(', ')}"
+    end
     nil
   elsif command.strip =~ /\*tm\s+untrack\s+(.+?)\s*\z/i
     requested = Regexp.last_match(1)
@@ -2639,7 +2977,7 @@ UpstreamHook.add(tm_upstream_hook_id, proc do |command|
     nil
   elsif command.strip =~ /\*tm\s+run\s+(\d+)\b/i
     num = Regexp.last_match(1).to_i
-    if Timers.run_macro(num)
+    if Timers.start_macro(num)
       respond "Timers: running macro for ##{num}"
     else
       respond "Timers: no macro registered for ##{num}"
