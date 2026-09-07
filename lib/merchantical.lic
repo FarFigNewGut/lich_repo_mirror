@@ -11,7 +11,7 @@ The following inputs are available:
         Other scripts: Combatical, VolnRestore2, Loresang
         game: gs
         tags: utility, economy, merchant, loresang, sell, pawnshop, shop, item, management
-        version: 1.5.5
+        version: 1.5.6
         required: Lich > 5.0
 
         \Version\
@@ -66,10 +66,11 @@ The following inputs are available:
                           the script travels there, updates it, and re-reads it to confirm.
         1.5.4 09/04/2026 - Items to Sell: duplicates nest under a "(xN)" row, ready rows
                           highlight, container picks reset on reopen, Scan Container finds held items and auto-opens the tab, each scan replaces the queue instead of accumulating, and multi-container scans nest under a bolded container name.
-        1.5.5 09/04/2026 - Container capacities: Shop Inventory shows room/container fill
-                          ("X of Y", "?" if unknown), learns real capacity from "no more room" at the table, and marks full containers in the sell dropdowns.
-                          Added a Ledger tab: detects items sold to other players (vs. items we
-                          pulled ourselves), with weekly/monthly/yearly totals and a 6-month income-vs-upkeep table.
+        1.5.5 09/04/2026 - Container capacities: Shop Inventory shows fill counts and marks
+                          full containers in sell dropdowns. Added a Ledger tab tracking
+                          sales with weekly/monthly/yearly totals and income-vs-upkeep.
+        1.5.6 09/07/2026 - Fixed transmog items showing short names in large containers;
+                          Items to Sell search now hides non-matches instead of dimming.
 
 
 =end
@@ -1113,7 +1114,7 @@ module Merchantical
       queue_search_row.pack_start(Gtk::Label.new(" Search:"), expand: false, fill: false, padding: 0)
       @sell_queue_search_entry = Gtk::SearchEntry.new
       @sell_queue_search_entry.set_tooltip_text(
-        "Filter by item name. Non-matching rows are darkened, not removed."
+        "Filter by item name. Non-matching rows are hidden until cleared."
       )
       @sell_queue_search_entry.signal_connect('search-changed') do
         @sell_queue_search = @sell_queue_search_entry.text.strip.downcase
@@ -1548,6 +1549,16 @@ module Merchantical
       end
 
       options = shop_container_options
+      search  = @sell_queue_search.to_s
+
+      if !search.empty? && queue.none? { |q| q['name'].to_s.downcase.include?(search) }
+        lbl = Gtk::Label.new
+        lbl.markup = "<i>No items match \"#{pe(@sell_queue_search_entry&.text.to_s)}\".</i>"
+        lbl.halign = :start
+        @sell_queue_box.pack_start(lbl, expand: false, fill: false, padding: 4)
+        @sell_queue_box.show_all
+        return
+      end
 
       by_container = queue.group_by { |q| q['source_container'].to_s }
       if by_container.length > 1
@@ -1558,23 +1569,30 @@ module Merchantical
         # actively working through.
         @sq_container_expanded ||= {}
         by_container.each do |cname, items|
+          has_match = search.empty? || items.any? { |q| q['name'].to_s.downcase.include?(search) }
+          # A container with no matches while searching is skipped entirely
+          # rather than shown collapsed and empty.
+          next unless has_match
+
           label = cname.empty? ? '(unknown container)' : cname
 
           cont_exp = Gtk::Expander.new
           cont_exp.use_markup = true
           cont_exp.label = "<b><span foreground='#e0a84a'>#{pe(label)}</span></b>"
-          cont_exp.expanded = @sq_container_expanded.fetch(cname, true)
+          # Force open while searching so a match isn't hidden behind a
+          # collapsed header the search itself has no way to open.
+          cont_exp.expanded = search.empty? ? @sq_container_expanded.fetch(cname, true) : true
           cont_exp.signal_connect('notify::expanded') { @sq_container_expanded[cname] = cont_exp.expanded }
 
           items_box = Gtk::Box.new(:vertical, 2)
           items_box.margin_start = 14
-          pack_sell_queue_items(items_box, items, options)
+          pack_sell_queue_items(items_box, items, options, search)
           cont_exp.add(items_box)
 
           @sell_queue_box.pack_start(cont_exp, expand: false, fill: false, padding: 3)
         end
       else
-        pack_sell_queue_items(@sell_queue_box, queue, options)
+        pack_sell_queue_items(@sell_queue_box, queue, options, search)
       end
       @sell_queue_box.show_all
     end
@@ -1583,8 +1601,11 @@ module Merchantical
     # rock" x3, say) are nested under one "(x3)" row instead of repeating the
     # same row three times -- see build_sell_queue_group. group_by preserves
     # first-seen order for both the groups and the items within each one.
-    def pack_sell_queue_items(box, items, options)
+    def pack_sell_queue_items(box, items, options, search = '')
       items.group_by { |q| q['name'] }.each do |name, group|
+        # Non-matching rows/groups are skipped entirely while searching,
+        # rather than shown but darkened.
+        next unless search.empty? || name.to_s.downcase.include?(search)
         widget = group.length == 1 ?
           build_sell_queue_row(group.first, options) :
           build_sell_queue_group(name, group, options)
@@ -6964,7 +6985,22 @@ module Merchantical
         s
       })
       fput cmd
-      fput CAPTURE_SENTINEL_CMD
+      if debug_on
+        fput CAPTURE_SENTINEL_CMD
+      else
+        # Script.current.silent suppresses Game.puts's own echo of the sent
+        # command to the window (see games.rb) -- keeps the meaningless
+        # "look at #0" sentinel invisible to the user, matching its response
+        # line above, which is already hidden unless debug is on.
+        script      = Script.current
+        save_silent = script.silent
+        script.silent = true
+        begin
+          fput CAPTURE_SENTINEL_CMD
+        ensure
+          script.silent = save_silent
+        end
+      end
       deadline = Time.now + timeout
       until done || Time.now > deadline
         pause 0.05
@@ -6985,6 +7021,34 @@ module Merchantical
     # example seen -- assumes each item (including duplicates) gets its own
     # entry in the sentence rather than a collapsed "3 small statues" count.
     def parse_container_listing(lines)
+      # Once a container holds enough items, the game switches from the plain
+      # "In the X, you see A, B, and C." sentence to a categorized listing --
+      # one line per category, e.g.:
+      #   "Magic Items [89]: a black crystal (32), a small statue (32), ..."
+      # Both forms need to be handled since which one the game sends depends
+      # on the container's contents, not on anything the script controls.
+      category_names = []
+      lines.each do |raw|
+        line = raw.to_s.strip
+        next unless (m = line.match(/\A[A-Za-z][A-Za-z '-]*\s*\[\d+\]:\s*(.+)\z/))
+        m[1].split(/,\s+/).each do |entry|
+          entry = entry.strip
+          next if entry.empty?
+          # A trailing "(N)" means N copies of that same item stacked together
+          # in the summary -- expand into N separate entries so this lines up
+          # 1:1 with GameObj's contents array, which has one entry per
+          # physical item rather than one per stack.
+          count = 1
+          if entry =~ /\A(.+?)\s*\((\d+)\)\z/
+            entry = $1.strip
+            count = $2.to_i
+          end
+          clean = entry.sub(/\A(?:a |an |the |some )/i, '')
+          count.times { category_names << clean }
+        end
+      end
+      return category_names unless category_names.empty?
+
       text = lines.join(' ').strip
       m = text.match(/you see\s+(.+?)\.\s*\z/mi)
       return [] unless m
