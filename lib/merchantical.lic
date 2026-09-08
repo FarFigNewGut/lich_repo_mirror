@@ -11,7 +11,7 @@ The following inputs are available:
         Other scripts: Combatical, VolnRestore2, Loresang
         game: gs
         tags: utility, economy, merchant, loresang, sell, pawnshop, shop, item, management
-        version: 1.5.6
+        version: 1.5.7
         required: Lich > 5.0
 
         \Version\
@@ -70,13 +70,18 @@ The following inputs are available:
                           full containers in sell dropdowns. Added a Ledger tab tracking
                           sales with weekly/monthly/yearly totals and income-vs-upkeep.
         1.5.6 09/07/2026 - Fixed transmog items showing short names in large containers;
-                          Items to Sell search now hides non-matches instead of dimming.
+                          Items to Sell search now hides non-matches instead of dimming,
+                          and its rows highlight on hover so controls are easy to match to items.
+        1.5.7 09/07/2026 - Fixed container scans sometimes mislabeling items when listing
+                          for sale. Ledger entries can now be individually deleted, with
+                          totals recalculating immediately.
 
 
 =end
 
 require 'gtk3' rescue nil
 require 'json'
+require 'securerandom'
 
 module Merchantical
   _mc_char         = XMLData.name.to_s.downcase.gsub(/[^a-z0-9]/, '_')
@@ -193,6 +198,12 @@ module Merchantical
       .mc-row { background-color: #{s[:bg]}; color: #{s[:fg]}; padding: 1px 2px; }
       .mc-row:hover { background-color: #{s[:hover]}; }
       #{w} box.mc-sq-ready { background-color: rgba(90, 200, 120, 0.22); }
+      /* Manually toggled (Box has no window of its own to trigger real :hover)
+         so the whole row -- name, dropdown, price, remove -- lights up as one
+         band, making it obvious which controls belong to which item name even
+         when neighboring rows differ in height (wrapped long names vs short
+         ones). */
+      #{w} box.mc-sq-hover { background-color: #{s[:hover]}; }
       #{w} entry { background-color: #{s[:bg2]}; color: #{s[:fg]}; }
       #{w} button { background-color: #{s[:bg3]}; color: #{s[:fg]}; border: 1px solid #{s[:border]}; }
       #{w} button:hover { background-color: #{s[:hover]}; }
@@ -1227,7 +1238,14 @@ module Merchantical
       return unless @ledger_box
       @ledger_box.children.each { |w| @ledger_box.remove(w) }
 
-      events     = @shop_state['ledger_events'] || []
+      events = @shop_state['ledger_events'] || []
+      # Events recorded before per-event ids existed have none -- give them a
+      # stable one now (once, persisted) so every entry can be individually
+      # removed regardless of when it was recorded.
+      needs_save = false
+      events.each { |e| next if e['id']; e['id'] = SecureRandom.hex(6); needs_save = true }
+      persist_shop_state if needs_save
+
       room_count = (@shop_state['shop_inventory'] || {}).length
 
       now          = Time.now
@@ -1314,6 +1332,11 @@ module Merchantical
       recent_lbl = Gtk::Label.new
       recent_lbl.markup = "<b>Recent Sales</b>"
       recent_lbl.halign = :start
+      recent_lbl.set_tooltip_text(
+        "Click \u{2715} on an entry to delete it -- e.g. one recorded for an item you\n" \
+        "actually pulled back out rather than sold. Stats/monthly totals above and\n" \
+        "the count/total here update immediately to reflect the removal."
+      )
       @ledger_box.pack_start(recent_lbl, expand: false, fill: false, padding: 2)
 
       if events.empty?
@@ -1327,13 +1350,32 @@ module Merchantical
       else
         events.sort_by { |e| e['date'].to_s }.reverse.first(200).each do |e|
           qty_txt = e['qty'].to_i > 1 ? " x#{e['qty']}" : ''
+
+          row = Gtk::Box.new(:horizontal, 4)
+          row.halign = :start
+
           lbl = Gtk::Label.new
           lbl.markup =
             "<span foreground='#888'>#{pe(e['date'])}</span>  #{pe(e['item_name'])}#{qty_txt}: " \
             "<span foreground='#d4af37'>#{format_silvers(e['price'].to_i * e['qty'].to_i)} silvers</span> " \
             "<span foreground='#666'>(#{pe(e['room_id'])})</span>"
           lbl.halign = :start
-          @ledger_box.pack_start(lbl, expand: false, fill: false, padding: 0)
+          row.pack_start(lbl, expand: false, fill: false, padding: 0)
+
+          remove_lbl = Gtk::Label.new
+          remove_lbl.markup = "<span size='small' foreground='#cc5555'>\u{2715}</span>"
+          remove_btn = Gtk::Button.new
+          remove_btn.add(remove_lbl)
+          remove_btn.relief = :none
+          remove_btn.set_tooltip_text("Delete this ledger entry (e.g. an item you pulled back out instead of sold)")
+          remove_btn.signal_connect('clicked') do
+            @shop_state['ledger_events'].reject! { |ev| ev['id'] == e['id'] }
+            persist_shop_state
+            rebuild_ledger_view
+          end
+          row.pack_start(remove_btn, expand: false, fill: false, padding: 0)
+
+          @ledger_box.pack_start(row, expand: false, fill: false, padding: 0)
         end
       end
 
@@ -1623,8 +1665,19 @@ module Merchantical
       # normally, but it made the mc-sq-ready highlight below paint clear across
       # that unused trailing width instead of hugging the row's actual content.
       row.halign = :start
-      row.margin_top = 2; row.margin_bottom = 2
+      row.margin_top = 3; row.margin_bottom = 3
       row.style_context.add_class('mc-sq-ready') if sell_queue_item_ready?(q)
+
+      # Box has no window of its own to generate real CSS :hover, so it's
+      # toggled by hand -- the whole row lights up as one band on mouseover,
+      # making it unambiguous which dropdown/price/remove belong to which
+      # item name, even when a neighboring row's name wraps to two lines and
+      # throws off the row heights.
+      row_evbox = Gtk::EventBox.new
+      row_evbox.visible_window = false
+      row_evbox.add(row)
+      row_evbox.signal_connect('enter-notify-event') { row.style_context.add_class('mc-sq-hover'); false }
+      row_evbox.signal_connect('leave-notify-event') { row.style_context.remove_class('mc-sq-hover'); false }
 
       refresh_ready_style = lambda do
         if sell_queue_item_ready?(q)
@@ -1643,7 +1696,7 @@ module Merchantical
       # up regardless of which kind of row it is. Keep these three widths
       # (SQ_LEAD_W / SQ_NAME_W / SQ_COUNT_W) in sync with build_sell_queue_group.
       spacer = sq_spacer(SQ_LEAD_W)
-      spacer.valign = :start
+      spacer.valign = :center
       row.pack_start(spacer, expand: false, fill: false, padding: 0)
 
       # Full item names (fetched via a LOOK, not just the short inventory name)
@@ -1658,16 +1711,16 @@ module Merchantical
       name_lbl.lines     = 2
       name_lbl.ellipsize = :end
       name_lbl.halign = :start
-      name_lbl.valign = :start
+      name_lbl.valign = :center
       name_lbl.xalign = 0.0
       row.pack_start(name_lbl, expand: false, fill: false, padding: 0)
 
       count_spacer = sq_spacer(SQ_COUNT_W)
-      count_spacer.valign = :start
+      count_spacer.valign = :center
       row.pack_start(count_spacer, expand: false, fill: false, padding: 0)
 
       combo = Gtk::ComboBoxText.new
-      combo.valign = :start
+      combo.valign = :center
       # Swallow scroll events so mousing over the row while scrolling the list
       # doesn't silently change which container is selected.
       combo.signal_connect('scroll-event') { true }
@@ -1702,7 +1755,7 @@ module Merchantical
       row.pack_start(combo, expand: false, fill: false, padding: 0)
 
       price_entry = Gtk::Entry.new
-      price_entry.valign = :start
+      price_entry.valign = :center
       price_entry.width_request = 90
       price_entry.set_placeholder_text("price")
       price_entry.text = q['price'].to_s if q['price']
@@ -1719,13 +1772,13 @@ module Merchantical
       # (non-stacked) row is always qty 1, so there's nothing to type here, but
       # the remove button still needs to land in the same column either way.
       qty_spacer = sq_spacer(SQ_QTY_W)
-      qty_spacer.valign = :start
+      qty_spacer.valign = :center
       row.pack_start(qty_spacer, expand: false, fill: false, padding: 0)
 
       remove_lbl = Gtk::Label.new
       remove_lbl.markup = "<span foreground='#cc5555'>\u{2715}</span>"
       remove_btn = Gtk::Button.new
-      remove_btn.valign = :start
+      remove_btn.valign = :center
       remove_btn.add(remove_lbl)
       remove_btn.relief = :none
       remove_btn.set_tooltip_text("Remove from sell queue")
@@ -1737,7 +1790,7 @@ module Merchantical
       end
       row.pack_start(remove_btn, expand: false, fill: false, padding: 0)
 
-      row
+      row_evbox
     end
 
     # A fixed-width, unclickable blank cell -- used to keep a plain row's leading
@@ -1768,19 +1821,27 @@ module Merchantical
       # its own content -- harmless for an unstyled box, but the mc-sq-ready
       # background below was painting clear across that whole extra width.
       header.halign = :start
-      header.margin_top = 2; header.margin_bottom = 2
+      header.margin_top = 3; header.margin_bottom = 3
       header.style_context.add_class('mc-sq-ready') if items.all? { |q| sell_queue_item_ready?(q) }
+
+      # Box has no window of its own to generate real CSS :hover, so it's
+      # toggled by hand -- see build_sell_queue_row for why.
+      header_evbox = Gtk::EventBox.new
+      header_evbox.visible_window = false
+      header_evbox.add(header)
+      header_evbox.signal_connect('enter-notify-event') { header.style_context.add_class('mc-sq-hover'); false }
+      header_evbox.signal_connect('leave-notify-event') { header.style_context.remove_class('mc-sq-hover'); false }
 
       arrow_lbl = Gtk::Label.new
       arrow_lbl.width_request = SQ_LEAD_W
       arrow_lbl.halign = :start
-      arrow_lbl.valign = :start
+      arrow_lbl.valign = :center
       arrow_lbl.xalign = 0.0
       # EventBox rather than Button: a Button's own theme padding would nudge
       # its footprint wider than the plain spacer label used in
       # build_sell_queue_row, drifting the columns again. EventBox adds none.
       toggle_evbox = Gtk::EventBox.new
-      toggle_evbox.valign = :start
+      toggle_evbox.valign = :center
       toggle_evbox.visible_window = false
       toggle_evbox.add(arrow_lbl)
       toggle_evbox.set_tooltip_text("Expand to edit each copy individually")
@@ -1806,7 +1867,7 @@ module Merchantical
       name_lbl.lines     = 2
       name_lbl.ellipsize = :end
       name_lbl.halign = :start
-      name_lbl.valign = :start
+      name_lbl.valign = :center
       name_lbl.xalign = 0.0
       header.pack_start(name_lbl, expand: false, fill: false, padding: 0)
 
@@ -1814,12 +1875,12 @@ module Merchantical
       count_lbl.markup = "<span foreground='#a0c8ff'>(x#{items.length})</span>"
       count_lbl.width_request = SQ_COUNT_W
       count_lbl.halign = :start
-      count_lbl.valign = :start
+      count_lbl.valign = :center
       count_lbl.xalign = 0.0
       header.pack_start(count_lbl, expand: false, fill: false, padding: 0)
 
       combo = Gtk::ComboBoxText.new
-      combo.valign = :start
+      combo.valign = :center
       combo.signal_connect('scroll-event') { true }
       combo.append('', 'Set all to...')
       full_by_id = {}
@@ -1833,7 +1894,7 @@ module Merchantical
       header.pack_start(combo, expand: false, fill: false, padding: 0)
 
       price_entry = Gtk::Entry.new
-      price_entry.valign = :start
+      price_entry.valign = :center
       price_entry.width_request = 90
       prices = items.map { |q| q['price'] }.uniq
       if prices.length == 1 && prices.first
@@ -1851,7 +1912,7 @@ module Merchantical
       # chrome and didn't actually work (their clicks fired 'value-changed',
       # which rebuilt the whole tab and tore out the very widget mid-click).
       qty_entry = Gtk::Entry.new
-      qty_entry.valign = :start
+      qty_entry.valign = :center
       qty_entry.width_chars   = 4
       qty_entry.width_request = SQ_QTY_W
       qty_entry.set_tooltip_text(
@@ -1934,7 +1995,7 @@ module Merchantical
       remove_lbl = Gtk::Label.new
       remove_lbl.markup = "<span foreground='#cc5555'>\u{2715}</span>"
       remove_btn = Gtk::Button.new
-      remove_btn.valign = :start
+      remove_btn.valign = :center
       remove_btn.add(remove_lbl)
       remove_btn.relief = :none
       remove_btn.set_tooltip_text("Remove all #{items.length} from sell queue")
@@ -1961,7 +2022,7 @@ module Merchantical
       set_expanded.call(@sq_group_expanded.fetch(name, false))
       toggle_evbox.signal_connect('button-press-event') { set_expanded.call(!@sq_group_expanded[name]); true }
 
-      outer.pack_start(header, expand: false, fill: false, padding: 0)
+      outer.pack_start(header_evbox, expand: false, fill: false, padding: 0)
       outer.pack_start(content, expand: false, fill: false, padding: 0)
       outer
     end
@@ -7214,6 +7275,7 @@ module Merchantical
             sold_qty   = old_qty - new_qty
             next if sold_qty <= 0
             events << {
+              'id'             => SecureRandom.hex(6),
               'date'           => today,
               'item_name'      => old_item['name'],
               'price'          => old_item['price'].to_i,
@@ -7310,19 +7372,39 @@ module Merchantical
           (GameObj.containers[cont_id] || GameObj.containers[cont.id])) rescue nil
         contents = contents.to_a
 
-        # The "look in" text already spells out each item's full description in
-        # listed order -- no need to look at items individually to get it.
-        # Falls back to the short name per-item if the listing didn't parse or
-        # its count doesn't match what Lich saw (order/count assumed to agree).
-        full_names = parse_container_listing(lines)
+        # The "look in" text already spells out each item's full description --
+        # no need to look at items individually to get it. But its listed
+        # order can NOT be assumed to match GameObj.containers' order: once a
+        # container holds enough items, the game switches to a categorized
+        # display (Containers / Magic Items / Scrolls / Gems / Clothing /
+        # Special) that buckets items by type for that summary, independent of
+        # whatever order Lich's own XML parsing saw them in. Pairing the two
+        # lists up purely by position silently assigned one item's full name
+        # to a completely different physical item (a diamond mislabeled and
+        # sold as a shirt) -- instead, match each full name to a GameObj by
+        # short name: every full name is that item's own short name with an
+        # optional descriptive clause appended, so a full name can only ever
+        # be claimed by an item of the exact same kind. Falls back to the
+        # bare short name for any item left unmatched (parsing gap, or more
+        # physical copies than the listing accounted for).
+        full_names     = parse_container_listing(lines)
+        full_name_pool = Hash.new { |h, k| h[k] = [] }
+        remaining      = full_names.dup
+        contents.map { |gi| gi.name.to_s.sub(/\A(?:a |an |the |some )/i, '').strip }.uniq
+          .sort_by { |s| -s.length } # longest short name first, so a longer name's own prefix can't be stolen by a shorter unrelated one
+          .each do |short|
+            key = short.downcase
+            matched, remaining = remaining.partition { |fn| fn.downcase.start_with?(key) }
+            full_name_pool[key].concat(matched)
+          end
 
         # id is qualified by container so the same item name in two different
         # scanned containers doesn't collide into a single sell-queue entry.
         cont_slug     = cont.name.to_s.gsub(/[^a-zA-Z0-9]/, '-').downcase
         name_indices  = Hash.new(0)
-        contents.each_with_index do |gi, i|
-          short_name = gi.name.to_s.sub(/\A(?:a |an |the )/i, '').strip
-          full_name  = full_names.length == contents.length ? full_names[i] : short_name
+        contents.each do |gi|
+          short_name = gi.name.to_s.sub(/\A(?:a |an |the |some )/i, '').strip
+          full_name  = full_name_pool[short_name.downcase].shift || short_name
           base_id   = "#{cont_slug}__#{short_name.gsub(/[^a-zA-Z0-9]/, '-').downcase}"
           idx       = name_indices[base_id]
           name_indices[base_id] += 1
