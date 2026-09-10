@@ -1,0 +1,583 @@
+# frozen_string_literal: true
+
+=begin
+  spellbookscan.lic: Scan saved game logs for spell specialization books pulled out of
+  boxes opened at the town locksmith or the locksmith pool, and report the drop rate.
+
+  A box only counts when the log shows a locksmith handing it back and the script then
+  opening it and looking inside, so boxes you picked yourself and books that came from
+  anywhere else (bought, traded, picked up off a shop floor) are not counted.
+
+  This reads eLoot's own log output, so it can only see box contents when eLoot was set
+  to show them. A character whose eloot.yaml is missing, unreadable, or does not have
+  :display_box_contents turned on is skipped rather than counted, because with that
+  setting off eLoot silences the LOOK IN and the boxes would still be tallied while
+  every book inside them went unseen.
+
+    ;spellbookscan              scan the current character's logs
+    ;spellbookscan --all        scan every character's logs found under LOG_DIR
+    ;spellbookscan --details    also list each book found, with its ANALYZE rank
+    ;spellbookscan --help       usage
+
+  Options combine, e.g. ;spellbookscan --all --details
+
+            author: elanthia-online
+        maintainer: Tysong
+              game: Gemstone
+              tags: loot, boxes, locksmith, spell specialization
+          required: Lich >= 5.15.0
+           version: 1.2.0
+
+  Improvements:
+  Major_change.feature_addition.bugfix
+  v1.2.0 (2026-09-10)
+    - fix: skip any character whose eLoot is not set to display box contents, since
+      their logs cannot show what was in a box and the rate would come out too low
+  v1.1.0 (2026-09-10)
+    - feature: show a progress bar with percent complete and an estimated time
+      remaining while the logs are being read
+  v1.0.0 (2026-09-10)
+    - new: report how many locksmith boxes you have opened, how many spell
+      specialization books came out of them, and the resulting drop rate
+=end
+
+require 'date'
+require 'yaml'
+
+module SpellbookScan
+  # Spell specialization books did not exist before this date, so there is nothing
+  # to find in any log older than it.
+  RELEASE_DATE = Date.new(2026, 8, 16)
+
+  ADJ1 = %w[cracked dirty faded immaculate pristine scuffed stained tattered weathered
+            worn].freeze
+  ADJ2 = %w[ancient arcane bronze-bound bronze-clasped bronze-edged bronzed-edged gilded
+            gold-leafed golden-edged mystic runebound rune-etched sigil-marked
+            silver-clasped silver-edged silver-inlaid].freeze
+  NOUN = %w[almanac arcanum breviary canticle codex compendium creed cursebook folio
+            grimoire handbook leechbook lorebook manuscript oathbook prayerbook psalter
+            songbook soulledger spellbook tome volume wildtome].freeze
+
+  BOOK_RE = /\b((?:#{ADJ1.join('|')})\s+(?:#{ADJ2.join('|')})\s+(?:#{NOUN.join('|')}))\b/i
+
+  # A locksmith handing a box back to us. The pool worker and the town locksmith use
+  # different wording, and the town locksmith also opens boxes for other players in the
+  # room, so the town pattern insists the box comes back to "you".
+  POOL_RE  = /says, "Alright, here's your .+ back\."/
+  TOWN_RE  = /turns h(?:is|er) attention to .*hands your .+ back to you\./
+
+  # Accepts both the "[script]>open #123" echo and a bare ">open #123", since not every
+  # frontend prefixes the command with the script that sent it.
+  OPEN_RE    = />open #(\d+)\s*$/
+  LOOKIN_RE  = />look in #(\d+)\s*$/
+  YOUOPEN_RE = /^\d\d:\d\d:\d\d: You open (?:a|an|some|the) (.+?)\.\s*$/
+  SEARCH_RE  = /^\d\d:\d\d:\d\d: You search through (?:a|an|some|the) (.+?) and find:\s*$/
+  LOOTED_RE  = /^\d\d:\d\d:\d\d: Looted \d+ items?\.\s*$/
+  TOTAL_RE   = /^\d\d:\d\d:\d\d: Total items: \d+\s*$/
+  NOTHING_RE = /^\d\d:\d\d:\d\d: There is nothing in the .+\.\s*$/
+  # Ends a contents listing. Deliberately narrow: game text can contain ">" (XML presets
+  # among it), so only a real command echo counts.
+  CMD_RE     = /\[[^\]]*\]>|^\d\d:\d\d:\d\d: >/
+
+  ANALYZE_RE = /You analyze (?:a|an|the|some|your) (.+?) and sense that the creator has provided/
+  RANK_RE    = /add (\d+) spell specialization ranks? (?:to casting|for) the spell (.+?) \((\d+)\)/
+
+  CTX_WINDOW = 20  # lines between the locksmith handing the box back and our OPEN
+  EVENT_SPAN = 120 # lines an opened box stays live waiting for its contents
+  BLOCK_SPAN = 60  # max lines of a contents listing
+
+  PROGRESS_STEP = 5 # report progress every this many percent
+  BAR_WIDTH     = 20
+
+  module_function
+
+  # --- output -------------------------------------------------------------------
+
+  def out(text)
+    if defined?(Lich::Messaging) && Lich::Messaging.respond_to?(:mono)
+      Lich::Messaging.mono(text)
+    else
+      puts text
+    end
+  end
+
+  def note(text)
+    if defined?(Lich::Messaging) && Lich::Messaging.respond_to?(:msg)
+      Lich::Messaging.msg('info', text)
+    else
+      puts text
+    end
+  end
+
+  # Lich's echo already wraps the text in "[spellbookscan: ...]".
+  def progress(text)
+    if respond_to?(:echo, true)
+      echo text
+    else
+      puts "[spellbookscan: #{text}]"
+    end
+  end
+
+  def bar(pct)
+    filled = (pct * BAR_WIDTH) / 100
+    ('#' * filled) + ('-' * (BAR_WIDTH - filled))
+  end
+
+  def dur(seconds)
+    seconds = seconds.round
+    return "#{seconds}s" if seconds < 60
+
+    format('%dm %02ds', seconds / 60, seconds % 60)
+  end
+
+  def commas(num)
+    num.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
+  end
+
+  # --- log discovery ------------------------------------------------------------
+
+  def log_root
+    defined?(LOG_DIR) ? LOG_DIR : File.join(Dir.home, 'logs')
+  end
+
+  def data_root
+    defined?(DATA_DIR) ? DATA_DIR : File.join(Dir.home, 'data')
+  end
+
+  def eloot_config(game, char)
+    File.join(data_root, game.to_s, char.to_s, 'eloot.yaml')
+  end
+
+  # eLoot writes its settings hash with symbol keys. Aliases and the odd non-scalar are
+  # tolerated so a hand-edited file still reads.
+  def read_yaml(path)
+    YAML.load_file(path, permitted_classes: [Symbol], aliases: true)
+  rescue StandardError
+    begin
+      YAML.unsafe_load_file(path)
+    rescue StandardError
+      nil
+    end
+  end
+
+  # True only when eloot.yaml positively turns box contents on. Returns the reason when
+  # it does not, so the caller can say why a character was passed over.
+  def display_box_contents?(game, char)
+    path = eloot_config(game, char)
+    return [false, "no eloot.yaml at #{path}"] unless File.exist?(path)
+
+    settings = read_yaml(path)
+    return [false, "could not parse #{path}"] unless settings.is_a?(Hash)
+
+    value = settings.fetch(:display_box_contents) { settings['display_box_contents'] }
+    return [false, ":display_box_contents is not set in #{path}"] if value.nil?
+    unless value == true || value.to_s.strip.casecmp('true').zero?
+      return [false, ":display_box_contents is off in #{path}"]
+    end
+
+    [true, nil]
+  end
+
+  # Only .log files, and only ones dated on or after the books existed. The date comes
+  # from the log's own name when it has one, otherwise from its mtime.
+  def log_files(dirs)
+    Array(dirs).flat_map { |d| Dir.glob(File.join(d, '**', '*.log')) }
+               .select { |f| File.file?(f) && recent_enough?(f) }
+               .uniq.sort
+  end
+
+  def recent_enough?(path)
+    if File.basename(path) =~ /(\d{4})-(\d{2})-(\d{2})/
+      begin
+        return Date.new(Regexp.last_match(1).to_i, Regexp.last_match(2).to_i,
+                        Regexp.last_match(3).to_i) >= RELEASE_DATE
+      rescue ArgumentError
+        # fall through to mtime
+      end
+    end
+    File.mtime(path).to_date >= RELEASE_DATE
+  rescue StandardError
+    true
+  end
+
+  def log_date(path)
+    return Regexp.last_match(0) if File.basename(path) =~ /\d{4}-\d{2}-\d{2}/
+
+    File.mtime(path).strftime('%Y-%m-%d')
+  rescue StandardError
+    '?'
+  end
+
+  # The current character, using the documented layout first and falling back to the
+  # "<GAME>-<Char>" directory some frontends write instead. Each entry is [game, dir]
+  # so the matching eloot.yaml can be located.
+  def current_dirs
+    game = (defined?(XMLData) ? XMLData.game.to_s : '')
+    char = (defined?(Char) ? Char.name.to_s : '')
+    return [] if char.empty?
+
+    [File.join(log_root, game, char),
+     File.join(log_root, "#{game}-#{char}")].select { |d| File.directory?(d) }
+                                            .map { |d| [game, d] }
+  end
+
+  # Every character with logs under LOG_DIR, in either layout. The year/month folders
+  # below a character ("GSF-Pickasso/2026/08") are picked up by the recursive glob in
+  # log_files, so only the character level has to be identified here.
+  def all_dirs
+    found = Hash.new { |h, k| h[k] = [] }
+    return found unless File.directory?(log_root)
+
+    Dir.children(log_root).sort.each do |entry|
+      path = File.join(log_root, entry)
+      next unless File.directory?(path)
+
+      if entry =~ /\A([A-Za-z]{2,8})-([A-Z][A-Za-z']*)\z/
+        found[Regexp.last_match(2)] << [Regexp.last_match(1), path]
+      else
+        Dir.children(path).sort.each do |sub|
+          sub_path = File.join(path, sub)
+          next unless File.directory?(sub_path)
+          next if sub =~ /\A\d{1,4}\z/ # year or month folder, not a character
+
+          found[sub] << [entry, sub_path]
+        end
+      end
+    end
+    found
+  end
+
+  # --- parsing ------------------------------------------------------------------
+
+  def new_acc
+    { boxes: 0, books: [], analyzed: [], files: 0, dates: [] }
+  end
+
+  # Logs arrive with a mix of CRLF and bare CR line endings, so each chunk read is
+  # split again on CR before being handed to the state machine.
+  def scan_file(path, acc)
+    ctx_line = -1_000_000
+    ctx_kind = nil
+    cur = nil
+    block = nil
+    pending = nil
+    pending_line = 0
+    i = 0
+
+    File.open(path, 'rb') do |fh|
+      fh.each_line do |raw|
+        parts = raw.force_encoding('UTF-8').scrub('').chomp.split(/\r/, -1)
+        parts = [''] if parts.empty?
+
+        parts.each do |line|
+          i += 1
+
+          # inside a contents listing: harvest books until the listing ends
+          if block
+            kind, start = block
+            done = i - start > BLOCK_SPAN
+            done ||= TOTAL_RE.match?(line) || NOTHING_RE.match?(line) if kind == :lookin
+            done ||= LOOTED_RE.match?(line) if kind == :loot
+            done ||= CMD_RE.match?(line)
+            unless done
+              line.scan(BOOK_RE).flatten.each { |b| cur[:books] << b.downcase.squeeze(' ') }
+              next
+            end
+            block = nil
+          end
+
+          # an ANALYZE result, tracked independently of any box
+          if line.include?('You analyze ') && (m = ANALYZE_RE.match(line))
+            pending = m[1]
+            pending_line = i
+            next
+          end
+          if pending && line.include?('spell specialization')
+            if (m = RANK_RE.match(line))
+              acc[:analyzed] << { date: log_date(path), short: pending.downcase.squeeze(' '),
+                                  ranks: m[1].to_i, spell: m[2], num: m[3] }
+              pending = nil
+            end
+          end
+          pending = nil if pending && i - pending_line > 4
+
+          # a locksmith handing a box back
+          if line.include?("here's your") && POOL_RE.match?(line)
+            ctx_line = i
+            ctx_kind = :pool
+            next
+          end
+          if line.include?('back to you.') && TOWN_RE.match?(line)
+            ctx_line = i
+            ctx_kind = :town
+            next
+          end
+
+          # our OPEN, but only if a locksmith just handed the box over
+          if line.include?('>open #') && (m = OPEN_RE.match(line))
+            acc[:boxes] += 1 if cur
+            harvest(cur, acc, path) if cur
+            if i - ctx_line <= CTX_WINDOW
+              cur = { id: m[1], kind: ctx_kind, desc: nil, books: [], open_line: i }
+              ctx_line = -1_000_000
+            else
+              cur = nil
+            end
+            next
+          end
+
+          next unless cur
+
+          if i - cur[:open_line] > EVENT_SPAN
+            acc[:boxes] += 1
+            harvest(cur, acc, path)
+            cur = nil
+            next
+          end
+
+          if cur[:desc].nil? && line.include?('You open ') && (m = YOUOPEN_RE.match(line))
+            cur[:desc] = m[1]
+            next
+          end
+
+          if line.include?('>look in #') && (m = LOOKIN_RE.match(line)) && m[1] == cur[:id]
+            block = [:lookin, i]
+            next
+          end
+
+          if line.include?('You search through ') && (m = SEARCH_RE.match(line)) &&
+             cur[:desc] && m[1] == cur[:desc]
+            block = [:loot, i]
+          end
+        end
+      end
+    end
+
+    if cur
+      acc[:boxes] += 1
+      harvest(cur, acc, path)
+    end
+    acc[:files] += 1
+    acc[:dates] << log_date(path)
+    acc
+  rescue StandardError => e
+    note "spellbookscan: skipped #{File.basename(path)} (#{e.message})"
+    acc
+  end
+
+  def harvest(cur, acc, path)
+    cur[:books].uniq.each do |full|
+      acc[:books] << { date: log_date(path), full: full,
+                       short: full.split(' ', 2).last, box: cur[:desc], kind: cur[:kind] }
+    end
+  end
+
+  # Pair each book found with the ANALYZE that describes it. The short name a book is
+  # analyzed under drops its first adjective, so two finds can share one, and the pair
+  # is resolved by date: the first analyze at or after the find wins.
+  def with_ranks(acc)
+    uniq = {}
+    acc[:analyzed].each do |a|
+      key = [a[:short], a[:ranks], a[:spell]]
+      uniq[key] = a if uniq[key].nil? || a[:date] < uniq[key][:date]
+    end
+    pool = uniq.values.group_by { |a| a[:short] }
+    pool.each_value { |v| v.sort_by! { |a| a[:date] } }
+    used = Hash.new { |h, k| h[k] = [] }
+
+    acc[:books].sort_by { |b| b[:date] }.map do |b|
+      cands = (pool[b[:short]] || []).reject { |a| used[b[:short]].include?(a) }
+      pick = cands.find { |a| a[:date] >= b[:date] } || cands.first
+      used[b[:short]] << pick if pick
+      b.merge(rank: pick && pick[:ranks], spell: pick && pick[:spell], num: pick && pick[:num])
+    end
+  end
+
+  def scan(dirs, label)
+    files = log_files(dirs)
+    if files.empty?
+      note "spellbookscan: no .log files dated #{RELEASE_DATE} or later for #{label}."
+      return nil
+    end
+    acc = new_acc
+    total = files.length
+    started = Time.now
+    last_pct = 0
+    progress "#{label}: reading #{commas(total)} log file(s)..."
+    files.each_with_index do |path, idx|
+      scan_file(path, acc)
+      done = idx + 1
+      pct = done * 100 / total
+      if pct >= last_pct + PROGRESS_STEP || done == total
+        last_pct = pct
+        elapsed = Time.now - started
+        tail = if done == total
+                 "done in #{dur(elapsed)}"
+               else
+                 "eta #{dur((elapsed / done) * (total - done))}"
+               end
+        progress format('%s [%s] %3d%%  %s/%s files  %s', label, bar(pct), pct,
+                        commas(done), commas(total), tail)
+      end
+      sleep 0.01 if (done % 25).zero?
+    end
+    acc
+  end
+
+  # --- reporting ----------------------------------------------------------------
+
+  def rate_text(boxes, books)
+    return 'n/a' if books.zero?
+
+    format('1 in %d', (boxes.to_f / books).round)
+  end
+
+  def pct_text(boxes, books)
+    return '0.000%' if boxes.zero?
+
+    format('%.3f%%', 100.0 * books / boxes)
+  end
+
+  def summary_block(label, acc)
+    boxes = acc[:boxes]
+    books = acc[:books].length
+    span = acc[:dates].reject { |d| d == '?' }.sort
+    lines = []
+    lines << "Spell Specialization Book Scan - #{label}"
+    lines << ('-' * 46)
+    lines << format('Logs scanned : %s files%s', commas(acc[:files]),
+                    span.empty? ? '' : "  (#{span.first} to #{span.last})")
+    lines << format('Boxes opened : %s', commas(boxes))
+    lines << format('Books found  : %s', commas(books))
+    lines << format('Rate         : %s  (%s)', rate_text(boxes, books), pct_text(boxes, books))
+    lines.join("\n")
+  end
+
+  def table_block(rows, total_boxes, total_books)
+    sep = '+------------+---------+-------+----------+'
+    lines = [sep, '| Character  |   Boxes | Books |   Rate   |', sep]
+    rows.each do |name, boxes, books|
+      lines << format('| %-10s | %7s | %5s | %-8s |', name[0, 10], commas(boxes),
+                      commas(books), rate_text(boxes, books))
+    end
+    lines << sep
+    lines << format('| %-10s | %7s | %5s | %-8s |', 'COMBINED', commas(total_boxes),
+                    commas(total_books), rate_text(total_boxes, total_books))
+    lines << sep
+    lines << format('  %s of boxes', pct_text(total_boxes, total_books))
+    lines.join("\n")
+  end
+
+  def details_block(label, acc)
+    books = with_ranks(acc)
+    return "#{label}: no books found." if books.empty?
+
+    spells = books.map { |b| b[:spell] ? "#{b[:spell]} (#{b[:num]})" : '(not analyzed)' }
+    bw = books.map { |b| b[:full].length }.push(4).max
+    sw = spells.map(&:length).push(5).max
+    sep = "+------------+------+-#{'-' * bw}-+-#{'-' * sw}-+"
+    lines = ["Books found - #{label}", sep,
+             format('| Date       | Rank | %-*s | %-*s |', bw, 'Book', sw, 'Spell'), sep]
+    books.each_with_index do |b, idx|
+      lines << format('| %-10s | %-4s | %-*s | %-*s |', b[:date],
+                      b[:rank] ? "+#{b[:rank]}" : '?', bw, b[:full], sw, spells[idx])
+    end
+    lines << sep
+    ranked = books.map { |b| b[:rank] }.compact
+    unless ranked.empty?
+      dist = ranked.tally.sort.map { |r, n| "+#{r}: #{n}" }.join('  ')
+      lines << format('  ranks  %s   (mean +%.2f of %d analyzed)', dist,
+                      ranked.sum.to_f / ranked.length, ranked.length)
+    end
+    lines.join("\n")
+  end
+
+  def usage
+    out <<~USAGE
+      ;spellbookscan            scan the current character's logs
+      ;spellbookscan --all      scan every character's logs under LOG_DIR
+      ;spellbookscan --details  also list each book found and its ANALYZE rank
+      ;spellbookscan --help     this message
+
+      Counts boxes handed back by the town locksmith or the locksmith pool that were
+      then opened and looked in. Logs before #{RELEASE_DATE} are skipped.
+
+      Requires eLoot's "Display box contents" setting, since that is what puts a box's
+      contents in the log. A character whose eloot.yaml is missing, unreadable, or does
+      not have :display_box_contents on is skipped rather than counted.
+    USAGE
+  end
+
+  def main(args = [])
+    args = Array(args).map(&:to_s)
+    if args.any? { |a| a =~ /\A--?h(elp)?\z/i }
+      usage
+      return
+    end
+    want_all = args.any? { |a| a =~ /\A--?all\z/i }
+    want_details = args.any? { |a| a =~ /\A--?det(ails?)?\z/i }
+
+    if want_all
+      chars = all_dirs
+      if chars.empty?
+        note "spellbookscan: no character log folders found under #{log_root}."
+        return
+      end
+      rows = []
+      total_boxes = 0
+      total_books = 0
+      details = []
+      skipped = []
+      chars.sort.each do |name, entries|
+        usable = entries.select { |game, _dir| display_box_contents?(game, name).first }
+        if usable.empty?
+          reason = display_box_contents?(entries.first.first, name).last
+          note "spellbookscan: skipping #{name} - #{reason}"
+          skipped << name
+          next
+        end
+        acc = scan(usable.map(&:last), name)
+        next if acc.nil?
+
+        rows << [name, acc[:boxes], acc[:books].length]
+        total_boxes += acc[:boxes]
+        total_books += acc[:books].length
+        details << details_block(name, acc) if want_details
+      end
+      if rows.empty?
+        note 'spellbookscan: nothing to report.'
+        return
+      end
+      out table_block(rows, total_boxes, total_books)
+      unless skipped.empty?
+        out "  skipped (eLoot not set to display box contents): #{skipped.join(', ')}"
+      end
+      details.each { |d| out d }
+    else
+      dirs = current_dirs
+      if dirs.empty?
+        game = (defined?(XMLData) ? XMLData.game.to_s : '?')
+        char = (defined?(Char) ? Char.name.to_s : '?')
+        note "spellbookscan: no log folder for #{char} under #{log_root}."
+        note "  looked for #{File.join(log_root, game, char)}"
+        note "  and        #{File.join(log_root, "#{game}-#{char}")}"
+        return
+      end
+      label = defined?(Char) ? Char.name.to_s : 'current character'
+      usable = dirs.select { |game, _dir| display_box_contents?(game, label).first }
+      if usable.empty?
+        note "spellbookscan: #{display_box_contents?(dirs.first.first, label).last}"
+        note '  eLoot silences LOOK IN with that setting off, so its logs cannot show'
+        note '  what was in a box. Turn on "Display box contents" and try again.'
+        return
+      end
+      acc = scan(usable.map(&:last), label)
+      return if acc.nil?
+
+      out summary_block(label, acc)
+      out details_block(label, acc) if want_details
+    end
+  end
+end
+
+SpellbookScan.main(Script.current.vars[1..] || []) if defined?(Script) && Script.respond_to?(:current)
