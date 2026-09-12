@@ -1,0 +1,154 @@
+=begin
+  creature_hp.lic
+
+  Bridges Lich creature health into the <crtrStatus> feed so front ends
+  can render creature HP bars. Nothing else is injected - no wounds, no
+  injuries, no status flags. The game's tag remains the sole source of
+  truth for every attribute this script does not own.
+
+  Two mechanisms, one snapshot:
+    1. A DownstreamHook enriches every game-sent <crtrStatus> tag in
+       flight with health/maxhealth from Lich::Gemstone::Creature -
+       appended only, nothing in the game's tag is altered or removed -
+       and caches the game's tag per exist id.
+    2. Combat::Tracker.on(:damage) marks creatures dirty; the script
+       thread replays the cached game tag with refreshed attributes, so
+       hits that land between game-sent tags still reach the front end.
+
+  Requires Lich combat tracking. If it is disabled the script says so
+  and exits without installing anything.
+
+  ;creature_hp          - start bridging
+  ;creature_hp debug    - also echo each enriched and replayed tag
+
+        author: Nisugi
+  contributors: Nisugi
+          game: Gemstone
+          tags: creature, health, hp, crtrStatus, frontend
+      required: Lich >= 5.12.0
+       version: 1.0.0
+
+  changelog:
+    1.0.0 (2026-09-11)
+      initial release
+=end
+
+module CreatureHP
+  HOOK_NAME = 'creature_hp_crtr'
+  SUB_NAME = 'creature_hp'
+  REPLAY_INTERVAL = 0.25 # seconds; coalesces bursts (mstrike, flares)
+  CACHE_MAX = 150        # per-id cached tags; pruned oldest-first
+
+  CRTR_TAG = /<crtrStatus exist=(["'])(-?\d+)\1([^>]*?)\/>/
+
+  @debug = false
+  @mutex = Mutex.new
+  @cache = {}          # id(String) => { quote:, rest: }
+  @dirty = {}          # id(String) => true (Hash as an ordered set)
+  @last_sent = {}      # id(String) => last emitted attrs string
+
+  class << self
+    attr_accessor :debug
+
+    # ---- data -----------------------------------------------------------
+
+    # Bridge attributes for one creature, or nil when we know no HP.
+    def attrs_for(creature)
+      return nil unless creature
+      return nil unless creature.max_hp && creature.current_hp
+
+      %( health="#{creature.current_hp}" maxhealth="#{creature.max_hp}")
+    end
+
+    # ---- hook: enrich in flight, cache the game's tag -------------------
+
+    def rewrite(line)
+      return line unless line.include?('<crtrStatus')
+
+      line.gsub(CRTR_TAG) do
+        quote, id, rest = $1, $2, ($3 || '')
+        remember(id, quote, rest)
+        tag = build_tag(id, quote, rest)
+        respond "[creature_hp] #{tag}" if @debug && tag != $&
+        tag
+      end
+    rescue StandardError => e
+      respond "[creature_hp] hook error: #{e.message}"
+      line
+    end
+
+    def build_tag(id, quote, rest)
+      attrs = attrs_for(Lich::Gemstone::Creature[id])
+      @mutex.synchronize { @last_sent[id] = attrs }
+      %(<crtrStatus exist=#{quote}#{id}#{quote}#{rest}#{attrs}/>)
+    end
+
+    def remember(id, quote, rest)
+      @mutex.synchronize do
+        @cache.delete(id) # re-insert so Hash order stays LRU-ish
+        @cache[id] = { quote: quote, rest: rest }
+        while @cache.size > CACHE_MAX
+          evicted, = @cache.shift
+          @last_sent.delete(evicted)
+        end
+      end
+    end
+
+    # ---- observers: mark dirty, replay from the script thread -----------
+
+    # Subscriber contract: worker thread, must be cheap and non-blocking.
+    def mark_dirty(data)
+      id = data[:id].to_s
+      @mutex.synchronize { @dirty[id] = true }
+    end
+
+    def drain_dirty
+      ids = @mutex.synchronize { keys = @dirty.keys; @dirty.clear; keys }
+      ids.each do |id|
+        entry = @mutex.synchronize { @cache[id] }
+        # Only replay tags the game actually sent - no cached tag means
+        # the front end never saw this creature's snapshot, and inventing
+        # one is exactly what this script must not do.
+        next unless entry
+
+        tag = build_tag(id, entry[:quote], entry[:rest])
+        _respond tag
+        respond "[creature_hp] replay #{tag}" if @debug
+      end
+    rescue StandardError => e
+      respond "[creature_hp] replay error: #{e.message}"
+    end
+  end
+end
+
+unless defined?(Lich::Gemstone::Creature)
+  echo 'creature_hp: Lich::Gemstone::Creature is not loaded; nothing to bridge.'
+  exit
+end
+
+unless Lich::Gemstone::Combat::Tracker.enabled?
+  Lich::Messaging.msg('monster', 'creature_hp: combat tracking is disabled, and this script needs it for creature HP.')
+  Lich::Messaging.msg('monster', 'creature_hp: enable it with:  ;e Combat::Tracker.enable!')
+  Lich::Messaging.msg('monster', 'creature_hp: the setting persists - then restart  ;creature_hp')
+  exit
+end
+
+before_dying do
+  DownstreamHook.remove(CreatureHP::HOOK_NAME)
+  Lich::Gemstone::Combat::Tracker.off(CreatureHP::SUB_NAME)
+end
+
+CreatureHP.debug = true if script.vars.include?('debug')
+
+DownstreamHook.add(CreatureHP::HOOK_NAME, proc { |line| CreatureHP.rewrite(line) })
+Lich::Gemstone::Combat::Tracker.on(:damage, name: CreatureHP::SUB_NAME) do |_type, data|
+  CreatureHP.mark_dirty(data)
+end
+
+echo 'creature_hp: bridging creature HP into crtrStatus.'
+echo 'creature_hp: debug on - echoing enriched and replayed tags.' if CreatureHP.debug
+
+loop do
+  sleep CreatureHP::REPLAY_INTERVAL
+  CreatureHP.drain_dirty
+end
