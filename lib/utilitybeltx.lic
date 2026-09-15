@@ -1,0 +1,1205 @@
+=begin
+  utilitybeltx.lic
+  Author: Hexbane
+  Version: 1.0
+  Tags: combat, automation, wing pin, parasite, vissi, cleric
+
+  Combined combat automation script managing:
+    - Wing pin abilities (dark and light modes)
+    - Cirrose Parasite vissi activation
+
+  Wing pin credits: original EnergyWings script by Ruseoffools and Codex.
+  Parasite credits: original ParasiteX script by Hexbane.
+
+  Each system runs in its own thread and can be independently enabled/disabled.
+
+  Wing Pin logic:
+    - Defensive tap (Shadow Mantle / Luminous Flight): fires when off cooldown
+    - Single target (Shadow Barb / Radiant Pulse): fires when target is vulnerable
+    - Multi target (Barbed Sweep / Blast of Brilliance): vulnerable AND target count >= threshold
+    - AOE (Rain of Thorns / Blinding Reprisal): target count >= threshold (precast invoke 1714)
+    - Guard AOE (Carrion Guard / Wings of Warding): bleeding AND target count >= threshold
+
+  Parasite logic:
+    - Fires when target is vulnerable and vissi is off cooldown
+    - Skips configured creature types
+
+  Usage:
+    ;utilitybeltx        -- start with saved settings
+    ;utilitybeltx setup  -- open GTK setup GUI
+    ;utilitybeltx reset  -- clear saved settings
+=end
+
+require 'yaml'
+require 'thread'
+
+module UtilityBeltX
+  PRONE_STATUS     = /sleeping|webbed|stunned|kneeling|sitting|lying|prone|frozen|held in place|entangled|rooted/i
+  POLL_INTERVAL    = 0.3
+  VISSI_MUTEX      = Mutex.new
+  @wing_active = false
+
+  def self.wing_active?; @wing_active; end
+  def self.wing_active=(v); @wing_active = v; end
+  @wealth_threshold = 1
+
+  def self.wealth_threshold=(val)
+    @wealth_threshold = val.to_i
+  end
+
+  def self.wealth_threshold
+    @wealth_threshold
+  end
+
+  def self.wealth_wants_fire?
+    return false unless Effects::Cooldowns.to_h.keys.none? { |k| k.to_s =~ /Wealth/i }
+    target_count = GameObj.npcs.count { |n| n && n.status.to_s !~ /dead|gone/ }
+    target_count >= @wealth_threshold
+  rescue StandardError
+    false
+  end
+
+  def self.settings_path
+    File.join(DATA_DIR, XMLData.game, Char.name, 'utilitybeltx.yaml')
+  end
+
+  def self.load_settings
+    defaults = {
+      'wings_enabled'          => true,
+      'wings_use_tap'          => true,
+      'wings_use_single'       => true,
+      'wings_use_multi'        => true,
+      'wings_use_aoe'          => true,
+      'wings_use_guard'        => true,
+      'wings_multi_threshold'  => 3,
+      'wings_aoe_threshold'    => 4,
+      'wings_guard_threshold'  => 4,
+      'wings_pause_scripts'    => 'bigshot',
+      'wings_precast_tap'      => '',
+      'wings_precast_single'   => '',
+      'wings_precast_multi'    => '',
+      'wings_precast_aoe'      => '',
+      'wings_precast_guard'    => '',
+      'parasite_enabled'       => true,
+      'parasite_command'       => 'rub my ave arc',
+      'parasite_pause_scripts' => '',
+      'parasite_skip'          => '',
+      'fatedfruit_enabled'       => true,
+      'fatedfruit_command'       => 'rub my ave arc',
+      'fatedfruit_pause_scripts' => '',
+      'fatedfruit_skip'          => '',
+      # Wealth Vissi
+      'wealth_enabled'           => false,
+      'wealth_verb'              => 'rub',
+      'wealth_arcarium'          => 'ave arc',
+      'wealth_threshold'         => 3,
+      'wealth_pause_scripts'     => '',
+      # Bloodstone
+      'bloodstone_enabled'           => false,
+      'bloodstone_noun'              => 'earring',
+      'bloodstone_vivacity_health'   => false,
+      'bloodstone_vivacity_health_threshold' => 50,
+      'bloodstone_vivacity_stamina'  => false,
+      'bloodstone_vivacity_stamina_threshold' => 50,
+      'bloodstone_vivacity_mana'     => false,
+      'bloodstone_vivacity_mana_threshold' => 30,
+      'bloodstone_sanguine_swap'     => false,
+      'bloodstone_sanguine_swap_wounds' => 3,
+      'bloodstone_prod'              => false,
+      'bloodstone_pinch'             => false,
+    }
+    return defaults unless File.exist?(settings_path)
+    loaded = YAML.load_file(settings_path) rescue {}
+    defaults.merge(loaded)
+  end
+
+  def self.save_settings(data)
+    dir = File.dirname(settings_path)
+    Dir.mkdir(dir) unless Dir.exist?(dir)
+    File.write(settings_path, data.to_yaml)
+  end
+
+  module SetupGUI
+    def self.run
+      unless defined?(Gtk) && Gtk::Version::MAJOR == 3
+        echo "GTK3 is not available."
+        exit
+      end
+
+      saved    = UtilityBeltX.load_settings
+      @running = true
+      @result  = nil
+
+      Gtk.queue do
+        @win = Gtk::Window.new(:toplevel)
+        @win.set_title("UtilityBeltX Setup")
+        @win.set_default_size(500, 560)
+        @win.set_border_width(10)
+        @win.keep_above = true
+
+        outer = Gtk::Box.new(:vertical, 6)
+        @win.add(outer)
+
+        nb = Gtk::Notebook.new
+        outer.pack_start(nb, expand: true, fill: true, padding: 0)
+
+        # --- Wing Pin Tab ---
+        w_scroll = Gtk::ScrolledWindow.new
+        w_scroll.set_policy(:automatic, :automatic)
+        w_vbox = Gtk::Box.new(:vertical, 8)
+        w_vbox.set_border_width(10)
+        w_scroll.add_with_viewport(w_vbox)
+
+        @w_enabled = Gtk::CheckButton.new("Enable Wing Pin system")
+        @w_enabled.active = saved['wings_enabled'] != false
+        w_vbox.pack_start(@w_enabled, expand: false, fill: false, padding: 0)
+        w_vbox.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 2)
+
+        @w_checks  = {}
+        @w_precasts = {}
+        [
+          ['wings_use_tap',    'Defensive tap (Shadow Mantle / Luminous Flight)',                        'wings_precast_tap',    'Tap pre-cast:',    'commands separated by ; e.g. incant 118'],
+          ['wings_use_single', 'Single target -- vulnerable (Shadow Barb / Radiant Pulse)',               'wings_precast_single', 'Single pre-cast:', 'commands separated by ; e.g. incant 118'],
+          ['wings_use_multi',  'Multi target -- vulnerable + count (Barbed Sweep / Blast of Brilliance)', 'wings_precast_multi',  'Multi pre-cast:',  'commands separated by ; e.g. incant 118'],
+          ['wings_use_aoe',    'AOE -- target count (Rain of Thorns / Blinding Reprisal)',                'wings_precast_aoe',    'AOE pre-cast:',    'commands separated by ; e.g. invoke 1714 tat; cast'],
+          ['wings_use_guard',  'Guard AOE -- bleeding + count (Carrion Guard / Wings of Warding)',        'wings_precast_guard',  'Guard pre-cast:',  'commands separated by ; e.g. incant 110'],
+        ].each do |chk_key, chk_label, pre_key, pre_label, pre_placeholder|
+          chk = Gtk::CheckButton.new(chk_label)
+          chk.active = saved[chk_key] != false
+          w_vbox.pack_start(chk, expand: false, fill: false, padding: 0)
+          @w_checks[chk_key] = chk
+
+          pre_row = Gtk::Box.new(:horizontal, 6)
+          pre_row.set_margin_start(20)
+          lbl = Gtk::Label.new(pre_label)
+          lbl.set_halign(:end)
+          pre_row.pack_start(lbl, expand: false, fill: false, padding: 0)
+          entry = Gtk::Entry.new
+          entry.set_placeholder_text(pre_placeholder)
+          entry.set_text(saved[pre_key].to_s) unless saved[pre_key].to_s.empty?
+          entry.set_hexpand(true)
+          pre_row.pack_start(entry, expand: true, fill: true, padding: 0)
+          w_vbox.pack_start(pre_row, expand: false, fill: false, padding: 0)
+          @w_precasts[pre_key] = entry
+        end
+
+        w_vbox.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 2)
+        w_vbox.pack_start(Gtk::Label.new("Target Thresholds:"), expand: false, fill: false, padding: 0)
+
+        w_grid = Gtk::Grid.new
+        w_grid.set_column_spacing(10)
+        w_grid.set_row_spacing(6)
+        w_vbox.pack_start(w_grid, expand: false, fill: false, padding: 0)
+
+        @w_thresh = {}
+        [
+          ['wings_multi_threshold', 'Multi target min:', 0],
+          ['wings_aoe_threshold',   'AOE min targets:',  1],
+          ['wings_guard_threshold', 'Guard AOE min:',    2],
+        ].each do |key, label, row|
+          lbl = Gtk::Label.new(label)
+          lbl.set_halign(:end)
+          w_grid.attach(lbl, 0, row, 1, 1)
+          entry = Gtk::Entry.new
+          entry.set_text(saved[key].to_s)
+          entry.set_hexpand(true)
+          w_grid.attach(entry, 1, row, 1, 1)
+          @w_thresh[key] = entry
+        end
+
+        w_vbox.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 2)
+        pause_lbl = Gtk::Label.new("Scripts to pause during abilities:")
+        pause_lbl.set_halign(:start)
+        w_vbox.pack_start(pause_lbl, expand: false, fill: false, padding: 0)
+        @w_pause = Gtk::Entry.new
+        @w_pause.set_placeholder_text("e.g. bigshot, hunt3")
+        @w_pause.set_text(saved['wings_pause_scripts'].to_s)
+        w_vbox.pack_start(@w_pause, expand: false, fill: false, padding: 0)
+
+        nb.append_page(w_scroll, Gtk::Label.new("Wing Pin"))
+
+        # --- Parasite Tab ---
+        p_vbox = Gtk::Box.new(:vertical, 8)
+        p_vbox.set_border_width(10)
+
+        @p_enabled = Gtk::CheckButton.new("Enable Cirrose Parasite system")
+        @p_enabled.active = saved['parasite_enabled'] != false
+        p_vbox.pack_start(@p_enabled, expand: false, fill: false, padding: 0)
+        p_vbox.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 2)
+
+        p_grid = Gtk::Grid.new
+        p_grid.set_column_spacing(12)
+        p_grid.set_row_spacing(8)
+        p_vbox.pack_start(p_grid, expand: false, fill: false, padding: 0)
+
+        @p_entries = {}
+        [
+          ['parasite_command',       'Activation Command:', 'e.g. rub my ave arc',                0],
+          ['parasite_pause_scripts', 'Scripts to Pause:',   'e.g. bigshot, hunt3',                1],
+          ['parasite_skip',          'Skip Creatures:',     'e.g. golem, wisp (comma separated)', 2],
+        ].each do |key, label, placeholder, row|
+          lbl = Gtk::Label.new(label)
+          lbl.set_halign(:end)
+          p_grid.attach(lbl, 0, row, 1, 1)
+          entry = Gtk::Entry.new
+          entry.set_placeholder_text(placeholder)
+          entry.set_text(saved[key].to_s) unless saved[key].to_s.empty?
+          entry.set_hexpand(true)
+          p_grid.attach(entry, 1, row, 1, 1)
+          @p_entries[key] = entry
+        end
+
+        nb.append_page(p_vbox, Gtk::Label.new("Cirrose Parasite"))
+
+        # --- Fated Fruit Tab ---
+        ff_vbox = Gtk::Box.new(:vertical, 8)
+        ff_vbox.set_border_width(10)
+
+        @ff_enabled = Gtk::CheckButton.new("Enable Fated Fruit system")
+        @ff_enabled.active = saved['fatedfruit_enabled'] != false
+        ff_vbox.pack_start(@ff_enabled, expand: false, fill: false, padding: 0)
+        ff_vbox.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 2)
+
+        ff_grid = Gtk::Grid.new
+        ff_grid.set_column_spacing(12)
+        ff_grid.set_row_spacing(8)
+        ff_vbox.pack_start(ff_grid, expand: false, fill: false, padding: 0)
+
+        @ff_entries = {}
+        [
+          ['fatedfruit_command',       'Activation Command:', 'e.g. rub my ave arc',                0],
+          ['fatedfruit_pause_scripts', 'Scripts to Pause:',   'e.g. bigshot, hunt3',                1],
+          ['fatedfruit_skip',          'Skip Creatures:',     'e.g. golem, wisp (comma separated)', 2],
+        ].each do |key, label, placeholder, row|
+          lbl = Gtk::Label.new(label)
+          lbl.set_halign(:end)
+          ff_grid.attach(lbl, 0, row, 1, 1)
+          entry = Gtk::Entry.new
+          entry.set_placeholder_text(placeholder)
+          entry.set_text(saved[key].to_s) unless saved[key].to_s.empty?
+          entry.set_hexpand(true)
+          ff_grid.attach(entry, 1, row, 1, 1)
+          @ff_entries[key] = entry
+        end
+
+        nb.append_page(ff_vbox, Gtk::Label.new("Fated Fruit"))
+
+        # --- Wealth Vissi Tab ---
+        wv_vbox = Gtk::Box.new(:vertical, 8)
+        wv_vbox.set_border_width(10)
+
+        @wv_enabled = Gtk::CheckButton.new("Enable Wealth Vissi (Aversaris AOE)")
+        @wv_enabled.active = saved['wealth_enabled'] == true
+        wv_vbox.pack_start(@wv_enabled, expand: false, fill: false, padding: 0)
+        wv_vbox.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 2)
+
+        wv_grid = Gtk::Grid.new
+        wv_grid.set_column_spacing(12)
+        wv_grid.set_row_spacing(8)
+        wv_vbox.pack_start(wv_grid, expand: false, fill: false, padding: 0)
+
+        @wv_entries = {}
+        [
+          ['wealth_verb',          'Activation Verb:',   'e.g. rub, tap, push, pull, poke', 0],
+          ['wealth_arcarium',      'Arcarium Noun:',     'e.g. ave arc',                    1],
+          ['wealth_pause_scripts', 'Scripts to Pause:',  'e.g. bigshot, hunt3',              2],
+        ].each do |key, label, placeholder, row|
+          lbl = Gtk::Label.new(label)
+          lbl.set_halign(:end)
+          wv_grid.attach(lbl, 0, row, 1, 1)
+          entry = Gtk::Entry.new
+          entry.set_placeholder_text(placeholder)
+          entry.set_text(saved[key].to_s) unless saved[key].to_s.empty?
+          entry.set_hexpand(true)
+          wv_grid.attach(entry, 1, row, 1, 1)
+          @wv_entries[key] = entry
+        end
+
+        lbl_thresh = Gtk::Label.new("Min target count:")
+        lbl_thresh.set_halign(:end)
+        wv_grid.attach(lbl_thresh, 0, 3, 1, 1)
+        @wv_threshold = Gtk::Entry.new
+        @wv_threshold.set_text(saved['wealth_threshold'].to_s)
+        @wv_threshold.set_hexpand(true)
+        wv_grid.attach(@wv_threshold, 1, 3, 1, 1)
+
+        nb.append_page(wv_vbox, Gtk::Label.new("Wealth Vissi"))
+
+        # --- Bloodstone Tab ---
+        bs_scroll = Gtk::ScrolledWindow.new
+        bs_scroll.set_policy(:automatic, :automatic)
+        bs_vbox = Gtk::Box.new(:vertical, 8)
+        bs_vbox.set_border_width(10)
+        bs_scroll.add_with_viewport(bs_vbox)
+
+        @bs_enabled = Gtk::CheckButton.new("Enable Bloodstone Jewelry system")
+        @bs_enabled.active = saved['bloodstone_enabled'] == true
+        bs_vbox.pack_start(@bs_enabled, expand: false, fill: false, padding: 0)
+        bs_vbox.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 2)
+
+        bs_grid = Gtk::Grid.new
+        bs_grid.set_column_spacing(12)
+        bs_grid.set_row_spacing(8)
+        bs_vbox.pack_start(bs_grid, expand: false, fill: false, padding: 0)
+
+        lbl_noun = Gtk::Label.new("Jewelry Noun:")
+        lbl_noun.set_halign(:end)
+        bs_grid.attach(lbl_noun, 0, 0, 1, 1)
+        @bs_noun = Gtk::Entry.new
+        @bs_noun.set_placeholder_text("e.g. earring, pendant, ring")
+        @bs_noun.set_text(saved['bloodstone_noun'].to_s) unless saved['bloodstone_noun'].to_s.empty?
+        @bs_noun.set_hexpand(true)
+        bs_grid.attach(@bs_noun, 1, 0, 1, 1)
+
+        bs_vbox.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 2)
+
+        # T3 Vivacity section
+        bs_vbox.pack_start(Gtk::Label.new("T3 Vivacity (BESEECH) -- auto-activate when resource falls below threshold %:"), expand: false, fill: false, padding: 0)
+
+        vivacity_grid = Gtk::Grid.new
+        vivacity_grid.set_column_spacing(12)
+        vivacity_grid.set_row_spacing(6)
+        bs_vbox.pack_start(vivacity_grid, expand: false, fill: false, padding: 0)
+
+        @bs_vivacity = {}
+        @bs_thresholds = {}
+        [
+          ['bloodstone_vivacity_health',  'Health',  'bloodstone_vivacity_health_threshold',  0],
+          ['bloodstone_vivacity_stamina', 'Stamina', 'bloodstone_vivacity_stamina_threshold', 1],
+          ['bloodstone_vivacity_mana',    'Mana',    'bloodstone_vivacity_mana_threshold',    2],
+        ].each do |chk_key, label, thresh_key, row|
+          chk = Gtk::CheckButton.new("#{label}:")
+          chk.active = saved[chk_key] == true
+          vivacity_grid.attach(chk, 0, row, 1, 1)
+          @bs_vivacity[chk_key] = chk
+
+          thresh_entry = Gtk::Entry.new
+          thresh_entry.set_placeholder_text("% e.g. 50")
+          thresh_entry.set_text(saved[thresh_key].to_s)
+          thresh_entry.set_hexpand(true)
+          vivacity_grid.attach(thresh_entry, 1, row, 1, 1)
+          @bs_thresholds[thresh_key] = thresh_entry
+
+          pct_lbl = Gtk::Label.new("%")
+          pct_lbl.set_halign(:start)
+          vivacity_grid.attach(pct_lbl, 2, row, 1, 1)
+        end
+
+        bs_vbox.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 2)
+
+        # T4 Sanguine Swap
+        @bs_swap = Gtk::CheckButton.new("T4 Sanguine Swap (SPIN) -- auto-activate when wound count >=")
+        @bs_swap.active = saved['bloodstone_sanguine_swap'] == true
+        bs_vbox.pack_start(@bs_swap, expand: false, fill: false, padding: 0)
+
+        swap_row = Gtk::Box.new(:horizontal, 8)
+        swap_row.set_margin_start(20)
+        lbl_wounds = Gtk::Label.new("Wound count threshold:")
+        lbl_wounds.set_halign(:end)
+        swap_row.pack_start(lbl_wounds, expand: false, fill: false, padding: 0)
+        @bs_swap_wounds = Gtk::Entry.new
+        @bs_swap_wounds.set_text(saved['bloodstone_sanguine_swap_wounds'].to_s)
+        @bs_swap_wounds.set_hexpand(true)
+        swap_row.pack_start(@bs_swap_wounds, expand: true, fill: true, padding: 0)
+        bs_vbox.pack_start(swap_row, expand: false, fill: false, padding: 0)
+
+        bs_vbox.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 2)
+
+        # T5 toggles
+        bs_vbox.pack_start(Gtk::Label.new("T5 Sanguine Sacrifice -- toggle on start:"), expand: false, fill: false, padding: 0)
+        @bs_prod = Gtk::CheckButton.new("PROD (enable extra concussion damage messaging)")
+        @bs_prod.active = saved['bloodstone_prod'] == true
+        bs_vbox.pack_start(@bs_prod, expand: false, fill: false, padding: 0)
+
+        @bs_pinch = Gtk::CheckButton.new("PINCH (enable overflow to Major Bleed)")
+        @bs_pinch.active = saved['bloodstone_pinch'] == true
+        bs_vbox.pack_start(@bs_pinch, expand: false, fill: false, padding: 0)
+
+        nb.append_page(bs_scroll, Gtk::Label.new("Bloodstone"))
+
+        # --- Buttons ---
+        btn_box = Gtk::Box.new(:horizontal, 8)
+
+        save_btn = Gtk::Button.new(label: "Save")
+        save_btn.signal_connect("clicked") do
+          data = {
+            'wings_enabled'       => @w_enabled.active?,
+            'wings_pause_scripts' => @w_pause.text.strip,
+            'parasite_enabled'    => @p_enabled.active?,
+          }
+          @w_checks.each { |key, chk| data[key] = chk.active? }
+          @w_thresh.each { |key, entry| data[key] = [entry.text.to_i, 1].max }
+          @p_entries.each { |key, entry| data[key] = entry.text.strip }
+          @ff_entries.each { |key, entry| data[key] = entry.text.strip }
+          data['fatedfruit_enabled'] = @ff_enabled.active?
+          data['wealth_enabled']    = @wv_enabled.active?
+          data['wealth_threshold']  = [@wv_threshold.text.to_i, 1].max
+          @wv_entries.each { |key, entry| data[key] = entry.text.strip }
+          # Bloodstone
+          data['bloodstone_enabled']  = @bs_enabled.active?
+          data['bloodstone_noun']     = @bs_noun.text.strip
+          data['bloodstone_prod']     = @bs_prod.active?
+          data['bloodstone_pinch']    = @bs_pinch.active?
+          data['bloodstone_sanguine_swap']        = @bs_swap.active?
+          data['bloodstone_sanguine_swap_wounds'] = [@bs_swap_wounds.text.to_i, 1].max
+          @bs_vivacity.each  { |key, chk|   data[key] = chk.active? }
+          @bs_thresholds.each { |key, entry| data[key] = [entry.text.to_i, 1].max }
+          @w_precasts.each { |key, entry| data[key] = entry.text.strip }
+          UtilityBeltX.save_settings(data)
+          @result = data
+          @win.destroy
+        end
+        btn_box.pack_end(save_btn, expand: false, fill: false, padding: 0)
+
+        cancel_btn = Gtk::Button.new(label: "Cancel")
+        cancel_btn.signal_connect("clicked") { @win.destroy }
+        btn_box.pack_end(cancel_btn, expand: false, fill: false, padding: 0)
+
+        outer.pack_start(btn_box, expand: false, fill: false, padding: 6)
+        @win.signal_connect("destroy") { Gtk.queue { @running = false } }
+        @win.show_all
+      end
+
+      wait_while { @running }
+      echo @result ? "Setup saved." : "Setup cancelled."
+    end
+  end
+
+  # ----------------------------
+  # Shared helpers
+  # ----------------------------
+  def self.living_target
+    target_id = XMLData.current_target_id rescue nil
+    return nil if target_id.nil? || target_id.empty?
+    target = GameObj[target_id] rescue nil
+    return nil unless target
+    return nil if target.status.to_s =~ /dead|gone/
+    target
+  rescue StandardError
+    nil
+  end
+
+  def self.target_vulnerable?(target)
+    return false unless target
+    target.status.to_s =~ PRONE_STATUS
+  rescue StandardError
+    false
+  end
+
+  def self.pause_scripts(list)
+    list.each do |name|
+      s = Script.running.find { |sc| sc.name =~ /^#{Regexp.escape(name)}$/i }
+      s&.pause
+    end
+  end
+
+  def self.resume_scripts(list)
+    list.each do |name|
+      s = Script.running.find { |sc| sc.name =~ /^#{Regexp.escape(name)}$/i }
+      s.unpause if s&.paused?
+    end
+  end
+
+  def self.in_allowed_room?
+    return true if Lich::Claim.mine?
+    return true if Room.current.location.to_s =~ /Dueling Sands/
+    return true unless GameObj.targets.empty?
+    false
+  rescue StandardError
+    true
+  end
+
+  def self.find_wing_pin
+    GameObj.inv.find { |i| i && i.name =~ /\A(?:dark|pale)\s+wing-shaped\s+pin\z/i }
+  rescue StandardError
+    nil
+  end
+
+  def self.wing_mode(pin)
+    return nil unless pin
+    return 'dark'  if pin.name =~ /dark/i
+    return 'light' if pin.name =~ /pale/i
+    nil
+  end
+
+  def self.ability_ready?(name)
+    !Effects::Cooldowns.active?(name)
+  rescue StandardError
+    true
+  end
+
+  # ----------------------------
+  # Wing Pin thread
+  # ----------------------------
+  class WingThread
+    def initialize(settings)
+      @settings   = settings
+      @pause_list = settings['wings_pause_scripts'].to_s.split(',').map(&:strip).reject(&:empty?)
+      @precasts = {
+        tap:    settings['wings_precast_tap'].to_s.strip,
+        single: settings['wings_precast_single'].to_s.strip,
+        multi:  settings['wings_precast_multi'].to_s.strip,
+        aoe:    settings['wings_precast_aoe'].to_s.strip,
+        guard:  settings['wings_precast_guard'].to_s.strip,
+      }
+    end
+
+    def fire(command, precast: nil)
+      UtilityBeltX.wing_active = true
+      UtilityBeltX.pause_scripts(@pause_list)
+      waitrt?
+      waitcastrt?
+      if precast && !precast.empty?
+        precast.each { |cmd| fput cmd }
+        waitrt?
+        waitcastrt?
+      end
+      fput command
+      waitrt?
+      waitcastrt?
+      sleep 0.5  # give cooldown time to register before next poll
+    ensure
+      UtilityBeltX.wing_active = false
+      UtilityBeltX.resume_scripts(@pause_list)
+    end
+
+    def precast_cmds(ability)
+      raw = @precasts[ability].to_s
+      return [] if raw.empty?
+      raw.split(/[;\n]+/).map(&:strip).reject(&:empty?)
+    end
+
+    def detect_mode
+      pin  = UtilityBeltX.find_wing_pin
+      mode = UtilityBeltX.wing_mode(pin)
+      [pin, mode]
+    end
+
+    def ability_names(mode)
+      if mode == 'dark'
+        {
+          tap:    'Shadow Mantle',
+          single: 'Shadow Barb',
+          multi:  'Barbed Sweep',
+          aoe:    'Rain of Thorns',
+          guard:  'Carrion Guard',
+        }
+      else
+        {
+          tap:    'Luminous Flight',
+          single: 'Radiant Pulse',
+          multi:  'Blast of Brilliance',
+          aoe:    'Blinding Reprisal',
+          guard:  'Wings of Warding',
+        }
+      end
+    end
+
+    def run
+      pin, mode = detect_mode
+
+      unless pin && mode
+        echo "Wing Pin: no dark/pale wing-shaped pin found -- wings disabled."
+        return
+      end
+
+      echo "Wing Pin: #{mode.upcase} mode (#{pin.name})"
+      abilities = ability_names(mode)
+
+      loop do
+        sleep POLL_INTERVAL
+        next unless UtilityBeltX.in_allowed_room?
+
+        # Auto-detect mode switch
+        new_pin, new_mode = detect_mode
+        if new_pin && new_mode && new_mode != mode
+          mode      = new_mode
+          pin       = new_pin
+          abilities = ability_names(mode)
+          echo "Wing mode switched: #{mode.upcase}"
+        end
+
+        target       = UtilityBeltX.living_target
+        vulnerable   = UtilityBeltX.target_vulnerable?(target)
+        target_count = GameObj.npcs.count { |n| n && n.status.to_s !~ /dead|gone/ }
+
+        # Skip entirely if no target
+        next unless target
+
+        # Defensive tap -- requires living target, off cooldown
+        if @settings['wings_use_tap'] && UtilityBeltX.ability_ready?(abilities[:tap])
+          fire('tap my wing pin', precast: precast_cmds(:tap))
+          next
+        end
+
+        # Single target -- vulnerable
+        if @settings['wings_use_single'] && vulnerable && UtilityBeltX.ability_ready?(abilities[:single])
+          fire('turn my wing pin', precast: precast_cmds(:single))
+          next
+        end
+
+        # Multi target -- vulnerable + count
+        if @settings['wings_use_multi'] && vulnerable &&
+           target_count >= @settings['wings_multi_threshold'].to_i &&
+           UtilityBeltX.ability_ready?(abilities[:multi])
+          fire('knock my wing pin', precast: precast_cmds(:multi))
+          next
+        end
+
+        # AOE -- count only, with precast
+        if @settings['wings_use_aoe'] &&
+           target_count >= @settings['wings_aoe_threshold'].to_i &&
+           UtilityBeltX.ability_ready?(abilities[:aoe])
+          fire('fold my wing pin', precast: precast_cmds(:aoe))
+          next
+        end
+
+        # Guard AOE -- bleeding + count
+        if @settings['wings_use_guard'] && bleeding? &&
+           target_count >= @settings['wings_guard_threshold'].to_i &&
+           UtilityBeltX.ability_ready?(abilities[:guard])
+          fire('push my wing pin', precast: precast_cmds(:guard))
+          next
+        end
+      end
+    rescue StandardError => e
+      echo "wing error: #{e.class} #{e.message}"
+    end
+  end
+
+  # ----------------------------
+  # Parasite thread
+  # ----------------------------
+  class ParasiteThread
+    def initialize(settings)
+      @command    = settings['parasite_command'].to_s
+      @command    = 'rub my ave arc' if @command.empty?
+      @pause_list = settings['parasite_pause_scripts'].to_s.split(',').map(&:strip).reject(&:empty?)
+      @skip_list  = settings['parasite_skip'].to_s.split(',').map(&:strip).map(&:downcase).reject(&:empty?)
+    end
+
+    def on_cooldown?
+      Effects::Cooldowns.to_h.keys.any? { |k| k.to_s =~ /Cirrose Parasite/i }
+    rescue StandardError
+      false
+    end
+
+    def skipped?(target)
+      return false if @skip_list.empty?
+      name = target.name.to_s.downcase
+      @skip_list.any? { |kw| name.include?(kw) }
+    end
+
+    def run
+      echo "Parasite: watching (command: #{@command})"
+      echo "Parasite skip: #{@skip_list.empty? ? 'none' : @skip_list.join(', ')}"
+
+      last_fired = Time.now - 999
+
+      loop do
+        sleep POLL_INTERVAL
+        next if on_cooldown?
+        next if Time.now - last_fired < 7
+        next if checkrt.to_i > 0
+
+        target = UtilityBeltX.living_target
+        next unless target
+        next unless UtilityBeltX.target_vulnerable?(target)
+        next if skipped?(target)
+
+        next unless UtilityBeltX::VISSI_MUTEX.try_lock
+
+        begin
+          UtilityBeltX.pause_scripts(@pause_list)
+          if checkrt.to_i == 0
+            target = UtilityBeltX.living_target
+            if target && UtilityBeltX.target_vulnerable?(target) && !on_cooldown?
+              fput "#{@command} at ##{target.id}"
+              last_fired = Time.now
+              sleep 4
+            end
+          end
+          UtilityBeltX.resume_scripts(@pause_list)
+        ensure
+          UtilityBeltX::VISSI_MUTEX.unlock
+        end
+      end
+    rescue StandardError => e
+      echo "parasite error: #{e.class} #{e.message}"
+    end
+  end
+
+  # ----------------------------
+  # Fated Fruit thread
+  # ----------------------------
+  class FatedFruitThread
+    def initialize(settings)
+      @command    = settings['fatedfruit_command'].to_s
+      @command    = 'rub my ave arc' if @command.empty?
+      @pause_list = settings['fatedfruit_pause_scripts'].to_s.split(',').map(&:strip).reject(&:empty?)
+      @skip_list  = settings['fatedfruit_skip'].to_s.split(',').map(&:strip).map(&:downcase).reject(&:empty?)
+    end
+
+    def on_cooldown?
+      Effects::Cooldowns.to_h.keys.any? { |k| k.to_s =~ /Fated Fruit/i }
+    rescue StandardError
+      false
+    end
+
+    def skipped?(target)
+      return false if @skip_list.empty?
+      name = target.name.to_s.downcase
+      @skip_list.any? { |kw| name.include?(kw) }
+    end
+
+    def run
+      echo "Fated Fruit: watching (command: #{@command})"
+      echo "Fated Fruit skip: #{@skip_list.empty? ? 'none' : @skip_list.join(', ')}"
+
+      # Stagger polling offset from parasite thread
+      sleep 4
+
+      last_fired = Time.now - 999
+
+      loop do
+        sleep POLL_INTERVAL
+        next if on_cooldown?
+        next if Time.now - last_fired < 7
+        next if checkrt.to_i > 0
+
+        target = UtilityBeltX.living_target
+        next unless target
+        next unless UtilityBeltX.target_vulnerable?(target)
+        next if skipped?(target)
+
+        # Try to claim the vissi lock -- skip if another vissi just fired
+        # Yield to wealth vissi if it's off cooldown and target count meets its threshold
+        next if UtilityBeltX.wealth_wants_fire?
+
+        next unless UtilityBeltX::VISSI_MUTEX.try_lock
+
+        begin
+          UtilityBeltX.pause_scripts(@pause_list)
+          if checkrt.to_i == 0
+            target = UtilityBeltX.living_target
+            if target && UtilityBeltX.target_vulnerable?(target) && !on_cooldown?
+              fput "#{@command} at ##{target.id}"
+              last_fired = Time.now
+            end
+          end
+          UtilityBeltX.resume_scripts(@pause_list)
+        ensure
+          UtilityBeltX::VISSI_MUTEX.unlock
+        end
+        sleep 4
+      end
+    rescue StandardError => e
+      echo "fated fruit error: #{e.class} #{e.message}"
+    end
+  end
+
+  # ----------------------------
+  # Bloodstone thread
+  # ----------------------------
+  class BloodstoneThread
+    VIVACITY_COOLDOWN = 3600  # 60 min in seconds
+    SWAP_COOLDOWN     = 1800  # 30 min in seconds
+    POLL_INTERVAL     = 2
+
+    def initialize(settings)
+      @noun          = settings['bloodstone_noun'].to_s
+      @noun          = 'earring' if @noun.empty?
+      # Vivacity
+      @vivacity_health   = settings['bloodstone_vivacity_health']  == true
+      @health_threshold  = settings['bloodstone_vivacity_health_threshold'].to_i
+      @vivacity_stamina  = settings['bloodstone_vivacity_stamina'] == true
+      @stamina_threshold = settings['bloodstone_vivacity_stamina_threshold'].to_i
+      @vivacity_mana     = settings['bloodstone_vivacity_mana']    == true
+      @mana_threshold    = settings['bloodstone_vivacity_mana_threshold'].to_i
+      # Sanguine Swap
+      @sanguine_swap     = settings['bloodstone_sanguine_swap'] == true
+      @swap_wounds       = settings['bloodstone_sanguine_swap_wounds'].to_i
+      # T5 toggles
+      @do_prod  = settings['bloodstone_prod']  == true
+      @do_pinch = settings['bloodstone_pinch'] == true
+
+      @vivacity_health_last  = Time.now - 999
+      @vivacity_stamina_last = Time.now - 999
+      @vivacity_mana_last    = Time.now - 999
+      @swap_last             = Time.now - 999
+      @swap_active           = false
+    end
+
+    def pct(current, max)
+      return 100 if max <= 0
+      (current.to_f / max.to_f * 100).round
+    end
+
+    def wound_count
+      # Count non-zero injury levels across body parts
+      count = 0
+      [:head, :neck, :chest, :back, :rightArm, :leftArm, :rightHand, :leftHand,
+       :rightLeg, :leftLeg, :rightFoot, :leftFoot, :abdomen].each do |part|
+        val = XMLData.injury(part) rescue 0
+        count += 1 if val.to_i > 0
+      end
+      count
+    rescue StandardError
+      0
+    end
+
+    def beseech(resource)
+      return if checkrt.to_i > 0
+      fput "beseech my #{@noun} #{resource}"
+      sleep 2
+    end
+
+    def spin
+      fput "spin my #{@noun}"
+      waitrt?
+    end
+
+    def run
+      echo "Bloodstone: active (#{@noun})"
+
+      # Apply T5 toggles on startup
+      if @do_prod
+        fput "prod my #{@noun}"
+        waitrt?
+        echo "Bloodstone: PROD toggled."
+      end
+      if @do_pinch
+        fput "pinch my #{@noun}"
+        waitrt?
+        echo "Bloodstone: PINCH toggled."
+      end
+
+      loop do
+        sleep POLL_INTERVAL
+
+        now = Time.now
+
+        # T3 Vivacity -- Health
+        if @vivacity_health &&
+           (now - @vivacity_health_last) >= VIVACITY_COOLDOWN &&
+           pct(checkhealth, maxhealth) <= @health_threshold
+          echo "Bloodstone: beseeching health (#{pct(checkhealth, maxhealth)}% <= #{@health_threshold}%)..."
+          beseech('health')
+          @vivacity_health_last = now  # set regardless of success to prevent spam
+        end
+
+        # T3 Vivacity -- Stamina
+        if @vivacity_stamina &&
+           (now - @vivacity_stamina_last) >= VIVACITY_COOLDOWN &&
+           pct(checkstamina, maxstamina) <= @stamina_threshold
+          echo "Bloodstone: beseeching stamina (#{pct(checkstamina, maxstamina)}% <= #{@stamina_threshold}%)..."
+          beseech('stamina')
+          @vivacity_stamina_last = now  # set regardless of success to prevent spam
+        end
+
+        # T3 Vivacity -- Mana
+        if @vivacity_mana &&
+           (now - @vivacity_mana_last) >= VIVACITY_COOLDOWN &&
+           pct(checkmana, maxmana) <= @mana_threshold
+          echo "Bloodstone: beseeching mana (#{pct(checkmana, maxmana)}% <= #{@mana_threshold}%)..."
+          beseech('mana')
+          @vivacity_mana_last = now  # set regardless of success to prevent spam
+        end
+
+        # T4 Sanguine Swap
+        if @sanguine_swap &&
+           !@swap_active &&
+           (now - @swap_last) >= SWAP_COOLDOWN &&
+           wound_count >= @swap_wounds
+          echo "Bloodstone: activating Sanguine Swap (#{wound_count} wounds >= #{@swap_wounds})..."
+          spin
+          @swap_active = true
+          @swap_last   = now
+        end
+
+        # Reset swap_active after 10 min (swap expires automatically)
+        @swap_active = false if @swap_active && (now - @swap_last) >= 600
+
+      end
+    rescue StandardError => e
+      echo "bloodstone error: #{e.class} #{e.message}"
+    end
+  end
+
+  # ----------------------------
+  # Wealth Vissi thread
+  # ----------------------------
+  class WealthThread
+    COOLDOWN_KEY = /Wealth/i
+
+    def initialize(settings)
+      @verb        = settings['wealth_verb'].to_s.strip
+      @verb        = 'rub' if @verb.empty?
+      @arcarium    = settings['wealth_arcarium'].to_s.strip
+      @arcarium    = 'ave arc' if @arcarium.empty?
+      @threshold   = [settings['wealth_threshold'].to_i, 1].max
+      @pause_list  = settings['wealth_pause_scripts'].to_s.split(',').map(&:strip).reject(&:empty?)
+      UtilityBeltX.wealth_threshold = @threshold
+    end
+
+    def on_cooldown?
+      Effects::Cooldowns.to_h.keys.any? { |k| k.to_s =~ COOLDOWN_KEY }
+    rescue StandardError
+      false
+    end
+
+    def run
+      echo "Wealth Vissi: active (#{@verb} my #{@arcarium}, threshold: #{@threshold} targets)"
+
+      last_fired = Time.now - 999
+
+      loop do
+        sleep POLL_INTERVAL
+        next if on_cooldown?
+        next if Time.now - last_fired < 7
+        next if checkrt.to_i > 0
+
+        target = UtilityBeltX.living_target
+        next unless target
+
+        target_count = GameObj.npcs.count { |n| n && n.status.to_s !~ /dead|gone/ }
+        next if target_count < @threshold
+
+        UtilityBeltX.pause_scripts(@pause_list)
+
+        next if checkrt.to_i > 0
+        target = UtilityBeltX.living_target
+        if target && !on_cooldown? &&
+           GameObj.npcs.count { |n| n && n.status.to_s !~ /dead|gone/ } >= @threshold
+          fput "#{@verb} my #{@arcarium} at ##{target.id}"
+          last_fired = Time.now
+          sleep 4
+        end
+
+        UtilityBeltX.resume_scripts(@pause_list)
+      end
+    rescue StandardError => e
+      echo "wealth vissi error: #{e.class} #{e.message}"
+    end
+  end
+
+  # ----------------------------
+  # Unified Vissi thread (runs all vissi in priority order in one loop)
+  # Priority: Wealth (multi-target) > Parasite > Fated Fruit
+  # ----------------------------
+  class VissiThread
+    def initialize(settings, parasite: nil, fatedfruit: nil, wealth: nil)
+      @parasite    = parasite
+      @fatedfruit  = fatedfruit
+      @wealth      = wealth
+    end
+
+    def run
+      loop do
+        sleep POLL_INTERVAL
+        next if checkrt > 0
+        next if UtilityBeltX.wing_active?
+
+        target       = UtilityBeltX.living_target
+        vulnerable   = target ? UtilityBeltX.target_vulnerable?(target) : false
+        target_count = GameObj.npcs.count { |n| n && n.status.to_s !~ /dead|gone/ }
+
+        # Priority 1: Wealth Vissi (multi-target, fires first if threshold met)
+        if @wealth && !@wealth.on_cooldown? && target &&
+           target_count >= @wealth.threshold &&
+           Time.now - @wealth.last_fired > 7
+          @wealth.fire(target)
+          next
+        end
+
+        # Priority 2: Parasite (single target, vulnerable)
+        if @parasite && !@parasite.on_cooldown? && target && vulnerable &&
+           !@parasite.skipped?(target) &&
+           Time.now - @parasite.last_fired > 7
+          @parasite.fire(target)
+          next
+        end
+
+        # Priority 3: Fated Fruit (single target, vulnerable)
+        if @fatedfruit && !@fatedfruit.on_cooldown? && target && vulnerable &&
+           !@fatedfruit.skipped?(target) &&
+           Time.now - @fatedfruit.last_fired > 7
+          @fatedfruit.fire(target)
+          next
+        end
+      end
+    rescue StandardError => e
+      echo "vissi error: #{e.class} #{e.message}"
+    end
+  end
+
+  # ----------------------------
+  # Parasite handler (used by VissiThread)
+  # ----------------------------
+  class ParasiteHandler
+    attr_reader :last_fired
+
+    def initialize(settings)
+      @command    = settings['parasite_command'].to_s
+      @command    = 'rub my ave arc' if @command.empty?
+      @pause_list = settings['parasite_pause_scripts'].to_s.split(',').map(&:strip).reject(&:empty?)
+      @skip_list  = settings['parasite_skip'].to_s.split(',').map(&:strip).map(&:downcase).reject(&:empty?)
+      @last_fired = Time.now - 999
+    end
+
+    def on_cooldown?
+      Effects::Cooldowns.to_h.keys.any? { |k| k.to_s =~ /Cirrose Parasite/i }
+    rescue StandardError
+      false
+    end
+
+    def skipped?(target)
+      return false if @skip_list.empty?
+      @skip_list.any? { |kw| target.name.to_s.downcase.include?(kw) }
+    end
+
+    def fire(target)
+      return if checkrt > 0
+      UtilityBeltX.pause_scripts(@pause_list)
+      result = dothistimeout("#{@command} at ##{target.id}", 4, /wait|Cast Roundtime|summons|hurl/i)
+      @last_fired = Time.now unless result =~ /wait/i
+      sleep 3
+      UtilityBeltX.resume_scripts(@pause_list)
+    end
+  end
+
+  # ----------------------------
+  # Fated Fruit handler (used by VissiThread)
+  # ----------------------------
+  class FatedFruitHandler
+    attr_reader :last_fired
+
+    def initialize(settings)
+      @command    = settings['fatedfruit_command'].to_s
+      @command    = 'rub my ave arc' if @command.empty?
+      @pause_list = settings['fatedfruit_pause_scripts'].to_s.split(',').map(&:strip).reject(&:empty?)
+      @skip_list  = settings['fatedfruit_skip'].to_s.split(',').map(&:strip).map(&:downcase).reject(&:empty?)
+      @last_fired = Time.now - 999
+    end
+
+    def on_cooldown?
+      Effects::Cooldowns.to_h.keys.any? { |k| k.to_s =~ /Fated Fruit/i }
+    rescue StandardError
+      false
+    end
+
+    def skipped?(target)
+      return false if @skip_list.empty?
+      @skip_list.any? { |kw| target.name.to_s.downcase.include?(kw) }
+    end
+
+    def fire(target)
+      return if checkrt > 0
+      UtilityBeltX.pause_scripts(@pause_list)
+      result = dothistimeout("#{@command} at ##{target.id}", 4, /wait|Cast Roundtime|summons|hurl/i)
+      @last_fired = Time.now unless result =~ /wait/i
+      sleep 3
+      UtilityBeltX.resume_scripts(@pause_list)
+    end
+  end
+
+  # ----------------------------
+  # Wealth handler (used by VissiThread)
+  # ----------------------------
+  class WealthHandler
+    attr_reader :last_fired, :threshold
+
+    def initialize(settings)
+      @verb        = settings['wealth_verb'].to_s.strip
+      @verb        = 'rub' if @verb.empty?
+      @arcarium    = settings['wealth_arcarium'].to_s.strip
+      @arcarium    = 'ave arc' if @arcarium.empty?
+      @threshold   = [settings['wealth_threshold'].to_i, 1].max
+      @pause_list  = settings['wealth_pause_scripts'].to_s.split(',').map(&:strip).reject(&:empty?)
+      @last_fired  = Time.now - 999
+      UtilityBeltX.wealth_threshold = @threshold
+    end
+
+    def on_cooldown?
+      Effects::Cooldowns.to_h.keys.any? { |k| k.to_s =~ /Wealth/i }
+    rescue StandardError
+      false
+    end
+
+    def fire(target)
+      return if checkrt > 0
+      UtilityBeltX.pause_scripts(@pause_list)
+      result = dothistimeout("#{@verb} my #{@arcarium} at ##{target.id}", 4, /wait|Cast Roundtime|summons|hurl|molten/i)
+      @last_fired = Time.now unless result =~ /wait/i
+      sleep 3
+      UtilityBeltX.resume_scripts(@pause_list)
+    end
+  end
+
+  # ----------------------------
+  # Runner
+  # ----------------------------
+  class Runner
+    def run
+      settings = UtilityBeltX.load_settings
+      echo "UtilityBeltX v1.0"
+
+      threads = []
+
+      if settings['wings_enabled']
+        threads << Thread.new { WingThread.new(settings).run }
+      else
+        echo "Wing Pin: DISABLED"
+      end
+
+      # Build vissi handlers and run in unified priority thread
+      parasite_handler   = settings['parasite_enabled']   ? ParasiteHandler.new(settings)   : nil
+      fatedfruit_handler = settings['fatedfruit_enabled'] ? FatedFruitHandler.new(settings) : nil
+      wealth_handler     = settings['wealth_enabled']     ? WealthHandler.new(settings)      : nil
+
+      echo "Parasite: #{parasite_handler ? "watching (command: #{settings['parasite_command']})" : 'DISABLED'}"
+      echo "Fated Fruit: #{fatedfruit_handler ? "watching (command: #{settings['fatedfruit_command']})" : 'DISABLED'}"
+      echo "Wealth Vissi: #{wealth_handler ? "active (#{settings['wealth_verb']} my #{settings['wealth_arcarium']}, threshold: #{settings['wealth_threshold']} targets)" : 'DISABLED'}"
+
+      if parasite_handler || fatedfruit_handler || wealth_handler
+        threads << Thread.new do
+          VissiThread.new(settings,
+            parasite:   parasite_handler,
+            fatedfruit: fatedfruit_handler,
+            wealth:     wealth_handler
+          ).run
+        end
+      end
+
+      if settings['bloodstone_enabled']
+        threads << Thread.new { BloodstoneThread.new(settings).run }
+      else
+        echo "Bloodstone: DISABLED"
+      end
+
+
+
+      if threads.empty?
+        echo "No systems enabled. Run ;utilitybeltx setup to configure."
+        exit
+      end
+
+      threads.each(&:join)
+    end
+  end
+end
+
+# ----------------------------
+# Entry point
+# ----------------------------
+cmd = Script.current.vars[1].to_s.strip.downcase
+
+case cmd
+when 'setup'
+  UtilityBeltX::SetupGUI.run
+when 'reset'
+  File.delete(UtilityBeltX.settings_path) if File.exist?(UtilityBeltX.settings_path)
+  echo "Settings cleared."
+else
+  UtilityBeltX::Runner.new.run
+end
