@@ -1,0 +1,326 @@
+=begin
+  invmgr.lic -- render the extended inventory manager feed as bordered ASCII tables.
+
+  Sends the extended "_inventory manager" request directly (not via
+  Lich::Common::Inventory, so capacity/weight can be kept as floats instead
+  of the module's integer-truncated lbs) and renders one bordered ASCII
+  table per container: each worn/held/reserved item that actually holds
+  something gets its own table (used/capacity, item count, encum, flags as
+  a heading row directly above the column header, sharing one continuous
+  border); everything worn/held/reserved that holds nothing is folded into
+  a single flat table per relation ("Worn Items", etc.); and every item
+  sitting in the room -- container or not -- is folded into one "Room"
+  table, since an unopened/locked box's contents aren't enumerable anyway.
+
+  Each item's name is a clickable <d> link that sends
+  "_inventory viewitem <nonce> <itemID>" to pop that item's detail dialog.
+  Columns (Capacity/Encum/Flags) are generated per-table from whatever
+  fields the items actually carry. WizardFE doesn't render <d> hyperlinks
+  (it dumps the raw tag text), so those links are stripped there.
+
+  CHANGELOG
+    1.2.0  WizardFE support: strip <d> hyperlink tags there instead of dumping
+           the raw tag text, since Wizard doesn't render clickable links
+    1.1.0  capacity/weight kept as floats (a sub-1lb weight showed as 0, now
+           shown as 0.1); heading row (name, used/capacity, item count, encum,
+           flags) merged into the table directly above the column header,
+           sharing one continuous border; auto-generated Capacity/Encum/Flags
+           columns; non-container worn/reserved/held items folded into one
+           flat table per relation, and all room items folded into one table
+    1.0.0  initial release -- send the extended inventory manager request,
+           parse the raw XML directly, one table per container with
+           clickable <d> viewitem links
+
+  author: Drafix
+  game: gs
+  tags: utility, items
+  required: Lich >= 5.0.0
+  version: 1.2.0
+=end
+
+INVMGR_VERSION = '1.2.0'
+NO_WEIGHT_LIMIT_SENTINEL = 99_990.0
+
+def invmgr_xml_unescape(str)
+  return str if str.nil?
+  str.gsub(/&(amp|lt|gt|quot|apos);/) { { 'amp' => '&', 'lt' => '<', 'gt' => '>', 'quot' => '"', 'apos' => "'" }[Regexp.last_match(1)] }
+end
+
+def invmgr_parse_loc(loc)
+  parts = loc.to_s.split(',')
+  case parts.size
+  when 0 then [nil, nil]
+  when 1 then parts.first == 'room' ? ['room', 'room'] : [parts.first, nil]
+  else [parts[0], parts[1]]
+  end
+end
+
+def invmgr_parse_name(raw)
+  parts = invmgr_xml_unescape(raw).to_s.split(',')
+  noun = parts.last.to_s.strip
+  article = parts.size > 1 ? parts.first.to_s.strip : ''
+  adjective = parts[1..-2].to_a.map(&:strip).reject(&:empty?).join(' ')
+  [article, adjective, noun].reject(&:empty?).join(' ')
+end
+
+def invmgr_parse_items(xml)
+  # The feed mixes quote styles per attribute (id/loc/weight are
+  # single-quoted, but name/long are double-quoted), so both must be matched.
+  xml.scan(/<i\s+([^>]*?)\/>/).flatten.map { |blob|
+    attrs = {}
+    blob.scan(/(\w+)=(?:'([^']*)'|"([^"]*)")/) { |k, v1, v2| attrs[k] = invmgr_xml_unescape(v1 || v2) }
+    attrs
+  }
+end
+
+def invmgr_fmt_num(n)
+  return '' if n.nil?
+  n == n.to_i ? n.to_i.to_s : format('%.1f', n)
+end
+
+# The feed only reports whole-lb weights, so anything genuinely under 1 lb
+# is rounded down to 0 on the wire. Show 0.1 instead so a real, light item
+# never reads as weighing nothing.
+def invmgr_fmt_weight(n)
+  return '' if n.nil?
+  invmgr_fmt_num(n.zero? ? 0.1 : n)
+end
+
+# `text` is what gets written out (may contain <d> markup); `vis` is the
+# substring that actually renders on screen and is what column widths and
+# centering are measured against.
+InvmgrCell = Struct.new(:text, :vis)
+
+def invmgr_cell(text, vis = nil)
+  InvmgrCell.new(text, vis || text)
+end
+
+def invmgr_pad_center(text, width, vis_len)
+  total = width - vis_len
+  total = 0 if total < 0
+  left = total / 2
+  right = total - left
+  (' ' * left) + text + (' ' * right)
+end
+
+def invmgr_row_line(cells, widths)
+  '|' + cells.each_index.map { |i| invmgr_pad_center(cells[i].text, widths[i], cells[i].vis.length) }.join('|') + '|'
+end
+
+def invmgr_col_widths(headers, rows)
+  headers.each_index.map { |i| ([headers[i].length] + rows.map { |r| r[i].vis.length }).max + 2 }
+end
+
+def invmgr_extra_cols(items)
+  {
+    capacity: items.any? { |c| c[:capacity] },
+    encum:    items.any? { |c| c[:encum] },
+    flags:    items.any? { |c| !c[:flags].empty? }
+  }
+end
+
+def invmgr_headers(extra_cols)
+  h = ['Name', 'ID', 'Weight']
+  h << 'Capacity' if extra_cols[:capacity]
+  h << 'Encum'    if extra_cols[:encum]
+  h << 'Flags'    if extra_cols[:flags]
+  h
+end
+
+def invmgr_item_row(item, extra_cols)
+  link = "<d cmd='_inventory viewitem #{invmgr_viewitem_nonce} #{item[:id]}'>#{item[:name]}</d>"
+  row = [invmgr_cell(link, item[:name]), invmgr_cell(item[:id]), invmgr_cell(invmgr_fmt_weight(item[:weight]))]
+  row << invmgr_cell(item[:capacity] ? invmgr_fmt_num(item[:capacity]) : '') if extra_cols[:capacity]
+  row << invmgr_cell(item[:encum] ? invmgr_fmt_num(item[:encum]) : '')       if extra_cols[:encum]
+  row << invmgr_cell(item[:flags].join(','))                                if extra_cols[:flags]
+  row
+end
+
+# Renders a heading row (one or more fields) immediately above an items
+# table, sharing one continuous border with it (the heading's bottom border
+# doubles as the item table's top border). If `items` is empty, only the
+# heading's own bordered box is emitted.
+def invmgr_render_section(heading_cells, items)
+  heading_widths = heading_cells.map { |c| c.vis.length + 2 }
+  heading_line = invmgr_row_line(heading_cells, heading_widths)
+
+  if items.empty?
+    border = '-' * heading_line.length
+    return [border, heading_line, border]
+  end
+
+  extra_cols = invmgr_extra_cols(items)
+  headers = invmgr_headers(extra_cols)
+  header_cells = headers.map { |h| invmgr_cell(h) }
+  rows = items.map { |item| invmgr_item_row(item, extra_cols) }
+  col_widths = invmgr_col_widths(headers, rows)
+  header_line = invmgr_row_line(header_cells, col_widths)
+
+  # Both rows share one border, so whichever of the two is narrower gets its
+  # last column padded out to match the wider one.
+  target_width = [heading_line.length, header_line.length].max
+  if heading_line.length < target_width
+    heading_widths[-1] += target_width - heading_line.length
+    heading_line = invmgr_row_line(heading_cells, heading_widths)
+  elsif header_line.length < target_width
+    col_widths[-1] += target_width - header_line.length
+    header_line = invmgr_row_line(header_cells, col_widths)
+  end
+
+  border = '-' * target_width
+  lines = [border, heading_line, border, header_line, border]
+  rows.each { |r| lines << invmgr_row_line(r, col_widths) }
+  lines << border
+end
+
+# Same as the global respond(), but skips the XmlEntities.encode step so a
+# literal <d cmd='...'>...</d> link survives -- respond() would otherwise
+# turn it into inert text on mono-capable frontends.
+def invmgr_respond(lines)
+  str = lines.map { |l| "#{l}\r\n" }.join
+  str.split(/\r?\n/).each { |line| Script.new_script_output(line); Buffer.update(line, Buffer::SCRIPT_OUTPUT) }
+  str = "<output class=\"mono\"/>\r\n#{str}<output class=\"\"/>\r\n" if Frontend.supports_mono?
+  $_CLIENT_.puts_main_stream(str) if $_CLIENT_&.alive?
+  detachable_clients_respond(str)
+end
+
+$invmgr_viewitem_seq = 0
+
+def invmgr_viewitem_nonce
+  ts = (Time.now.to_f * 1000).to_i.to_s(36).rjust(10, '0')
+  letter = ('a'..'z').to_a[$invmgr_viewitem_seq % 26]
+  $invmgr_viewitem_seq += 1
+  "#{ts}#{letter}"
+end
+
+# --- send the request and capture the raw response line ourselves -------
+
+request_id = (Time.now.to_f * 1000).to_i.to_s(36).rjust(10, '0') + 'e'
+captured = nil
+hook_name = "invmgr_#{request_id}"
+
+action = proc { |server_string|
+  captured = server_string if captured.nil? && server_string.include?("<inventoryManager id='#{request_id}'")
+  server_string
+}
+DownstreamHook.add(hook_name, action)
+
+begin
+  respond "Requesting inventory manager data..."
+  Game._puts("_inventory manager #{request_id}")
+
+  deadline = Time.now + 10
+  until captured || Time.now > deadline
+    sleep 0.05
+  end
+ensure
+  DownstreamHook.remove(hook_name)
+end
+
+if captured.nil?
+  respond "invmgr: no response from the inventory manager feed (timed out, or unsupported this session)."
+  exit
+end
+
+# --- parse -----------------------------------------------------------------
+
+items = {}
+invmgr_parse_items(captured).each do |attrs|
+  id = attrs['id']
+  next if id.nil? || id.empty?
+
+  relation, parent_id = invmgr_parse_loc(attrs['loc'])
+  in_max = attrs['in_max'] || attrs['on_max']
+  capacity =
+    if in_max
+      n = in_max.to_f
+      n == NO_WEIGHT_LIMIT_SENTINEL ? nil : n / 10.0
+    end
+
+  items[id] = {
+    id: id,
+    name: invmgr_parse_name(attrs['name']),
+    weight: attrs['weight'].to_f,
+    capacity: capacity,
+    encum: attrs['encum'] ? attrs['encum'].to_f : nil,
+    flags: attrs['flags'] ? attrs['flags'].split(',') : [],
+    relation: relation,
+    parent_id: parent_id,
+    children: []
+  }
+end
+
+items.each_value do |item|
+  pid = item[:parent_id]
+  next if pid.nil? || pid == 'player' || pid == 'room'
+
+  parent = items[pid]
+  parent[:children] << item if parent
+end
+
+top_level = items.values.select { |it| it[:parent_id].nil? || it[:parent_id] == 'player' || it[:parent_id] == 'room' }
+
+if top_level.empty?
+  respond "invmgr: no items found."
+  exit
+end
+
+RELATION_ORDER = { 'worn' => 0, 'reserved' => 1, 'righthand' => 1, 'lefthand' => 1, 'atfeet' => 1, 'room' => 2 }.freeze
+RELATION_LABEL = {
+  'worn'      => 'Worn Items',
+  'reserved'  => 'Reserved Items',
+  'righthand' => 'Held Items',
+  'lefthand'  => 'Held Items',
+  'atfeet'    => 'Items At Feet'
+}.freeze
+GROUP_ORDER = ['Worn Items', 'Reserved Items', 'Held Items', 'Items At Feet'].freeze
+
+# Room items are always flattened into one table regardless of whether they
+# hold anything (an unopened/locked box's contents aren't enumerable, so
+# there's nothing meaningful to drill into).
+room_items = top_level.select { |it| it[:relation] == 'room' }
+non_room   = top_level.reject { |it| it[:relation] == 'room' }
+
+individual = non_room.select { |it| !it[:children].empty? }
+                      .sort_by { |it| [RELATION_ORDER.fetch(it[:relation], 1), it[:name]] }
+groupable  = non_room.select { |it| it[:children].empty? }
+
+output = []
+
+individual.each do |container|
+  used = container[:children].sum { |c| c[:weight] }
+  frac = container[:capacity] ? "#{invmgr_fmt_weight(used)}/#{invmgr_fmt_num(container[:capacity])} lbs" : "#{invmgr_fmt_weight(used)} lbs"
+
+  heading_cells = [
+    invmgr_cell("#{container[:name]} (#{container[:relation]})"),
+    invmgr_cell(frac),
+    invmgr_cell("items: #{container[:children].size}")
+  ]
+  heading_cells << invmgr_cell("encum: #{invmgr_fmt_num(container[:encum])}") if container[:encum]
+  heading_cells << invmgr_cell("flags: #{container[:flags].join(',')}") unless container[:flags].empty?
+
+  output << ''
+  output.concat(invmgr_render_section(heading_cells, container[:children]))
+end
+
+groupable.group_by { |it| RELATION_LABEL.fetch(it[:relation], (it[:relation] || 'other').capitalize) }
+         .sort_by { |label, _| GROUP_ORDER.index(label) || GROUP_ORDER.size }
+         .each do |label, list|
+  output << ''
+  output.concat(invmgr_render_section([invmgr_cell("#{label} (#{list.size})")], list))
+end
+
+unless room_items.empty?
+  output << ''
+  output.concat(invmgr_render_section([invmgr_cell("Room (#{room_items.size})")], room_items))
+end
+
+# WizardFE renders no <d> hyperlinks -- it would just dump the raw tag text
+# into the window -- so strip them there and keep only the item name. The
+# surrounding padding was already sized to the visible text, not the
+# markup, so stripping it afterward doesn't disturb column alignment.
+if Frontend.client.to_s.downcase == 'wizard'
+  output = output.map { |line| line.gsub(%r{</?d\b[^>]*>}, '') }
+end
+
+invmgr_respond(output)
