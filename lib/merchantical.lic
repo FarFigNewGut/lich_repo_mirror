@@ -11,7 +11,7 @@ The following inputs are available:
         Other scripts: Combatical, VolnRestore2, Loresang
         game: gs
         tags: utility, economy, merchant, loresang, sell, pawnshop, shop, item, management
-        version: 1.5.7
+        version: 1.6.0
         required: Lich > 5.0
 
         \Version\
@@ -75,6 +75,9 @@ The following inputs are available:
         1.5.7 09/07/2026 - Fixed container scans sometimes mislabeling items when listing
                           for sale. Ledger entries can now be individually deleted, with
                           totals recalculating immediately.
+        1.6.0 09/18/2026 - Edit Items For Sale: per-item editable price, ctrl/shift-click
+                          multi-select with bulk +/-% and remove buttons. Added ? help
+                          popups for Loresang and Shop Inventory Management.
 
 
 =end
@@ -187,6 +190,7 @@ module Merchantical
       #{w} * { background-image: none; }
       #{w} { background-color: #{s[:bg]}; color: #{s[:fg]}; }
       #{w} box { background-color: inherit; }
+      #{w} eventbox { background-color: inherit; }
       #{w} viewport { background-color: #{s[:bg]}; }
       #{w} scrolledwindow { background-color: #{s[:bg]}; }
       #{w} frame { background-color: #{s[:bg]}; border-color: #{s[:border]}; }
@@ -204,6 +208,20 @@ module Merchantical
          when neighboring rows differ in height (wrapped long names vs short
          ones). */
       #{w} box.mc-sq-hover { background-color: #{s[:hover]}; }
+      /* Edit Items For Sale: ctrl/shift-click selection highlight, and a price
+         field the user has actually typed into (vs. still showing the item's
+         current listed price). */
+      #{w} box.mc-item-row-selected { background-color: rgba(80, 140, 255, 0.22); }
+      #{w} entry.mc-item-row-selected { background-color: rgba(80, 140, 255, 0.35); }
+      /* Faint version of the selection tint, toggled by hand while the mouse
+         is over a row's price field (see price_entry's enter/leave-notify
+         below) -- just enough to tell you which row a text box belongs to. */
+      #{w} box.mc-item-row-hover { background-color: rgba(80, 140, 255, 0.10); }
+      #{w} entry.mc-price-edited { color: #ffffff; }
+      /* Tighter than a stock entry -- shrinks Edit Items For Sale's price
+         column so rows pack closer together instead of each one stretching
+         to the theme's default entry height. */
+      #{w} entry.mc-item-price-entry { padding: 1px 4px; min-height: 0px; }
       #{w} entry { background-color: #{s[:bg2]}; color: #{s[:fg]}; }
       #{w} button { background-color: #{s[:bg3]}; color: #{s[:fg]}; border: 1px solid #{s[:border]}; }
       #{w} button:hover { background-color: #{s[:hover]}; }
@@ -831,6 +849,7 @@ module Merchantical
     SHOP_ICON        = "\u{1F3EA}".freeze
     MUSIC_ICON       = "\u266B".freeze   # \u266B text char  -  responds to Pango foreground
     GEAR_ICON        = "\u2699".freeze
+    HELP_ICON        = "\u2753".freeze
     LOCK_ON_ICON     = "\u{1F512}".freeze  # \u{1F512}
     LOCK_OFF_ICON    = "\u{1F513}".freeze  # \u{1F513}
     LOCKER_ICON      = "\u{1F4E6}".freeze  # \u{1F4E6} locker indicator (display only)
@@ -843,6 +862,16 @@ module Merchantical
     SQ_NAME_W  = 380
     SQ_COUNT_W = 45
     SQ_QTY_W   = 46
+
+    # Edit Items For Sale row layout: every item name gets this same fixed
+    # width (wrap/ellipsize inside it) so the price/X columns after it line
+    # up regardless of name length. REMOVAL_INDENT_W approximates the room +
+    # container nesting (@shop_inv_box margin 10, room_vbox margin_start 14,
+    # cont_vbox margin_start 24, minus inv_summary_row's own margin_start 6)
+    # so the bulk %/X buttons above the list can be offset to roughly meet
+    # the price column -- a visual approximation, not pixel-exact.
+    REMOVAL_NAME_W   = 380
+    REMOVAL_INDENT_W = 42
 
     def initialize(items, cmd_queue, on_close, state, shop_state = nil)
       super()
@@ -870,6 +899,15 @@ module Merchantical
       @removal_cancel_btn    = nil
       @removal_mode          = false
       @removal_marked        = {}
+      @price_edits           = {}
+      @selected_items         = Set.new
+      @last_clicked_key       = nil
+      @removal_item_order     = []
+      @removal_item_info      = {}
+      # Keeps the bulk %/X buttons' leading spacer (inv_summary_row) the same
+      # width as every item name column below it, so they stay aligned with
+      # the price column even as item names/window size change.
+      @name_col_size_group    = Gtk::SizeGroup.new(:horizontal)
       @normal_scroll         = nil
       @row_data          = []
       @sell_timers       = {}
@@ -1037,9 +1075,9 @@ module Merchantical
       # inv_body holds the search row, totals ribbon, and the scrolling item
       # list -- everything the Shop Inventory view actually is. It's the same
       # single widget whether you're looking at it from the "Shop Inventory"
-      # tab or the "Remove Items for Sale" tab; switch-page (below) reparents
+      # tab or the "Edit Items For Sale" tab; switch-page (below) reparents
       # it between inv_page and removal_page rather than keeping two separate
-      # copies of this view in sync. "Remove Items for Sale" is a real
+      # copies of this view in sync. "Edit Items For Sale" is a real
       # notebook page for exactly this reason -- a genuine tab gets the same
       # native selected/depressed look as the other two for free, instead of
       # a button trying to imitate one.
@@ -1073,19 +1111,76 @@ module Merchantical
       @shop_inv_summary_lbl.xalign = 0.0
       inv_summary_row.pack_start(@shop_inv_summary_lbl, expand: false, fill: false, padding: 0)
 
-      # Spacer pushes Commit removal / Cancel to the far right, separated from
-      # the summary label. Both stay hidden (no_show_all so a window-wide
-      # show_all can't reveal them by accident) until the removal tab is
-      # selected -- but their own label children are shown once right here at
-      # construction, since a child added via .add() is never auto-shown by
-      # GTK the way a stock label: constructor's internal label is, and a
-      # parent that's had no_show_all set skips showing ITS children too, not
-      # just itself, on any later show_all() -- without this the button would
-      # just render as an empty box even once made visible.
+      # Bulk price adjustment for whatever's currently selected (ctrl/shift-click
+      # on item names below) -- percent buttons nudge each selected item's price
+      # (stacking on top of any edit already pending), the X marks the whole
+      # selection for removal instead. Hidden outside removal/edit mode, same as
+      # Commit/Cancel below. Positioned (rather than pushed to the far right)
+      # so it lands roughly above the price column -- see the two leading
+      # spacers packed into it first, below.
+      @bulk_price_box = Gtk::Box.new(:horizontal, 2)
+      @bulk_price_box.no_show_all = true
+      @bulk_price_box.visible = false
+      # Same no_show_all trap as Commit/Cancel below -- @bulk_price_box's own
+      # visibility is toggled directly (not via show_all), so every child
+      # packed into it needs an explicit .show once at construction or it
+      # never renders even once the box itself is made visible.
+      indent_spacer = Gtk::Label.new("")
+      indent_spacer.width_request = REMOVAL_INDENT_W
+      indent_spacer.show
+      @bulk_price_box.pack_start(indent_spacer, expand: false, fill: false, padding: 0)
+      name_col_spacer = Gtk::Label.new("")
+      @name_col_size_group.add_widget(name_col_spacer)
+      name_col_spacer.show
+      @bulk_price_box.pack_start(name_col_spacer, expand: false, fill: false, padding: 0)
+
+      note_lbl = Gtk::Label.new
+      note_lbl.markup = "<span size='small' foreground='#888'>[note]</span>"
+      note_lbl.show
+      note_lbl.set_tooltip_text(
+        "Click an item name to select it. Ctrl+click adds/removes one item from\n" \
+        "the selection; shift+click selects the range since your last click.\n\n" \
+        "Ctrl+click a container's header to select every item in it, or a room's\n" \
+        "header to select every item in every container of that room -- either\n" \
+        "one replaces the current selection rather than adding to it."
+      )
+      @bulk_price_box.pack_start(note_lbl, expand: false, fill: false, padding: 6)
+
+      [5, 10, 20, -5, -10, -20].each do |pct|
+        pct_btn = Gtk::Button.new(label: "#{pct > 0 ? '+' : ''}#{pct}%")
+        pct_btn.set_tooltip_text("Adjust the price of every selected item by #{pct > 0 ? '+' : ''}#{pct}%.")
+        pct_btn.signal_connect('clicked') { adjust_selected_prices(pct) }
+        pct_btn.show
+        @bulk_price_box.pack_start(pct_btn, expand: false, fill: false, padding: 1)
+      end
+      bulk_x_lbl = Gtk::Label.new
+      bulk_x_lbl.markup = "<span foreground='#cc5555'>\u{2715}</span>"
+      bulk_x_lbl.show
+      bulk_x_btn = Gtk::Button.new
+      bulk_x_btn.add(bulk_x_lbl)
+      bulk_x_btn.relief = :none
+      bulk_x_btn.style_context.add_class('mc-x-btn')
+      bulk_x_btn.set_tooltip_text("Mark every selected item for removal from the shop.")
+      bulk_x_btn.signal_connect('clicked') { mark_selected_for_removal }
+      bulk_x_btn.show
+      @bulk_price_box.pack_start(bulk_x_btn, expand: false, fill: false, padding: 4)
+      inv_summary_row.pack_start(@bulk_price_box, expand: false, fill: false, padding: 4)
+
+      # Spacer pushes Commit Changes/Removals / Cancel to the far right,
+      # separated from everything before it (including @bulk_price_box, which
+      # is deliberately NOT pushed right -- see above). Both buttons stay
+      # hidden (no_show_all so a window-wide show_all can't reveal them by
+      # accident) until the removal tab is selected -- but their own label
+      # children are shown once right here at construction, since a child
+      # added via .add() is never auto-shown by GTK the way a stock label:
+      # constructor's internal label is, and a parent that's had no_show_all
+      # set skips showing ITS children too, not just itself, on any later
+      # show_all() -- without this the button would just render as an empty
+      # box even once made visible.
       inv_summary_row.pack_start(Gtk::Label.new, expand: true, fill: true, padding: 0)
 
       commit_removal_lbl = Gtk::Label.new
-      commit_removal_lbl.markup = "<span foreground='#ff4444' weight='bold'>Commit removal</span>"
+      commit_removal_lbl.markup = "<span foreground='#ff4444' weight='bold'>Commit Changes/Removals</span>"
       commit_removal_lbl.show
       @removal_commit_btn = Gtk::Button.new
       @removal_commit_btn.add(commit_removal_lbl)
@@ -1093,8 +1188,9 @@ module Merchantical
       @removal_commit_btn.no_show_all = true
       @removal_commit_btn.visible = false
       @removal_commit_btn.set_tooltip_text(
-        "Pull and stow every item currently marked red, room by room, and\n" \
-        "update the Shop Inventory tab as each one is confirmed removed."
+        "Pull and stow every item currently marked red, and pull + re-list every\n" \
+        "item with an edited price, room by room -- updating the Shop Inventory\n" \
+        "tab as each one is confirmed."
       )
       @removal_commit_btn.signal_connect('clicked') { commit_removal }
       inv_summary_row.pack_start(@removal_commit_btn, expand: false, fill: false, padding: 4)
@@ -1167,11 +1263,15 @@ module Merchantical
       # Gtk::Notebook page gets the same native selected/"depressed" tab
       # styling as the other two automatically, which a button dressed up to
       # look like a tab can't quite reproduce.
-      removal_tab_lbl = Gtk::Label.new("Remove Items for Sale")
+      removal_tab_lbl = Gtk::Label.new("Edit Items For Sale")
       removal_tab_lbl.set_tooltip_text(
-        "Mark listed items to pull back from the shop. Shows a X next to every\n" \
-        "item -- click one to mark it (red), click again to unmark. Nothing is\n" \
-        "actually removed until you click Commit removal."
+        "Mark listed items to pull back from the shop, or edit their price. Shows\n" \
+        "a X next to every item -- click one to mark it for removal (red), click\n" \
+        "again to unmark. Click an item's name to select it (ctrl/shift-click for\n" \
+        "multiple), then use the %/X buttons above to bulk-adjust price or mark\n" \
+        "for removal. Type directly into an item's price field to set it exactly\n" \
+        "(shown in white once changed). Nothing happens until you click Commit\n" \
+        "Changes/Removals."
       )
       nb.append_page(removal_page, removal_tab_lbl)
 
@@ -1185,12 +1285,16 @@ module Merchantical
         else
           removal_page.remove(inv_body)
           inv_page.pack_start(inv_body, expand: true, fill: true, padding: 0)
-          @removal_marked = {}
+          @removal_marked    = {}
+          @price_edits       = {}
+          @selected_items    = Set.new
+          @last_clicked_key  = nil
         end
         @removal_mode = now_removal
         inv_body.show_all
         @removal_commit_btn.visible = now_removal
         @removal_cancel_btn.visible = now_removal
+        @bulk_price_box.visible     = now_removal
         rebuild_shop_inventory_view
       end
 
@@ -1205,10 +1309,24 @@ module Merchantical
       ledger_tab_lbl = Gtk::Label.new("Ledger")
       ledger_tab_lbl.set_tooltip_text(
         "Items that vanished from Shop Inventory between scans without being\n" \
-        "pulled by Remove Items for Sale -- the closest thing to a sales report\n" \
+        "pulled by Edit Items For Sale -- the closest thing to a sales report\n" \
         "the game gives us, since it never reports sales directly."
       )
       nb.append_page(ledger_page, ledger_tab_lbl)
+
+      # Shop help button, set as the notebook's own action widget rather than
+      # packed into any one tab's row -- GTK renders it in the tab strip's
+      # own corner, so it stays visible no matter which of the four tabs is
+      # selected instead of needing to be duplicated into each one.
+      shop_help_lbl = Gtk::Label.new
+      shop_help_lbl.markup = "<span size='large' foreground='#d4af37'>#{HELP_ICON}</span>"
+      shop_help_btn = Gtk::Button.new
+      shop_help_btn.add(shop_help_lbl)
+      shop_help_btn.relief = :none
+      shop_help_btn.set_tooltip_text("How to use Shop Inventory Management")
+      shop_help_btn.signal_connect('clicked') { show_help_dialog("Shop Inventory Management Help", shop_help_text) }
+      shop_help_btn.show_all
+      nb.set_action_widget(shop_help_btn, :end)
 
       rebuild_shop_inventory_view
       rebuild_sell_queue_view
@@ -1217,12 +1335,77 @@ module Merchantical
     end
 
     def commit_removal
-      if @removal_marked.empty?
-        Lich::Messaging.msg("yellow", "[Merchantical] Remove items: nothing marked.")
+      if @removal_marked.empty? && @price_edits.empty?
+        Lich::Messaging.msg("yellow", "[Merchantical] Edit items: nothing marked or changed.")
         return
       end
-      @cmd_queue.push({ commit_shop_removal: @removal_marked.values })
+      @cmd_queue.push({ commit_shop_changes: { removals: @removal_marked.values, price_edits: @price_edits.values } })
       @shop_notebook.page = 0
+    end
+
+    # Click-to-select for the Edit Items For Sale item list -- plain click
+    # replaces the selection, ctrl+click toggles one item in/out of it, and
+    # shift+click selects the range since the last-clicked item (against
+    # @removal_item_order, captured fresh on every rebuild so it always
+    # matches what's on screen). Ctrl+shift extends the existing selection by
+    # that range instead of replacing it.
+    def select_item(key, event)
+      ctrl  = (event.state.to_i & 4) != 0 # GDK_CONTROL_MASK
+      shift = (event.state.to_i & 1) != 0 # GDK_SHIFT_MASK
+
+      if shift && @last_clicked_key
+        from = @removal_item_order.index(@last_clicked_key)
+        to   = @removal_item_order.index(key)
+        range = (from && to) ? @removal_item_order[[from, to].min..[from, to].max] : [key]
+        @selected_items = ctrl ? (@selected_items | range) : range.to_set
+      elsif ctrl
+        @selected_items.include?(key) ? @selected_items.delete(key) : @selected_items.add(key)
+        @last_clicked_key = key
+      else
+        @selected_items   = Set[key]
+        @last_clicked_key = key
+      end
+      rebuild_shop_inventory_view
+    end
+
+    # Ctrl+click on a container or room header selects only the items inside
+    # it, replacing whatever was selected before -- headers have no plain-
+    # click selection action to begin with (that click already means expand/
+    # collapse), so ctrl+click here plays the same "select just this" role a
+    # plain click plays for an individual item name, just scoped wider.
+    def select_only(keys)
+      return if keys.empty?
+      @selected_items = keys.to_set
+      @last_clicked_key = keys.last
+      rebuild_shop_inventory_view
+    end
+
+    # +pct/-pct of the item's actual current listed price (not any pending
+    # unsaved edit) -- each click recomputes from that same baseline, so it
+    # doesn't matter which %/how many times you've clicked before, and mixing
+    # +/- buttons stays predictable.
+    def adjust_selected_prices(pct)
+      return if @selected_items.empty?
+      @selected_items.each do |key|
+        info = @removal_item_info[key]
+        next unless info
+        new_price = (info['price'] * (100 + pct) / 100.0).round
+        next if new_price <= 0
+        @price_edits[key] = info.merge('new_price' => new_price)
+      end
+      rebuild_shop_inventory_view
+    end
+
+    def mark_selected_for_removal
+      return if @selected_items.empty?
+      @selected_items.each do |key|
+        info = @removal_item_info[key]
+        next unless info
+        @removal_marked[key] = info
+        @price_edits.delete(key)
+      end
+      @selected_items = Set.new
+      rebuild_shop_inventory_view
     end
 
     def format_silvers(n)
@@ -1388,6 +1571,11 @@ module Merchantical
       return unless @shop_inv_box
       @shop_inv_box.children.each { |w| @shop_inv_box.remove(w) }
 
+      # Rebuilt fresh on every pass so shift-click range selection always
+      # matches the order items are actually rendered in below.
+      @removal_item_order = []
+      @removal_item_info  = {}
+
       search = @shop_inv_search.to_s
       inv = @shop_state['shop_inventory'] || {}
       total_items = 0
@@ -1434,6 +1622,26 @@ module Merchantical
           room_exp.label =
             "<b><span foreground='#e0a84a'>#{pe(room_id)}#{name_part}</span></b>" \
             "  <span foreground='#888'>#{room_count} of #{room_cap_txt}</span>"
+          if @removal_mode
+            # Filled in as containers/items below are built -- complete by the
+            # time a click could actually happen. Ctrl+click here selects
+            # every item in every container of this room; a plain click still
+            # falls through to the Expander's own expand/collapse.
+            room_keys = []
+            # No tooltip -- GTK falls back to an ancestor's tooltip for any
+            # descendant that doesn't have its own, so this one was popping
+            # up (and killing the row-hover highlight, see item_evbox above)
+            # for every item hovered anywhere inside this room, not just the
+            # header itself.
+            room_exp.signal_connect('button-press-event') do |_w, event|
+              if (event.state.to_i & 4) != 0
+                select_only(room_keys)
+                true
+              else
+                false
+              end
+            end
+          end
 
           room_row = Gtk::Box.new(:horizontal, 8)
           room_row.halign = :start
@@ -1476,6 +1684,19 @@ module Merchantical
             cont_exp.label =
               "#{pe(cont['preposition'].to_s.capitalize)} <b>#{pe(cont['name'])}</b>  " \
               "<span foreground='#{cap && items.length >= cap ? '#cc5555' : '#888888'}'>(#{cap_txt} items)</span>"
+            if @removal_mode
+              # Same deal as room_keys above, scoped to just this container --
+              # and no tooltip here either, for the same reason.
+              cont_keys = []
+              cont_exp.signal_connect('button-press-event') do |_w, event|
+                if (event.state.to_i & 4) != 0
+                  select_only(cont_keys)
+                  true
+                else
+                  false
+                end
+              end
+            end
             # Auto-expand a container while searching if it holds a match, so results
             # are visible without hunting through every container by hand. Also
             # forced open for the whole removal-mode session -- marking an X
@@ -1484,7 +1705,11 @@ module Merchantical
             # collapse right back on every single click without this.
             cont_exp.expanded = @removal_mode || (!search.empty? && has_match)
             cont_vbox = Gtk::Box.new(:vertical, 0)
-            cont_vbox.margin_start = 14
+            # Wider than room_vbox's own 14 -- GtkExpander's arrow already eats
+            # into that, so 14 here barely read as indented past the container
+            # label above it. This makes items clearly nest under their
+            # container instead of nearly lining up with it.
+            cont_vbox.margin_start = 24
             cont_exp.add(cont_vbox)
 
             if items.empty?
@@ -1497,33 +1722,152 @@ module Merchantical
               formatted = item['price'].to_i.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\1,').reverse
               # Items aren't otherwise identified beyond name/price/qty, so
               # this composite key (room + container + item name) is what
-              # removal-mode marks toggle against and what commit_removal
-              # eventually acts on.
+              # removal-mode marks/selection/price edits all toggle against
+              # and what commit_removal eventually acts on.
               removal_key = "#{room_id}|#{cont['name']}|#{item['name']}"
-              marked = @removal_marked.key?(removal_key)
+              marked      = @removal_marked.key?(removal_key)
+              current_price = item['price'].to_i
+
+              if @removal_mode
+                @removal_item_order << removal_key
+                @removal_item_info[removal_key] = {
+                  'room_id' => room_id, 'container_name' => cont['name'], 'item_name' => item['name'],
+                  'price'   => current_price
+                }
+                cont_keys << removal_key
+                room_keys << removal_key
+              end
 
               item_row = Gtk::Box.new(:horizontal, 4)
               item_row.halign = :start
+              item_row.style_context.add_class('mc-item-row-selected') if @selected_items.include?(removal_key)
+
+              if @removal_mode
+                # Wraps the whole row so hovering ANY part of it -- name,
+                # price field, X button -- lights it up, not just whichever
+                # widget happens to have its own window. enter/leave-notify
+                # fire spurious pairs when the pointer crosses into/out of a
+                # child's own window (price_entry, x_btn, item_evbox) rather
+                # than actually leaving the row -- detail == :INFERIOR marks
+                # exactly those, so only a "real" leave (any other detail)
+                # turns the highlight back off. That filtering only works if
+                # this EventBox actually owns its area as a real window its
+                # children nest under -- visible_window: false (GTK docs:
+                # "the input-only window is not an ancestor window of any
+                # windowed widgets it might contain") left price_entry/x_btn
+                # as siblings instead, so entering them read as an unrelated
+                # (non-inferior) leave and killed the highlight -- which is
+                # why it only ever worked over genuinely empty row space.
+                item_row_evbox = Gtk::EventBox.new
+                item_row_evbox.visible_window = true
+                item_row_evbox.signal_connect('enter-notify-event') do
+                  item_row.style_context.add_class('mc-item-row-hover')
+                  false
+                end
+                item_row_evbox.signal_connect('leave-notify-event') do |_w, event|
+                  item_row.style_context.remove_class('mc-item-row-hover') unless event.detail == :INFERIOR
+                  false
+                end
+              end
 
               item_lbl = Gtk::Label.new
               name_markup = marked ? "<span foreground='#cc5555'>#{pe(item['name'])}</span>" : pe(item['name'])
-              item_lbl.markup =
-                "#{name_markup}: <span foreground='#d4af37'>#{formatted} silvers</span> " \
-                "<span foreground='#888'>(#{item['qty']})</span>"
+              # A stack of 1 is the common case -- only show the count once
+              # there's actually more than one to distinguish.
+              qty_markup = item['qty'].to_i > 1 ? " <span foreground='#888'>(#{item['qty']})</span>" : ''
+              # Edit Items For Sale shows price in its own dedicated column
+              # right after the name (see price_entry below) -- repeating it
+              # in the name text too was the main source of the ragged,
+              # unaligned look this fixed-width column replaces.
+              item_lbl.markup = @removal_mode ?
+                "#{name_markup}#{qty_markup}" :
+                "#{name_markup}: <span foreground='#d4af37'>#{formatted} silvers</span>#{qty_markup}"
               item_lbl.halign = :start
+              item_lbl.valign = :center
+              # halign positions the label WIDGET within extra space its parent
+              # gives it; xalign positions the TEXT within the widget's own
+              # width. Once width_request below gives it a fixed, often-wider-
+              # than-the-text box, xalign is what actually keeps short names
+              # left-justified instead of Label's default centering them.
+              item_lbl.xalign = 0.0
               # Darken (don't remove) items that don't match an active search.
               matches = search.empty? || item['name'].to_s.downcase.include?(search)
               item_lbl.opacity = matches ? 1.0 : 0.35
-              item_row.pack_start(item_lbl, expand: false, fill: false, padding: 0)
 
               if @removal_mode
+                # Fixed width (wrap up to 2 lines, ellipsize past that) so
+                # every row's name column is the same width regardless of how
+                # long the item name is -- that's what lines price/X up into
+                # real columns instead of each one starting wherever its own
+                # name text happened to end. Joins the same size group as the
+                # spacer above the list so the bulk %/X buttons align with it.
+                # No max_width_chars here -- at a char-per-pixel ratio tighter
+                # than width_request, Pango uses it as the wrap width instead
+                # of the full width_request, wrapping well before the line
+                # actually runs out of room. width_request alone is enough.
+                item_lbl.width_request = REMOVAL_NAME_W
+                item_lbl.wrap      = true
+                item_lbl.wrap_mode = :word_char
+                item_lbl.lines     = 2
+                item_lbl.ellipsize = :end
+              end
+
+              # Wrapped in its own EventBox so clicking the name selects the row
+              # (ctrl/shift for multi-select) without disturbing the price entry
+              # or X button that sit beside it -- only wired up in removal mode,
+              # since the read-only Shop Inventory tab shares this same code path.
+              item_evbox = Gtk::EventBox.new
+              item_evbox.visible_window = false
+              item_evbox.valign = :center
+              item_evbox.add(item_lbl)
+              if @removal_mode
+                @name_col_size_group.add_widget(item_evbox)
+                # No tooltip here -- its popup window overlapping the row
+                # generates a genuine (non-:INFERIOR) leave-notify on hover,
+                # which was killing the row-hover highlight right after it
+                # appeared instead of it just being a same-window quirk.
+                item_evbox.signal_connect('button-press-event') do |_w, event|
+                  select_item(removal_key, event)
+                  true
+                end
+              end
+              item_row.pack_start(item_evbox, expand: false, fill: false, padding: 0)
+
+              if @removal_mode
+                price_entry = Gtk::Entry.new
+                price_entry.width_request = 55
+                price_entry.valign = :center
+                price_entry.style_context.add_class('mc-item-price-entry')
+                price_entry.style_context.add_class('mc-item-row-selected') if @selected_items.include?(removal_key)
+                edited = @price_edits.dig(removal_key, 'new_price')
+                price_entry.text = (edited || current_price).to_s
+                price_entry.style_context.add_class('mc-price-edited') if edited
+                price_entry.signal_connect('changed') do
+                  parsed = price_entry.text.gsub(/[^\d]/, '').to_i
+                  if parsed <= 0 || parsed == current_price
+                    @price_edits.delete(removal_key)
+                    price_entry.style_context.remove_class('mc-price-edited')
+                  else
+                    @price_edits[removal_key] = {
+                      'room_id'        => room_id,
+                      'container_name' => cont['name'],
+                      'item_name'      => item['name'],
+                      'new_price'      => parsed
+                    }
+                    price_entry.style_context.add_class('mc-price-edited')
+                  end
+                end
+                item_row.pack_start(price_entry, expand: false, fill: false, padding: 4)
+
                 x_lbl = Gtk::Label.new
                 x_lbl.markup = "<span size='x-small' foreground='#cc5555'>\u{2715}</span>"
                 x_btn = Gtk::Button.new
                 x_btn.add(x_lbl)
                 x_btn.relief = :none
+                x_btn.valign = :center
                 x_btn.style_context.add_class('mc-x-btn')
-                x_btn.set_tooltip_text("Mark/unmark this item for removal")
+                # No tooltip -- same popup-vs-hover-highlight interference as
+                # the other item-row tooltips removed above.
                 x_btn.signal_connect('clicked') do
                   if @removal_marked.key?(removal_key)
                     @removal_marked.delete(removal_key)
@@ -1533,13 +1877,20 @@ module Merchantical
                       'container_name' => cont['name'],
                       'item_name'      => item['name']
                     }
+                    # No point re-listing an item that's about to be pulled.
+                    @price_edits.delete(removal_key)
                   end
                   rebuild_shop_inventory_view
                 end
                 item_row.pack_start(x_btn, expand: false, fill: false, padding: 0)
               end
 
-              cont_vbox.pack_start(item_row, expand: false, fill: false, padding: 0)
+              if @removal_mode
+                item_row_evbox.add(item_row)
+                cont_vbox.pack_start(item_row_evbox, expand: false, fill: false, padding: 0)
+              else
+                cont_vbox.pack_start(item_row, expand: false, fill: false, padding: 0)
+              end
             end
 
             room_vbox.pack_start(cont_exp, expand: false, fill: false, padding: 1)
@@ -2255,6 +2606,15 @@ module Merchantical
       )
       copy_btn.signal_connect('clicked') { copy_shop_data }
       arow.pack_start(copy_btn, expand: false, fill: false, padding: 2)
+
+      # Toolbar help button  -  far right, before gear
+      toolbar_help_lbl = Gtk::Label.new
+      toolbar_help_lbl.markup = "<span size='large' foreground='#{LORESANG_COLOR}'>#{HELP_ICON}</span>"
+      toolbar_help_btn = Gtk::Button.new
+      toolbar_help_btn.add(toolbar_help_lbl)
+      toolbar_help_btn.set_tooltip_text("How to use the toolbar (Loresang, Validate, Export, Settings)")
+      toolbar_help_btn.signal_connect('clicked') { show_help_dialog("Toolbar Help", toolbar_help_text) }
+      arow.pack_start(toolbar_help_btn, expand: false, fill: false, padding: 2)
 
       # Gear (settings) button  -  far right of the action row
       gear_lbl = Gtk::Label.new
@@ -4298,6 +4658,171 @@ module Merchantical
       gear_win.show_all
     end
 
+    # Small standalone popup for a "?" button -- a scrollable read-only text
+    # block plus Close, same look as the gear/Settings About tab but focused
+    # on one feature area instead of the whole script.
+    def show_help_dialog(title, text)
+      help_win = Gtk::Window.new
+      help_win.title = "Merchantical - #{title}"
+      help_win.name  = 'merchantical_win'
+      help_win.set_default_size(560, 520)
+      help_win.transient_for = self
+      help_win.set_window_position(:center_on_parent)
+      help_win.keep_above = true
+
+      outer = Gtk::Box.new(:vertical, 0)
+      help_win.add(outer)
+
+      scroll = Gtk::ScrolledWindow.new
+      scroll.hscrollbar_policy = :never
+      scroll.vscrollbar_policy = :automatic
+      vbox = Gtk::Box.new(:vertical, 10)
+      vbox.margin = 16
+      scroll.add(vbox)
+
+      title_lbl = Gtk::Label.new
+      title_lbl.markup = "<b>#{pe(title)}</b>"
+      title_lbl.halign = :start
+      vbox.pack_start(title_lbl, expand: false, fill: false, padding: 0)
+
+      tv = Gtk::TextView.new
+      tv.editable        = false
+      tv.cursor_visible   = false
+      tv.wrap_mode        = :word
+      tv.left_margin      = 4
+      tv.buffer.text      = text
+      vbox.pack_start(tv, expand: false, fill: false, padding: 0)
+
+      outer.pack_start(scroll, expand: true, fill: true, padding: 0)
+
+      close_btn = Gtk::Button.new(label: "Close")
+      close_btn.signal_connect('clicked') { help_win.destroy }
+      outer.pack_end(close_btn, expand: false, fill: false, padding: 6)
+
+      help_win.show_all
+    end
+
+    def toolbar_help_text
+      <<~TXT
+        A quick tour of the main toolbar, left to right.
+
+        Loresang builds your item list by unlocking (if you're a bard) and recalling
+        every item you're carrying, then parsing the recall text for enchant, weight,
+        spells, and other tags. This is what powers everything else in Merchantical --
+        selling, filtering, shop export, etc. Its three buttons:
+
+        #{MUSIC_ICON} New List
+          Runs ;loresang and REPLACES the entire item list below with a fresh scan.
+          Destructive -- anything you'd already flagged, priced, or manually tweaked
+          is gone unless you locked it first. Click once to arm (flashes purple for
+          3s), click again to confirm. Lock (checkbox on each row) anything you want
+          to survive the wipe.
+
+        #{MUSIC_ICON} Append Container
+          Runs ;loresang and ADDS newly found items to the existing list instead of
+          replacing it. Non-destructive, no arm/confirm needed -- one click and go.
+          An item already in the list with identical recall text is skipped; one with
+          the same name but different recall (e.g. a re-rolled item) is added as a
+          second entry rather than overwriting the original.
+
+        #{MUSIC_ICON} Append Item
+          For adding a single item by hand without a full Loresang run -- opens a
+          small dialog where you type the item's name and the container it's in.
+          Click Check first to recall it and confirm the details, then Append to add
+          it to the list.
+
+        Validate Items
+          Re-checks which items from the list are actually on you right now, without
+          re-running Loresang. Matches against current inventory -- including items
+          nested in a greatcloak or your Loresong sing/sung containers, via text
+          matching, not just Lich's own item tracking -- and updates each row's
+          #{SEARCH_ICON} to green (found) or red (not found). Check "Use locker?"
+          under the gear icon first if it should visit your locker too.
+
+        #{SHOP_ICON} Shop Inventory Management
+          Switches the whole window to a separate view for running a player shop --
+          scanning what's currently listed, queuing new items to sell, editing or
+          removing listings, and a sales ledger. That view has its own #{HELP_ICON}
+          button (upper-right of its tabs) with the full rundown.
+
+        Export Shop HTML #{SHOP_ICON}
+          Flag items with the #{SHOP_ICON} icon on their row first, then click this to
+          open the export window. Set an asking price per item (shorthand like
+          "2M500K" works), then:
+            * Save HTML    - a searchable page grouped by item type (H1), each item
+                             as its own expandable H2 entry showing silvers, enchant,
+                             weight, spell, and property tags -- what customers open.
+            * Save RTF     - opens in Word, Google Docs (File > Import), or LibreOffice.
+            * Google Site  - a themed HTML block meant to be pasted into a Google
+                             Sites embed (open the saved file, copy all, paste into
+                             Sites' Embed Code, publish).
+            * Open in Browser / Open Directory  - preview the saved HTML, or jump
+                             straight to the folder it's saved in.
+          Each file is saved per-character, so alts don't overwrite each other's exports.
+
+        #{GEAR_ICON} Settings
+          Options (locker use, gemshop-first selling, locker room/bags, debug mode),
+          Loresong (sing/sung container setup used by Loresang and Validate Items
+          above), Colors (window theme), and About (general item-list usage notes).
+      TXT
+    end
+
+    def shop_help_text
+      <<~TXT
+        Shop Inventory Management (toggle via the #{SHOP_ICON} button in the main
+        toolbar) is a separate view for running a player shop: what's currently
+        listed, what you're about to list, editing/removing listings, and a rough
+        sales report. It has four tabs:
+
+        Shop Inventory
+          Read-only snapshot of what's actually sitting in your shop right now.
+          Enter the shop's location (a real, mapped room near its entrance -- the
+          shop interior itself isn't go2-able) and its tested entry text (whatever
+          exact word makes 'go <word>' work when you try it standing there) in the
+          "Shop location & entry" expander, then click Scan Shop. It travels there,
+          walks the shop's interior (up to 3 rooms), and builds this Room ->
+          Container -> Item tree from 'shop inventory' output. Each room's sign is
+          also read and shown, and clicking it lets you edit the sign in-place.
+
+        Items to Sell
+          Your outgoing queue. Enter one or more worn/held containers (comma-
+          separated) and click Scan Container to pull their contents in here. For
+          each item, pick a destination shop container from the dropdown and type a
+          price -- once both are set the row highlights green. Click List Items For
+          Sale to actually sell everything that's ready: it travels to the shop,
+          room by room, picks up each item and runs 'shop sell <price> <container>'.
+          A container that fills up mid-run is remembered as full and skipped for
+          the rest of the queue automatically.
+
+        Edit Items For Sale
+          Make changes to what's already listed. Every item shows a price field (its
+          current price by default) and a red X. Click an item's name to select it
+          -- ctrl+click to add/remove one at a time, shift+click to select a range --
+          then use the %/X buttons above the list to bulk-adjust the selection's
+          price (+/-5/10/20%, always computed off each item's actual current price)
+          or bulk-mark it for removal. Typing directly into one item's price field
+          works too, and turns white once changed. Nothing actually happens in the
+          shop until you click Commit Changes/Removals -- it then travels room by
+          room, pulling each marked/repriced item and either stowing it (removed) or
+          re-listing it at the new price (a reprice is really a pull + re-sell under
+          the hood, since the game has no direct "change price" command).
+
+        Ledger
+          The game never reports a sale directly, so this infers one: any item that
+          was present in an earlier Scan Shop but is gone from a later one, without
+          having been pulled via Edit Items For Sale, gets logged as sold. Shows
+          this week/month/year totals, a 6-month income-vs-upkeep table (upkeep is
+          the game's real 10,000-silver-per-room monthly shop fee), and the raw
+          recent-sales list -- click the X on an entry to delete it (e.g. one you
+          actually pulled back out by hand instead of selling).
+
+        Export Shop HTML (main toolbar, next to the #{SHOP_ICON} toggle) is separate
+        from this notebook -- it saves every item you've flagged with #{SHOP_ICON} in
+        your main item list as a browsable HTML file for customers, independent of
+        whatever's actually scanned into Shop Inventory Management.
+      TXT
+    end
+
     def open_loresang_append_item_dialog
       dialog_win = Gtk::Window.new
       dialog_win.title = "Loresang Append Item"
@@ -4561,6 +5086,129 @@ module Merchantical
     # exactly as if it had been excluded up front.
     GEM_SHOP_EXCLUDED_TYPES = %w[weapon armor shield clothing].freeze
 
+    # Item names bury their actual PULL/STOW noun ahead of whatever decorative
+    # clause follows it -- "a plain satin soutane stitched with chameleon
+    # agate in a pattern of waves" wants "soutane", not "stitched", "agate",
+    # or "waves" (the literal last word, which is what a naive guess used to
+    # send and which the game rejected almost every time). There's no way to
+    # know the game's own noun dictionary from text alone, so these are the
+    # words that most often START that trailing clause -- guess_item_noun
+    # tries the word right before the first one it finds first, since that's
+    # right far more often than not, then falls through a handful of other
+    # candidates the caller can retry against the game itself.
+    # A few otherwise-plausible entries are deliberately left out here --
+    # "spotted", "banded", "ringed", "marked", "streaked", "mottled",
+    # "swirled", "veined" -- because they're just as commonly a LEADING
+    # adjective describing a base material's natural pattern ("a spotted
+    # thrak hide knapsack") as a trailing decoration verb, and guessing
+    # wrong there is worse than not guessing at all: the natural word-order
+    # fallback below would have found the real noun regardless. "dyed" was
+    # cut for the same hypothetical reason but actually observed ONLY as a
+    # trailing verb ("boots dyed with...") -- put back once there was real
+    # evidence instead of just a guess about a guess.
+    DECORATIVE_CLAUSE_STARTERS = %w[
+      with stitched pierced glinting fringed set inscribed studded tooled tied
+      inlaid trimmed dyed patterned engraved graced lined painted carved
+      capped tipped threaded worked chased wrapped bearing accented sewn
+      woven crusted dusted flecked depicting featuring forming etched
+      adorned wrought hemmed edged bordered rimmed enameled
+      splashed coated glazed
+      lacquered embroidered laced draped hung topped crowned shot
+    ].freeze
+
+    # Ordered noun guesses for a PULL/STOW/GET target, best guess first: the
+    # word right before the earliest decorative-clause starter, if there is
+    # one (a decorated name's real noun always sits before that clause, not
+    # in it -- "soutane", not "stitched"/"agate"/"waves"). Most names have NO
+    # such clause at all though ("a gleaming carmiln long bow"), and for
+    # those the noun is essentially always the LAST word -- plain adjectives
+    # front-load, the noun caps it off -- so the rest of the candidates run
+    # back to front, nearest-to-the-end first, rather than front to back.
+    def guess_item_noun_candidates(item_name)
+      words = item_name.to_s.downcase.split(/\s+/).map { |w| w.gsub(/[^a-z'-]/, '') }.reject(&:empty?)
+      return [] if words.empty?
+
+      trigger_idx = words.each_index.find { |i| DECORATIVE_CLAUSE_STARTERS.include?(words[i]) }
+      candidates  = []
+      candidates << words[trigger_idx - 1] if trigger_idx && trigger_idx > 0
+      candidates.concat(words.reverse)
+      candidates.uniq.reject { |w| %w[a an the of in on with].include?(w) }
+    end
+
+    # True when another item in the same shop container would ALSO answer to
+    # `noun` -- e.g. "a lilac grosgrain bow" and "a gleaming carmiln long
+    # bow" both reducing to plain "bow". A bare noun is genuinely ambiguous
+    # then: PULL just grabs whichever one the game lists first, which isn't
+    # necessarily the one meant. Compares against each other item's own known
+    # (or best-guessed) noun, the same way this item's own noun was found.
+    def container_noun_collision?(shop_state, room_id, container_name, item_name, noun)
+      return false if noun.to_s.empty?
+      items = shop_state.dig('shop_inventory', room_id, 'containers')
+                &.find { |c| c['name'] == container_name }
+                &.dig('items') || []
+      items.any? do |i|
+        next false if i['name'] == item_name
+        other_noun = shop_state.dig('item_nouns', i['name']) || guess_item_noun_candidates(i['name']).first
+        other_noun.to_s.downcase == noun.to_s.downcase
+      end
+    end
+
+    # The one word immediately before `noun`, plus the bare noun itself --
+    # for "a gleaming carmiln long bow" and noun "bow": "long bow", "bow".
+    # Capped at 2 words, not the full leadup to the noun: Gemstone's PULL
+    # parser rejects anything longer outright ("Please rephrase that
+    # command"), confirmed against an actual log where 3- and 4-word
+    # phrases both got that exact rejection before "hide shoes" (2 words)
+    # and finally bare "shoes" got anywhere -- trying the longer ones first
+    # was just guaranteed-wasted round trips, not extra disambiguation. Two
+    # words is usually already enough to tell a same-noun sibling apart
+    # ("long bow" vs "grosgrain bow") the same way a person would.
+    def noun_phrase_candidates(item_name, noun)
+      words = item_name.to_s.downcase.split(/\s+/).map { |w| w.gsub(/[^a-z'-]/, '') }.reject(&:empty?)
+      words = words.drop(1) if %w[a an some the].include?(words.first)
+      idx = words.rindex(noun.to_s.downcase)
+      return [noun.to_s] unless idx
+      start = [idx - 1, 0].max
+      [words[start..idx].join(' '), noun.to_s].uniq
+    end
+
+    # Expands any candidate that collides with a same-container sibling into
+    # its longer-phrase ladder (see noun_phrase_candidates); leaves
+    # unambiguous candidates alone. Applied right before actually trying
+    # PULL, so both a known noun and a guessed one get the same protection.
+    def expand_for_collisions(shop_state, room_id, container_name, item_name, base_candidates)
+      base_candidates.flat_map do |candidate|
+        if container_noun_collision?(shop_state, room_id, container_name, item_name, candidate)
+          noun_phrase_candidates(item_name, candidate)
+        else
+          [candidate]
+        end
+      end.uniq
+    end
+
+    # Tries PULL <candidate>, and if that specifically gets "I'm afraid that
+    # you can't pull that" (a real response seen in practice) -- meaning the
+    # word matched SOMETHING, just not something pullable, most likely the
+    # player's own worn item of the same name (nearly every character wears
+    # some kind of pack/bag) rather than the shop container's -- retries
+    # once naming the container explicitly. A bare "don't see"/"what were
+    # you referring to" (no match at all, or ambiguous) isn't retried this
+    # way since a container name wouldn't fix either of those. Returns just
+    # `candidate` on success either way (never the "from ..." qualifier --
+    # that's only for targeting THIS pull, stow/shop sell afterward want the
+    # bare noun same as any other successful candidate), or nil.
+    def attempt_pull(candidate, container_noun)
+      resp = capture_command("pull #{candidate}").join(' ')
+      pause 0.2
+      return candidate if resp =~ /you pull/i
+      if resp =~ /can.t pull that/i && !container_noun.to_s.empty?
+        resp2 = capture_command("pull #{candidate} from #{container_noun}").join(' ')
+        pause 0.2
+        return candidate if resp2 =~ /you pull/i
+      end
+      nil
+    end
+
     def gem_shop_ineligible?(item)
       opts = @state['options'] || {}
       return true if opts['use_gemshop_first'] == false
@@ -4728,7 +5376,7 @@ module Merchantical
           elsif task[:scan_containers]        then do_scan_containers(task[:scan_containers])
           elsif task[:list_items_for_sale]    then do_list_items_for_sale
           elsif task[:set_shop_sign]          then do_set_shop_sign(task[:set_shop_sign])
-          elsif task[:commit_shop_removal]    then do_commit_shop_removal(task[:commit_shop_removal])
+          elsif task[:commit_shop_changes]    then do_commit_shop_changes(task[:commit_shop_changes])
           end
         else
           pause 0.1
@@ -7537,6 +8185,14 @@ module Merchantical
             Lich::Messaging.msg("yellow", "[Merchantical] Listed #{q['name']} for #{q['price'].to_i} silvers.")
             added_counts[q['shop_container']] += 1
             listed_ids << q['id']
+            # Remembered so a later pull from the shop display (Edit Items
+            # For Sale) can reuse the real noun Lich already knew from this
+            # item's own inventory data, instead of guessing one back out of
+            # the shop's plain display text.
+            unless q['noun'].to_s.empty?
+              shop_state['item_nouns'] ||= {}
+              shop_state['item_nouns'][q['name']] = q['noun']
+            end
           end
         end
 
@@ -7561,63 +8217,140 @@ module Merchantical
       Lich::Messaging.msg("yellow", "[Merchantical] List for sale error: #{e.message}")
     end
 
-    # Pulls each marked item back from its shop container and stows it,
-    # room by room. marked_items: [{'room_id', 'container_name', 'item_name'}, ...]
-    # from MainWindow#commit_removal.
-    def do_commit_shop_removal(marked_items)
-      return if marked_items.to_a.empty?
+    # Pulls each marked item back from its shop container and stows it, or
+    # pulls and re-lists it at its edited price, room by room. payload:
+    # {removals: [{'room_id','container_name','item_name'}, ...],
+    #  price_edits: [{'room_id','container_name','item_name','new_price'}, ...]}
+    # from MainWindow#commit_removal. A removal takes precedence over a price
+    # edit for the same item -- no point re-listing something about to be
+    # pulled anyway (the UI itself already keeps the two from overlapping,
+    # this is just a second guarantee).
+    def do_commit_shop_changes(payload)
+      removals    = (payload[:removals] || []).to_a
+      price_edits = (payload[:price_edits] || []).to_a
+      removal_keys = removals.map { |m| "#{m['room_id']}|#{m['container_name']}|#{m['item_name']}" }.to_set
+      price_edits  = price_edits.reject { |e| removal_keys.include?("#{e['room_id']}|#{e['container_name']}|#{e['item_name']}") }
+      return if removals.empty? && price_edits.empty?
 
       shop_state = ShopState.load
       location  = shop_state['shop_location'].to_s
       shop_name = shop_state['shop_name'].to_s
       if location.empty? || shop_name.empty?
         Lich::Messaging.msg("yellow",
-          "[Merchantical] Remove items: run Scan Shop first so the shop location/name are known.")
+          "[Merchantical] Edit items: run Scan Shop first so the shop location/name are known.")
         return
       end
 
-      origin_room  = ((Map.current_room_id rescue nil) || XMLData.room_id).to_s
-      by_room      = marked_items.group_by { |m| m['room_id'] }
-      removed_count = 0
+      origin_room = ((Map.current_room_id rescue nil) || XMLData.room_id).to_s
+      actions = removals.map { |m| m.merge('action' => 'remove') } +
+                price_edits.map { |e| e.merge('action' => 'reprice') }
+      by_room = actions.group_by { |a| a['room_id'] }
+      removed_count  = 0
+      repriced_count = 0
 
-      Lich::Messaging.msg("yellow", "[Merchantical] Remove items: traveling to #{location}...")
+      Lich::Messaging.msg("yellow", "[Merchantical] Edit items: traveling to #{location}...")
       unless enter_player_shop(location, shop_name)
         Lich::Messaging.msg("yellow",
-          "[Merchantical] Remove items: could not enter '#{shop_name}' from #{location} -- check the name and try again.")
+          "[Merchantical] Edit items: could not enter '#{shop_name}' from #{location} -- check the name and try again.")
         go2_to(origin_room) unless origin_room.empty?
         return
       end
 
       by_room.each do |room_id, items_for_room|
         path = shop_state.dig('shop_paths', room_id) || []
-        Lich::Messaging.msg("yellow", "[Merchantical] Removing #{items_for_room.length} item(s) in #{room_id}...")
+        Lich::Messaging.msg("yellow", "[Merchantical] Editing #{items_for_room.length} item(s) in #{room_id}...")
         path.each { |dir| fput dir; waitrt?; pause 0.3 }
 
         items_for_room.each do |m|
           item_name = m['item_name'].to_s
-          # Confirmed against an actual log: PULL/STOW want the short noun
-          # ("stat" matched "a small statue"), not the full descriptive name
-          # -- sending the full name is what "What were you referring to?"
-          # was actually complaining about.
-          noun = item_name.split(/\s+/).last.to_s.gsub(/[^a-zA-Z'-]/, '')
-
-          pull_resp = capture_command("pull #{noun}").join(' ')
-          pause 0.2
-          if pull_resp =~ /don.t see|what were you referring|can.t find|nothing happens/i
-            Lich::Messaging.msg("yellow", "[Merchantical] Remove items: #{item_name} -- couldn't pull it, skipping.")
-            next
-          end
-
-          fput "stow #{noun}"; waitrt?; pause 0.2
-          removed_count += 1
-          Lich::Messaging.msg("yellow", "[Merchantical] Removed #{item_name}.")
-
-          # Update the cached data immediately -- rather than waiting for the
-          # room's own re-scan below -- so the Shop Inventory tab reflects
-          # each removal as it happens, not just once the whole room is done.
+          # PULL/STOW want the short noun ("stat" matched "a small statue"),
+          # not the full descriptive name. Lich already knew this item's real
+          # noun once -- from GameObj, when it was scanned/listed via Items
+          # to Sell (see shop_state['item_nouns'], recorded in
+          # do_list_items_for_sale) -- and that's far more reliable than
+          # re-guessing one out of the shop's plain display text, which is
+          # all a later scan of the shop itself has to go on. Try the known
+          # noun first; only guess (trying candidates until the game accepts
+          # one) if this item was never seen that way.
           cont_data = (shop_state.dig('shop_inventory', room_id, 'containers') || [])
                         .find { |c| c['name'] == m['container_name'] }
-          cont_data['items']&.reject! { |i| i['name'] == item_name } if cont_data
+          preposition    = cont_data ? cont_data['preposition'] : 'on'
+          container_noun = cont_data && !cont_data['noun'].to_s.empty? ?
+                              cont_data['noun'] :
+                              m['container_name'].to_s.split(/\s+/).last.to_s
+
+          known_noun = shop_state.dig('item_nouns', item_name)
+          primary    = known_noun ? [known_noun] : guess_item_noun_candidates(item_name)
+          # If another item in this same container would ALSO answer to a
+          # candidate (two bows, two rings, ...), that candidate alone is
+          # ambiguous -- expand it into longer, more specific phrases first
+          # (see noun_phrase_candidates) so PULL can't grab the wrong one.
+          candidates = expand_for_collisions(shop_state, room_id, m['container_name'], item_name, primary)
+          noun = nil
+          candidates.each do |candidate|
+            found = attempt_pull(candidate, container_noun)
+            if found
+              noun = found
+              break
+            end
+          end
+          # A known noun (and its collision-expanded phrases) that stopped
+          # working -- or no known noun at all -- falls through to a full,
+          # equally collision-aware guess pass.
+          if !noun && known_noun
+            fallback = expand_for_collisions(
+              shop_state, room_id, m['container_name'], item_name,
+              guess_item_noun_candidates(item_name) - candidates
+            )
+            fallback.each do |candidate|
+              found = attempt_pull(candidate, container_noun)
+              if found
+                noun = found
+                break
+              end
+            end
+          end
+          unless noun
+            Lich::Messaging.msg("yellow", "[Merchantical] Edit items: #{item_name} -- couldn't pull it, skipping.")
+            next
+          end
+          unless noun == known_noun
+            shop_state['item_nouns'] ||= {}
+            shop_state['item_nouns'][item_name] = noun
+          end
+
+          if m['action'] == 'remove'
+            fput "stow #{noun}"; waitrt?; pause 0.2
+            removed_count += 1
+            Lich::Messaging.msg("yellow", "[Merchantical] Removed #{item_name}.")
+            cont_data['items']&.reject! { |i| i['name'] == item_name } if cont_data
+          else
+            # shop sell requires the item in the RIGHT hand specifically --
+            # pull doesn't report which hand it lands in the way get's response
+            # does, so just check after the fact and swap if it's empty.
+            fput "swap" if GameObj.right_hand.nil?
+
+            sell_resp = capture_command("shop sell #{m['new_price'].to_i} #{preposition} #{container_noun}").join(' ')
+            pause 0.3
+
+            still_in_hand = GameObj.right_hand&.name.to_s == item_name || GameObj.left_hand&.name.to_s == item_name
+
+            if sell_resp =~ /no more room/i
+              Lich::Messaging.msg("yellow",
+                "[Merchantical] Edit items: #{item_name} -- #{m['container_name']} is full, stowing (price unchanged).")
+              fput "stow #{noun}"; waitrt?; pause 0.1
+            elsif still_in_hand
+              Lich::Messaging.msg("yellow",
+                "[Merchantical] Edit items: #{item_name} -- reprice failed, stowing (price unchanged).")
+              fput "stow #{noun}"; waitrt?; pause 0.1
+            else
+              repriced_count += 1
+              Lich::Messaging.msg("yellow", "[Merchantical] Repriced #{item_name} to #{m['new_price'].to_i} silvers.")
+              found = cont_data && cont_data['items']&.find { |i| i['name'] == item_name }
+              found['price'] = m['new_price'].to_i if found
+            end
+          end
+
           ShopState.save(shop_state)
           Gtk.queue { @window&.apply_shop_state(shop_state) } rescue nil
         end
@@ -7638,9 +8371,9 @@ module Merchantical
       go2_to(origin_room) unless origin_room.empty?
 
       Lich::Messaging.msg("yellow",
-        "[Merchantical] Remove items complete -- #{removed_count}/#{marked_items.length} item(s) pulled and stowed.")
+        "[Merchantical] Edit items complete -- #{removed_count} removed, #{repriced_count} repriced.")
     rescue => e
-      Lich::Messaging.msg("yellow", "[Merchantical] Remove items error: #{e.message}")
+      Lich::Messaging.msg("yellow", "[Merchantical] Edit items error: #{e.message}")
     end
 
     def save_final_state
