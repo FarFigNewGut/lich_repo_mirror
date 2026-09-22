@@ -94,8 +94,48 @@
   Author: Claude Code(Creator and Feature Additions), Codex(Bug Fixes and Review), RuseofFools (Very Little)
   Required: Lich >= 5.20.0
   Tags: wrayth, saga, frontend, mod, window, target, creature, mob, bounty, advguild, avalon, wizard, gtk3
-  Version: 1.31.0
+  Version: 1.35.0
   Recently changed:
+    v1.35.0 (2026-09-22)
+      - Fixed the current target's own row (separated out above the grid,
+        *cwtarget off is the default) using the narrow grid column width
+        instead of the full dialog width. In *cwhp bar mode this starved
+        the status-icon row of space, wrapping icons onto a second line
+        that overlapped the "###/### hp" text drawn right below it -- even
+        though the target has that whole row to itself with room to
+        spare. Target row now renders at the full dialog width
+        (BOUNTY_ROW_WIDTH) instead of col_width.
+    v1.34.0 (2026-09-22)
+      - Added two status icons that were missing from
+        CW_SAGA_STATUS_ICONS_EMOJI entirely, so they rendered as raw text
+        ("dazed"/"limb_favored") instead of an icon in emoji mode:
+        limb_favored -> adhesive bandage, dazed -> cyclone (kept distinct
+        from disoriented's existing spiral-eyes icon -- the two are
+        separate statuses, confirmed in STATUS_DURATIONS,
+        lib/common/creature/creature_base.rb). Neither has a unicode-mode
+        icon, matching the other combat-module statuses in this same
+        section (weakened, silenced, blind, etc.), which are emoji-only.
+    v1.33.0 (2026-09-21)
+      - *cwhp bar/text now sources HP from the game's own <crtrStatus
+        health="..." maxhealth="..."> when available (confirmed genuine
+        server data -- present in the raw pre-hook server_string, i.e. what
+        session logs capture before any DownstreamHook runs, not something
+        a script injects), instead of Creature#current_hp/#max_hp's
+        damage-tracking estimate. This is the actual reason the native
+        Saga combat panel read as "more accurate": it was reading the
+        server's own numbers the whole time, not a shared estimate as
+        first assumed. Fixed at the shared Lich::Gemstone::Creature level
+        (lib/gemstone/creature.rb), so every consumer benefits, not just
+        this window. Falls back to the old estimate only for a creature
+        the feed hasn't reported a health for yet.
+    v1.32.0 (2026-09-21)
+      - *cwhp bar/text now redraws promptly on damage instead of waiting on
+        the main loop's 1-second heartbeat. targets_snapshot (the other
+        redraw trigger) is built from "id:status:name" -- no HP in it -- so
+        a hit that doesn't also flip a status (stunned/dead/etc) could sit
+        stale for up to a second. ensure_hp_tracking! now subscribes to
+        Combat::Tracker's :damage event and pushes an immediate
+        update_window instead of waiting on the heartbeat.
     v1.31.0  (2026-09-12)
       - *cwhp "bar" mode now draws a native Saga progressBar/skin health bar
         (not emoji blocks) on every creature, 2-row layout: name centered
@@ -1533,7 +1573,9 @@ CW_SAGA_STATUS_ICONS_EMOJI = {
   /\bpoisoned\b/i    => "&#x1F922;",           # U+1F922 nauseated face (matches effectsbar)
   /\bparalyzed\b/i   => "&#x1F5FF;",           # U+1F5FF moai (matches effectsbar)
   /\bvulnerable\b/i  => "&#x1F4A5;",           # U+1F4A5 collision (matches effectsbar)
-  /\bdisoriented\b/i => "&#x1F635;&#x200D;&#x1F4AB;" # U+1F635 200D 1F4AB face with spiral eyes
+  /\bdisoriented\b/i => "&#x1F635;&#x200D;&#x1F4AB;", # U+1F635 200D 1F4AB face with spiral eyes
+  /\blimb_favored\b/i => "&#x1FA79;",          # U+1FA79 adhesive bandage
+  /\bdazed\b/i       => "&#x1F300;"            # U+1F300 cyclone -- distinct from disoriented's spiral-eyes icon above; both are real, separate statuses (see STATUS_DURATIONS in lib/common/creature/creature_base.rb)
 }.freeze
 
 CW_SAGA_DEAD_ICON_EMOJI = "&#x1F480;" # U+1F480 skull
@@ -1639,6 +1681,21 @@ end
 # on it staying enabled.
 def CreatureWindow.ensure_hp_tracking!
   return unless defined?(Combat::Tracker)
+
+  # Subscribed unconditionally (even if tracking was already enabled by
+  # something else) -- Tracker.on(..., name:) is idempotent like
+  # DownstreamHook.add, so repeat calls just replace the same handler
+  # rather than stacking. Without this, the HP bar/text only redraws on
+  # targets_snapshot changing (id:status:name -- no HP in it) or the main
+  # loop's 1-second heartbeat (creaturewindow.lic:4282), so a hit that
+  # doesn't flip a status could sit stale for up to a second. creature_hp.lic
+  # (the crtrStatus bridge for the native Saga combat panel) already pushes
+  # a fresh value within 250ms of every :damage event -- this closes that
+  # same gap for the in-window bar/text instead of waiting on the heartbeat.
+  Combat::Tracker.on(:damage, name: 'creaturewindow_hp') do |_type, _data|
+    CreatureWindow::CMD_QUEUE.push("update_window") if CreatureWindow.target_hp_mode != "off"
+  end
+
   return if Combat::Tracker.enabled?
 
   Combat::Tracker.enable!
@@ -3760,10 +3817,20 @@ def CreatureWindow.push_creatures_to_window(targets)
       # (creature_hp_bar_xml) as the rest of the grid in "bar" mode -- it
       # previously never called creature_cell_xml at all, so it only ever
       # got the separate dedicated-row HP display below.
-      output += CreatureWindow.creature_cell_xml('target_creature', target_creature, 0, current_top, col_width, creature_row_height, true)
+      #
+      # Uses the full dialog width here, not the narrow grid col_width --
+      # unlike every other creature, the target has this row entirely to
+      # itself (nothing else shares it), so there's no column to stay
+      # aligned with. Passing col_width (clamped to CW_DYNAMIC_COL_MAX,
+      # only 260px) starved bar-mode's status-icon row of space, wrapping
+      # icons onto a second line that then overlapped the HP text drawn
+      # right below it, even though the row had plenty of unused space to
+      # its right.
+      target_row_width = CreatureWindow::BOUNTY_ROW_WIDTH
+      output += CreatureWindow.creature_cell_xml('target_creature', target_creature, 0, current_top, target_row_width, creature_row_height, true)
       current_top += creature_row_height
 
-      output, current_top = CreatureWindow.append_target_ucs_row(output, target_creature, 0, current_top, col_width, row_height)
+      output, current_top = CreatureWindow.append_target_ucs_row(output, target_creature, 0, current_top, target_row_width, row_height)
 
       current_top += row_height # Add a little extra space after target (and hp, if shown) for clarity
     end
@@ -4230,6 +4297,7 @@ end)
 before_dying do
   UpstreamHook.remove(upstream_hook_id)
   DownstreamHook.remove(downstream_hook_id) rescue nil
+  Combat::Tracker.off('creaturewindow_hp') if defined?(Combat::Tracker)
 
   if CreatureWindow.gtk_available && defined?(CreatureWindowGtk) && (cw = CreatureWindowGtk.instance_variable_get(:@window))
     Gtk.queue do
