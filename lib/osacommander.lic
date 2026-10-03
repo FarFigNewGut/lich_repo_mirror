@@ -1,5 +1,5 @@
 =begin
-	   OSACommander Version: '4.1.0 (September 20, 2026)
+	   OSACommander Version: '4.1.2 (October 2, 2026)
 	
 	   Usage: 
 	
@@ -63,14 +63,27 @@
                              routing during enemy ship encounters. commander_have_boxes now catches inventory-full responses and
                              routes held boxes to disk, pool, or security officer before recursing. give_boxes_to_security_officer
                              drops held boxes first. ph_on and ;osacommander begin now reset boarding flag to false on activation.
-							 
-        September 20, 2026 - commander_spell_sever now mirrors standard commander_spell_up before broadcasting "Begin Sever
+    September 20, 2026 - commander_spell_sever now mirrors standard commander_spell_up before broadcasting "Begin Sever
                              Spellup!": asks for armor adjustments, checks mana spellup eligibility (spellup_needed?) and
                              fires mana spellup if warranted, always runs self spellup via ewaggle when selfspellup is
                              checked to fill any duration gaps, then applies armor specializations. Added Mana Spellup
                              Threshold (min) field (default 60); replaces old hardcoded waggletimeleft <= 90 check
                              everywhere mana spellup is triggered. spellup_needed? compares average remaining spell
                              duration in minutes against this threshold.
+    September 28, 2026 - Fixed sever spellup announcing "Sever Spellup Complete" before the whole crew finished.
+                             Task Complete reports are now collected by a small listener started before "Begin Sever
+                             Spellup!", so reports that arrive while the commander is casting are no longer lost. Each
+                             crew member is counted once by name (duplicate LNet lines no longer double count), only
+                             mustered crew are counted, the wait limit went from 60 seconds to 10 minutes, and the
+                             commander sees a running "x/y - waiting on" count plus who was missing on a timeout.
+           October 2, 2026 - Every Task Complete wait (spellups, sever, task time, loot selling, underway, after
+                             sinking/razing) now uses one method: a listener that runs for the whole script logs
+                             reports by name and time, so nothing is lost while the commander is busy and nobody
+                             is counted twice. The commander sees a running "x/y - waiting on" count (refreshed
+                             every minute), and on a 10 minute timeout it names who never reported. Sever spellup
+                             now uses this shared wait.
+                             The commander's mana spellup and self ewaggle for sever spellup now run after "Begin Sever
+                             Spellup!" so the commander spells up at the same time as the crew instead of before them.
 =end 
 
 def load_yaml_file(path)
@@ -1293,6 +1306,40 @@ def who_needs_blessed
 	end
 end
 
+# Task Complete tracking (used by every commander_task_complete wait).
+# A small exec script runs for the life of osacommander and logs every
+# "Task Complete" report with the time it arrived. It has its own line buffer,
+# so the commander's own fput/casting can no longer wipe reports out. It also
+# notes the time of the commander's last crew-channel broadcast (ignoring mana
+# requests); that marks the start of the current task round.
+def commander_start_task_listener
+	commander_stop_task_listener
+	$osa_task_log = []
+	$osa_task_round_start = Time.now
+	$osa_task_channel = osacrew_data["crew"].to_s
+	@task_listener = start_exec_script(<<~'LISTENER', { quiet: true })
+		chan = Regexp.escape($osa_task_channel.to_s)
+		loop do
+			line = get
+			if line =~ /^\[#{chan}\]-You: "(?!I Need .* Mana!)/
+				$osa_task_round_start = Time.now
+			elsif line =~ /^\[Private\]-GSIV:([^:]+): "Task Complete"/
+				$osa_task_log << [$1.strip, Time.now]
+				$osa_task_log.shift while $osa_task_log.size > 200
+			end
+		end
+	LISTENER
+end
+
+def commander_stop_task_listener
+	begin
+		@task_listener.kill if @task_listener && @task_listener.running?
+	rescue StandardError
+		nil
+	end
+	@task_listener = nil
+end
+
 def commander_spell_sever
 	# Ask crew to submit their sever spell requests, wait for responses, then trigger casting
 	lnet_crew("Submit your sever spell requests!")
@@ -1302,6 +1349,17 @@ def commander_spell_sever
 	lnet_crew("Does Anyone Need Armor Adjustments?")
 	pause 4
 
+	# Armor specializations
+	if osacrew_data["armor_specs"]
+		commander_apply_support
+		@supportlist.clear
+	end
+	commander_self_armor_spec
+
+	lnet_crew("Begin Sever Spellup!")
+
+	# Commander does its own mana spellup / self spellup at the same time as the crew
+	# (crew run pre_sever_spellup when they hear Begin Sever Spellup!)
 	# Mana spellup check
 	spellup = Lich::Util.quiet_command("mana", /Normal/, /You have used the MANA SPELLUP ability (.*) out of (.*) times for today\./, true, 3, true)
 	if spellup.to_s =~ /You have used the MANA SPELLUP ability (.*) out of (.*) times for today\./
@@ -1329,28 +1387,11 @@ def commander_spell_sever
 		@mana_watcher.kill if @mana_watcher&.alive?
 	end
 
-	# Armor specializations
-	if osacrew_data["armor_specs"]
-		commander_apply_support
-		@supportlist.clear
-	end
-	commander_self_armor_spec
-
-	lnet_crew("Begin Sever Spellup!")
-
-	# Cast own sever spells while waiting for crew to finish
+	# Cast own sever spells while the crew works
 	crew_cast_sever
 
-	# Collect Task Complete from each crew member before signaling cleanup
-	crew_size = (@commander_data["crewsize"] || []).count
-	if crew_size > 0
-		task_complete_count = 0
-		deadline = Time.now + 60
-		while task_complete_count < crew_size && Time.now < deadline
-			result = matchtimeout(2, /^\[Private\]-GSIV:.*: \"Task Complete\"/)
-			task_complete_count += 1 if result
-		end
-	end
+	# Wait until every mustered crew member has reported Task Complete
+	commander_task_complete
 
 	lnet_crew("Sever Spellup Complete")
 
@@ -1496,14 +1537,37 @@ def three_masts
 	move "west"
 end
 
-def commander_task_complete
-	@taskcount = Array.new
-	@taskcount.clear
-	(@commander_data["crewsize"] || []).count.times {
-	result = matchtimeout 600, /^\[Private\]-GSIV:(.*)\: \"Task Complete\"$/
-	if result.to_s =~ /^\[Private\]-GSIV:(.*)\: \"Task Complete\"$/
-			@taskcount.push($1)
-	end}
+def commander_task_complete(timeout = 600)
+	# Waits until every mustered crew member has reported "Task Complete" for the
+	# current round (anything since the commander's last crew-channel order).
+	# Shows a running count and who is still outstanding; on timeout, names who
+	# never reported and moves on.
+	@taskcount = []
+	crew = (@commander_data["crewsize"] || []).map(&:to_s).map(&:strip).reject(&:empty?).uniq
+	return if crew.empty?
+	commander_start_task_listener unless (@task_listener && @task_listener.running? rescue false)
+	since = $osa_task_round_start || Time.now
+	deadline = Time.now + timeout
+	last_count = -1
+	last_note = Time.now
+	loop do
+		reported = ($osa_task_log || []).dup.select { |_name, at| at >= since }.map(&:first)
+		done = crew.select { |c| reported.any? { |r| r.casecmp?(c) } }
+		@taskcount = done
+		missing = crew - done
+		break if missing.empty?
+		if done.size != last_count || (Time.now - last_note) >= 60
+			respond "--- OSACommander: Task Complete #{done.size}/#{crew.size} - waiting on: #{missing.join(', ')}"
+			last_count = done.size
+			last_note = Time.now
+		end
+		if Time.now >= deadline
+			respond "--- OSACommander: Timed out waiting on: #{missing.join(', ')} - continuing."
+			break
+		end
+		sleep 1
+	end
+	respond "--- OSACommander: All #{crew.size} crew reported Task Complete." if (crew - @taskcount).empty?
 end
 
 def commander_crew_request
@@ -3007,8 +3071,7 @@ def commander_muster_up
 end
 
 def commander_roger_up
-	@new_taskcount = Array.new
-	@new_taskcount.push(@taskcount)
+	@new_taskcount = Array(@taskcount)
 	if @commander_data["crewsize"].nil?
 		respond ""
 		respond "      You Have Not Built A Ships Roster Yet!"
@@ -4609,7 +4672,7 @@ def self.load_commander_yaml
 	path
 end
 
-save_to_commander("commanderversion", "4.1.0 (September 20, 2026)", push: false)
+save_to_commander("commanderversion", "4.1.2 (October 2, 2026)", push: false)
 TITLE = "OSACommander: v. (#{@commander_data["commanderversion"]})"
 require "yaml"
 require "gtk3"
@@ -4638,6 +4701,7 @@ end
 @mana_watcher = nil
 before_dying {
 	@mana_watcher.kill if @mana_watcher&.alive?
+	commander_stop_task_listener
 	@warning = false
 }
 @anchor_aweigh = false
@@ -4646,4 +4710,5 @@ before_dying {
 @done_with_sec_off = false
 save_to_commander("cleanup_type", nil)
 mana_share
+commander_start_task_listener
 commander_begin_it

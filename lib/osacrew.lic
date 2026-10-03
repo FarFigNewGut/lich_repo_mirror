@@ -1,4 +1,4 @@
-version = '6.1.0 (September 20, 2026)'
+version = '6.1.3 (October 2, 2026)'
 =begin
                                        ..
                                      .(  )`-._
@@ -36,7 +36,7 @@ version = '6.1.0 (September 20, 2026)'
    _.-` ``--..  ..  `.-._  `._  `- `-._ .-_. ._.- -._ --.._`` _.-`-.
 
 --------------------------------------------------------------------------
-	OSACrew Version: 6.1.0 (September 20, 2026)
+	OSACrew Version: 6.1.3 (October 2, 2026)
 	
 	   Usage: 
 	
@@ -66,10 +66,8 @@ version = '6.1.0 (September 20, 2026)'
                              (.*?) for person name. Added You: variant matching alongside GSIV: so each character captures their
                              own broadcast request and includes themselves in their severlist; person resolves to checkname when
                              the You: variant is matched.
-							 
               July 9, 2026 - Replaced deprecated percentmana with Char.percent_mana and maxmana with Char.maxmana throughout.
-			  
-        September 20, 2026 - Added pre_sever_spellup: before casting sever spells, crew now checks mana spellup eligibility
+    September 20, 2026 - Added pre_sever_spellup: before casting sever spells, crew now checks mana spellup eligibility
                              (spellup_needed?) and runs mana spellup if warranted, then always runs self spellup via ewaggle
                              when selfspellup is checked (regardless of mana spellup outcome) so ewaggle fills any duration
                              gaps mana spellup missed. Added Mana Spellup Threshold (min) field to General tab (default 60);
@@ -78,6 +76,20 @@ version = '6.1.0 (September 20, 2026)'
                              against this threshold. Fixed 220 (Word of Return) misfire handling for Hallowed Ground: on
                              "Your spell misfires and you feel weakened", announces to crew channel and calls need_mana if
                              not affordable, then retries casting.
+    September 26, 2026 - Hallowed Ground 220 cast now uses a retry loop: treats both "Your spell misfires and you
+                             feel weakened" and "A column of flame erupts around you" as misfires, announces to the
+                             crew channel and recasts. If 220 is unaffordable it calls for mana on the crew channel and
+                             waits until it can cast. The mana call is rebuilt via mana_share each time so it lists
+                             the mana types you can accept.
+    September 28, 2026 - crew_cast_sever now still sends "Task Complete" when there are no sever requests to cast,
+                             so the commander is never left waiting on a crew member who had nothing to do.
+           October 2, 2026 - Sever spellup casting reworked: group spells (Mass Blur 911 and the like) are cast once with
+                             no target instead of once per requester, self-only spells are skipped when someone else
+                             requested them, and all other spells multicast when possible (cast <name> <count>). The
+                             count uses ewaggle's training formula, is capped so it never stacks past the spell's max
+                             duration, and drops to whatever count your current mana can afford.
+                             Removed the second self ewaggle at the end of crew_cast_sever; self spellup now runs once,
+                             before sever casting (pre_sever_spellup / commander_spell_sever), only when Spellup Self is on.
 =end
 
 def lnet_crew(msg)
@@ -1817,29 +1829,103 @@ def pre_sever_spellup
 	end
 end
 
+# Max casts in one multicast, same rank formula ewaggle uses
+def sever_max_multicast(spell)
+	ranks = 0
+	if Stats.prof == 'Wizard'
+		ranks = Skills.emc
+	elsif Stats.prof =~ /^Cleric$|^Ranger$|^Paladin$/
+		ranks = Skills.smc
+	elsif Stats.prof =~ /^Empath$|^Monk$|^Bard$/
+		if [1, 2].include?(spell.circle.to_i)
+			ranks = Skills.smc + (Skills.mmc / 2)
+		elsif spell.circle.to_i == 11
+			ranks = [Skills.mmc, Skills.smc].max + ([Skills.mmc, Skills.smc].min / 2)
+		elsif spell.circle.to_i == 12
+			ranks = Skills.mmc + (Skills.smc / 2)
+		elsif spell.circle.to_i == 4
+			ranks = Skills.emc + (Skills.mmc / 2)
+		end
+	elsif Stats.prof =~ /^Sorcerer$|^Warrior$|^Rogue$/
+		if spell.circle.to_i == 4
+			ranks = Skills.emc + (Skills.smc / 2)
+		elsif spell.circle.to_i == 1
+			ranks = Skills.smc + (Skills.emc / 2)
+		elsif spell.circle.to_i == 7
+			ranks = [Skills.emc, Skills.smc].max + ([Skills.emc, Skills.smc].min / 2)
+		end
+	end
+	(ranks / 25) + 1
+end
+
+# How many times to multicast this spell on this target: capped by training, by the
+# spell's max duration (no point stacking past the cap), and by the mana on hand.
+def sever_multicast_count(spell, target)
+	begin
+		return 1 unless spell.multicastable?(:target => target)
+	rescue StandardError
+		return 1
+	end
+	count = sever_max_multicast(spell)
+	begin
+		per    = spell.time_per(:target => target).to_f
+		maxdur = spell.max_duration(:target => target).to_f
+		count  = [count, (maxdur / per).floor].min if per > 0 && maxdur > 0
+	rescue StandardError
+		nil
+	end
+	count = 1 if count < 1
+	count.downto(2) { |n| return n if spell.affordable?(:multicast => n) }
+	1
+end
+
+# Cast one requested sever spell.
+#  - Group spells (e.g. 911 Mass Blur) are cast once, with no target, no matter how many asked.
+#  - Self-only spells are skipped when someone else asked for them.
+#  - Everything else is multicast when possible: cast <name> <count>
+def sever_cast_spell(spell, target, group_done)
+	me = target.to_s.downcase == checkname.to_s.downcase
+	if spell.availability == 'group'
+		return if group_done.include?(spell.num)
+		group_done << spell.num
+		me = true
+	elsif spell.availability == 'self-cast' && !me
+		return
+	end
+	cast_on = me ? Char.name : target
+	count = sever_multicast_count(spell, cast_on)
+	waitrt?
+	waitcastrt?
+	if me
+		count > 1 ? spell.cast("#{count}") : spell.cast
+	else
+		count > 1 ? spell.cast("#{target} #{count}") : spell.cast(target)
+	end
+end
+
 def crew_cast_sever
-	return if @severlist.empty?
+	# Still report in when there is nothing to cast, or the commander waits on us
+	return if @severlist.nil?
+	if @severlist.empty?
+		crew_task_complete
+		return
+	end
 	pause_script("osacombat") if running?("osacombat")
 	# Cast sever spells on requesters
+	group_done = []
 	@severlist.each do |entry|
 		target   = entry[0]
 		spells   = entry[1..]
 		spells.compact.reject(&:empty?).each do |spell_num|
 			num = spell_num.to_s.strip
 			next if num.empty?
-			if Spell[num.to_i] && Spell[num.to_i].known?
-				waitrt?
-				waitcastrt?
-				Spell[num.to_i].cast(target)
-			end
+			spell = Spell[num.to_i]
+			next unless spell && spell.known?
+			sever_cast_spell(spell, target, group_done)
 		end
 	end
 	@severlist.clear
-	start_script("ewaggle", ['--start-at=181', '--stop-at=240', 'self'])
-	@mana_watcher.kill if @mana_watcher&.alive?
-	@mana_watcher = Thread.new { need_mana }
-	wait_until { !running?("ewaggle") }
-	@mana_watcher.kill if @mana_watcher&.alive?
+	# Self spellup already ran in pre_sever_spellup (crew) / commander_spell_sever (commander)
 	unpause_script("osacombat") if running?("osacombat")
 	crew_task_complete
 end
@@ -3970,7 +4056,24 @@ while line = get
 			fput "release"
 			waitrt?
 			waitcastrt?
-			Spell[220].cast
+			loop do
+				# Out of mana for 220 - build "I Need X and Y Mana!" from the mana types we can accept and call it out
+				unless Spell[220].affordable?
+					mana_share
+					lnet_crew($mana_message)
+					wait_until { Spell[220].affordable? }
+				end
+				waitrt?
+				waitcastrt?
+				result = dothistimeout "incant 220", 10, /Your spell misfires and you feel weakened|A column of flame erupts around you|Cast Roundtime|You feel the magic/
+				waitcastrt?
+				waitrt?
+				if result.to_s =~ /Your spell misfires and you feel weakened|A column of flame erupts around you/
+					lnet_crew("220 misfired! Attempting to recast...")
+					next
+				end
+				break
+			end
 			unpause_script("ecure") if running?("ecure")
 			unpause_script("osacombat") if running?("osacombat")
 		end
