@@ -5,7 +5,7 @@
         game: gemstone
         tags: bounty, adventurer's guild, undead, voln
     requires: Lich > 5.4.0
-     version: 1.6
+     version: 1.10
 
   Want to keep earning favor with Voln while at the same time completing bounties?
 
@@ -77,7 +77,46 @@
   level), the script stops with a clear message instead of burning through
   the attempt cap uselessly.
 
+  Handles zero Bounty Boosts gracefully too (common on F2P accounts).
+  Requesting a SPECIFIC bounty type requires an active boost, so without
+  one the script asks the taskmaster generically instead (`ask taskmaster
+  about bounty`) and takes whatever's offered. If the taskmaster is on
+  cooldown ("Come back in about N minutes if you want another task."), it
+  exits with a clean "nothing to do right now (eligible again in about N
+  minutes)" message instead of treating it as a failure. Meant to play
+  nicely with something like a bigshot hunt/rest loop calling this in
+  between sessions.
+
+  Only follows through on a "creature problem" assignment (the kind that
+  routes to a town guard for a cull/dangerous task). If the taskmaster
+  hands out something else instead - a herb/gem/skin/heirloom/rescue quest
+  - the script recognizes that immediately, removes it, and stops rather
+  than sending you to ask a town guard who has no idea what you're talking
+  about (previously this could loop for a long time asking "ask guard for
+  bounty" over and over).
+
   changelog:
+    1.10
+      - recognize a directly-assigned task like :escort, not just types
+        ending in "assignment" - previously it could sit unrecognized for
+        a full timeout (or, if the taskmaster was only asked once, go
+        completely unnoticed and never get removed)
+    1.9
+      - only accept a :creature_assignment task before heading to the town
+        guard; any other assignment type (herb/gem/skin/heirloom/rescue) is
+        now recognized, removed, and handled immediately - fixes a case
+        where the script would repeatedly ask a guard for a bounty that was
+        never routed through them in the first place
+    1.8
+      - without a Bounty Boost, stop requesting a specific bounty type
+        (the game doesn't support that unboosted) and ask generically
+        instead, pulling the real wait time out of the taskmaster's own
+        "come back in about N minutes" cooldown response
+    1.7
+      - handle zero Bounty Boosts gracefully: still try the taskmaster once
+        or twice in case a free task is available, then exit cleanly
+        (mentioning the "eligible again in N minutes" cooldown when known)
+        instead of failing or burning through the full attempt cap
     1.6
       - fix creature_undead? missing creatures whose full in-game name
         always carries a fixed descriptor (e.g. "voluptuous magna vereri")
@@ -192,9 +231,23 @@ module UndeadBounty
     wait_for_bounty { true }
   end
 
+  # matches both "...eligible for new task assignment in about 43 minutes"
+  # (from `bounty` status) and "...come back in about 37 minutes if you
+  # want another task" (from asking the taskmaster while on cooldown)
+  MINUTES_PATTERN = /in about (\d+) minutes?/i.freeze
+
+  def self.minutes_until_eligible(text)
+    m = MINUTES_PATTERN.match(text.to_s)
+    m && m[1].to_i
+  end
+
   # sends a command once (no auto-resend) and watches incoming lines for up
   # to `timeout` seconds for any of the given patterns; returns the matching
   # pattern, or nil if none showed up in time
+  # returns the matching pattern (not the line) to keep existing `matched
+  # == SOME_PATTERN` call sites simple; the actual matched line is stashed
+  # in @last_matched_line for the rare caller (e.g. minute-count parsing)
+  # that needs the real text.
   def self.fput_and_check(command, patterns, timeout: 5)
     Script.current.clear
     fput command
@@ -204,6 +257,7 @@ module UndeadBounty
       if line.nil?
         sleep 0.1
       elsif (pattern = patterns.find { |p| line =~ p })
+        @last_matched_line = line
         return pattern
       end
     end
@@ -246,18 +300,24 @@ module UndeadBounty
     waitrt?
   end
 
+  # returns true if a Bounty Boost is active (already was, or "boost bounty"
+  # just activated one); false if there are none to redeem - in that case
+  # we still go ahead and ask the taskmaster, since F2P accounts sometimes
+  # have a free task available even with zero boosts (it's the "eligible
+  # for new task assignment in about N minutes" cooldown that gates that,
+  # not the boost itself).
   def self.boost_bounty
     if Effects::Buffs.active?('Bounty Boost')
       respond 'UndeadBounty: Bounty Boost already active, skipping "boost bounty".'
-      return
+      return true
     end
 
     result = dothistimeout('boost bounty', 5, /You do not have any Bounty Boosts to redeem\.|You have activated a Bounty Boost\./)
     waitrt?
 
     if result =~ /You do not have any Bounty Boosts to redeem/
-      respond "UndeadBounty: #{result}"
-      exit
+      respond "UndeadBounty: #{result} Trying the taskmaster anyway in case a free task is available."
+      return false
     end
 
     # the Buffs dialog data lags a bit behind the chat confirmation, so give
@@ -274,15 +334,36 @@ module UndeadBounty
       respond 'UndeadBounty: Bounty Boost does not appear to be active after "boost bounty", stopping.'
       exit
     end
+
+    true
   end
 
   ALREADY_ASSIGNED_PATTERN = /already been assigned a task/i.freeze
   TASKMASTER_BUSY_PATTERN = /kind of busy right now/i.freeze
   NO_SUITABLE_TASK_PATTERN = /don't seem to have any tasks that are suitable for you/i.freeze
+  # this reuses the same opening line as TASKMASTER_BUSY_PATTERN, but with a
+  # real multi-minute cooldown attached - only seen (so far) when asking
+  # without a Bounty Boost active
+  TASKMASTER_COOLDOWN_PATTERN = /come back in about .+ if you want another task/i.freeze
+
+  # Task#assigned? matches ANY "...assignment" type - herb_assignment,
+  # gem_assignment, skin_assignment, heirloom_assignment, rescue_assignment,
+  # bandit_assignment, creature_assignment. This script only knows how to
+  # follow the creature_assignment ("It appears they have a creature
+  # problem they'd like you to solve") track through the town guard to a
+  # cull/dangerous task. Any other assignment type sent to ask_guard_for_bounty
+  # just has the guard saying "I don't have any tasks for you right now" in
+  # an endless-looking loop, since that quest was never routed through them.
+  def self.creature_assignment?(task)
+    task&.type == :creature_assignment
+  end
 
   def self.ask_master_for_bounty(bounty_type, max_attempts: 10)
     go_to_advguild
-    boost_bounty
+
+    # asking for a SPECIFIC bounty type requires an active Bounty Boost -
+    # without one, the game doesn't support it at all, so don't even try
+    return ask_master_for_free_bounty unless boost_bounty
 
     max_attempts.times do
       matched = fput_and_check(
@@ -306,11 +387,70 @@ module UndeadBounty
         next
       end
 
-      task = wait_for_bounty(&:assigned?)
-      return task if task
+      # Task#assigned? only matches types ending in "assignment" - but some
+      # types (e.g. :escort) get handed out directly in their final "ready"
+      # form, skipping that intermediate stage entirely, so they'd go
+      # unrecognized here and only get cleaned up later (if at all) via the
+      # "already assigned" text fallback above. any? (anything but :none)
+      # catches both shapes.
+      task = wait_for_bounty(&:any?)
+      next unless task
+
+      if creature_assignment?(task)
+        return task
+      end
+
+      respond "UndeadBounty: taskmaster assigned a #{task.type} task instead of a creature problem, " \
+              'requesting removal and retrying...'
+      ask_master_for_removal
     end
 
-    respond 'UndeadBounty: never got a new assignment from the bounty master, stopping.'
+    respond 'UndeadBounty: never got a new creature-problem assignment from the bounty master, stopping.'
+    exit
+  end
+
+  # no Bounty Boost active: can't request a specific type, so just ask
+  # generically and take whatever's offered. Unlike the boosted path, there's
+  # no point retrying here if it's not a creature problem - without a boost
+  # a fresh assignment is a real cooldown away, so just remove it and stop.
+  def self.ask_master_for_free_bounty
+    2.times do
+      matched = fput_and_check(
+        "ask #{BOUNTY_MASTER_NAME} about bounty",
+        [ALREADY_ASSIGNED_PATTERN, TASKMASTER_COOLDOWN_PATTERN]
+      )
+      waitrt?
+
+      if matched == ALREADY_ASSIGNED_PATTERN
+        respond 'UndeadBounty: taskmaster says a task is already assigned, requesting removal...'
+        ask_master_for_removal
+        next
+      elsif matched == TASKMASTER_COOLDOWN_PATTERN
+        @eligible_in_minutes = minutes_until_eligible(@last_matched_line) || @eligible_in_minutes
+        wait_note = @eligible_in_minutes ? " (eligible again in about #{@eligible_in_minutes} minutes)" : ''
+        respond "UndeadBounty: no Bounty Boost available and no free task assignment right now#{wait_note}."
+        respond 'UndeadBounty: nothing to do - stopping so the hunt/rest cycle can just try again later.'
+        exit
+      end
+
+      # Task#assigned? only matches types ending in "assignment" - but some
+      # types (e.g. :escort) get handed out directly in their final "ready"
+      # form, skipping that intermediate stage entirely, so they'd go
+      # unrecognized here and only get cleaned up later (if at all) via the
+      # "already assigned" text fallback above. any? (anything but :none)
+      # catches both shapes.
+      task = wait_for_bounty(&:any?)
+      next unless task
+
+      return task if creature_assignment?(task)
+
+      respond "UndeadBounty: no Bounty Boost, and the free task offered was a #{task.type} problem, not a " \
+              "creature problem. Removing it and stopping so the hunt/rest cycle can try again later."
+      ask_master_for_removal
+      exit
+    end
+
+    respond 'UndeadBounty: no Bounty Boost, and the taskmaster never confirmed a task or a cooldown - stopping.'
     exit
   end
 
@@ -400,6 +540,13 @@ module UndeadBounty
       turn_in_bounty(task)
       return
     end
+
+    # :none can still carry a "You will be eligible for new task assignment
+    # in about N minutes" cooldown notice - stash it so a later "couldn't
+    # get a task" exit message can mention it instead of just failing blind.
+    # NOTE: Task#description is never actually populated by the parser, so
+    # we have to go back to the raw bounty stream text via checkbounty.
+    @eligible_in_minutes = minutes_until_eligible(checkbounty) if task.type == :none
 
     return unless task.creature
 
@@ -579,6 +726,7 @@ module UndeadBounty
     # module-level state survives across separate script runs in the same
     # Lich session, so reset it at the start of each run
     @bounty_history = []
+    @eligible_in_minutes = nil
     start_room = Room.current.id
 
     return if handle_existing_bounty(creature_filter) == :already_matching
@@ -664,6 +812,14 @@ module UndeadBounty
     respond ''
     respond 'If the taskmaster has no suitable tasks left for your level (hunting ground got too'
     respond 'easy), the script stops with a clear message instead of retrying uselessly.'
+    respond ''
+    respond 'With zero Bounty Boosts (common on F2P), requesting a specific type is not possible, so'
+    respond 'it asks generically instead and takes whatever is offered. On cooldown, it exits cleanly'
+    respond 'with the real wait time pulled from the taskmaster - no boost needed to run this.'
+    respond ''
+    respond 'Only "creature problem" assignments are followed to the town guard. A herb/gem/skin/'
+    respond 'heirloom/rescue task is recognized immediately, removed, and the script stops instead'
+    respond 'of asking a guard who was never involved in that quest.'
   end
 end
 
