@@ -1,0 +1,482 @@
+=begin
+  mariocloth.lic
+
+  Unwraps every wrapped swaddling cloth in your inventory and logs what
+  the two-headed marionette inside does when inspected. For each cloth it
+  GETs the cloth, OPENs it, INSPECTs the marionette that falls out, then
+  STOWs anything left in your hands. Stops when you're out of cloths.
+
+  Only your own marionette's messages are logged - other people's cloths,
+  room chatter and prompts are ignored, so it's safe to run on several
+  characters in the same room at once. Poems are saved exactly as the
+  game shows them, indentation included.
+
+  Results go to mariocloth.log in your Lich logs folder, which is rebuilt
+  after every marionette as an easy-to-read report: totals, a per-character
+  breakdown, one line per marionette, each poem written out once, and each
+  game message written out once. The raw entries behind it are kept in
+  mariocloth-data.jsonl next to it. A mariocloth.log made by version 1.0.0
+  is converted automatically the next time the script runs (the original
+  is kept as a mariocloth-old-format backup).
+
+  ;mariocloth           unwrap and inspect every cloth you're carrying
+  ;mariocloth help      show usage and log location
+
+       author: Mara
+         game: Gemstone
+         tags: naidem, marionette, cloth, inspect, logging
+      contact: mara.lilly on Discord, @Lillymara on GitHub
+    co-author: Claude (Anthropic) - claude.ai/code
+      version: 1.1.0
+
+  Changelog:
+    1.1.0 (2026-10-05) - Only logs your own marionette's messages instead
+      of everything on screen for up to 20 seconds; poems keep their
+      in-game indentation; log is now a sorted, de-duplicated report
+      rebuilt on every run; 1.0.0 logs are converted automatically.
+    1.0.0 (2026-10-05) - Initial release.
+=end
+
+require 'json'
+require 'fileutils'
+
+# ---------------------------------------------------------------------------
+# Log storage, parsing and report formatting
+# ---------------------------------------------------------------------------
+module MarioLog
+  WIDTH = 76
+
+  # The character's own reply to INSPECT.
+  START = /^\s*(?:Empty\s+)?You (?!notice|also see|put|pick up|remove|drop|get|grab)\b.*(?:lay your hands|marionette)/
+  PROMPT = /^\s*\S{0,3}>\s*$/
+
+  def self.paths(dir)
+    { log: File.join(dir, 'mariocloth.log'),
+      data: File.join(dir, 'mariocloth-data.jsonl'),
+      lock: File.join(dir, 'mariocloth.lock') }
+  end
+
+  # Picks this character's own marionette messages out of a run of game
+  # lines that may also contain other people's actions, prompts, etc.
+  # Returns [own_lines, status]; status is :none (no inspect reply yet),
+  # :simple (reply seen, no poem), :poem_open (poem still coming) or
+  # :complete (poem finished with its closing line).
+  def self.extract(lines)
+    i = lines.index { |l| l =~ START }
+    return [nil, :none] unless i
+
+    own = [lines[i].sub(/^\s*(?:Empty\s+)?/, '').rstrip]
+    state = :simple
+    lines[(i + 1)..].each do |l|
+      text = l.rstrip
+      case state
+      when :simple
+        # Only the line right after our own reply can belong to it - anything
+        # later may be someone else's marionette.
+        next if text.strip.empty? || text =~ PROMPT
+        if text =~ /recites:\s*$/ && own.first !~ /insubstantial|weep|shift their gaze/
+          own << text
+          state = :poem_open
+          next
+        end
+        own << text.strip if text =~ /^\s*The marionette\b.*\byour?\b/i
+        break
+      when :poem_open
+        next if text.strip.empty? || text =~ PROMPT
+        own << text
+        state = :closing if text =~ /"\s*$/
+      when :closing
+        # The closing line talks about "the marionette"; other people's
+        # actions name "a two-headed ... marionette".
+        if text =~ /marionette/i && text !~ /two-headed/i && text !~ /^\s*Falling\b/
+          own << text.strip
+          state = :complete
+          break
+        end
+      end
+    end
+    state = :poem_open if state == :closing
+    [own, state]
+  end
+
+  def self.with_lock(dir)
+    p = paths(dir)
+    File.open(p[:lock], File::RDWR | File::CREAT, 0o644) do |f|
+      f.flock(File::LOCK_EX)
+      yield p
+    end
+  end
+
+  def self.load(p)
+    return [] unless File.exist?(p[:data])
+    File.readlines(p[:data], chomp: true).reject(&:empty?).map { |l| JSON.parse(l) rescue nil }.compact
+  end
+
+  def self.append(p, entries)
+    File.open(p[:data], 'a') { |f| entries.each { |e| f.puts(JSON.generate(e)) } }
+  end
+
+  # Converts a mariocloth.log written by 1.0.0 ("=== ... inspects ... ===" blocks).
+  def self.migrate_old_log(p)
+    return 0 unless File.exist?(p[:log])
+    text = File.read(p[:log], encoding: 'UTF-8', invalid: :replace, undef: :replace)
+    return 0 unless text =~ /^=== .* inspects .* ===$/
+
+    entries = []
+    cur = nil
+    text.split("\n").each do |l|
+      if (m = l.match(/^=== (\d{4}-\d\d-\d\d)(?: (\d\d:\d\d:\d\d))? (\S+) inspects (.*?)(?: \(#\d+\))? ===$/))
+        cur = { 'time' => [m[1], m[2]].compact.join(' '), 'char' => m[3], 'item' => m[4], 'body' => [] }
+        entries << cur
+      elsif cur
+        cur['body'] << l
+      end
+    end
+    entries.each do |e|
+      own, = extract(e.delete('body'))
+      e['lines'] = own || ['(no inspect message found in old log)']
+    end
+
+    stamp = Time.now.strftime('%Y%m%d-%H%M%S')
+    FileUtils.cp(p[:log], p[:log].sub(/\.log$/, "-old-format-#{stamp}.log"))
+    append(p, entries)
+    entries.size
+  end
+
+  # ------------------------------------------------------------- analysis --
+
+  def self.poem_body(lines)
+    i = lines.index { |l| l =~ /recites:\s*$/ } or return nil
+    body = []
+    lines[(i + 1)..].each { |l| body << l; break if l =~ /"\s*$/ }
+    body
+  end
+
+  def self.kind(lines)
+    t = lines.join(' ')
+    return :poem  if t =~ /recites:/
+    return :stare if t =~ /shift their gaze|fall directly upon you/
+    return :weep  if t =~ /weep/i
+    return :mist  if t =~ /insubstantial|fine mist/
+    :other
+  end
+
+  KIND_LABEL = { weep: 'Wept and laughed, then shattered', mist: 'Turned to white mist',
+                 poem: 'Came alive and recited a poem', stare: 'Stared at you',
+                 other: 'Something else' }.freeze
+  KIND_SHORT = { weep: 'Wept', mist: 'Mist', poem: 'Poem', stare: 'Stared', other: 'Other' }.freeze
+
+  # The line after the poem's closing quote, if it was captured.
+  def self.poem_closing(lines)
+    i = lines.index { |l| l =~ /recites:\s*$/ } or return nil
+    lines[i + 1 + poem_body(lines).size]
+  end
+
+  def self.poem_ending(lines)
+    case poem_closing(lines)
+    when nil then 'ending not captured'
+    when /sudden jerk/ then 'yanked up into the sky'
+    when /collapses in upon itself/ then 'collapsed into mist'
+    when /sanguine|obliterat/ then 'destroyed by a bolt of red light'
+    else 'ended another way'
+    end
+  end
+
+  def self.stare_kept?(lines)
+    lines.none? { |l| l =~ /slips from your hand/ }
+  end
+
+  def self.wrap(text, indent, first_indent = indent)
+    out = []
+    line = first_indent.dup
+    text.split(/\s+/).each do |w|
+      if line.length + w.length + 1 > WIDTH && line.strip != ''
+        out << line.rstrip
+        line = indent.dup
+      end
+      line << w << ' '
+    end
+    out << line.rstrip
+    out
+  end
+
+  # --------------------------------------------------------------- report --
+
+  def self.render(p)
+    entries = load(p)
+    poems = {} # normalized text => { lines:, closings: {}, chars: [], count: }
+    rows = entries.each_with_index.map do |e, idx|
+      lines = e['lines'] || []
+      k = kind(lines)
+      what =
+        case k
+        when :poem
+          body = poem_body(lines) || []
+          key = body.map(&:strip).join("\n")
+          pm = (poems[key] ||= { lines: body, closings: Hash.new(0), chars: [], count: 0, num: poems.size + 1 })
+          # Keep the copy with the game's indentation if one has it.
+          pm[:lines] = body if body.sum { |l| l[/^\s*/].size } > pm[:lines].sum { |l| l[/^\s*/].size }
+          pm[:count] += 1
+          pm[:chars] |= [e['char']]
+          closing = poem_closing(lines)
+          pm[:closings][closing] += 1 if closing
+          "Recited Poem #{pm[:num]}, then #{poem_ending(lines)}"
+        when :stare
+          stare_kept?(lines) ? 'Stared at you, kept it (stowed)' : 'Stared at you, then slipped and shattered'
+        when :other
+          "Something else: #{lines.first.to_s[0, 40]}..."
+        else KIND_LABEL[k]
+        end
+      { n: idx + 1, time: e['time'].to_s, char: e['char'].to_s, kind: k, what: what, lines: lines }
+    end
+
+    out = []
+    bar = '=' * WIDTH
+    rule = '-' * WIDTH
+    chars = rows.map { |r| r[:char] }.uniq.sort
+    out << bar
+    out << ' MARIONETTE LOG'
+    out << " #{rows.size} marionette#{'s' unless rows.size == 1} unwrapped by #{chars.size} character#{'s' unless chars.size == 1}"
+    out << " Last updated: #{Time.now.strftime('%Y-%m-%d %H:%M:%S')}"
+    out << ' Rebuilt automatically by ;mariocloth - edits to this file are overwritten.'
+    out << bar
+    out << ''
+
+    out << 'WHAT THEY DID'
+    counts = rows.group_by { |r| r[:kind] }
+    counts.sort_by { |k, v| [-v.size, k.to_s] }.each do |k, v|
+      extra = ''
+      if k == :stare
+        kept = v.count { |r| stare_kept?(r[:lines]) }
+        extra = "  (#{kept} kept, #{v.size - kept} slipped and shattered)"
+      end
+      out << format('  %4d  %s%s', v.size, KIND_LABEL[k], extra)
+    end
+    out << ''
+
+    out << 'BY CHARACTER'
+    kinds = %i[weep mist poem stare other].select { |k| counts[k] }
+    out << format('  %-14s %5s', 'Character', 'Total') + kinds.map { |k| format(' %6s', KIND_SHORT[k]) }.join
+    chars.each do |c|
+      mine = rows.select { |r| r[:char] == c }
+      out << format('  %-14s %5d', c, mine.size) + kinds.map { |k| format(' %6d', mine.count { |r| r[:kind] == k }) }.join
+    end
+    out << ''
+
+    unless poems.empty?
+      out << 'POEMS'
+      poems.each_value do |pm|
+        title = pm[:lines].first.to_s.strip.sub(/^"/, '').sub(/[,;:.!-]*"?$/, '')
+        out << format('  Poem %-2d  recited %2d time%s  "%s"', pm[:num], pm[:count], pm[:count] == 1 ? ' ' : 's', title)
+      end
+      out << ''
+    end
+
+    out << rule
+    out << ' EVERY MARIONETTE'
+    out << rule
+    out << format('  %4s  %-14s  %-13s %s', '#', 'When', 'Character', 'What happened')
+    rows.each do |r|
+      date, time = r[:time].split(' ')
+      when_s = "#{date.to_s[5..]} #{time || '--:--:--'}"
+      out << format('  %4d  %-14s  %-13s %s', r[:n], when_s, r[:char], r[:what])
+    end
+    out << ''
+
+    unless poems.empty?
+      out << rule
+      out << ' THE POEMS, EXACTLY AS RECITED IN GAME'
+      out << rule
+      poems.each_value do |pm|
+        out << ''
+        out << "Poem #{pm[:num]} - recited #{pm[:count]} time#{'s' unless pm[:count] == 1} (#{pm[:chars].sort.join(', ')})"
+        out << ''
+        out << 'Lifting its mouth wide, the newly formed marionette recites:'
+        out.concat(pm[:lines])
+        pm[:closings].sort_by { |_, c| -c }.each do |line, c|
+          out << line
+          out << "    (that ending: #{c} time#{'s' unless c == 1})" if pm[:closings].size > 1
+        end
+      end
+      out << ''
+    end
+
+    out << rule
+    out << ' WHAT THE GAME SAYS (each message written once)'
+    out << rule
+    rows.group_by { |r| r[:kind] }.sort_by { |k, v| [-v.size, k.to_s] }.each do |k, v|
+      msgs = Hash.new(0)
+      v.each do |r|
+        r[:lines].each do |l|
+          break if l =~ /recites:\s*$/
+          msgs[l.strip] += 1
+        end
+      end
+      out << ''
+      out << "#{KIND_LABEL[k]} - #{v.size} time#{'s' unless v.size == 1}"
+      msgs.sort_by { |_, c| -c }.each do |m, c|
+        out << ''
+        out.concat(wrap(m, ' ' * 8, format('  %3dx  ', c)))
+      end
+    end
+    out << ''
+
+    tmp = "#{p[:log]}.tmp"
+    File.write(tmp, out.join("\n"))
+    File.rename(tmp, p[:log])
+  end
+
+  # Converts any old-format log, then rebuilds the report.
+  def self.sync(dir, new_entry = nil)
+    with_lock(dir) do |p|
+      migrated = migrate_old_log(p)
+      append(p, [new_entry]) if new_entry
+      render(p)
+      migrated
+    end
+  end
+end # MarioLog
+
+# ---------------------------------------------------------------------------
+# Game side
+# ---------------------------------------------------------------------------
+
+MAX_SECS  = 20   # give up waiting for a marionette's messages after this long
+POEM_WAIT = 1.5  # after a non-poem reply, wait this long in case a poem follows
+LOG_HOOK  = 'mariocloth_log'
+LOG_PATHS = MarioLog.paths(LOG_DIR)
+
+def hand_items
+  [GameObj.right_hand, GameObj.left_hand].reject { |h| h.nil? || h.id.nil? || h.name == 'Empty' }
+end
+
+def stow_hands
+  hand_items.each do |item|
+    result = dothistimeout "stow ##{item.id}", 3, /You put|You stow|can't|won't fit|no room|nowhere/i
+    echo "Couldn't stow #{item.name}." if result.nil? || result =~ /can't|won't fit|no room|nowhere/i
+  end
+end
+
+# Strips game XML down to the text the player sees, dropping side-window
+# streams (inventory, experience, etc.) and hand/prompt tags.
+$mariocloth_in_stream = false
+def mariocloth_clean(xml)
+  out = +''
+  rest = xml.dup
+  until rest.empty?
+    if $mariocloth_in_stream
+      if (m = rest.match(%r{<popStream[^>]*/>}))
+        rest = rest[m.end(0)..]
+        $mariocloth_in_stream = false
+      else
+        rest = ''
+      end
+    elsif (m = rest.match(%r{<pushStream[^>]*>}))
+      out << rest[0...m.begin(0)]
+      rest = rest[m.end(0)..]
+      $mariocloth_in_stream = true
+    else
+      out << rest
+      rest = ''
+    end
+  end
+  out.gsub(%r{<(right|left|spell|prompt|compass)\b[^>]*>.*?</\1>}m, '')
+     .gsub(/<[^>]*>/, '')
+     .gsub('&gt;', '>').gsub('&lt;', '<').gsub('&quot;', '"').gsub('&apos;', "'").gsub('&amp;', '&')
+end
+
+# Inspects the marionette and records only its own messages.
+def inspect_and_log(ref, label)
+  captured = []
+  lock = Mutex.new
+  DownstreamHook.add(LOG_HOOK, proc { |xml|
+    text = mariocloth_clean(xml)
+    lock.synchronize { text.split("\n").each { |l| captured << l } }
+    xml
+  })
+  own = nil
+  begin
+    fput "inspect #{ref}"
+    started = Time.now
+    reply_at = nil
+    loop do
+      own, status = lock.synchronize { MarioLog.extract(captured.dup) }
+      reply_at ||= Time.now if own
+      break if status == :complete
+      break if status == :simple && Time.now - reply_at >= POEM_WAIT
+      break if Time.now - started >= MAX_SECS
+      sleep 0.2
+    end
+  ensure
+    DownstreamHook.remove(LOG_HOOK)
+  end
+
+  entry = { 'time' => Time.now.strftime('%Y-%m-%d %H:%M:%S'), 'char' => Char.name, 'item' => label,
+            'lines' => own || ['(no inspect message captured)'] }
+  MarioLog.sync(LOG_DIR, entry)
+end
+
+if script.vars[1] =~ /^(?:help|-h|--help|\?)$/i
+  respond <<~HELP
+
+    mariocloth - unwraps swaddling cloths and logs what the marionettes do
+
+    Usage:
+      ;mariocloth          Process every cloth in your inventory
+      ;mariocloth help     Show this help
+
+    For each cloth it will:
+      1. GET a cloth from your inventory
+      2. OPEN it to release the marionette
+      3. INSPECT the marionette and log what it does (only your own
+         marionette - other people's actions in the room are ignored)
+      4. STOW anything left in your hands
+    It stops when you have no cloths left.
+
+    Log file: mariocloth.log in your Lich "logs" folder
+      (on this setup: #{LOG_PATHS[:log]})
+    It's rebuilt each time as a sorted report with totals, one line per
+    marionette, and every poem written out once exactly as recited.
+    Older-style logs are converted automatically.
+    Safe to run on several characters at once.
+
+    Stop early with ;k mariocloth
+  HELP
+  exit
+end
+
+before_dying { DownstreamHook.remove(LOG_HOOK) }
+
+migrated = MarioLog.sync(LOG_DIR)
+echo "Converted #{migrated} entries from an older mariocloth.log." if migrated > 0
+
+count = 0
+stow_hands
+
+loop do
+  result = dothistimeout 'get my cloth', 3, /You (?:remove|get|grab|pick up|slip)|Get what\?|could not find|can't find/i
+  break if result.nil? || result =~ /Get what\?|could not find|can't find/i
+
+  before = (hand_items + GameObj.loot.to_a).map { |o| o.id.to_s }
+
+  cloth = hand_items.find { |h| h.noun =~ /cloth/i }
+  fput(cloth ? "open ##{cloth.id}" : 'open my cloth')
+  pause 1
+
+  # Find the thing that came out: prefer something named mario*, else anything new in hands/room
+  candidates = (hand_items + GameObj.loot.to_a).reject { |o| o.id.nil? || o.noun =~ /cloth/i }
+  target = candidates.find { |o| o.name =~ /mario/i } ||
+           candidates.find { |o| !before.include?(o.id.to_s) }
+
+  if target
+    inspect_and_log("##{target.id}", target.name)
+  else
+    echo "Couldn't spot what came out; trying 'inspect mario'."
+    inspect_and_log('mario', 'mario')
+  end
+
+  stow_hands
+  count += 1
+end
+
+echo "Out of cloths. Processed #{count}. Log: #{LOG_PATHS[:log]}"
