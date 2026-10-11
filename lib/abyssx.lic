@@ -1,0 +1,384 @@
+#Arena of the Abyss - Ebon Gate (abyssx)
+#Author: Hexbane
+#Version: 3.0
+#
+# Automates the Ebon Gate Arena of the Abyss. Checks your stored entry count
+# via 'event entr', pays the entry fee, fights through each wave, loots the
+# prize from the oculoth, and loops until entries run out. Entries must be
+# redeemed before starting (redeem key).
+#
+# Attack modes (set in setup):
+#   bigshot  -- calls ;bigshot quick each combat round (default)
+#   spell    -- spams a single incant <number> until all targets are dead;
+#               waits if mana drops below the configured minimum
+#
+# Mind rest:
+#   If your mind hits the configured pause threshold, the script navigates
+#   to a mana node via ;go2 node and waits until mind falls to the resume
+#   threshold, then returns to the arena entrance and continues.
+#
+# Usage:
+#   ;abyssx        -- run the arena loop using saved settings
+#   ;abyssx setup  -- open the GTK setup GUI to configure options:
+#                       Loot container, Attack mode, Spell number,
+#                       Min mana, Pause at mind %, Resume at mind %
+
+require 'yaml'
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+module AbyssX
+  VERSION = '3.0'
+
+  MANA_WAIT_DEFAULT   = 30
+  MIND_PAUSE_DEFAULT  = 100
+  MIND_RESUME_DEFAULT = 75
+
+  def self.settings_path
+    File.join(DATA_DIR, XMLData.game, Char.name, 'abyssx.yaml')
+  end
+
+  def self.load_settings
+    return {} unless File.exist?(settings_path)
+    YAML.load_file(settings_path) rescue {}
+  end
+
+  def self.save_settings(data)
+    dir = File.dirname(settings_path)
+    Dir.mkdir(dir) unless Dir.exist?(dir)
+    File.write(settings_path, data.to_yaml)
+  end
+
+  # ---------------------------------------------------------------------------
+  # GUI
+  # ---------------------------------------------------------------------------
+  module SetupGUI
+    def self.run
+      unless defined?(Gtk) && Gtk::Version::MAJOR == 3
+        echo 'GTK3 is not available. Cannot open setup GUI.'
+        exit
+      end
+
+      saved    = AbyssX.load_settings
+      @running = true
+      @result  = nil
+
+      Gtk.queue do
+        @win = Gtk::Window.new(:toplevel)
+        @win.set_title('AbyssX Setup')
+        @win.set_default_size(380, 280)
+        @win.set_border_width(12)
+        @win.keep_above = true
+
+        vbox = Gtk::Box.new(:vertical, 10)
+        @win.add(vbox)
+
+        # --- Lootsack ---
+        row1 = Gtk::Box.new(:horizontal, 6)
+        lbl1 = Gtk::Label.new('Loot container:')
+        lbl1.set_size_request(140, -1)
+        lbl1.set_halign(:start)
+        @entry_lootsack = Gtk::Entry.new
+        @entry_lootsack.text = saved.fetch('lootsack', Vars.lootsack.to_s)
+        @entry_lootsack.set_hexpand(true)
+        row1.pack_start(lbl1,            expand: false, fill: false, padding: 0)
+        row1.pack_start(@entry_lootsack, expand: true,  fill: true,  padding: 0)
+        vbox.pack_start(row1, expand: false, fill: false, padding: 0)
+
+        vbox.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 4)
+
+        # --- Attack mode ---
+        mode_lbl = Gtk::Label.new('Attack mode:')
+        mode_lbl.set_halign(:start)
+        vbox.pack_start(mode_lbl, expand: false, fill: false, padding: 0)
+
+        @radio_bigshot = Gtk::RadioButton.new(label: 'Use bigshot quick')
+        @radio_spell   = Gtk::RadioButton.new(member: @radio_bigshot, label: 'Spam spell')
+
+        if saved.fetch('attack_mode', 'bigshot') == 'spell'
+          @radio_spell.active = true
+        else
+          @radio_bigshot.active = true
+        end
+
+        vbox.pack_start(@radio_bigshot, expand: false, fill: false, padding: 0)
+        vbox.pack_start(@radio_spell,   expand: false, fill: false, padding: 0)
+
+        # --- Spell number ---
+        row2 = Gtk::Box.new(:horizontal, 6)
+        lbl2 = Gtk::Label.new('Spell number:')
+        lbl2.set_size_request(140, -1)
+        lbl2.set_halign(:start)
+        @entry_spell = Gtk::Entry.new
+        @entry_spell.text = saved.fetch('spell_number', '').to_s
+        @entry_spell.set_hexpand(true)
+        row2.pack_start(lbl2,         expand: false, fill: false, padding: 0)
+        row2.pack_start(@entry_spell, expand: true,  fill: true,  padding: 0)
+        vbox.pack_start(row2, expand: false, fill: false, padding: 0)
+
+        # --- Min mana ---
+        row3 = Gtk::Box.new(:horizontal, 6)
+        lbl3 = Gtk::Label.new('Min mana (spell mode):')
+        lbl3.set_size_request(140, -1)
+        lbl3.set_halign(:start)
+        @entry_mana = Gtk::Entry.new
+        @entry_mana.text = saved.fetch('min_mana', AbyssX::MANA_WAIT_DEFAULT).to_s
+        @entry_mana.set_hexpand(true)
+        row3.pack_start(lbl3,        expand: false, fill: false, padding: 0)
+        row3.pack_start(@entry_mana, expand: true,  fill: true,  padding: 0)
+        vbox.pack_start(row3, expand: false, fill: false, padding: 0)
+
+        # --- Mind pause ---
+        row4 = Gtk::Box.new(:horizontal, 6)
+        lbl4 = Gtk::Label.new('Pause at mind %:')
+        lbl4.set_size_request(140, -1)
+        lbl4.set_halign(:start)
+        @entry_mind_pause = Gtk::Entry.new
+        @entry_mind_pause.text = saved.fetch('mind_pause', AbyssX::MIND_PAUSE_DEFAULT).to_s
+        @entry_mind_pause.set_hexpand(true)
+        row4.pack_start(lbl4,             expand: false, fill: false, padding: 0)
+        row4.pack_start(@entry_mind_pause, expand: true, fill: true,  padding: 0)
+        vbox.pack_start(row4, expand: false, fill: false, padding: 0)
+
+        # --- Mind resume ---
+        row5 = Gtk::Box.new(:horizontal, 6)
+        lbl5 = Gtk::Label.new('Resume at mind %:')
+        lbl5.set_size_request(140, -1)
+        lbl5.set_halign(:start)
+        @entry_mind_resume = Gtk::Entry.new
+        @entry_mind_resume.text = saved.fetch('mind_resume', AbyssX::MIND_RESUME_DEFAULT).to_s
+        @entry_mind_resume.set_hexpand(true)
+        row5.pack_start(lbl5,              expand: false, fill: false, padding: 0)
+        row5.pack_start(@entry_mind_resume, expand: true, fill: true,  padding: 0)
+        vbox.pack_start(row5, expand: false, fill: false, padding: 0)
+
+        vbox.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 4)
+
+        # --- Buttons ---
+        btnrow = Gtk::Box.new(:horizontal, 8)
+        vbox.pack_start(btnrow, expand: false, fill: false, padding: 0)
+
+        save_btn = Gtk::Button.new(label: 'Save & Close')
+        save_btn.signal_connect('clicked') do
+          data = {
+            'lootsack'     => @entry_lootsack.text.strip,
+            'attack_mode'  => @radio_spell.active? ? 'spell' : 'bigshot',
+            'spell_number' => @entry_spell.text.strip.to_i,
+            'min_mana'     => @entry_mana.text.strip.to_i,
+            'mind_pause'   => @entry_mind_pause.text.strip.to_i,
+            'mind_resume'  => @entry_mind_resume.text.strip.to_i,
+          }
+          AbyssX.save_settings(data)
+          @result = data
+          @win.destroy
+        end
+
+        cancel_btn = Gtk::Button.new(label: 'Cancel')
+        cancel_btn.signal_connect('clicked') { @win.destroy }
+
+        btnrow.pack_end(save_btn,   expand: false, fill: false, padding: 0)
+        btnrow.pack_end(cancel_btn, expand: false, fill: false, padding: 0)
+
+        @win.signal_connect('destroy') { Gtk.queue { @running = false } }
+        @win.show_all
+      end
+
+      wait_while { @running }
+
+      if @result
+        echo 'AbyssX settings saved.'
+      else
+        echo 'Setup cancelled.'
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Arena runner
+  # ---------------------------------------------------------------------------
+  class Runner
+    def initialize(settings)
+      @settings    = settings
+      @lootsack    = settings.fetch('lootsack', Vars.lootsack.to_s)
+      @mode        = settings.fetch('attack_mode', 'bigshot')
+      @spell_num   = settings.fetch('spell_number', 0).to_i
+      @min_mana    = settings.fetch('min_mana',    MANA_WAIT_DEFAULT).to_i
+      @mind_pause  = settings.fetch('mind_pause',  MIND_PAUSE_DEFAULT).to_i
+      @mind_resume = settings.fetch('mind_resume', MIND_RESUME_DEFAULT).to_i
+
+      @entrance_count = 0
+      @fight_count    = 0
+      @run_start      = nil
+    end
+
+    def run
+      echo "AbyssX v#{AbyssX::VERSION} starting. " \
+           "Mode: #{@mode}#{@mode == 'spell' ? " (incant #{@spell_num})" : ''}. " \
+           "Loot: #{@lootsack}"
+
+      loop do
+        navigate_to_entrance
+        enter_arena
+        arena_controller
+      end
+    end
+
+    private
+
+    # ------------------------------------------------------------------
+    # Navigation
+    # ------------------------------------------------------------------
+    def navigate_to_entrance
+      return if Room.current.id == 28549
+      echo '  [Abyss] Navigating to arena entrance (28549)...'
+      Script.run('go2', '28549')
+      wait_while { running?('go2') }
+    end
+
+    # ------------------------------------------------------------------
+    # Mind / rest check (uses percentmind -- returns 0-100 integer)
+    # ------------------------------------------------------------------
+    def mind_rest_needed?
+      @mind_pause > 0 && percentmind >= @mind_pause
+    end
+
+    def rest_until_clear
+      echo "  [Abyss] Mind at #{percentmind}% (>= #{@mind_pause}%). " \
+           'Heading to node to rest...'
+      Script.run('go2', 'node')
+      wait_while { running?('go2') }
+      wait_while { percentmind >= @mind_resume }
+      echo "  [Abyss] Mind at #{percentmind}%. Returning to arena entrance..."
+      Script.run('go2', '28549')
+      wait_while { running?('go2') }
+      echo '  [Abyss] Back at arena. Resuming.'
+    end
+
+    # ------------------------------------------------------------------
+    # Entry check
+    # ------------------------------------------------------------------
+    def remaining_entries
+      fput 'event entr'
+      deadline = Time.now + 5
+      while Time.now < deadline
+        line = get
+        return line.match(/Ebon Gate Entries:\s+(\d+)/)[1].to_i \
+          if line =~ /Ebon Gate Entries:\s+(\d+)/
+      end
+      echo '  [Abyss] Could not read Ebon Gate entry count.'
+      0
+    end
+
+    # ------------------------------------------------------------------
+    # Enter
+    # ------------------------------------------------------------------
+    def enter_arena
+      rest_until_clear if mind_rest_needed?
+
+      entries = remaining_entries
+      if entries == 0
+        echo 'No Ebon Gate entries remaining. Stopping.'
+        exit
+      end
+
+      echo "  [Abyss] Ebon Gate entries remaining: #{entries}"
+      Lich::Messaging.stream_window(
+        "Entry: #{@entrance_count + 1} (#{entries} left)\r\n", 'familiar')
+
+      result = dothistimeout('pay', 8,
+        /You raise a barrel key|no entries|you don't have/i)
+
+      if result =~ /You raise a barrel key/
+        @entrance_count += 1
+        @run_start = Time.now
+      else
+        echo "  [Abyss] Could not enter arena: #{result.inspect}"
+        exit
+      end
+    end
+
+    # ------------------------------------------------------------------
+    # Combat
+    # ------------------------------------------------------------------
+    def cast_spell
+      waitrt?
+      waitcastrt?
+      # checkmana returns current mana as integer
+      if checkmana < @min_mana
+        echo "  [Abyss] Low mana (#{checkmana}/#{maxmana}). Waiting..."
+        wait_while { checkmana < @min_mana }
+        echo '  [Abyss] Mana recovered. Resuming.'
+      end
+      fput "incant #{@spell_num}"
+      waitcastrt?
+    end
+
+    def attack_sequence
+      while GameObj.targets.any? { |t| t.status !~ /dead|gone/ }
+        if @mode == 'spell' && @spell_num > 0
+          cast_spell
+        else
+          waitrt?
+          waitcastrt?
+          Script.run('bigshot', 'quick')
+          wait_while { running?('bigshot') }
+        end
+      end
+    end
+
+    # ------------------------------------------------------------------
+    # Arena event loop
+    # ------------------------------------------------------------------
+    def arena_controller
+      loop do
+        line = get
+
+        if line =~ /We have another living one,.*#{Char.name}.*hailing from beyond this valence!/
+          fput 'beg'
+
+        elsif line =~ /A crimson bolt of lightning strikes the arena and .* appears!/
+          @fight_count += 1
+          attack_sequence
+
+        elsif line =~ /#{Char.name} is triumphant, vanquishing all those that opposed (?:her|him|them)\./
+          elapsed = Time.now - @run_start
+          Lich::Messaging.stream_window(
+            "Total Time: #{Time.at(elapsed).strftime('%M:%S')}\r\n", 'familiar')
+          @fight_count = 0
+
+        elsif line =~ /A massive tenebrous oculoth floats in and regurgitates (.*) into your (right|left) hand\./
+          prize = $1
+          hand  = $2
+          Lich::Messaging.stream_window("Prize: #{prize}\r\n", 'familiar')
+          result = dothistimeout("put #{hand} in my #{@lootsack}", 5, /You put/)
+          if result =~ /You put/
+            echo "  [Abyss] Looted: #{prize} (#{hand} hand -> #{@lootsack})"
+          else
+            echo "  [Abyss] Warning: could not stow #{prize} from #{hand} hand " \
+                 "(#{result.inspect})"
+          end
+          break
+        end
+      end
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+arg = Script.current.vars[1].to_s.strip.downcase
+
+if arg == 'setup'
+  AbyssX::SetupGUI.run
+  exit
+end
+
+settings = AbyssX.load_settings
+if settings.empty?
+  echo 'No settings found. Run: ;abyssx setup'
+  exit
+end
+
+AbyssX::Runner.new(settings).run
