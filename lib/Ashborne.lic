@@ -4,12 +4,20 @@
 #           game: gs
 #           tags: hunting, combat, group, gui, utility, automation
 #       required: Lich >= 5.17.1
-#        version: 0.8.47
+#        version: 0.8.55
 #
 # Includes solo and multi-account group hunting, class-aware combat, safety,
 # coordinated town services, repeat hunts, loot rotation, GUI, and Intel worker.
 #
 # Recent version notes:
+# 0.8.55 (2026-10-12): Bonespear legacy hunts use the mapped tower footprint instead of repeated hallway/occupied-room bouncing.
+# 0.8.54 (2026-10-11): Recheck Unstun results; failed rescue requests coordinated Minor Sanctuary and never pulls a still-stunned teammate.
+# 0.8.53 (2026-10-09): Emergency retreats keep the party grouped; fresh mobility checks and coordinated Minor Sanctuary before departure.
+# 0.8.52 (2026-10-09): Normal verified group followers continue combat when shared target updates lapse.
+# 0.8.51 (2026-10-09): Clerics and Empaths switch to trained, affordable bolts after repeated warding failures on a target.
+# 0.8.50 (2026-10-08): Verified colocated followers may fight during regroup even while travel readiness is held.
+# 0.8.49 (2026-10-08): Stale visible follower heartbeats trigger controller recovery, not solo departure.
+# 0.8.48 (2026-10-07): Non-destructive reconnect startup; assembly self-defense; regroup timeout no longer abandons followers.
 # 0.8.47 (2026-10-07): Preserve town retry checkpoints; guarded selling transit and follower startup commands.
 # 0.8.46 (2026-10-07): Citadel roaming uses mapped stairs to reach upper floors, battlements, and dungeon.
 # 0.8.45 (2026-10-06): Pinefar selling runs reunite and rest in Icemule, after urgent healing.
@@ -706,7 +714,7 @@ begin
 rescue
   nil
 end
-ashborne_version = "0.8.47"
+ashborne_version = "0.8.55"
 ashborne_last_update = "9/18/2026"
 # Hide Command Inputs
 silence_me
@@ -6390,6 +6398,18 @@ module Ashborne_toolkit
   def stop_group_travel_without_group(reason)
     Script.kill("go2") if Script.running?("go2")
     sleep 0.25
+    if $ashborne_group_ai == "1" && !checkdead && !Ashborne_toolkit.medical_retreat_reason? && $ashborne_group_danger_active != "1"
+      respond "Group travel held: #{reason}. Keeping combat active and retrying reconnect/regroup; not departing alone."
+      until Ashborne_toolkit.configured_followers_missing_in_room.empty?
+        return false if checkdead
+        if Ashborne_toolkit.medical_retreat_reason? || $ashborne_group_danger_active == "1"
+          return Ashborne_toolkit.emergency_return_to_town_if_needed
+        end
+        Ashborne_toolkit.rally_and_regroup_for_travel("reconnect recovery", 15)
+        sleep 0.5
+      end
+      return true
+    end
     $ashborne_return_why = "Group travel stopped: #{reason}"
     $ashborne_group_danger_active = "1"
     Ashborne_toolkit.publish_group_danger($ashborne_return_why) if $ashborne_group_ai != "0"
@@ -9169,10 +9189,11 @@ module Ashborne_toolkit
       state = Ashborne_toolkit.read_group_state(name)
       fresh_here = state && now - state["timestamp"].to_i <= 5 &&
         state["session_id"].to_s == session_id && state["room_id"].to_s == room_id
+      next [name, pc, "missing current mobility acknowledgment"] unless fresh_here && pc
       flags = fresh_here ? state["flags"].to_s : ""
       status = pc ? pc.status.to_s : ""
       next if status =~ /dead/i || flags =~ /dead/i
-      blocked = status =~ /stun|lying down|prone|kneeling|webbed|bound/i ||
+      blocked = state["sitting"] || status =~ /stun|lying down|prone|kneeling|sitting|webbed|bound/i ||
         flags =~ /stunned|webbed|bound|prone|recovering|swallowed/i ||
         (fresh_here && (state["roundtime"].to_f > 0 || state["cast_roundtime"].to_f > 0))
       next unless blocked
@@ -9181,7 +9202,23 @@ module Ashborne_toolkit
     end
   rescue => error
     respond "Group departure check warning: #{error.message}" if $ashborne_qc_debug == "1"
-    []
+    Ashborne_toolkit.configured_group_members.map { |name| [name, nil, "mobility check failed"] }
+  end
+
+  def protect_group_retreat
+    return false if GameObj.targets.empty?
+    return false unless Ashborne_toolkit.emergency_minor_sanctuary_enabled?
+    room = Ashborne_toolkit.current_room_id.to_s
+    return false if @retreat_sanctuary_room == room && Time.now.to_f - @retreat_sanctuary_at.to_f < 15
+    @retreat_sanctuary_room = room
+    @retreat_sanctuary_at = Time.now.to_f
+    Ashborne_toolkit.emergency_minor_sanctuary_if_needed("group retreat readiness")
+    Ashborne_toolkit.configured_group_members.each do |name|
+      next unless Ashborne_toolkit.visible_group_pc(name)
+      Ashborne_toolkit.send_remote_group_command(name,
+        ';e Lich::Common::Ashborne_toolkit.emergency_minor_sanctuary_if_needed("group retreat readiness")')
+    end
+    true
   end
 
   def wait_for_group_departure_rescue(context = "group travel")
@@ -9190,9 +9227,13 @@ module Ashborne_toolkit
     last_notice = Time.at(0)
     loop do
       return false if checkdead
+      if context.to_s =~ /retreat/i
+        Ashborne_toolkit.protect_group_retreat
+        Ashborne_toolkit.prepare_for_group_departure
+      end
       Ashborne_toolkit.publish_group_state(true)
       blocked = Ashborne_toolkit.group_departure_blocked_members
-      return true if blocked.empty?
+      return true if blocked.empty? && Ashborne_toolkit.individual_trip_mobility_ready?
 
       if Time.now - last_notice >= 5
         respond "#{context}: holding the group together while #{blocked.map(&:first).join(', ')} recovers."
@@ -9760,8 +9801,30 @@ module Ashborne_toolkit
     true
   end
 
+  def enable_bonespear_mapped_roaming
+    return false if Ashborne_toolkit.huntplan_catalog_zone?
+    return false unless %w[soldybbuk solnmwaern].include?($ashborne_my_area.to_s)
+    current = Ashborne_toolkit.current_room_id.to_i
+    rooms = (Array(HUNTPLAN_ZONE_CATALOG.fetch("dybbuk")[3]) +
+      Array(HUNTPLAN_ZONE_CATALOG.fetch("waern")[3])).map(&:to_i).uniq.select do |id|
+      Room[id] && Array(Room[id].title).any? { |title| title.to_s =~ /Bonespear Tower/i }
+    end
+    return false unless rooms.include?(current)
+    $ashborne_huntplan_catalog_key = "bonespear"
+    $ashborne_huntplan_catalog_anchor = current
+    $ashborne_huntplan_catalog_rooms = Ashborne_toolkit.huntplan_catalog_connected_rooms(rooms, current)
+    $ashborne_huntplan_catalog_recent_rooms = []
+    $ashborne_huntplan_catalog_sweep_counter = 0
+    $ashborne_huntplan_catalog_last_sweep_at = 0.0
+    respond "Bonespear mapped roaming enabled; exploring the tower's connected hunting rooms."
+    true
+  end
+
   def safe_walk
     return nil unless Ashborne_toolkit.autonomous_movement_permitted?
+    if $ashborne_group_ai == "1" && Ashborne_toolkit.recover_stale_visible_follower
+      return nil
+    end
     return nil unless Ashborne_toolkit.group_wait_for_followers_to_move
     return nil if Ashborne_toolkit.group_disarm_recovery_active?
     return nil unless Ashborne_toolkit.movement_guard
@@ -9803,6 +9866,7 @@ module Ashborne_toolkit
     return crawl_result unless crawl_result.nil?
 
     Ashborne_toolkit.enable_citadel_mapped_roaming
+    Ashborne_toolkit.enable_bonespear_mapped_roaming
     if Ashborne_toolkit.huntplan_catalog_zone?
       result = Ashborne_toolkit.huntplan_catalog_walk
       return result unless result.nil?
@@ -13763,6 +13827,51 @@ module Ashborne_toolkit
     end
   end
 
+  def prepare_warding_bolt_fallback
+    @warding_cast_attempt = nil
+    return unless %w[Cleric Empath].include?(Stats.prof.to_s)
+    return unless $ashborne_spell_default.to_s == "0"
+    return if Ashborne_toolkit.custom_spell_rotation_enabled?
+    target = GameObj.target
+    return unless target && !target.id.to_s.empty?
+    @warding_target_failures ||= {}
+    if @warding_target_failures[target.id.to_s].to_i >= 2 && Skills.spellaiming.to_i > 0 &&
+        percentmana.to_i > Ashborne_toolkit.mana_efficient_mana_reserve
+      choices = if Stats.prof.to_s == "Empath"
+                  [1110, 111]
+                elsif Ashborne_toolkit.bind_then_kill_undead_target?(target) && $ashborne_disable_306.to_s == "0"
+                  [306, 111]
+                else
+                  [111]
+                end
+      spell = choices.find do |number|
+        Ashborne_toolkit.caster_spell_ready?(number) &&
+          Ashborne_toolkit.mana_efficient_spell_allowed?(number)
+      end
+      Ashborne_toolkit.set_style9_primary_spell(spell) if spell
+    end
+    primary = Stats.prof.to_s == "Empath" ? $ashborne_empath_primary_spell : $ashborne_cleric_primary_spell
+    if [302, 1106, 1101, 1115].include?(primary)
+      @warding_cast_attempt = { id: target.id.to_s, at: Time.now.to_f, own_output: false }
+    end
+  end
+
+  def observe_warding_fallback_line(line)
+    attempt = @warding_cast_attempt
+    return unless attempt && Time.now.to_f - attempt[:at] < 15
+    text = line.to_s.gsub(/<[^>]*>/, "").strip
+    if text =~ /\AYou (?:channel|cast|gesture|concentrate intently)\b/
+      attempt[:own_output] = true
+    elsif text =~ /\A[A-Z][a-z]+ (?:channels|casts|gestures|concentrates)\b/
+      attempt[:own_output] = false
+    elsif attempt[:own_output] && text =~ /\ACS:.*==\s*([+-]?\d+)/
+      @warding_target_failures ||= {}
+      @warding_target_failures[attempt[:id]] = $1.to_i <= 100 ? @warding_target_failures[attempt[:id]].to_i + 1 : 0
+      @warding_target_failures.shift while @warding_target_failures.size > 128
+      @warding_cast_attempt = nil
+    end
+  end
+
   def spell_cast
     return false if Ashborne_toolkit.gas_cloud_escape_if_needed
     return true if Ashborne_toolkit.group_undead_hold_opener
@@ -13802,6 +13911,8 @@ module Ashborne_toolkit
       $ashborne_bard_primary_spell = "9999"
       $ashborne_paladin_primary_spell = "9999"
     end
+
+    Ashborne_toolkit.prepare_warding_bolt_fallback
 
     # BEGIN ASHBORNE CLERIC BOLT WEB
     if Stats.prof == "Cleric" && $ashborne_cleric_primary_spell == "118b"
@@ -14797,6 +14908,12 @@ module Ashborne_toolkit
       Ashborne_toolkit.follower_defense_target
     else
       Ashborne_toolkit.shared_group_combat_target
+    end
+    if !target && $ashborne_follow_mode.to_s != "1" && Ashborne_toolkit.verified_regroup_combat? &&
+        Ashborne_toolkit.occupied_room_players.empty?
+      target = GameObj.targets.find do |creature|
+        creature.status.to_s !~ /dead|gone/i && !Ashborne_toolkit.environmental_hazard_target?(creature)
+      end
     end
     return false unless target
     Ashborne_toolkit.remember_follower_defense_context(target)
@@ -15967,17 +16084,15 @@ module Ashborne_toolkit
       unless active_follower
         Ashborne_toolkit.send_remote_group_command(
           member_name,
-          ";kill #{Ashborne_toolkit.script_command_name}"
+          ";e Script.start(#{Ashborne_toolkit.script_command_name.inspect}, 'auto group') unless checkdead || Script.running?(#{Ashborne_toolkit.script_command_name.inspect})"
         )
-        sleep 0.75
-        Ashborne_toolkit.send_remote_group_command(member_name, ";#{Ashborne_toolkit.script_command_name} auto group")
-        sleep 1.0
+        sleep 0.25
       end
       Ashborne_toolkit.send_remote_group_command(
         member_name,
         ";e Lich::Common::Ashborne_toolkit.group_follow_sync(true)"
       )
-      action = active_follower ? "keep active Ashborne and sync" : "restart Ashborne and sync"
+      action = active_follower ? "keep active Ashborne and sync" : "start only if absent, then sync"
       respond "Regroup command sent to #{member_name}: #{action} to room #{room_id} for #{context}."
       sleep 0.25
     end
@@ -16053,8 +16168,12 @@ module Ashborne_toolkit
           next_rally = Time.now + 5
         end
       end
-      Ashborne_toolkit.target_check
-      Ashborne_toolkit.combat_unique_to_ashborne
+      if $ashborne_group_ai == "2"
+        Ashborne_toolkit.follower_assembly_defense
+      else
+        Ashborne_toolkit.target_check
+        Ashborne_toolkit.combat_unique_to_ashborne
+      end
       return false if Ashborne_toolkit.current_room_id != defense_room
       if checkdead
         Ashborne_toolkit.publish_group_danger("dead") if $ashborne_group_ai != "0"
@@ -16070,9 +16189,7 @@ module Ashborne_toolkit
     unless GameObj.targets.empty?
       Ashborne_toolkit.stance_defensive
       if catalog_regroup && Ashborne_toolkit.group_incomplete_in_current_room?
-        Ashborne_toolkit.emergency_retreat_to_town_now(
-          "Catalog hunt aborted: group wait defense timed out with hostiles still present."
-        )
+        respond "Regroup defense checkpoint reached; keeping combat active and waiting for missing followers, not leaving them behind."
       else
         respond "Group wait defense timed out; Ashborne remains in defensive stance and will not depart."
       end
@@ -16082,6 +16199,25 @@ module Ashborne_toolkit
     Ashborne_toolkit.stance_defensive
     respond "Group wait defense warning: #{error.message}" if $ashborne_qc_debug == "1"
     false
+  end
+
+  def follower_assembly_defense
+    return false if checkdead || GameObj.targets.empty?
+    return false unless Ashborne_toolkit.occupied_room_players.empty?
+    return false if Ashborne_toolkit.medical_retreat_reason?
+    original_group_mode = $ashborne_group_ai
+    begin
+      # Local defense must not depend on a leader target order lost on reconnect.
+      $ashborne_group_ai = "0"
+      $ashborne_recent_eviction = "0"
+      $ashborne_own_this_room = 1
+      $ashborne_action = 7
+      Ashborne_toolkit.target_check
+      Ashborne_toolkit.combat_unique_to_ashborne
+      true
+    ensure
+      $ashborne_group_ai = original_group_mode
+    end
   end
 
   def recover_from_emergency_blocker(blockers = [])
@@ -16170,7 +16306,7 @@ module Ashborne_toolkit
   end
 
   def visible_non_group_players
-    group_names = Ashborne_toolkit.actual_group_names.map { |name| name.to_s.downcase }
+    group_names = Ashborne_toolkit.actual_group_names.map { |name| Ashborne_toolkit.canonical_character_name(name).downcase }
     group_names |= Ashborne_toolkit.verified_group_session_room_names
     defense = Ashborne_toolkit.follower_leader_loss_context
     group_names |= defense[:members] if defense
@@ -16354,6 +16490,15 @@ module Ashborne_toolkit
     false
   end
 
+  def failed_unstun_sanctuary(target_name)
+    pc = Ashborne_toolkit.visible_group_pc(target_name)
+    return false unless pc && pc.status.to_s =~ /stun/i && pc.status.to_s !~ /dead/i
+    return false unless GameObj.targets.any? { |target| target.status.to_s !~ /dead|gone/i }
+    respond "Unstun did not clear #{target_name}'s stun; requesting Minor Sanctuary instead of pulling."
+    Ashborne_toolkit.protect_group_retreat
+    true
+  end
+
   def rescue_visible_groupmate(target_name, reason = "group danger", pc = nil)
     return false if $ashborne_group_ai == "0"
     return false if target_name.to_s.casecmp(Char.name.to_s).zero?
@@ -16382,10 +16527,16 @@ module Ashborne_toolkit
       fput "prep 108"
       fput "cast #{pc.noun}"
       sleep 2
+      pc = Ashborne_toolkit.visible_group_pc(target_name)
+      return false unless pc && pc.status.to_s !~ /dead/i
+      if pc.status.to_s =~ /stun/i
+        Ashborne_toolkit.failed_unstun_sanctuary(target_name)
+        return false
+      end
       assisted = true
     end
 
-    if pc.status.to_s =~ /lying down|prone|kneeling/i
+    if pc.status.to_s !~ /stun/i && pc.status.to_s =~ /lying down|prone|kneeling/i
       waitrt?
       fput "pull #{pc.noun}"
       sleep 2
@@ -17403,6 +17554,7 @@ module Ashborne_toolkit
   end
 
   def observe_self_danger_line(line)
+    Ashborne_toolkit.observe_warding_fallback_line(line)
     Ashborne_toolkit.observe_confirmed_loot_line(line)
     Ashborne_toolkit.observe_empath_bloodless_target_line(line)
     Ashborne_toolkit.observe_empath_boneless_line(line)
@@ -18183,6 +18335,7 @@ module Ashborne_toolkit
   end
 
   def walk_avoiding_environmental_rooms(reason = "environmental danger")
+    Ashborne_toolkit.enable_bonespear_mapped_roaming
     starting_room = Room.current && Ashborne_toolkit.current_room_id ? Ashborne_toolkit.current_room_id.to_s : nil
     occupied_transit = reason.to_s == "occupied by another player"
     if occupied_transit
@@ -21029,6 +21182,21 @@ module Ashborne_toolkit
     true
   end
 
+  def recover_stale_visible_follower
+    return false unless $ashborne_group_ai == "1"
+    follower = Ashborne_toolkit.stale_visible_follower_controller
+    return false unless follower
+
+    Script.kill("go2") if Script.running?("go2")
+    @stale_follower_recovery_at ||= {}
+    if Time.now.to_f - @stale_follower_recovery_at.fetch(follower, 0.0) >= 5.0
+      @stale_follower_recovery_at[follower] = Time.now.to_f
+      respond "#{follower}'s safety heartbeat is stale. Holding movement and restoring the follower controller; combat remains active."
+      Ashborne_toolkit.command_missing_followers_for_regroup([follower], "visible follower heartbeat recovery")
+    end
+    true
+  end
+
   def group_danger_status_check
     return false if checkdead
     return true if Ashborne_toolkit.individual_travel_hold?
@@ -21045,15 +21213,7 @@ module Ashborne_toolkit
     end
 
     if $ashborne_group_ai == "1"
-      stale_follower = Ashborne_toolkit.stale_visible_follower_controller
-      if stale_follower
-        $ashborne_group_danger_active = "1"
-        $ashborne_return_why = "Group danger: #{stale_follower}'s Ashborne safety heartbeat stopped during combat."
-        $ashborne_action = 99
-        respond "Follower safety heartbeat lost for #{stale_follower}; retreating the group now."
-        Ashborne_toolkit.emergency_return_to_town_if_needed
-        return true
-      end
+      Ashborne_toolkit.recover_stale_visible_follower
     end
 
     if Ashborne_toolkit.apply_group_danger_abort
@@ -21175,12 +21335,8 @@ module Ashborne_toolkit
       end
 
       Ashborne_toolkit.group_wait_for_loot_to_settle(10) unless urgent_retreat
-      if urgent_retreat && $ashborne_group_ai == "1"
-        return nil unless Ashborne_toolkit.individual_group_trip("town", "emergency retreat to town", true)
-      else
-        return nil unless urgent_retreat || Ashborne_toolkit.wait_for_group_departure_rescue("Emergency retreat")
-        Ashborne_toolkit.emergency_go2_to_town
-      end
+      return nil unless Ashborne_toolkit.wait_for_group_departure_rescue("Emergency retreat")
+      Ashborne_toolkit.emergency_go2_to_town
 
       moved_from_danger = Room.current && Ashborne_toolkit.current_room_id &&
         retreat_origin && Ashborne_toolkit.current_room_id.to_s != retreat_origin.to_s
@@ -21799,7 +21955,6 @@ module Ashborne_toolkit
     defense = Ashborne_toolkit.follower_leader_loss_context
     return nil unless defense && $ashborne_group_peace != "1"
     return nil if Script.running?("go2")
-    return nil if Time.now.to_f - defense[:lost_at] >= 30.0 && !Ashborne_toolkit.group_captain_swallowed?
     return nil unless Ashborne_toolkit.occupied_room_players.empty?
     targets = GameObj.targets.reject do |target|
       target.status.to_s =~ /dead|gone/i || Ashborne_toolkit.environmental_hazard_target?(target)
@@ -21829,7 +21984,7 @@ module Ashborne_toolkit
       if !GameObj.dead.empty? && Ashborne_toolkit.occupied_room_players.empty?
         Ashborne_toolkit.loot_script($ashborne_loot_script.to_s)
       end
-    elsif (Time.now.to_f - defense[:lost_at] >= 30.0 && !Ashborne_toolkit.group_captain_swallowed?) || $ashborne_group_peace == "1"
+    elsif $ashborne_group_peace == "1"
       Ashborne_toolkit.publish_group_danger("leader unavailable with hostiles; withdrawing")
       Ashborne_toolkit.group_danger_retreat_if_needed
     else
@@ -21854,9 +22009,19 @@ module Ashborne_toolkit
     return false unless Ashborne_toolkit.group_follower_attack_priority
     return false if $ashborne_captain.nil? || $ashborne_captain == "0"
     return false unless checkpcs("#{$ashborne_captain}")
-    return false unless Ashborne_toolkit.leader_group_ready_for_followers?
+    return false unless Ashborne_toolkit.leader_group_ready_for_followers? || Ashborne_toolkit.verified_regroup_combat?
 
     true
+  end
+
+  def verified_regroup_combat?
+    return false unless $ashborne_group_ai == "2" && $ashborne_startup_ready == "1"
+    return false if $ashborne_group_peace == "1" || Script.running?("go2") || GameObj.targets.empty?
+    captain = Ashborne_toolkit.canonical_character_name($ashborne_captain)
+    return false unless Ashborne_toolkit.valid_character_name?(captain) && checkpcs(captain)
+    return false unless Ashborne_toolkit.actual_group_leader_name.to_s.casecmp(captain).zero?
+    members = Ashborne_toolkit.actual_group_names.map { |name| name.to_s.downcase }
+    members.include?(captain.downcase) && members.include?(Char.name.to_s.downcase)
   end
 
   def group_follower_should_hold?
