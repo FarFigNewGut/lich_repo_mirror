@@ -1,0 +1,1340 @@
+=begin
+  paperdoll.lic - worn gear and enhancive dashboard in a popup window
+
+  WHAT IT DOES
+    Reads your worn inventory and enhancive totals from the game and shows
+    them in a resizable popup, one character at a time:
+      - every worn location as a tile: functional slots used and free
+      - which items are enhancive, and what each one gives you
+      - every enhancive bonus against its cap, with the item supplying it
+      - tattoos and piercings, and charges left on each enhancive item
+      - your own picture in place of the outline, if you add one
+      - one-click player shop searches for a bonus (shops.elanthia.online)
+      - search across every character you have scanned
+      - ENHANCIVES ON / OFF switch and a Rescan button in the window
+
+  USAGE
+    ;paperdoll                scan, open the window, and keep running so the
+                              window's buttons work for this character
+    ;paperdoll scan           scan once and exit
+    ;paperdoll show           open the window without scanning
+    ;paperdoll forget <name>  remove a character from the saved data
+    ;paperdoll help
+    ;kill paperdoll           stop it (closing the window does the same
+                              after a few seconds)
+
+  THINGS TO KNOW
+    - If a bonus shows as "unidentified", or an enhancive item is not gold,
+      the item has not been loresung. Have a bard loresing it and
+      permanently unlock it, then rescan.
+    - Grey squares are items the game itself lists as nonfunctional. Some
+      useful items, teleport jewelry for one, are listed that way.
+    - The popup needs Google Chrome (Chromium on Linux). Without it the
+      page opens as a tab in your default browser, which should also work.
+    - The window's buttons only work for a character whose ;paperdoll is
+      still running. Other characters show their last scan.
+    - The ON / OFF switch sends INVENTORY ENHANCIVE ON or OFF. Nothing else
+      the script sends changes anything in game. Turning enhancives off
+      needs an enhancive pause from the SimuCoins Store.
+    - Notes and manual bonus assignments are kept by the browser, on this
+      computer only. Scans live in <lich>/data/paperdoll/.
+
+  author: PANGH (Darcimer)
+  game: Gemstone
+  tags: inventory, enhancive, gear, utility
+  version: 0.8.5
+=end
+
+require 'json'
+require 'fileutils'
+require 'socket'
+require 'securerandom'
+
+module PaperDoll
+  VERSION = '0.8.5'
+
+  # The commands this script sends. If your INVENTORY syntax differs, change it here.
+  CMD_USAGE     = 'inventory usage'
+  CMD_LOCATION  = 'inventory location usage'
+  CMD_ENHANCIVE = 'inventory enhancive totals details'
+
+  WINDOW_SIZE = '860,640'
+
+  # ---------------------------------------------------------------- parsing
+
+  def self.clean(line)
+    line.to_s
+        .gsub(/<[^>]+>/, '')
+        .gsub('&apos;', "'").gsub('&quot;', '"').gsub('&lt;', '<').gsub('&gt;', '>').gsub('&amp;', '&')
+        .gsub(/\s+\z/, '')
+  end
+
+  def self.clean_all(lines)
+    Array(lines).flat_map { |l| l.to_s.split(/\r?\n/) }.map { |l| clean(l) }
+  end
+
+  #   6/8     9/20     As a pin                         1
+  def self.parse_usage(lines)
+    clean_all(lines).filter_map do |line|
+      m = line.match(%r{^\s*(\d+)/(\d+)\s+(\d+)/(\d+)\s+(.+?)\s+(\d+)\s*$})
+      next unless m
+
+      { 'fu' => m[1].to_i, 'fm' => m[2].to_i, 'tu' => m[3].to_i, 'tm' => m[4].to_i,
+        'name' => m[5].strip, 'code' => m[6].to_i }
+    end
+  end
+
+  # As a pin:
+  #     a chased platinum pin (functional)
+  def self.parse_location(lines)
+    items = []
+    loc = nil
+    clean_all(lines).each do |raw|
+      line = raw.strip
+      next if line.empty? || line =~ /^>/ || line =~ /currently wearing/i
+      break if line =~ /^\(\d+ items? displayed\)/i
+
+      if line =~ /^(.+):$/
+        loc = Regexp.last_match(1).strip
+      elsif loc
+        functional = nil
+        functional = false if line =~ /\(nonfunctional\)/i
+        functional = true if functional.nil? && line =~ /\(functional\)/i
+        name = line.gsub(/\s*\((?:non)?functional\)/i, '').strip
+        items << { 'loc' => loc, 'name' => name, 'fn' => functional } unless name.empty?
+      end
+    end
+    items
+  end
+
+  # Skills:
+  #   Dodging Bonus: 10/50
+  #     +5: a rune-etched pink topaz necklace
+  def self.parse_enhancive(lines)
+    sections = []
+    stats = {}
+    section = nil
+    prop = nil
+    clean_all(lines).each do |raw|
+      line = raw.strip
+      next if line.empty? || line =~ /^>/
+
+      if (m = line.match(/^([+-]\d+):\s*(.+)$/))
+        prop['sources'] << { 'amt' => m[1].to_i, 'item' => m[2].strip } if prop
+      elsif (m = line.match(%r{^(.+?):\s*(-?\d+)\s*/\s*(\d+)$}))
+        next unless section
+
+        prop = { 'name' => m[1].strip, 'total' => m[2].to_i, 'cap' => m[3].to_i, 'sources' => [] }
+        section['props'] << prop
+      elsif (m = line.match(/^([A-Za-z][A-Za-z \/&-]*):$/))
+        prop = nil
+        if m[1] =~ /^statistics$/i
+          section = nil
+          stats['_in'] = true
+        else
+          stats.delete('_in')
+          section = { 'name' => m[1].strip, 'props' => [] }
+          sections << section
+        end
+      elsif stats['_in'] && (m = line.match(/^(.+?):\s*(-?\d+)$/))
+        stats[m[1].strip] = m[2].to_i
+      end
+    end
+    stats.delete('_in')
+    { 'sections' => sections.reject { |s| s['props'].empty? }, 'stats' => stats }
+  end
+
+  # You possess the following tattoos:
+  #   a black scarab tattoo on your neck (exposed), which is a mystic tattoo of the third circle (196 of 200 charges remaining).
+  # (Total: 1)
+  def self.parse_listing(lines)
+    out = []
+    on = false
+    clean_all(lines).each do |raw|
+      line = raw.strip
+      next if line.empty? || line =~ /^>/
+      break if line =~ /^\(Total:/i
+
+      if line =~ /:$/
+        on = true
+      elsif on
+        name, detail = line.split(/,\s+which\s+(?:is\s+)?/i, 2)
+        out << { 'name' => name.strip.sub(/\.$/, ''), 'detail' => detail.to_s.strip.sub(/\.$/, '') }
+      end
+    end
+    out
+  end
+
+  # You are wearing the following enhancive items:
+  #   a garnet-set sterling silver stickpin (31/31 charges)
+  #   a gilded locus
+  def self.parse_enh_list(lines)
+    out = []
+    on = false
+    clean_all(lines).each do |raw|
+      line = raw.strip
+      next if line.empty? || line =~ /^>/
+
+      if line =~ /:$/
+        on = true
+      elsif on && line !~ /^You /
+        if (m = line.match(%r{^(.+?)\s*\((\d+)\s*/\s*(\d+) charges?\)$}))
+          out << { 'name' => m[1].strip, 'cur' => m[2].to_i, 'max' => m[3].to_i }
+        else
+          out << { 'name' => line, 'cur' => nil, 'max' => nil }
+        end
+      end
+    end
+    out
+  end
+
+  # ---------------------------------------------------------------- game I/O
+
+  def self.capture_xml(cmd, start_rx, timeout = 6)
+    return [] unless defined?(Lich::Util) && Lich::Util.respond_to?(:issue_command)
+
+    lines = Lich::Util.issue_command(cmd, start_rx, /<prompt/,
+                                     include_end: false, timeout: timeout,
+                                     silent: true, usexml: true, quiet: true)
+    lines.is_a?(Array) ? lines : []
+  rescue StandardError
+    []
+  end
+
+  # Plain put/get. Output shows in the game window.
+  def self.capture_plain(cmd, start_rx, end_rx, timeout = 6)
+    clear
+    put cmd
+    out = []
+    started = false
+    deadline = Time.now + timeout
+    while Time.now < deadline
+      line = get?
+      if line.nil?
+        sleep 0.05
+        next
+      end
+      started ||= (line =~ start_rx)
+      next unless started
+
+      out << line
+      break if line =~ end_rx
+    end
+    out
+  end
+
+  def self.capture(cmd, start_rx, end_rx, timeout = 6)
+    lines = capture_xml(cmd, start_rx, timeout)
+    lines.empty? ? capture_plain(cmd, start_rx, end_rx, timeout) : lines
+  end
+
+  def self.scan_listing(cmd, rx, log)
+    raw = capture_xml(cmd, rx, 3)
+    raw = capture_plain(cmd, rx, /^\(Total:|\bnot\b|\bno\b|\bnothing\b/i, 3) if raw.empty?
+    log << "=== #{cmd} ===" << raw.map(&:to_s).join("\n")
+    parse_listing(raw)
+  end
+
+  # The worn-item list is checked against the usage table's totals. If a
+  # capture comes up short, the next method is tried and the best one kept.
+  def self.scan_items(usage, log)
+    want  = usage.sum { |u| u['tu'] }
+    names = usage.map { |u| u['name'].downcase }
+    start_rx = /You are currently wearing/i
+    end_rx   = /items? displayed\)/i
+    tries = [
+      [CMD_LOCATION, :xml], [CMD_LOCATION, :plain],
+      ['inventory location', :xml], ['inventory location', :plain]
+    ]
+    best = []
+    best_n = -1
+    tries.each do |cmd, mode|
+      raw = mode == :xml ? capture_xml(cmd, start_rx) : capture_plain(cmd, start_rx, end_rx)
+      items = parse_location(raw)
+      n = items.count { |i| names.include?(i['loc'].downcase) }
+      log << "=== #{cmd} (#{mode}): #{n} of #{want} worn items parsed ===" << raw.map(&:to_s).join("\n")
+      if n > best_n
+        best = items
+        best_n = n
+      end
+      break if want.positive? && n >= want
+    end
+    [best, best_n, want]
+  end
+
+  def self.hands
+    h = {}
+    begin
+      { 'right' => GameObj.right_hand, 'left' => GameObj.left_hand }.each do |side, obj|
+        h[side] = obj.name if obj && obj.id && obj.name.to_s !~ /^empty$/i
+      end
+    rescue StandardError
+      # no hand data available
+    end
+    h
+  end
+
+  def self.scan
+    log = []
+    raw_usage = capture(CMD_USAGE, /Your worn location usage/i, /Additionally equipped/i)
+    usage = parse_usage(raw_usage)
+    items, got, want = scan_items(usage, log)
+    raw_list = capture_xml('inventory enhancive list', /enhancive items/i, 4)
+    raw_list = capture_reply('inventory enhancive list') if raw_list.empty?
+    log << '=== inventory enhancive list ===' << raw_list.map(&:to_s).join("\n")
+    enh_list = parse_enh_list(raw_list)
+    tattoos   = scan_listing('inventory tattoo', /tattoo/i, log)
+    piercings = scan_listing('inventory piercing', /piercing/i, log)
+    raw_enh = capture(CMD_ENHANCIVE,
+                      /^(?:<[^>]*>)*\s*(?:Stats|Skills|Resources|Statistics)\s*:|enhancive/i,
+                      /Total Enhancive Amount/i)
+    enh = parse_enhancive(raw_enh)
+    log.unshift("=== #{CMD_USAGE} ===", raw_usage.map(&:to_s).join("\n"))
+    log.push("=== #{CMD_ENHANCIVE} ===", raw_enh.map(&:to_s).join("\n"))
+    begin
+      File.write(debug_path, log.join("\n"))
+    rescue StandardError
+      nil
+    end
+    { 'scanned' => Time.now.strftime('%Y-%m-%d %H:%M'),
+      'usage' => usage, 'items' => items, 'hands' => hands, 'enh' => enh,
+      'tattoos' => tattoos, 'piercings' => piercings, 'enh_list' => enh_list, 'got' => got, 'want' => want }
+  end
+
+  # ---------------------------------------------------------------- storage
+
+  def self.dir
+    base = defined?(DATA_DIR) ? DATA_DIR : Dir.pwd
+    d = File.join(base, 'paperdoll')
+    FileUtils.mkdir_p(d)
+    d
+  end
+
+  def self.db_path;   File.join(dir, 'paperdoll.json');    end
+  def self.data_path; File.join(dir, 'paperdoll_data.js'); end
+  def self.debug_path; File.join(dir, 'paperdoll_debug.txt'); end
+  def self.html_path; File.join(dir, 'paperdoll.html');    end
+
+  def self.load_db
+    db = JSON.parse(File.read(db_path))
+    db.is_a?(Hash) && db['chars'].is_a?(Hash) ? db : { 'chars' => {} }
+  rescue StandardError
+    { 'chars' => {} }
+  end
+
+  def self.save_db(db)
+    File.write(db_path, JSON.pretty_generate(db))
+  end
+
+  def self.write_view(db, current)
+    payload = { 'stamp' => (Time.now.to_f * 1000).to_i, 'current' => current, 'version' => VERSION, 'chars' => db['chars'] }
+    File.write(data_path, "window.__paperdollLoad(#{JSON.generate(payload)});\n")
+    File.write(html_path, HTML.gsub('__PD_VERSION__', VERSION))
+  end
+
+  # ---------------------------------------------------------------- actions
+
+  IDLE_LIMIT = 120
+  KEEP = %w[enh_state enh_msg enh_at port token].freeze
+
+  # Several characters can scan at the same moment. Every read-change-save
+  # of the shared file happens under this lock so no scan is lost.
+  def self.locked
+    File.open(File.join(dir, 'paperdoll.lock'), File::RDWR | File::CREAT, 0o644) do |f|
+      f.flock(File::LOCK_EX)
+      yield
+    end
+  end
+
+  def self.update_char(name)
+    locked do
+      db = load_db
+      rec = db['chars'][name]
+      next unless rec
+
+      yield rec
+      save_db(db)
+      write_view(db, name)
+    end
+  end
+
+  def self.rescan(name)
+    record = scan
+    return nil if record['usage'].empty? && record['items'].empty?
+
+    locked do
+      db = load_db
+      old = db['chars'][name] || {}
+      KEEP.each { |k| record[k] = old[k] if old.key?(k) }
+      db['chars'][name] = record
+      save_db(db)
+      write_view(db, name)
+    end
+    record
+  end
+
+  def self.summary(name, record)
+    props = record['enh']['stats']['Enhancive Properties'] || record['enh']['sections'].sum { |s| s['props'].length }
+    msg = "#{name}: #{record['items'].length} worn items, #{props} enhancive properties."
+    if record['got'] < record['want']
+      msg += " Only #{record['got']} of #{record['want']} worn items could be read; raw output is in #{debug_path}"
+    end
+    msg
+  end
+
+  # Send a command once and return whatever the game says back.
+  def self.capture_reply(cmd, timeout = 3)
+    clear
+    put cmd
+    out = []
+    deadline = Time.now + timeout
+    quiet_until = nil
+    while Time.now < deadline
+      line = get?
+      if line.nil?
+        break if quiet_until && Time.now > quiet_until
+
+        sleep 0.05
+        next
+      end
+      text = clean(line).strip
+      next if text.empty? || text =~ /^>/ || text =~ /^\[.*\]$/
+
+      out << text
+      quiet_until = Time.now + 0.4
+    end
+    out
+  end
+
+  # The switch only lights up when the game does not refuse the command.
+  REFUSED = /nothing seems to happen|you can(?:'|no)t|unable to|must wait|wait \d+|not able|please rephrase|usage:/i
+
+  def self.set_enhancives(name, on)
+    msg = capture_reply("inventory enhancive #{on ? 'on' : 'off'}").first(2).join(' ')
+    return { 'ok' => false, 'msg' => 'No reply from the game.' } if msg.empty?
+
+    refused = msg =~ REFUSED
+    msg += ' The game says enhancive pauses are bought from the SimuCoins Store.' if !on && msg =~ /nothing seems to happen/i
+    state = on ? 'on' : 'off'
+    update_char(name) do |r|
+      r['enh_msg'] = msg
+      next if refused
+
+      r['enh_state'] = state
+      r['enh_at'] = Time.now.strftime('%H:%M')
+    end
+    { 'ok' => !refused, 'state' => state, 'msg' => (refused ? "Game refused: #{msg}" : msg) }
+  end
+
+  # ---------------------------------------------------------------- listener
+  # The window talks to this script over a local-only socket. Requests must
+  # carry the random token written into the window's data file.
+
+  def self.reply(client, code, body)
+    json = JSON.generate(body)
+    client.write("HTTP/1.1 #{code}\r\nContent-Type: application/json\r\n" \
+                 "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Private-Network: true\r\n" \
+                 "Access-Control-Allow-Methods: GET, OPTIONS\r\nCache-Control: no-store\r\n" \
+                 "Connection: close\r\nContent-Length: #{json.bytesize}\r\n\r\n#{json}")
+  rescue StandardError
+    nil
+  end
+
+  def self.handle(client, name, token)
+    @keep = false
+    return unless IO.select([client], nil, nil, 2)
+
+    data = client.readpartial(8192)
+    verb, path = data[/\A([A-Z]+) (\S+)/, 1], data[/\A[A-Z]+ (\S+)/, 1].to_s
+    return reply(client, '204 No Content', {}) if verb == 'OPTIONS'
+
+    tok, action = path.sub(%r{^/}, '').split('/', 2)
+    return reply(client, '403 Forbidden', { 'ok' => false }) unless tok == token
+
+    @hit = true
+
+    case action
+    when 'ping'
+      @bye_at = nil
+      reply(client, '200 OK', { 'ok' => true, 'name' => name })
+    when 'hold'
+      # The window keeps this connection open for as long as it exists.
+      client.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\n" \
+                   "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Private-Network: true\r\n\r\n: ok\n\n")
+      @holds << client
+      @keep = true
+      @bye_at = nil
+    when 'bye'
+      @bye_at = Time.now
+      reply(client, '200 OK', { 'ok' => true })
+    when 'enh/on'  then reply(client, '200 OK', set_enhancives(name, true))
+    when 'enh/off' then reply(client, '200 OK', set_enhancives(name, false))
+    when 'scan'
+      rec = rescan(name)
+      reply(client, '200 OK', rec ? { 'ok' => true, 'msg' => summary(name, rec) } : { 'ok' => false, 'msg' => 'Scan read nothing back.' })
+    else reply(client, '404 Not Found', { 'ok' => false })
+    end
+  rescue StandardError => e
+    reply(client, '500 Error', { 'ok' => false, 'msg' => e.message })
+  ensure
+    begin
+      client.close unless @keep
+    rescue StandardError
+      nil
+    end
+  end
+
+  def self.serve(name)
+    server = TCPServer.new('127.0.0.1', 0)
+    token = SecureRandom.hex(8)
+    update_char(name) do |r|
+      r['port'] = server.addr[1]
+      r['token'] = token
+    end
+    before_dying do
+      begin
+        server.close
+        PaperDoll.update_char(name) { |r| r.delete('port'); r.delete('token') }
+      rescue StandardError
+        nil
+      end
+    end
+    # The window says goodbye when it closes. A reload pings again right
+    # away, which cancels the goodbye.
+    # Backstop: an open window checks in every few seconds (at worst once a
+    # minute when Chrome throttles a hidden window). If one has connected
+    # and then none checks in for IDLE_LIMIT seconds, the window is gone.
+    @bye_at = nil
+    @holds = []
+    seen = false
+    idle = 0
+    loop do
+      break if @bye_at && Time.now - @bye_at > 5
+      break if seen && @holds.empty? && idle >= IDLE_LIMIT
+
+      ready = IO.select([server] + @holds, nil, nil, 1)
+      idle = @holds.empty? ? idle + 1 : 0 unless ready
+      next unless ready
+
+      ready[0].each do |io|
+        if io == server
+          @hit = false
+          handle(server.accept, name, token)
+          if @hit
+            idle = 0
+            seen = true
+          end
+          next
+        end
+        # A held connection only becomes readable when the window has gone away.
+        gone = begin
+          data = io.read_nonblock(1024)
+          data.nil? || data.empty?
+        rescue IO::WaitReadable
+          false
+        rescue StandardError
+          true
+        end
+        next unless gone
+
+        @holds.delete(io)
+        begin
+          io.close
+        rescue StandardError
+          nil
+        end
+        @bye_at = Time.now if @holds.empty?
+      end
+    end
+    echo 'PaperDoll window closed, so the script is stopping.'
+    begin
+      server.close
+      update_char(name) { |r| r.delete('port'); r.delete('token') }
+    rescue StandardError
+      nil
+    end
+  end
+
+  # ---------------------------------------------------------------- window
+
+  def self.file_url(path)
+    p = File.expand_path(path).tr('\\', '/').gsub(' ', '%20')
+    p.start_with?('/') ? "file://#{p}" : "file:///#{p}"
+  end
+
+  def self.open_window
+    url = file_url(html_path)
+    host = RbConfig::CONFIG['host_os']
+    ok =
+      if host =~ /mswin|mingw|cygwin/i
+        system(%(cmd /c start "" chrome --app="#{url}" --window-size=#{WINDOW_SIZE})) ||
+          system(%(cmd /c start "" "#{url}"))
+      elsif host =~ /darwin/i
+        system('open', '-na', 'Google Chrome', '--args', "--app=#{url}", "--window-size=#{WINDOW_SIZE}") ||
+          system('open', url)
+      else
+        %w[google-chrome chromium chromium-browser].any? do |bin|
+          pid = begin
+            spawn(bin, "--app=#{url}", "--window-size=#{WINDOW_SIZE}", %i[out err] => File::NULL)
+          rescue StandardError
+            nil
+          end
+          Process.detach(pid) if pid
+          pid
+        end || system('xdg-open', url)
+      end
+    ok ? true : false
+  end
+
+  HTML = <<~'PAPERDOLL_HTML'
+    <!doctype html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PaperDoll</title>
+    <style>
+    :root{--bg:#131519;--panel:#1b1e24;--raise:#23272f;--line:#2c313b;--text:#dadde2;--mute:#8b929d;
+      --enh:#e2b454;--fn:#6f9bd1;--nf:#565c66;--warn:#dd7a4c}
+    *{box-sizing:border-box}
+    html,body{height:100%;margin:0}
+    body{background:var(--bg);color:var(--text);font:13px/1.35 "Segoe UI",system-ui,sans-serif;
+      display:flex;flex-direction:column;overflow:hidden}
+    header{display:flex;gap:8px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--line);flex:none}
+    header .brand{font-weight:600;letter-spacing:.04em;color:var(--enh)}
+    select,input[type=search],textarea{background:var(--panel);color:var(--text);border:1px solid var(--line);
+      border-radius:4px;font:inherit;padding:3px 6px}
+    input[type=search]{flex:1;min-width:80px}
+    select:focus,input:focus,textarea:focus,button:focus-visible{outline:1px solid var(--enh);outline-offset:0}
+    main{flex:1;display:grid;grid-template-columns:minmax(380px,1.3fr) minmax(250px,1fr);min-height:0}
+    #doll{padding:8px;overflow:auto;border-right:1px solid var(--line)}
+    .cols{display:grid;grid-template-columns:minmax(0,1fr) 100px minmax(0,1fr);gap:6px;align-items:start}
+    .col{display:flex;flex-direction:column;gap:3px}
+    .extras{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:3px;margin-top:6px}
+    .tile{display:flex;align-items:center;gap:6px;width:100%;min-height:25px;padding:2px 6px;background:var(--panel);
+      color:inherit;font:inherit;text-align:left;border:1px solid var(--line);border-radius:4px;cursor:pointer}
+    .tile:hover{background:var(--raise)}
+    .tile.empty .lbl{color:var(--mute)}
+    .tile.sel{border-color:var(--enh);background:var(--raise)}
+    .tile .lbl{flex:0 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .tile .pips{flex:1 0 auto;max-width:60%;display:flex;flex-wrap:wrap;gap:2px;justify-content:flex-end}
+    .tile .cnt{flex:none;color:var(--mute);font-variant-numeric:tabular-nums;font-size:12px}
+    .tile.full .cnt{color:var(--warn)}
+    .pip{width:8px;height:8px;border-radius:50%;border:1px solid var(--nf);display:inline-block;flex:none}
+    .pip.enh{background:var(--enh);border-color:var(--enh)}
+    .pip.fn{background:var(--fn);border-color:var(--fn)}
+    .pip.nf{background:var(--nf);border-radius:1px}
+    svg.fig{width:100%;height:auto;display:block}
+    .fig .body{fill:#20242b;stroke:#3a404c;stroke-width:1.5}
+    .fig .dot{fill:var(--bg);stroke:var(--nf);stroke-width:1.5;cursor:pointer}
+    .fig .dot.fn{fill:var(--fn);stroke:var(--fn)}
+    .fig .dot.enh{fill:var(--enh);stroke:var(--enh)}
+    .fig .dot.sel{stroke:#fff;stroke-width:2}
+    .legend{display:flex;flex-wrap:wrap;gap:10px;margin-top:8px;color:var(--mute);font-size:12px}
+    .legend span{display:inline-flex;align-items:center;gap:4px}
+    #panel{display:flex;flex-direction:column;min-height:0}
+    .tabs{display:flex;border-bottom:1px solid var(--line);flex:none}
+    .tabs button{flex:1;padding:6px;background:none;border:0;border-bottom:2px solid transparent;color:var(--mute);
+      font:inherit;cursor:pointer}
+    .tabs button.on{color:var(--text);border-bottom-color:var(--enh)}
+    #view{flex:1;overflow:auto;padding:10px}
+    h2{font-size:15px;margin:0 0 2px;font-weight:600}
+    .sub{color:var(--mute);margin-bottom:8px}
+    .item{border:1px solid var(--line);border-radius:4px;background:var(--panel);padding:6px 8px;margin-bottom:5px}
+    .item .top{display:flex;gap:6px;align-items:baseline;cursor:pointer}
+    .item .name{flex:1}
+    .item .tag{font-size:11px;color:var(--mute);flex:none}
+    .item.nf .name{color:var(--mute)}
+    .chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+    .chip{background:rgba(226,180,84,.13);color:var(--enh);border-radius:3px;padding:0 5px;font-size:12px}
+    .chip.guess{background:none;border:1px dashed var(--enh)}
+    .src select{padding:0 2px;font-size:12px;max-width:100%;min-width:0}
+    .src.unk select{color:var(--mute);font-style:italic}
+    header{flex-wrap:wrap}
+    .btn{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:4px;font:inherit;padding:3px 9px;cursor:pointer;flex:none}
+    .btn:hover:not(:disabled){background:var(--raise)}
+    .btn:disabled{opacity:.45;cursor:default}
+    .seg{display:inline-flex;align-items:center;flex:none}
+    .seg .lbl{color:var(--mute);font-size:12px;margin-right:6px}
+    #enh-on{border-radius:4px 0 0 4px}
+    #enh-off{border-radius:0 4px 4px 0;border-left:0}
+    .btn.is-on,.btn.is-on:hover:not(:disabled){background:var(--enh);border-color:var(--enh);color:#1a1405;font-weight:600;opacity:1}
+    .btn.is-off,.btn.is-off:hover:not(:disabled){background:var(--warn);border-color:var(--warn);color:#1a0d05;font-weight:600;opacity:1}
+    #help{flex:none;max-height:55%;overflow:auto;padding:10px 14px;background:var(--panel);border-bottom:1px solid var(--line)}
+    #help h2{margin-bottom:6px}
+    #help ul{margin:0;padding-left:18px;max-width:78ch}
+    #help li{margin-bottom:5px}
+    #help code{background:var(--bg);padding:0 4px;border-radius:3px}
+    #helpclose{float:right;margin-left:10px}
+    .pic{width:100%;display:block;border-radius:6px;border:1px solid var(--line)}
+    .picbar{display:flex;gap:4px;justify-content:center;margin-top:5px}
+    .btn.mini{padding:1px 6px;font-size:11px;color:var(--mute)}
+    .item .tag.low{color:var(--warn)}
+    .picbar{flex-wrap:wrap}
+    .shoprow{display:flex;gap:6px;margin-bottom:3px}
+    .shoprow input{flex:1;min-width:0;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:4px;font:inherit;padding:3px 6px}
+    a.shop{color:var(--fn);font-size:11px;text-decoration:none;margin-left:4px}
+    a.shop:hover{text-decoration:underline}
+    .item textarea{width:100%;margin-top:6px;min-height:48px;resize:vertical}
+    .sec{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--mute);margin:10px 0 4px}
+    .sec:first-child{margin-top:0}
+    .prop{margin-bottom:8px}
+    .prop .row{display:flex;justify-content:space-between;gap:8px}
+    .prop .num{font-variant-numeric:tabular-nums;color:var(--mute)}
+    .bar{height:3px;background:var(--line);border-radius:2px;margin:2px 0 3px;overflow:hidden}
+    .bar i{display:block;height:100%;background:var(--enh)}
+    .src{display:flex;gap:6px;font-size:12px;padding-left:8px}
+    .src .amt{width:34px;text-align:right;color:var(--enh);font-variant-numeric:tabular-nums;flex:none}
+    .src a{color:var(--text);text-decoration:none;cursor:pointer}
+    .src a:hover{text-decoration:underline}
+    .src.unk{color:var(--mute);font-style:italic}
+    .src.unk .amt{color:var(--mute)}
+    .hit{padding:5px 8px;border:1px solid var(--line);border-radius:4px;background:var(--panel);margin-bottom:4px;cursor:pointer}
+    .hit:hover{background:var(--raise)}
+    .hit small{color:var(--mute);display:block}
+    .none{color:var(--mute);padding:6px 0}
+    footer{flex:none;border-top:1px solid var(--line);padding:4px 10px;color:var(--mute);font-size:12px;
+      white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    #tip{position:fixed;display:none;pointer-events:none;z-index:9;max-width:300px;background:#0d0f12;
+      border:1px solid var(--line);border-radius:4px;padding:6px 8px;font-size:12px;box-shadow:0 4px 14px rgba(0,0,0,.5)}
+    #tip b{display:block;margin-bottom:2px}
+    #tip .e{color:var(--enh)} #tip .n{color:var(--mute)}
+    @media (max-width:620px){
+      body{overflow:auto}
+      main{display:block}
+      #doll{border-right:0;border-bottom:1px solid var(--line)}
+      #view{overflow:visible}
+    }
+    </style>
+    </head>
+    <body>
+    <header>
+      <span class="brand" title="version __PD_VERSION__">PaperDoll</span>
+      <select id="who" aria-label="Character"></select>
+      <input id="q" type="search" placeholder="Search items or bonuses, all characters" aria-label="Search">
+      <span class="seg" id="seg"><span class="lbl">Enhancives</span><button class="btn" id="enh-on">ON</button><button class="btn" id="enh-off" title="Needs an enhancive pause from the SimuCoins Store">OFF*</button></span>
+      <button class="btn" id="rescan">Rescan</button>
+      <button class="btn" id="helpbtn" aria-label="Help">?</button>
+    </header>
+    <section id="help" hidden>
+      <button class="btn" id="helpclose">Got it</button>
+      <h2>PaperDoll basics <small style="color:var(--mute);font-weight:400">version __PD_VERSION__</small></h2>
+      <ul>
+        <li><b>What you are looking at.</b> Each tile is a worn location. The count is functional slots used out of the limit, and it turns orange when the location is full. Hover a tile for a quick list, click it for details.</li>
+        <li><b>Dots.</b> Gold is an enhancive item, blue is a functional item, a hollow ring is an open functional slot, a grey square is an item the game lists as nonfunctional. Some useful items, teleport jewelry for one, are listed as nonfunctional by the game.</li>
+        <li><b>Something not showing?</b> If a bonus says "unidentified", or an enhancive item is blue and not gold, the item has not been loresung. Have a bard loresing it and permanently unlock it, then press Rescan. Until then you can pick the item yourself from the dropdown on the Enhancives tab.</li>
+        <li><b>Charges.</b> Each enhancive item shows its charges left, in orange at a quarter or less. An item marked enhancive with no bonuses listed has not been loresung.</li>
+        <li><b>Picture.</b> "Add picture" under the outline adds your own image of that character. "Show outline" and "Show picture" switch between the two. It is kept by this browser only.</li>
+        <li><b>Shop search.</b> On a location, type a bonus and press "Search shops", or use the "shop" link beside any bonus on the Enhancives tab. It opens shops.elanthia.online showing enhancives with that bonus, cheapest first. From a location, the search is limited to items worn there.</li>
+        <li><b>Enhancives tab.</b> Every bonus against its cap, and which item supplies it.</li>
+        <li><b>ON / OFF and Rescan.</b> These only work for a character whose <code>;paperdoll</code> is still running in Lich. Closing this window stops those scripts. ON and OFF send INVENTORY ENHANCIVE ON or OFF to the game. Turning them off needs an enhancive pause from the SimuCoins Store; without one the game refuses and the footer says so. Other characters show their last scan.</li>
+        <li><b>Adding characters.</b> Run <code>;paperdoll</code> on each one. This window updates itself within a few seconds.</li>
+        <li><b>Browser.</b> The popup needs Google Chrome (Chromium on Linux). Without it the page opens as a tab in your default browser, which should also work.</li>
+        <li><b>Notes and manual assignments</b> are kept by this browser, on this computer only.</li>
+      </ul>
+    </section>
+    <main>
+      <section id="doll"></section>
+      <section id="panel">
+        <div class="tabs">
+          <button id="t-slot" data-tab="slot">Location</button>
+          <button id="t-enh" data-tab="enh">Enhancives</button>
+        </div>
+        <div id="view"></div>
+      </section>
+    </main>
+    <footer id="status">Waiting for data. Run ;paperdoll in game.</footer>
+    <input type="file" id="file" accept="image/*" hidden>
+    <div id="tip"></div>
+    <script>
+    'use strict';
+    var DATA = null, cur = null, sel = null, tab = 'slot', query = '', openItem = null;
+    var $ = function (id) { return document.getElementById(id); };
+    function esc(s) {
+      return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+      });
+    }
+    function norm(s) { return String(s || '').toLowerCase().replace(/^(an?|some|the)\s+/, '').trim(); }
+    function sign(n) { return (n > 0 ? '+' : '') + n; }
+    function isUnk(s) { return /unknown source|needs loresong/i.test(s); }
+    function getAssign(who, uk) { try { return localStorage.getItem('pd:assign:' + who + ':' + uk) || ''; } catch (e) { return ''; } }
+
+    // code: [short label, column, x, y on the figure]
+    var LAYOUT = {
+      1: ['Pin', 'L', 120, 104], 4: ['Head', 'L', 100, 20], 22: ['Hair', 'L', 119, 27],
+      16: ['Ear (single)', 'L', 77, 44], 17: ['Ears (both)', 'L', 123, 44], 12: ['Neck', 'L', 100, 72],
+      5: ['Shoulder (slung)', 'L', 64, 88], 6: ['Shoulders (draped)', 'L', 136, 88],
+      8: ['Chest', 'L', 100, 116], 19: ['Front', 'L', 100, 152], 23: ['Chest (slipped on)', 'L', 82, 134],
+      2: ['Back', 'L', 118, 134],
+      14: ['Arms', 'R', 50, 138], 9: ['Wrist', 'R', 40, 194], 20: ['Hands', 'R', 36, 220],
+      10: ['Fingers', 'R', 164, 220], 3: ['Waist', 'R', 100, 200], 13: ['Belt', 'R', 124, 208],
+      7: ['Legs (pulled over)', 'R', 84, 276], 15: ['Legs (attached)', 'R', 116, 276],
+      24: ['Legs (slipped on)', 'R', 84, 320], 18: ['Ankle', 'R', 116, 384],
+      21: ['Feet (slipped on)', 'R', 82, 414], 11: ['Feet', 'R', 118, 414]
+    };
+    var ORDER_L = [1, 4, 22, 16, 17, 12, 5, 6, 8, 19, 23, 2];
+    var ORDER_R = [14, 9, 20, 10, 3, 13, 7, 15, 24, 18, 21, 11];
+
+    function model(name) {
+      var c = DATA.chars[name];
+      if (!c) return null;
+      var byItem = {}, unknown = [], props = 0;
+      var named = {}, res = {}, pend = [], extraItems = {};
+      function add(item, prop, amt, how) {
+        var k = norm(item);
+        (byItem[k] = byItem[k] || []).push({ prop: prop, amt: amt, how: how });
+      }
+      ((c.enh || {}).sections || []).forEach(function (s) {
+        s.props.forEach(function (p) {
+          props++;
+          p.sources.forEach(function (src, i) {
+            if (isUnk(src.item)) {
+              var uk = p.name + '|' + i, a = getAssign(name, uk);
+              if (a) { res[uk] = { item: a, how: 'assigned' }; add(a, p.name, src.amt, 'assigned'); extraItems[norm(a)] = 1; }
+              else pend.push({ uk: uk, prop: p.name, amt: src.amt });
+              return;
+            }
+            named[norm(src.item)] = 1;
+            add(src.item, p.name, src.amt);
+          });
+        });
+      });
+      // One enhancive item left unaccounted for and one locus worn: credit the rest to the locus.
+      var total = ((c.enh || {}).stats || {})['Enhancive Items'];
+      var loci = (c.items || []).filter(function (it) { return /\blocus$/i.test(it.name); });
+      var known = Object.keys(named).length + Object.keys(extraItems).filter(function (k) { return !named[k]; }).length;
+      // INVENTORY ENHANCIVE LIST names every enhancive item, loresung or not.
+      var listed = c.enh_list || [], chg = {};
+      listed.forEach(function (e) { chg[norm(e.name)] = e; });
+      var mystery = listed.filter(function (e) { return !named[norm(e.name)] && !extraItems[norm(e.name)]; });
+      var target = null;
+      if (listed.length) { if (mystery.length === 1) target = mystery[0].name; }
+      else if (total != null && total - known === 1 && loci.length === 1 &&
+               !named[norm(loci[0].name)] && !extraItems[norm(loci[0].name)]) target = loci[0].name;
+      if (pend.length && target) {
+        pend.forEach(function (u) { res[u.uk] = { item: target, how: 'inferred' }; add(target, u.prop, u.amt, 'inferred'); });
+      } else unknown = pend;
+      var cands = (c.items || []).filter(function (it) { return it.fn !== false; }).map(function (it) { return it.name; });
+      var locs = [], byName = {};
+      (c.usage || []).forEach(function (u) {
+        var lay = LAYOUT[u.code];
+        var l = { key: 'c' + u.code, code: u.code, name: u.name, short: lay ? lay[0] : u.name,
+          col: lay ? lay[1] : 'X', x: lay ? lay[2] : null, y: lay ? lay[3] : null,
+          fu: u.fu, fm: u.fm, tu: u.tu, tm: u.tm, items: [] };
+        locs.push(l); byName[u.name.toLowerCase()] = l;
+      });
+      function extra(nm) {
+        var l = { key: 'x' + nm.toLowerCase().replace(/[^a-z0-9]+/g, '-'), code: null, name: nm, short: nm,
+          col: 'X', x: null, y: null, fu: null, fm: null, tu: null, tm: null, items: [] };
+        locs.push(l); byName[nm.toLowerCase()] = l; return l;
+      }
+      (c.items || []).forEach(function (it) {
+        var along = /^elsewhere$/i.test(it.loc) ? locs.filter(function (x) { return x.code === 25; })[0] : null;
+        var l = byName[it.loc.toLowerCase()] || along || extra(it.loc);
+        l.items.push({ name: it.name, fn: it.fn, enh: byItem[norm(it.name)] || [], loc: l });
+      });
+      var h = c.hands || {};
+      if (h.right || h.left) {
+        var hl = extra('In your hands');
+        ['right', 'left'].forEach(function (side) {
+          if (h[side]) hl.items.push({ name: h[side], fn: true, enh: byItem[norm(h[side])] || [], loc: hl, note: side + ' hand' });
+        });
+      }
+      [['tattoos', 'Tattoos', 'tattoo'], ['piercings', 'Piercings', 'piercing']].forEach(function (d) {
+        if (!c[d[0]]) return;
+        var tl = extra(d[1]);
+        c[d[0]].forEach(function (t) {
+          var e = byItem[norm(t.name)] || byItem[norm(t.name.replace(/ (on|in) your .*$/i, ''))] || [];
+          tl.items.push({ name: t.name, fn: true, enh: e, loc: tl, note: d[2], detail: t.detail });
+        });
+      });
+      var byKey = {};
+      locs.forEach(function (l) {
+        byKey[l.key] = l;
+        l.items.forEach(function (i) {
+          i.chg = chg[norm(i.name)] || chg[norm(i.name.replace(/ (on|in) your .*$/i, ''))] || null;
+          i.listed = !!i.chg;
+        });
+      });
+      return { c: c, locs: locs, byKey: byKey, byItem: byItem, unknown: unknown, props: props, res: res, cands: cands };
+    }
+
+    function counts(l) {
+      var enh = 0, fn = 0, nf = 0;
+      if (l.items.length) {
+        l.items.forEach(function (i) { if (i.fn === false) nf++; else { fn++; if (i.enh.length || i.listed) enh++; } });
+      } else if (l.fu != null) { fn = l.fu; nf = Math.max(0, l.tu - l.fu); }
+      if (l.items.length && l.fu != null && l.items.every(function (i) { return i.fn == null; })) {
+        fn = l.fu; nf = Math.max(0, l.tu - l.fu); enh = Math.min(enh, fn);
+      }
+      var free = (l.fm != null && l.fm <= 12) ? Math.max(0, l.fm - fn) : 0;
+      return { enh: enh, fn: fn, nf: nf, free: free, used: fn + nf };
+    }
+
+    function tile(l) {
+      var k = counts(l);
+      var pips = rep('<i class="pip enh"></i>', k.enh) + rep('<i class="pip fn"></i>', k.fn - k.enh) +
+        rep('<i class="pip"></i>', k.free) + rep('<i class="pip nf"></i>', k.nf);
+      var cnt = l.fm != null ? (l.fm > 12 ? String(Math.max(l.tu, l.items.length)) : l.fu + '/' + l.fm) : String(l.items.length);
+      var cls = 'tile' + (k.used ? '' : ' empty') + (l.key === sel ? ' sel' : '') +
+        (l.fm != null && l.fm <= 12 && l.fu >= l.fm ? ' full' : '');
+      return '<button class="' + cls + '" data-loc="' + l.key + '"><span class="lbl">' + esc(l.short) +
+        '</span><span class="pips">' + pips + '</span><span class="cnt">' + cnt + '</span></button>';
+    }
+    function rep(s, n) { return n > 0 ? new Array(n + 1).join(s) : ''; }
+
+    function figure(m) {
+      var pic = showPic() ? getPic() : '';
+      if (pic) return '<img class="pic" src="' + pic + '" alt="Character picture">';
+      var s = '<svg class="fig" viewBox="0 0 200 440" role="img" aria-label="Body map">' +
+        '<g class="body"><circle cx="100" cy="40" r="24"/><rect x="90" y="62" width="20" height="16" rx="4"/>' +
+        '<path d="M62 80 Q100 70 138 80 L134 205 Q100 214 66 205 Z"/>' +
+        '<path d="M62 82 Q44 90 42 130 L32 215 Q36 228 46 216 L60 140 Z"/>' +
+        '<path d="M138 82 Q156 90 158 130 L168 215 Q164 228 154 216 L140 140 Z"/>' +
+        '<path d="M68 208 L98 212 L94 400 Q84 424 70 420 L76 400 Z"/>' +
+        '<path d="M132 208 L102 212 L106 400 Q116 424 130 420 L124 400 Z"/></g>';
+      m.locs.forEach(function (l) {
+        if (l.x == null) return;
+        var k = counts(l);
+        var cls = 'dot' + (k.enh ? ' enh' : (k.fn ? ' fn' : '')) + (l.key === sel ? ' sel' : '');
+        s += '<circle class="' + cls + '" data-loc="' + l.key + '" cx="' + l.x + '" cy="' + l.y + '" r="5"/>';
+      });
+      return s + '</svg>';
+    }
+
+    function renderDoll(m) {
+      function col(order) {
+        return order.map(function (code) { var l = m.byKey['c' + code]; return l ? tile(l) : ''; }).join('');
+      }
+      var extras = m.locs.filter(function (l) { return l.col === 'X'; }).map(tile).join('');
+      $('doll').innerHTML = '<div class="cols"><div class="col">' + col(ORDER_L) + '</div><div>' + figure(m) + picBar() +
+        '</div><div class="col">' + col(ORDER_R) + '</div></div>' +
+        (extras ? '<div class="extras">' + extras + '</div>' : '') +
+        '<div class="legend"><span><i class="pip enh"></i>enhancive</span><span><i class="pip fn"></i>functional</span>' +
+        '<span><i class="pip"></i>open functional slot</span><span><i class="pip nf"></i>nonfunctional</span><span>* OFF needs a SimuCoins enhancive pause</span></div>';
+    }
+
+    function noteKey(it) { return 'pd:note:' + cur + ':' + norm(it.name); }
+    function getNote(it) { try { return localStorage.getItem(noteKey(it)) || ''; } catch (e) { return ''; } }
+
+    function chgTag(it) {
+      var c = it.chg;
+      if (!c || c.max == null) return '';
+      return '<span class="tag' + (c.cur / c.max <= 0.25 ? ' low' : '') + '">' + c.cur + '/' + c.max + ' charges</span>';
+    }
+    function getPic() { try { return localStorage.getItem('pd:pic:' + cur) || ''; } catch (e) { return ''; } }
+    function showPic() { try { return localStorage.getItem('pd:picview:' + cur) !== 'doll'; } catch (e) { return true; } }
+    function picBar() {
+      if (!getPic()) return '<div class="picbar"><button class="btn mini" data-act="pic">Add picture</button></div>';
+      return '<div class="picbar"><button class="btn mini" data-act="picview">' + (showPic() ? 'Show outline' : 'Show picture') + '</button>' +
+        '<button class="btn mini" data-act="pic">Change</button><button class="btn mini" data-act="nopic">Remove</button></div>';
+    }
+    // ---- player shop search (shops.elanthia.online)
+    var STAT_NAMES = ['strength', 'constitution', 'dexterity', 'agility', 'discipline', 'aura', 'logic', 'intuition', 'wisdom', 'influence'];
+    var RESOURCES = ['"max health"', '"max mana"', '"max stamina"', '"health recovery"', '"mana recovery"', '"stamina recovery"'];
+    // Skill names from the GSWiki Ascension tier list, which lines up with what enhancives can carry.
+    var SKILLS = ['Ambush', 'Arcane Symbols', 'Armor Use', 'Blunt Weapons', 'Brawling', 'Climbing', 'Combat Maneuvers', 'Disarming Traps',
+      'Dodging', 'Edged Weapons', 'Elemental Lore, Air', 'Elemental Lore, Earth', 'Elemental Lore, Fire', 'Elemental Lore, Water',
+      'Elemental Mana Control', 'First Aid', 'Harness Power', 'Magic Item Use', 'Mental Lore, Divination', 'Mental Lore, Manipulation',
+      'Mental Lore, Telepathy', 'Mental Lore, Transference', 'Mental Lore, Transformation', 'Mental Mana Control', 'Multi Opponent Combat',
+      'Perception', 'Physical Fitness', 'Picking Locks', 'Picking Pockets', 'Polearm Weapons', 'Ranged Weapons', 'Shield Use',
+      'Sorcerous Lore, Demonology', 'Sorcerous Lore, Necromancy', 'Spell Aiming', 'Spirit Mana Control', 'Spiritual Lore, Blessings',
+      'Spiritual Lore, Religion', 'Spiritual Lore, Summoning', 'Stalking and Hiding', 'Survival', 'Swimming', 'Thrown Weapons', 'Trading',
+      'Two Weapon Combat', 'Two-Handed Weapons'];
+    // The shop site writes properties as "+3 Blunt Weapons Bonus", "+2 Blunt Weapons Ranks", "+7 Influence Base",
+    // "+2 Spiritual Lore - Summoning Bonus", so the Bonus / Ranks / Base word stays in the search. Lores are
+    // searched by their last part ("summoning bonus"), which avoids the hyphen the site also uses for NOT.
+    function shopTerm(name) {
+      var raw = String(name), t = raw.replace(/\s*\([^)]*\)/g, '').trim().toLowerCase();
+      if (/\([A-Z]{3}\)/.test(raw) && !/\b(bonus|base)$/.test(t)) t += ' base';
+      if (/ - |,/.test(t)) t = t.split(/ - |,/).pop().trim();
+      return /\s/.test(t) ? '"' + t + '"' : t;
+    }
+    function shopList() {
+      var out = [];
+      STAT_NAMES.forEach(function (n) { out.push('"' + n + ' base"', '"' + n + ' bonus"'); });
+      out = out.concat(RESOURCES);
+      SKILLS.forEach(function (n) { out.push(shopTerm(n + ' Bonus'), shopTerm(n + ' Ranks')); });
+      return out;
+    }
+    // Game worn-location code -> the shop site's wearLocation value. Codes not listed have no known match there.
+    var WEAR = { 1: 'pin', 4: 'head', 22: 'hair', 16: 'ear', 17: 'ears', 12: 'neck', 5: 'shoulders', 6: 'cloak', 8: 'chest', 19: 'front',
+      23: 'undershirt', 2: 'back', 14: 'arms', 9: 'wrist', 20: 'hands', 10: 'finger', 3: 'waist', 13: 'belt', 7: 'pants',
+      15: 'legs', 24: 'leggings', 18: 'ankle', 21: 'socks', 11: 'feet' };
+    function shopUrl(term, code) {
+      return 'https://shops.elanthia.online/?mode=search&q=' + encodeURIComponent(term) +
+        '&fields=name%2Cproperties&itemType=%21weapon%2C%21armor%2C%21shield' +
+        (WEAR[code] ? '&wearLocation=' + WEAR[code] : '') + '&specialProps=enhancive&sort=price&dir=asc';
+    }
+    function shopRow(m, l) {
+      var last = '', seen = {}, opts = [];
+      try { last = localStorage.getItem('pd:shopq') || ''; } catch (e) {}
+      ((m.c.enh || {}).sections || []).forEach(function (sec) { sec.props.forEach(function (p) { opts.push(shopTerm(p.name)); }); });
+      opts = opts.concat(shopList()).filter(function (o) { if (seen[o]) return false; seen[o] = 1; return true; });
+      return '<div class="shoprow"><input id="shopq" list="shoplist" placeholder="Bonus to shop for, e.g. dexterity" value="' + esc(last) +
+        '" aria-label="Bonus to shop for"><datalist id="shoplist">' + opts.map(function (o) { return '<option value="' + esc(o) + '">'; }).join('') +
+        '</datalist><button class="btn" data-act="shop">Search shops</button></div>' +
+        '<div class="sub">' + (WEAR[l.code] ? 'Opens the player shop site: enhancives worn here ("' + WEAR[l.code] + '") with that bonus, cheapest first. Delete the last word (bonus, ranks or base) to match either kind. Leave the box empty to see every enhancive for this location.'
+          : 'Opens the player shop site: enhancives with that bonus, cheapest first. The site has no filter I know of for this location, so every location is shown.') + '</div>';
+    }
+    function goShop() {
+      var q = ($('shopq') ? $('shopq').value : '').trim();
+      var m = model(cur), l = m && m.byKey[sel], code = l ? l.code : null;
+      if (!q && !WEAR[code]) { flash('Type a bonus to shop for first, such as dexterity.'); return; }
+      window.open(shopUrl(q, code), '_blank');
+    }
+    function itemCard(it, idx) {
+      var tag = it.note || (it.fn === false ? 'nonfunctional' : (it.fn === true ? 'functional' : ''));
+      var note = getNote(it);
+      var open = openItem === idx;
+      var s = '<div class="item' + (it.fn === false ? ' nf' : '') + '"><div class="top" data-item="' + idx + '">' +
+        '<i class="pip ' + (it.fn === false ? 'nf' : (it.enh.length || it.listed ? 'enh' : 'fn')) + '"></i>' +
+        '<span class="name">' + esc(it.name) + '</span>' + chgTag(it) + '<span class="tag">' + esc(tag) + (note && !open ? ' \u00b7 note' : '') + '</span></div>';
+      if (it.enh.length) {
+        s += '<div class="chips">' + it.enh.map(function (e) {
+          return '<span class="chip' + (e.how ? ' guess" title="' + e.how + ', not confirmed by the game' : '') + '">' + sign(e.amt) + ' ' + esc(e.prop) + '</span>';
+        }).join('') + '</div>';
+      }
+      if (it.listed && !it.enh.length) s += '<div class="sub" style="margin:4px 0 0">Enhancive, but its bonuses are not identified yet. It needs a loresong.</div>';
+      if (it.detail) s += '<div class="sub" style="margin:4px 0 0">' + esc(it.detail) + '</div>';
+      if (open) s += '<textarea data-note="' + idx + '" placeholder="Notes for this item">' + esc(note) + '</textarea>';
+      return s + '</div>';
+    }
+
+    function renderSlot(m) {
+      var l = m.byKey[sel];
+      if (!l) { $('view').innerHTML = '<div class="none">Pick a location.</div>'; return; }
+      var k = counts(l), sub = [];
+      if (l.fm != null && l.fm > 12) sub.push(l.items.length + ' worn alongside your other gear');
+      else if (l.fm != null) {
+        sub.push('functional ' + l.fu + (l.fm > 12 ? '' : '/' + l.fm));
+        sub.push('worn ' + l.tu + (l.tm > 12 && l.fm > 12 ? '' : '/' + l.tm));
+        if (l.fm <= 12) sub.push(k.free ? k.free + ' functional open' : 'no functional slots open');
+      }
+      var s = '<h2>' + esc(l.name) + '</h2><div class="sub">' + esc(sub.join(' \u00b7 ')) + '</div>';
+      if (l.code != null && l.code !== 25) s += shopRow(m, l);
+      if (l.items.length) s += l.items.map(itemCard).join('');
+      else s += '<div class="none">' + (k.used ? 'Items here were not listed by the scan.' : (l.code == null ? 'None found by the last scan.' : 'Nothing worn here.')) + '</div>';
+      $('view').innerHTML = s;
+    }
+
+    function findLoc(m, itemName) {
+      var k = norm(itemName), hit = null;
+      m.locs.forEach(function (l) { l.items.forEach(function (i) { if (!hit && norm(i.name) === k) hit = l; }); });
+      return hit;
+    }
+
+    function renderEnh(m) {
+      var secs = (m.c.enh || {}).sections || [];
+      if (!secs.length) { $('view').innerHTML = '<div class="none">No enhancive bonuses were reported.</div>'; return; }
+      var s = '';
+      secs.forEach(function (sec) {
+        s += '<div class="sec">' + esc(sec.name) + '</div>';
+        sec.props.forEach(function (p) {
+          var pct = p.cap ? Math.max(0, Math.min(100, 100 * p.total / p.cap)) : 0;
+          s += '<div class="prop"><div class="row"><span>' + esc(p.name) + ' <a class="shop" target="_blank" rel="noopener" href="' + esc(shopUrl(shopTerm(p.name))) + '">shop</a></span><span class="num">' + p.total + ' / ' + p.cap +
+            '</span></div><div class="bar"><i style="width:' + pct + '%"></i></div>';
+          p.sources.forEach(function (src, i) {
+            if (isUnk(src.item)) {
+              var uk = p.name + '|' + i, r = m.res[uk];
+              var first = r && r.how === 'inferred' ? r.item + ' (inferred)' : 'unidentified item (needs loresong)';
+              s += '<div class="src' + (r ? '' : ' unk') + '"><span class="amt">' + sign(src.amt) + '</span><select data-assign="' + esc(uk) +
+                '" aria-label="Source item"><option value="">' + esc(first) + '</option>' + m.cands.map(function (n) {
+                  return '<option' + (r && r.how === 'assigned' && norm(r.item) === norm(n) ? ' selected' : '') + '>' + esc(n) + '</option>';
+                }).join('') + '</select>' + (r && r.how === 'assigned' ? '<span style="color:var(--mute)">assigned</span>' : '') + '</div>';
+            } else {
+              var l = findLoc(m, src.item);
+              s += '<div class="src"><span class="amt">' + sign(src.amt) + '</span><a' + (l ? ' data-goto="' + l.key + '"' : '') + '>' +
+                esc(src.item) + '</a>' + (l ? '<span class="n" style="color:var(--mute)">\u00b7 ' + esc(l.short) + '</span>' : '') + '</div>';
+            }
+          });
+          s += '</div>';
+        });
+      });
+      $('view').innerHTML = s;
+    }
+
+    function renderSearch() {
+      var q = query.toLowerCase(), hits = [];
+      Object.keys(DATA.chars).sort().forEach(function (name) {
+        var m = model(name);
+        m.locs.forEach(function (l) {
+          l.items.forEach(function (i) {
+            var bon = i.enh.map(function (e) { return sign(e.amt) + ' ' + e.prop; }).join(', ');
+            if ((i.name + ' ' + bon).toLowerCase().indexOf(q) >= 0) hits.push({ who: name, l: l, i: i, bon: bon });
+          });
+        });
+      });
+      var s = '<div class="sub">' + hits.length + ' match' + (hits.length === 1 ? '' : 'es') + ' for "' + esc(query) + '"</div>';
+      s += hits.slice(0, 200).map(function (h) {
+        return '<div class="hit" data-who="' + esc(h.who) + '" data-goto="' + h.l.key + '">' + esc(h.i.name) +
+          '<small>' + esc(h.who) + ' \u00b7 ' + esc(h.l.short) + (h.i.fn === false ? ' \u00b7 nonfunctional' : '') +
+          (h.bon ? ' \u00b7 ' + esc(h.bon) : '') + '</small></div>';
+      }).join('');
+      $('view').innerHTML = s;
+    }
+
+    function render() {
+      if (!DATA) return;
+      var names = Object.keys(DATA.chars).sort();
+      if (!names.length) {
+        $('doll').innerHTML = ''; $('view').innerHTML = '<div class="none">No characters scanned yet. Run ;paperdoll in game.</div>';
+        $('who').innerHTML = ''; $('status').textContent = 'No data.'; return;
+      }
+      if (!DATA.chars[cur]) cur = names[0];
+      $('who').innerHTML = names.map(function (n) {
+        return '<option' + (n === cur ? ' selected' : '') + '>' + esc(n) + '</option>';
+      }).join('');
+      var m = model(cur);
+      if (!m.byKey[sel]) {
+        var pick = m.locs.filter(function (l) { return counts(l).enh; })[0] ||
+          m.locs.filter(function (l) { return l.items.length; })[0] || m.locs[0];
+        sel = pick ? pick.key : null; openItem = null;
+      }
+      renderDoll(m);
+      $('t-slot').className = (!query && tab === 'slot') ? 'on' : '';
+      $('t-enh').className = (!query && tab === 'enh') ? 'on' : '';
+      if (query) renderSearch(); else if (tab === 'enh') renderEnh(m); else renderSlot(m);
+      var st = (m.c.enh || {}).stats || {};
+      var worn = (m.c.items || []).length;
+      var bits = [cur, 'scanned ' + (m.c.scanned || '?'), worn + ' worn'];
+      if (st['Enhancive Items'] != null) bits.push(st['Enhancive Items'] + ' enhancive items');
+      if (st['Enhancive Properties'] != null) bits.push(st['Enhancive Properties'] + ' properties');
+      if (st['Total Enhancive Amount'] != null) bits.push(st['Total Enhancive Amount'] + ' total');
+      if (m.unknown.length) bits.push(m.unknown.length + ' bonuses from unidentified items');
+      if (m.c.enh_state) bits.push('enhancives ' + m.c.enh_state.toUpperCase() + (m.c.enh_at ? ' (set ' + m.c.enh_at + ')' : ''));
+      if (!(Date.now() < hold)) $('status').textContent = bits.join(' \u00b7 ');
+      renderCtl();
+    }
+
+    function go(key, who) {
+      if (who) cur = who;
+      sel = key; tab = 'slot'; query = ''; $('q').value = ''; openItem = null; render();
+    }
+
+    document.addEventListener('click', function (ev) {
+      var t = ev.target.closest('[data-act],[data-tab],[data-goto],[data-loc],[data-item]');
+      if (!t) return;
+      if (t.dataset.act) {
+        var act = t.dataset.act;
+        if (act === 'shop') goShop();
+        else if (act === 'pic') $('file').click();
+        else {
+          try {
+            if (act === 'nopic') { localStorage.removeItem('pd:pic:' + cur); localStorage.removeItem('pd:picview:' + cur); }
+            else if (act === 'picview') localStorage.setItem('pd:picview:' + cur, showPic() ? 'doll' : 'pic');
+          } catch (e) {}
+          render();
+        }
+        return;
+      }
+      if (t.dataset.tab) { tab = t.dataset.tab; query = ''; $('q').value = ''; render(); }
+      else if (t.dataset.goto) go(t.dataset.goto, t.dataset.who);
+      else if (t.dataset.loc) go(t.dataset.loc);
+      else if (t.dataset.item != null) { var i = +t.dataset.item; openItem = (openItem === i ? null : i); render(); }
+    });
+    document.addEventListener('input', function (ev) {
+      var t = ev.target;
+      if (t.id === 'q') { query = t.value.trim(); render(); }
+      else if (t.id === 'shopq') { try { localStorage.setItem('pd:shopq', t.value); } catch (e) {} }
+      else if (t.dataset && t.dataset.note != null) {
+        var m = model(cur), l = m.byKey[sel], it = l && l.items[+t.dataset.note];
+        if (it) { try { t.value ? localStorage.setItem(noteKey(it), t.value) : localStorage.removeItem(noteKey(it)); } catch (e) {} }
+      }
+    });
+    document.addEventListener('change', function (ev) {
+      var t = ev.target;
+      if (!t.dataset || t.dataset.assign == null) return;
+      try {
+        var k = 'pd:assign:' + cur + ':' + t.dataset.assign;
+        if (t.value) localStorage.setItem(k, t.value); else localStorage.removeItem(k);
+      } catch (e) {}
+      render();
+    });
+    document.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' && ev.target.id === 'shopq') goShop(); });
+    $('who').addEventListener('change', function () { cur = this.value; sel = null; openItem = null; live = false; render(); ping(); });
+
+    // ---- link to the running Lich script
+    var live = false, hold = 0, busy = false;
+    function flash(msg) { hold = Date.now() + 7000; $('status').textContent = msg; setTimeout(render, 7100); }
+    function api(cmd) {
+      var c = DATA && DATA.chars[cur];
+      if (!c || !c.port) return Promise.reject(new Error('offline'));
+      return fetch('http://127.0.0.1:' + c.port + '/' + c.token + '/' + cmd, { cache: 'no-store' })
+        .then(function (r) { if (!r.ok) throw new Error('refused'); return r.json(); });
+    }
+    function ping() {
+      var who = cur;
+      api('ping').then(function (r) { if (who === cur) { live = r.name === cur; renderCtl(); } },
+        function () { if (who === cur) { live = false; renderCtl(); } });
+    }
+    function others(cmd, beacon) {
+      if (!DATA) return;
+      Object.keys(DATA.chars).forEach(function (n) {
+        var c = DATA.chars[n];
+        if (!c.port || (!beacon && n === cur)) return;
+        var url = 'http://127.0.0.1:' + c.port + '/' + c.token + '/' + cmd;
+        try { if (beacon) { navigator.sendBeacon(url); fetch(url, { keepalive: true, mode: 'no-cors' }).catch(function () {}); } else fetch(url, { cache: 'no-store' }).catch(function () {}); } catch (e) {}
+      });
+    }
+    // Each running script gets one long-lived connection. When this window goes away the connection drops,
+    // and the script stops a few seconds later.
+    var holds = {};
+    function syncHolds() {
+      if (!DATA || !window.EventSource) return;
+      Object.keys(holds).forEach(function (n) { if (!DATA.chars[n]) { holds[n].es.close(); delete holds[n]; } });
+      Object.keys(DATA.chars).forEach(function (n) {
+        var c = DATA.chars[n], key = c.port ? c.port + '/' + c.token : '';
+        if (holds[n] && holds[n].key !== key) { holds[n].es.close(); delete holds[n]; }
+        if (key && !holds[n]) { try { holds[n] = { key: key, es: new EventSource('http://127.0.0.1:' + key + '/hold') }; } catch (e) {} }
+      });
+    }
+    // Closing the window stops every running ;paperdoll script.
+    window.addEventListener('pagehide', function () { others('bye', true); });
+    window.addEventListener('beforeunload', function () { others('bye', true); });
+    function renderCtl() {
+      var c = DATA && DATA.chars[cur], st = c && c.enh_state;
+      $('enh-on').disabled = $('enh-off').disabled = $('rescan').disabled = !live || busy;
+      $('enh-on').className = 'btn' + (st === 'on' ? ' is-on' : '');
+      $('enh-off').className = 'btn' + (st === 'off' ? ' is-off' : '');
+      $('seg').title = !live ? 'Run ;paperdoll on ' + (cur || 'this character') + ' to use these buttons'
+        : (c && c.enh_msg ? 'Game said: ' + c.enh_msg : 'Not set from this window yet');
+    }
+    function act(cmd, waitMsg) {
+      if (busy || !live) return;
+      busy = true; renderCtl(); flash(waitMsg);
+      api(cmd).then(function (r) { flash(r.msg || (r.ok ? 'Done.' : 'That did not work.')); },
+        function () { flash('No answer from the game script. Is ;paperdoll still running on ' + cur + '?'); live = false; })
+        .then(function () { busy = false; renderCtl(); poll(); });
+    }
+    $('enh-on').addEventListener('click', function () { act('enh/on', 'Turning enhancives on...'); });
+    $('enh-off').addEventListener('click', function () { act('enh/off', 'Turning enhancives off...'); });
+    $('rescan').addEventListener('click', function () { act('scan', 'Scanning ' + cur + '...'); });
+    function showHelp(on) { $('help').hidden = !on; if (!on) { try { localStorage.setItem('pd:help-seen', '1'); } catch (e) {} } }
+    $('helpbtn').addEventListener('click', function () { showHelp($('help').hidden); });
+    $('helpclose').addEventListener('click', function () { showHelp(false); });
+    try { if (!localStorage.getItem('pd:help-seen')) showHelp(true); } catch (e) { showHelp(true); }
+
+    // Picture: shrunk and kept by this browser, per character.
+    $('file').addEventListener('change', function () {
+      var f = this.files[0], who = cur;
+      this.value = '';
+      if (!f) return;
+      var rd = new FileReader();
+      rd.onload = function () {
+        var img = new Image();
+        img.onload = function () {
+          var sc = Math.min(1, 480 / Math.max(img.width, img.height));
+          var cv = document.createElement('canvas');
+          cv.width = Math.max(1, Math.round(img.width * sc)); cv.height = Math.max(1, Math.round(img.height * sc));
+          var g = cv.getContext('2d');
+          g.fillStyle = '#1b1e24'; g.fillRect(0, 0, cv.width, cv.height); g.drawImage(img, 0, 0, cv.width, cv.height);
+          try { localStorage.setItem('pd:pic:' + who, cv.toDataURL('image/jpeg', 0.85)); localStorage.setItem('pd:picview:' + who, 'pic'); } catch (e) { flash('Could not save that picture.'); }
+          render();
+        };
+        img.onerror = function () { flash('That file is not a picture this browser can read.'); };
+        img.src = rd.result;
+      };
+      rd.readAsDataURL(f);
+    });
+
+    var tip = $('tip');
+    document.addEventListener('mousemove', function (ev) {
+      var t = ev.target.closest ? ev.target.closest('#doll [data-loc]') : null;
+      if (!t || !DATA) { tip.style.display = 'none'; return; }
+      var m = model(cur), l = m && m.byKey[t.dataset.loc];
+      if (!l) { tip.style.display = 'none'; return; }
+      var s = '<b>' + esc(l.name) + '</b>';
+      if (!l.items.length) s += '<span class="n">empty</span>';
+      l.items.forEach(function (i) {
+        var bon = i.enh.map(function (e) { return sign(e.amt) + ' ' + e.prop; }).join(', ');
+        s += '<div class="' + (i.fn === false ? 'n' : '') + '">' + esc(i.name) + (i.fn === false ? ' (nonfunctional)' : '') +
+          (bon ? ' <span class="e">' + esc(bon) + '</span>' : '') +
+          (i.chg && i.chg.max != null ? ' <span class="n">' + i.chg.cur + '/' + i.chg.max + '</span>' : '') + '</div>';
+      });
+      tip.innerHTML = s; tip.style.display = 'block';
+      var x = ev.clientX + 14, y = ev.clientY + 14;
+      if (x + tip.offsetWidth > window.innerWidth - 4) x = Math.max(4, ev.clientX - tip.offsetWidth - 10);
+      if (y + tip.offsetHeight > window.innerHeight - 4) y = Math.max(4, ev.clientY - tip.offsetHeight - 10);
+      tip.style.left = x + 'px'; tip.style.top = y + 'px';
+    });
+
+    // Data arrives by re-loading paperdoll_data.js, which calls this.
+    window.__paperdollLoad = function (d) {
+      // A newer script wrote a newer page: load it, so an open window never runs stale code.
+      if (d.version && d.version !== '__PD_VERSION__') {
+        var last = 0;
+        try { last = +sessionStorage.getItem('pd:reload') || 0; sessionStorage.setItem('pd:reload', String(Date.now())); } catch (e) {}
+        if (Date.now() - last > 10000) { location.reload(); return; }
+      }
+      if (DATA && d.stamp === DATA.stamp) return;
+      var typing = document.activeElement && document.activeElement.tagName === 'TEXTAREA';
+      var switched = d.current && d.current !== cur;
+      DATA = d;
+      syncHolds();
+      if (typing) return;
+      if (switched && d.chars[d.current]) { cur = d.current; sel = null; openItem = null; }
+      render();
+    };
+    function poll() {
+      var s = document.createElement('script');
+      s.src = 'paperdoll_data.js?t=' + Date.now();
+      s.onload = s.onerror = function () { s.remove(); ping(); others('ping'); };
+      document.head.appendChild(s);
+    }
+    poll(); setInterval(poll, 3000);
+    </script>
+    </body>
+    </html>
+  PAPERDOLL_HTML
+end
+
+# ==== main ====
+
+args = Script.current.vars
+cmd  = (args[1] || '').downcase
+
+case cmd
+when 'help', '?'
+  respond ''
+  respond "PaperDoll #{PaperDoll::VERSION}"
+  respond '  ;paperdoll                scan, open the window, keep running for its buttons'
+  respond '  ;paperdoll scan           scan once and exit'
+  respond '  ;paperdoll show           open the window without scanning'
+  respond '  ;paperdoll forget <name>  remove a character from the saved data'
+  respond '  ;kill paperdoll           stop it (closing the window does the same)'
+  respond ''
+when 'show'
+  db = PaperDoll.load_db
+  PaperDoll.write_view(db, XMLData.name)
+  echo "Could not launch a browser. Open this file yourself: #{PaperDoll.html_path}" unless PaperDoll.open_window
+when 'forget'
+  target = args[2].to_s
+  PaperDoll.locked do
+    db = PaperDoll.load_db
+    key = db['chars'].keys.find { |k| k.casecmp?(target) }
+    if key
+      db['chars'].delete(key)
+      PaperDoll.save_db(db)
+      PaperDoll.write_view(db, XMLData.name)
+      echo "Removed #{key}."
+    else
+      echo "No saved character named '#{target}'. Saved: #{db['chars'].keys.sort.join(', ')}"
+    end
+  end
+else
+  name = XMLData.name
+  record = PaperDoll.rescan(name)
+  if record.nil?
+    echo 'Scan read nothing back from the game, so nothing was saved.'
+    echo "Check that '#{PaperDoll::CMD_LOCATION}' and '#{PaperDoll::CMD_USAGE}' work when typed by hand."
+    exit
+  end
+  echo PaperDoll.summary(name, record)
+  unless cmd == 'scan'
+    echo "Could not launch a browser. Open this file yourself: #{PaperDoll.html_path}" unless PaperDoll.open_window
+    echo "Running for #{name} so the window's buttons work. Close the window or ;kill paperdoll to stop."
+    PaperDoll.serve(name)
+  end
+end
