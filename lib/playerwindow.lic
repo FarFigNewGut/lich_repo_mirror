@@ -30,8 +30,11 @@
     *pwstatus                    - Cycle Saga status display: text -> unicode -> emoji -> text
     *pwmove                      - Toggle player movement filtering
     *pwflare                     - Toggle flare-message filtering
-    *pwcombat                    - Toggle combat message filtering (attack rolls, damage
-                                    math, crit flavor, flares, statuses, etc.)
+    *pwcombat                    - Cycle Combat Filter: ALL (hides everything, even AS/DS/
+                                    CS/TD/SMR rolls and damage) -> NUMBERS (keeps attack
+                                    rolls/resolutions visible, combines every damage line in
+                                    a round into one "N points of damage total" summary) ->
+                                    OFF (no combat filtering)
     *pwclaim                     - Hide/show claim status
     *pwgtk                       - Enable GTK window
     *pwgroup                     - Hide/show the group display
@@ -51,8 +54,24 @@
 
   Author: Phocosoen, ChatGPT
   Tags: wrayth, saga, frontend, mod, window, players, spam, filter, group, avalon, wizard, gtk3
-  Version: 2.13.0
+  Version: 2.14.0
   Recently changed:
+    v2.14.0 (2026-10-12) - Combat Filter (*pwcombat/*filtercombat) is now
+      a 3-state cycle instead of a single on/off toggle: ALL (hides every
+      recognized combat line, including AS/DS/CS/TD/SMR resolution rolls
+      and damage numbers) -> NUMBERS (the old "filter on" behavior --
+      attack/resolution lines stay visible, flavor text in between is
+      dropped) -> OFF (no filtering). The GTK header button was a
+      ToggleButton (binary active/inactive) and couldn't represent three
+      states, so it's now a plain Button that relabels itself on each
+      click; the Saga panel button and *pwcombat/*filtercombat command
+      cycle the same way. Existing saved "filter_combat_math" true/false
+      settings migrate automatically (true -> NUMBERS, false -> OFF).
+      Also combined NUMBERS mode's damage lines into one summary per
+      round ("N points of damage total (M hits)!" emitted at the next
+      prompt) instead of showing each hit separately, the same idea as
+      combatbrief.lic/combatfilter_sagapanel.lic's own damage roll-up --
+      attack/resolution lines are unaffected and still show individually.
     v2.13.0 (2026-10-10) - Combat Filter now lets AS/DS/CS/TD resolution
       rolls (family :resolution) through instead of dropping them, same
       as attack and damage lines -- only the crit/flare/status/etc.
@@ -196,7 +215,7 @@ module PlayerWindow
                   :filter_spam,
                   :filter_animals,
                   :filter_flares,
-                  :filter_combat_math,
+                  :combat_filter_mode,
                   :single_column,
                   :columns,
                   :show_filter_buttons,
@@ -226,7 +245,7 @@ module PlayerWindow
       "columns"              => 2,
       "filter_animals"       => false,
       "filter_flares"        => false,
-      "filter_combat_math"   => false,
+      "combat_filter_mode"   => "off",
       "filter_spam"          => true,
       "show_filter_buttons"  => true,
       "show_claim_status"    => true,
@@ -465,6 +484,50 @@ module PlayerWindow
     @combat_families = []
   end
 
+  # Three-state Combat Filter: "all" hides every recognized combat line,
+  # even AS/DS/CS/TD/SMR resolution rolls and damage numbers; "numbers"
+  # (the original single-toggle behavior) keeps attack/damage/resolution
+  # lines visible and drops only the flavor text in between; "off" is no
+  # filtering at all. Cycled in that order by *pwcombat/*filtercombat.
+  COMBAT_FILTER_MODES = %w[all numbers off].freeze
+
+  # Reads the persisted mode, migrating the old boolean "filter_combat_math"
+  # setting (true -> "numbers", false/missing -> "off") for anyone upgrading
+  # from before the 3-state cycle existed.
+  def normalize_combat_filter_mode(pw)
+    mode = pw["combat_filter_mode"]
+    return mode if PlayerWindow::COMBAT_FILTER_MODES.include?(mode)
+
+    pw["filter_combat_math"] ? "numbers" : "off"
+  end
+
+  def cycle_combat_filter_mode!
+    modes = PlayerWindow::COMBAT_FILTER_MODES
+    current = modes.include?(PlayerWindow.combat_filter_mode) ? PlayerWindow.combat_filter_mode : "off"
+    PlayerWindow.combat_filter_mode = modes[(modes.index(current) + 1) % modes.length]
+  end
+
+  def combat_filter_label
+    case PlayerWindow.combat_filter_mode
+    when "all" then "Combat ALL"
+    when "numbers" then "Combat NUM"
+    else "Combat OFF"
+    end
+  end
+
+  # Pulls the damage amount out of a damage line via lich-5's own
+  # Definitions::Damage parser (the same source CombatClassifier's :damage
+  # family recognizes it with) instead of a hand-rolled regex.
+  def parse_damage_amount(plain_line)
+    mod = CombatClassifier.lookup(Lich::Gemstone.const_get(:Combat, false), 'Definitions::Damage')
+    return nil unless mod.respond_to?(:parse)
+
+    result = mod.parse(plain_line)
+    result && result[:damage]
+  rescue StandardError
+    nil
+  end
+
   def spell_falloff_patterns
     return @spell_falloff_patterns if @spell_falloff_patterns
 
@@ -553,7 +616,7 @@ PlayerWindow.use_gtk_playerwindow = player_window_settings["use_gtk_playerwindow
 PlayerWindow.filter_spam      = player_window_settings["filter_spam"]      || false
 PlayerWindow.filter_animals   = player_window_settings["filter_animals"]   || false
 PlayerWindow.filter_flares    = player_window_settings["filter_flares"]    || false
-PlayerWindow.filter_combat_math = player_window_settings["filter_combat_math"] || false
+PlayerWindow.combat_filter_mode = PlayerWindow.normalize_combat_filter_mode(player_window_settings)
 PlayerWindow.columns = begin
   c = player_window_settings["columns"].to_i
   c = (player_window_settings["single_column"] ? 1 : 2) unless (1..8).include?(c)
@@ -725,7 +788,7 @@ class PlayerWindowGtk
     PlayerWindow.filter_spam    = pw["filter_spam"]    || false
     PlayerWindow.filter_animals = pw["filter_animals"] || false
     PlayerWindow.filter_flares  = pw["filter_flares"]  || false
-    PlayerWindow.filter_combat_math = pw["filter_combat_math"] || false
+    PlayerWindow.combat_filter_mode = PlayerWindow.normalize_combat_filter_mode(pw)
     @font_size = pw["font_size"] || 14
     pw["palette"] || "White on Black"
 
@@ -770,14 +833,17 @@ class PlayerWindowGtk
     end
     header.pack_start(flare_toggle)
 
-    # - Combat Filter toggle -
-    combat_math_toggle = Gtk::ToggleButton.new(label: "Combat")
+    # - Combat Filter cycle (all -> numbers -> off) -
+    # A plain Button, not ToggleButton -- the filter has three states now,
+    # not two, so there's no single "active?" to bind to. Each click just
+    # advances PlayerWindow.combat_filter_mode and relabels itself.
+    combat_math_toggle = Gtk::Button.new(label: PlayerWindow.combat_filter_label)
     combat_math_toggle.style_context.add_class("header-toggle")
-    combat_math_toggle.active = PlayerWindow.filter_combat_math
-    combat_math_toggle.signal_connect("toggled") do |btn|
-      PlayerWindow.filter_combat_math = btn.active?
-      respond "Combat filtering #{PlayerWindow.filter_combat_math ? 'ENABLED' : 'DISABLED'}."
-      PlayerWindow.update_player_setting("filter_combat_math", PlayerWindow.filter_combat_math)
+    combat_math_toggle.signal_connect("clicked") do |btn|
+      PlayerWindow.cycle_combat_filter_mode!
+      btn.label = PlayerWindow.combat_filter_label
+      respond "Combat filtering is now #{PlayerWindow.combat_filter_mode.upcase}."
+      PlayerWindow.update_player_setting("combat_filter_mode", PlayerWindow.combat_filter_mode)
       update_players(GameObj.pcs.reject { |pc| pc.name == Char.name })
     end
     header.pack_start(combat_math_toggle)
@@ -1354,7 +1420,7 @@ def PlayerWindow.push_players_to_window(pcs, group_display = nil)
     toggles = [
       ["filter_toggle",      "Spam #{PlayerWindow.filter_spam ? check : xmark}",        "*filterspam",    "Toggling Spam Filter..."],
       ["flare_toggle",       "Flare #{PlayerWindow.filter_flares ? check : xmark}",      "*filterflares",  "Toggling Flare Filter..."],
-      ["combat_math_toggle", "Combat #{PlayerWindow.filter_combat_math ? check : xmark}", "*filtercombat",  "Toggling Combat Filter..."],
+      ["combat_math_toggle", PlayerWindow.combat_filter_label, "*filtercombat",  "Cycling Combat Filter..."],
       ["animal_toggle",      "Animal #{PlayerWindow.filter_animals ? check : xmark}",    "*filteranimals", "Toggling Animal Filter..."],
     ]
     toggles.each_with_index do |(id, value, cmd, echo), idx|
@@ -1500,9 +1566,9 @@ upstream_proc = proc do |command|
     nil
 
   when /\*(pwcombat|filtercombat)/i
-    PlayerWindow.filter_combat_math = !PlayerWindow.filter_combat_math
-    respond "Combat filtering is now #{PlayerWindow.filter_combat_math ? 'ENABLED' : 'DISABLED'}."
-    PlayerWindow.update_player_setting("filter_combat_math", PlayerWindow.filter_combat_math)
+    PlayerWindow.cycle_combat_filter_mode!
+    respond "Combat filtering is now #{PlayerWindow.combat_filter_mode.upcase}."
+    PlayerWindow.update_player_setting("combat_filter_mode", PlayerWindow.combat_filter_mode)
 
     pcs = GameObj.pcs.reject { |pc| pc.name == Char.name }
     PlayerWindow.push_players_to_window(pcs)
@@ -1719,6 +1785,8 @@ end
 
 @pw_skip_next_line = false
 @pw_combat_block_active = false
+@pw_damage_total = 0
+@pw_damage_hits = 0
 
 downstream_proc = proc { |line, _server_string|
   line = line.to_s # Ensure line is always a String.
@@ -1726,26 +1794,59 @@ downstream_proc = proc { |line, _server_string|
 
   if PlayerWindow.prompt_line?(line)
     @pw_combat_block_active = false
+    if @pw_damage_total > 0
+      hits = @pw_damage_hits
+      respond "   ... #{@pw_damage_total} points of damage total (#{hits} hit#{'s' unless hits == 1})!"
+      @pw_damage_total = 0
+      @pw_damage_hits = 0
+    end
     next line
   end
 
   # Combat message filtering -- recognized via lich-5's own Gemstone combat
   # definitions (PlayerWindow::CombatClassifier, built the same way
   # combatstream.lic builds its own), not the hand-rolled "You swing/
-  # slash/..." + AS:/CS:/SSR/SMR regex this used before. An attack (self
-  # or otherwise), a damage line, or an AS/DS/CS/TD resolution roll stays
-  # visible and opens a block; everything else the classifier recognizes
-  # as combat -- and any unclassified flavor text in between -- is
-  # dropped until the next damage/death line or prompt. Unlike
-  # combatstream.lic, nothing here gets moved to another window: this
-  # filter only omits.
-  if PlayerWindow.filter_combat_math
-    family, _result = PlayerWindow::CombatClassifier.classify(PlayerWindow.combat_families, line)
+  # slash/..." + AS:/CS:/SSR/SMR regex this used before. Three modes,
+  # cycled by *pwcombat/*filtercombat:
+  #   "off"     - no combat filtering at all.
+  #   "numbers" - an attack (self or otherwise) or an AS/DS/CS/TD/SMR
+  #               resolution roll stays visible and opens a block; every
+  #               damage line in that block is combined into a single
+  #               "N points of damage total (M hits)!" summary emitted at
+  #               the next prompt instead of showing each hit separately
+  #               (same idea as combatbrief.lic/combatfilter_sagapanel.lic's
+  #               own damage roll-up); everything else the classifier
+  #               recognizes as combat -- and any unclassified flavor text
+  #               in between -- is dropped until the next death line or
+  #               prompt.
+  #   "all"     - hides attack/damage/resolution lines too, on top of
+  #               everything "numbers" already drops; no damage summary
+  #               either, since there's nothing left to total.
+  # Unlike combatstream.lic, nothing here gets moved to another window:
+  # this filter only omits.
+  mode = PlayerWindow.combat_filter_mode
+  if mode != "off"
+    family, = PlayerWindow::CombatClassifier.classify(PlayerWindow.combat_families, line)
 
-    if family == :attack || family == :damage || family == :resolution
+    if family == :damage && mode == "numbers"
+      @pw_combat_block_active = true
+      amount = PlayerWindow.parse_damage_amount(plain_line)
+      if amount
+        @pw_damage_total += amount
+        @pw_damage_hits += 1
+      end
+      PlayerWindow.debug_filter("COMBAT (damage, buffered)", line)
+      next nil
+    end
+
+    if (family == :attack || family == :resolution) && mode == "numbers"
       @pw_combat_block_active = true
       next line
     end
+
+    # mode == "all": attack/damage/resolution fall through to the generic
+    # combat-block drop below instead of passing through or being buffered.
+    @pw_combat_block_active = true if family == :attack || family == :damage || family == :resolution
 
     if @pw_combat_block_active
       if PlayerWindow.combat_death_line?(line)
@@ -1859,10 +1960,12 @@ downstream_proc = proc { |line, _server_string|
     end
   end
 
-  # Always keep damage lines, even when mixed into larger raw XML packets.
-  # (Independent of the filter_combat_math toggle above -- this unconditional
-  # rule predates it and is a baseline safety net for any filter state.)
+  # Always keep damage lines, even when mixed into larger raw XML packets --
+  # UNLESS the Combat Filter is in "all" mode, which means hide every bit of
+  # combat math including damage numbers; this unconditional rule predates
+  # that mode and would otherwise leak damage back in regardless of it.
   if PlayerWindow.combat_damage_line?(line)
+    next nil if PlayerWindow.combat_filter_mode == "all"
     next line
   end
 
@@ -1871,7 +1974,7 @@ downstream_proc = proc { |line, _server_string|
     PlayerWindow.filter_spam ||
     PlayerWindow.filter_animals ||
     PlayerWindow.filter_flares ||
-    PlayerWindow.filter_combat_math
+    PlayerWindow.combat_filter_mode != "off"
   )
   if any_filter_enabled && line.strip.empty?
     next nil
@@ -2382,7 +2485,7 @@ loop do
     PlayerWindow.filter_spam,
     PlayerWindow.filter_animals,
     PlayerWindow.filter_flares,
-    PlayerWindow.filter_combat_math,
+    PlayerWindow.combat_filter_mode,
     PlayerWindow.show_claim_status,
     PlayerWindow.hidden_player_detected
   ]
