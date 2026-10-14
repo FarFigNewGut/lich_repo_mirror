@@ -2,6 +2,8 @@
 
 require 'json'
 require 'fileutils'
+require 'set'
+require 'digest'
 
 =begin
 
@@ -12,8 +14,12 @@ Track your weapon and armor CER services in a hidden note, viewed through the li
 List the enhancive benefits of your items right next to their name!
 
 
+Highly recommended companion script: ;invdb (Xanlin). Run it now and then to refresh its inventory
+database - isharpie reads that database (read-only, silently) to find tagged items that are in your
+lockers, vaults or other characters' storage before it ever flags them as missing.
+
 The following inputs are available:
-  ;isharpie tag <noun> ["<note>"] [SN "<silent>"] [color ...]  - tag item in hand
+  ;isharpie tag <noun> ["<note>"] [SN "<silent>"] [color] [perm]  - tag item in hand (options in any order)
   ;isharpie color <name>                 - set color on last tagged item
   ;isharpie delete <noun>                - remove note from item in hand (or ;isharpie d <noun>)
   ;isharpie list                         - list all stored notes
@@ -24,7 +30,7 @@ The following inputs are available:
       Other scripts: Combatical, Merchantical, Loresang, VolnRestore2
       game: gs
       tags: items, inventory, notes, highlight, Sharpie
-      version: 1.3.7
+      version: 1.4.2
       required: Lich > 5.0
 
       \\Version\\
@@ -42,11 +48,19 @@ The following inputs are available:
       1.3.5 08/08/2026 - recall capture no longer uses reget - fixes tagged lines silently dropped from recall text
       1.3.6 08/08/2026 - sorcery now read from sanctify count instead of a dead "sorcery" keyword match; enchant/sorcery/ensorcel always render as one +XX/SX/EX group
       1.3.7 08/08/2026 - fixed CER adjective capture swallowing "is" for one-word adjectives, always falling back to "?"
+      1.3.8 10/11/2026 - bare-noun notes no longer match every item with that noun; tags now survive locker manifests
+      1.4.0 10/11/2026 - identical-item hardening: (Multiple Identical) marker, verify prompt on pickup, one id per note
+                         silent fingerprints (look, recall, analyze, examine, look in) only when identical items exist
+                         identical copies that match share one note; tagged items re-identified at startup; racks tracked
+      1.4.1 10/11/2026 - stale-note culling: unseen 7 days played, then missing once their last container is browsed
+                         tag options in any order (color, perm); sentinel-based command capture filters chat/stream noise
+                         fixed a stray "false" in the tag confirmation message
+      1.4.2 10/13/2026 - annotator hook now runs after all other downstream hooks so it can't starve them of replies
 
 =end
 
 module ISharpie
-  VERSION = '1.3.7'.freeze
+  VERSION = '1.4.2'.freeze
 
   VALID_COLORS = %w[orange teal green yellow none].freeze
   DEFAULT_RECALL_MODE = 'loud'.freeze
@@ -92,15 +106,67 @@ module ISharpie
   # (confirmed against real .xml logs).
   ITEM_TAG_RX = /<a exist="(-?\d+)" noun="([^"]*)">([^<]*)<\/a>([^<.,:;!?(]*)/.freeze
 
-  # "You put X in (a|an|the|your) Y." - deposit into a named container.
-  PUT_RX = /You put (.+?) in (?:a|an|the|your) (.+?)\./.freeze
+  # "You put X in|on (a|an|the|your) Y." - deposit into a named container.
+  # Locker weapon racks use "on" ("You put a dagger on a weapon rack.").
+  PUT_RX = /You put (.+?) (?:in|on|under|behind) (?:a|an|the|your) (.+?)\./.freeze
 
-  # "You remove X from in (a|an|the|your) Y." - "from in" is the
+  # "You remove X from in|on (a|an|the|your) Y." - "from in"/"from on" is the
   # distinguishing substring; plain "from your belt"-style removals (no
   # container involved) never match this, by design.
-  REMOVE_RX = /You remove (.+?) from in (?:a|an|the|your) (.+?)\./.freeze
+  REMOVE_RX = /You remove (.+?) from (?:in|on|under|behind) (?:a|an|the|your) (.+?)\./.freeze
+
+  # One entry of a server-side container listing:
+  #   <inv id='CONTAINER'> a <a exist="ID" noun="NOUN">TAG_TEXT</a></inv>
+  # Sent after <clearContainer id="CONTAINER"/> whenever a container's
+  # contents are refreshed - including the remaining contents of the source
+  # container on a "You remove" line (confirmed against real .xml logs). The
+  # "In the <a ...>wardrobe</a>:" header entry never matches (no article).
+  # Container ids are usually numeric, but the stow container is sent as
+  # id="stow".
+  INV_LIST_RX        = /<inv id='([^']+)'>\s*(?:an?|some|the)?\s*<a exist="(\d+)" noun="[^"]*">([^<]*)<\/a>(?:([^<]*)<\/inv>)?/.freeze
+  CLEAR_CONTAINER_RX = /<clearContainer id="([^"]+)"\/>/.freeze
+
+  # Categorized inventory views collapse identical items into one tag with a
+  # count: "a <a ...>slender iron rapier</a> (2)".
+  STACK_COUNT_RX = /\A\s*\((\d+)\)/.freeze
+
+  # Locker manifests list only the player's own items, under exist ids that
+  # are regenerated every time the locker is opened or a manifest is read.
+  MANIFEST_START_RX  = /you (?:see|recall) the contents of your (.+?):/i.freeze
+  MANIFEST_END_RX    = /Obvious items:|There are no items in this/i.freeze
+  MANIFEST_TIMEOUT   = 15
+  MANIFEST_MAX_LINES = 3000
+
+  # Locations that mean "somewhere on the character" without naming a
+  # specific container. Notes created before container tracking default here.
+  ON_PERSON = %w[carried worn].freeze
+
+  AMBIGUOUS_TEXT = 'Multiple Identical - at least one tagged'.freeze
+
+  # Two container fingerprints count as the same container when at least this
+  # share of items overlaps - contents drift as items are added and removed.
+  CONTENTS_MATCH_RATIO = 0.75
+
+  # Fingerprint verbs run against an item's exist id (all accept "#id").
+  # recall is compared as its parsed summary; the rest as normalized text.
+  FINGERPRINT_VERBS = {
+    look:    'look at #%s',
+    recall:  'recall #%s',
+    analyze: 'analyze #%s',
+    examine: 'examine #%s'
+  }.freeze
+  FINGERPRINT_MIN_TEXT   = 20  # shorter output is a refusal/error, not evidence
+  FINGERPRINT_MIN_SHARED = 2   # informative fields two items must share to be called the same
+
+  # Stale-note culling. A note not seen for STALE_PLAYED_DAYS days played
+  # (distinct dates the script ran - offline days never count) goes stale;
+  # a stale note whose last-known location is browsed without finding it
+  # goes into culling, where the player reviews it with ;isharpie list cull.
+  STALE_PLAYED_DAYS = 7
+  INVDB_PATH        = File.join(LICH_DIR, 'data', 'inv.db3').freeze
 
   ANNOTATOR_HOOK_ID          = 'isharpie_annotator'.freeze
+  ANNOTATOR_PRIORITY         = -1000 # runs after every other downstream hook
   CONTAINER_TRACKER_HOOK_ID  = 'isharpie_container_tracker'.freeze
   UPSTREAM_HOOK_ID           = 'isharpie_upstream'.freeze
   RECALL_CAPTURE_HOOK_ID     = 'isharpie_recall_capture'.freeze
@@ -120,8 +186,20 @@ module ISharpie
   @last_ambiguous_list  = nil
   @note_counter         = nil
   @startup_suppress     = false
+  @startup_suppress_since = nil
   @inventory_only       = false
   @recall_mode          = nil
+  @manifest_buffer      = nil
+  @manifest_started     = nil
+  @manifest_where       = nil
+  @manifest_count       = 0
+  @sweeping             = false
+  @cull_listed          = false
+  @dirty                = false
+  @played_days          = 0
+  @last_play_date       = nil
+  @last_fp_scan         = nil
+  @fp_scan_done         = false
 
   ## ---- persisted notes ---------------------------------------------------
 
@@ -147,7 +225,9 @@ module ISharpie
         state = {
           notes: Array(data[:notes]),
           inventory_only: data[:inventory_only] || false,
-          recall_mode: normalize_recall_mode(data[:recall_mode] || DEFAULT_RECALL_MODE)
+          recall_mode: normalize_recall_mode(data[:recall_mode] || DEFAULT_RECALL_MODE),
+          played_days: data[:played_days].to_i,
+          last_play_date: data[:last_play_date]
         }
       end
     else
@@ -156,6 +236,8 @@ module ISharpie
 
     @inventory_only = state[:inventory_only]
     @recall_mode = state[:recall_mode]
+    @played_days = state[:played_days].to_i
+    @last_play_date = state[:last_play_date]
     state
   rescue StandardError => e
     say "could not load notes from #{notes_path}: #{e.class}"
@@ -175,7 +257,9 @@ module ISharpie
     File.write(notes_path, JSON.pretty_generate({
       notes: @notes || notes,
       inventory_only: @inventory_only,
-      recall_mode: recall_mode
+      recall_mode: recall_mode,
+      played_days: @played_days,
+      last_play_date: @last_play_date
     }))
   rescue StandardError => e
     say "could not save notes to #{notes_path}: #{e.class}"
@@ -243,9 +327,12 @@ module ISharpie
     # GameObj.right_hand.name at tag-time may be shorter than what the stream
     # shows. If no exact match, accept any stored name that is a trailing
     # suffix of the stream name.
+    # Stored names that are a single bare noun ("sack") are excluded: they would
+    # match every other item sharing that noun ("small burlap sack").
     if matches.empty?
       matches = notes.select { |n|
-        n[:long_name].length < long_name.length && long_name.end_with?(n[:long_name])
+        n[:long_name].split.length >= 2 &&
+          n[:long_name].length < long_name.length && long_name.end_with?(n[:long_name])
       }
     end
 
@@ -302,8 +389,156 @@ module ISharpie
     notes.find { |n| n[:id] == note_id }
   end
 
-  def self.bind!(exist_id, note_id)
+  # A note is bound to at most one exist id at a time. Ids regenerate on
+  # login and on every locker open, so a fresh id for the same note replaces
+  # the stale one; callers check bound_elsewhere_on_person? first to stop a
+  # genuine identical twin from stealing the binding.
+  # A note whose copies were fingerprinted as indistinguishable
+  # (:interchangeable) may be bound to several ids at once - it doesn't matter
+  # which copy carries the tag.
+  def self.bind!(exist_id, note_id, where: nil)
+    exist_id = exist_id.to_s
+    record = notes.find { |n| n[:id] == note_id }
+    unless record && record[:interchangeable]
+      @exist_bindings.delete_if { |eid, nid| nid == note_id && eid != exist_id }
+    end
     @exist_bindings[exist_id] = note_id
+    mark_seen(note_id, where || (carried_id?(exist_id) ? 'carried' : nil))
+  end
+
+  def self.bound_elsewhere_on_person?(note_id, exist_id, entries = carried_entries)
+    ids = entries.map { |o, _| o.id.to_s }
+    @exist_bindings.any? { |eid, nid| nid == note_id && eid != exist_id.to_s && ids.include?(eid) }
+  end
+
+  ## ---- sightings and note status ------------------------------------------
+  # status: nil (normal) -> 'stale' (unseen STALE_PLAYED_DAYS days played)
+  #         -> 'culling' (stale, and its last-known location was browsed
+  #            without finding it). Any sighting returns a note to normal.
+
+  def self.perm?(note)
+    !!note[:perm]
+  end
+
+  # Where a note was last known to be: a town/vault, a container name,
+  # 'carried' or 'worn'.
+  def self.where_for(note)
+    (note[:last_seen_where] || note[:container]).to_s
+  end
+
+  # Persisted lazily (main_loop flushes) - this runs on the socket thread, and
+  # sightings are frequent, so only a change in what we persist sets @dirty.
+  def self.mark_seen(note_id, where = nil)
+    record = notes.find { |n| n[:id] == note_id }
+    return unless record
+
+    changed = record[:seen_day] != @played_days || record[:status] || record[:cull_no] ||
+              (where && record[:last_seen_where] != where)
+    record[:last_seen] = Time.now.to_i
+    record[:seen_day] = @played_days
+    record[:last_seen_where] = where if where
+    record[:status] = nil
+    record.delete(:cull_no)
+    record.delete(:cull_saved)
+    @dirty = true if changed
+  end
+
+  # Container names are stored from put/remove text ("clothing wardrobe") but
+  # listings head themselves with the bare noun phrase ("wardrobe").
+  def self.container_name_match?(a, b)
+    a = a.to_s.strip.downcase
+    b = b.to_s.strip.downcase
+    return false if a.empty? || b.empty? || ON_PERSON.include?(a) || ON_PERSON.include?(b)
+    return true if a == b
+
+    short, long = [a, b].sort_by(&:length)
+    long.end_with?(" #{short}")
+  end
+
+  def self.next_cull_no
+    notes.map { |n| n[:cull_no].to_i }.max.to_i + 1
+  end
+
+  def self.enter_culling(note)
+    return if perm?(note) || note[:status] == 'culling'
+
+    note[:status]   = 'culling'
+    note[:cull_no]  = next_cull_no
+    note[:culling_since] = Time.now.to_i
+    @dirty = true
+  end
+
+  def self.culling_notes
+    notes.select { |n| n[:status] == 'culling' }.sort_by { |n| n[:cull_no].to_i }
+  end
+
+  # One played day per distinct calendar date the script runs on.
+  def self.tick_played_day
+    notes # load state (including the counters) before comparing dates
+    today = Time.now.strftime('%Y-%m-%d')
+    return false if @last_play_date == today
+
+    @played_days += 1 if @last_play_date
+    @last_play_date = today
+    # Notes from before culling existed start their clock now.
+    notes.each { |n| n[:seen_day] ||= @played_days }
+    @dirty = true
+    update_stale_status
+    true
+  end
+
+  def self.update_stale_status
+    notes.each do |n|
+      next if perm?(n) || n[:status]
+
+      n[:seen_day] ||= @played_days
+      n[:status] = 'stale' if @played_days - n[:seen_day] >= STALE_PLAYED_DAYS
+    end
+    @dirty = true
+  end
+
+  ## ---- what the character is carrying -----------------------------------
+
+  def self.held_objects
+    [GameObj.right_hand, GameObj.left_hand].compact.select { |g| g.id && g.name && g.name != 'Empty' }
+  end
+
+  # [[GameObj, location]] for everything on the character. location is
+  # 'carried' for hands, 'worn' for top-level inventory, otherwise the
+  # normalized name of the container holding it - the same form the put/remove
+  # tracker stores in a note's :container.
+  def self.carried_entries
+    entries = held_objects.map { |o| [o, 'carried'] }
+    walk = lambda do |items, location|
+      items.each do |i|
+        entries << [i, location]
+        walk.call(i.contents.to_a, normalize_container_name(long_name_for(i)))
+      end
+    end
+    walk.call(GameObj.inv.to_a, 'worn')
+    entries
+  end
+
+  def self.carried_id?(exist_id)
+    id = exist_id.to_s
+    carried_entries.any? { |o, _| o.id.to_s == id }
+  end
+
+  def self.on_person_names(entries)
+    ON_PERSON + entries.map { |o, _| normalize_container_name(long_name_for(o)) }
+  end
+
+  # Identical items share the exact same <a> tag text. Hands report a
+  # shortened name ("iron rapier" for "slender iron rapier"), so a multi-word
+  # trailing match also counts; a bare noun never does.
+  def self.same_item_name?(a, b)
+    a = a.to_s.strip.downcase
+    b = b.to_s.strip.downcase
+    return false if a.empty? || b.empty?
+    return true if a == b
+
+    short, long = [a, b].sort_by(&:length)
+    short.split.length >= 2 && long.end_with?(" #{short}")
   end
 
   # Returns true if the given exist_id is found anywhere in the player's own
@@ -328,7 +563,20 @@ module ISharpie
   # @startup_suppress so nothing shows to the player; Lich's XML parser still
   # runs underneath and fills in item.contents for each container.
   # Non-containers get a "can't look in that" response which is also suppressed.
+  # Startup suppression expires on its own: a stuck preload must never be able
+  # to blank the whole game stream.
+  STARTUP_SUPPRESS_MAX_SECONDS = 30
+
+  def self.startup_suppressed?
+    return false unless @startup_suppress
+    return true if Time.now.to_f - @startup_suppress_since.to_f <= STARTUP_SUPPRESS_MAX_SECONDS
+
+    @startup_suppress = false
+    false
+  end
+
   def self.preload_containers
+    @startup_suppress_since = Time.now.to_f
     @startup_suppress = true
     silence_me  # toggles script.silent = true, suppresses [script]>command echo
     begin
@@ -382,7 +630,7 @@ module ISharpie
     long_name = "#{tag_text}#{sanitize_trailing(trailing)}".strip
     return nil if long_name.empty?
 
-    { exist_id: exist_id, long_name: long_name }
+    { exist_id: exist_id, long_name: long_name, tag_text: tag_text.strip }
   end
 
   def self.extract_container_name(span)
@@ -397,6 +645,8 @@ module ISharpie
   def self.format_annotation(note_record, confirmed:)
     visible = note_record[:note].to_s.strip
     return nil if visible.empty?
+    # Copies that checked out identical on every fingerprint share the note.
+    visible += ' - identical copy' if note_record[:interchangeable]
     text = "(#{visible}#{confirmed ? '' : '?'})"
     color = note_record[:color] || 'none'
     return text if color == 'none'
@@ -404,30 +654,216 @@ module ISharpie
     Lich::Messaging.msg_format(COLOR_MAP[color] || color, text, encode: true)
   end
 
+  # Shown on every copy when identical items are in view and we can't tell
+  # which one carries the note - never the note text itself, which would put
+  # a confident tag on what may be the wrong item.
+  def self.format_ambiguous(note_records)
+    text  = "(#{AMBIGUOUS_TEXT})"
+    color = note_records.map { |n| n[:color] }.find { |c| c && c != 'none' } || 'none'
+    return text if color == 'none'
+
+    Lich::Messaging.msg_format(COLOR_MAP[color] || color, text, encode: true)
+  end
+
+  def self.label_for(note_record)
+    visible = note_record[:note].to_s.strip
+    silent  = note_record[:silent_note].to_s.strip
+    return visible unless visible.empty?
+
+    silent.empty? ? note_record[:id].to_s : "SN: #{silent}"
+  end
+
+  ## ---- identity resolution ------------------------------------------------------
+  # Exist ids regenerate on login and on every locker open, so an unbound item
+  # is identified by name, by what identical items are in view, and by the
+  # container its note was last tracked in.
+
+  # Name match with the trailing-clause retry: a trailing clause ("with a
+  # rippling green sheen...") is narrative description, not identity.
+  def self.name_candidates(long_name, tag_text)
+    candidates = candidates_for(long_name)
+    tag = tag_text.to_s.strip
+    candidates = candidates_for(tag) if candidates.empty? && !tag.empty? && tag != long_name
+    candidates
+  end
+
+  # tag text (downcased) => Set of exist ids appearing in a line or block.
+  def self.context_ids(text)
+    ctx = Hash.new { |h, k| h[k] = Set.new }
+    text.to_s.scan(ITEM_TAG_RX) { |eid, _noun, tag, _trailing| ctx[tag.strip.downcase] << eid }
+    ctx
+  end
+
+  # Exist ids of other items identical to this one that are in view: in the
+  # same line/block (e.g. a container listing or a manifest), on the
+  # character, or in the source container's current contents.
+  def self.twin_ids(exist_id, tag_text, context, entries, container_id: nil)
+    ids = Set.new
+    context&.each { |tag, eids| ids.merge(eids) if same_item_name?(tag, tag_text) }
+    entries.each { |o, _| ids << o.id.to_s if same_item_name?(o.name, tag_text) }
+    if container_id
+      Array(GameObj.containers[container_id.to_s]).each { |o| ids << o.id.to_s if same_item_name?(o.name, tag_text) }
+    end
+    ids.delete(exist_id.to_s)
+    ids
+  end
+
+  # Does the item's location fit where its note was last tracked?
+  #   location - container name, 'carried', :manifest, or nil (unknown)
+  def self.container_agrees?(note_container, location, person_names)
+    nc = note_container.to_s
+    return true if nc.empty? || ON_PERSON.include?(nc) || location.nil?
+    return true if nc == location
+    # A manifest can't be checked against a locker container name, but a note
+    # last tracked into a container on the character points away from it.
+    return !person_names.include?(nc) if location == :manifest
+    return person_names.include?(nc) if person_names.include?(location)
+
+    false
+  end
+
+  # Decides what an unbound item is:
+  #   [:bind, note]       - one note fits and no unidentified twin is in view
+  #   [:maybe, note]      - one note fits by name, but it was last tracked elsewhere
+  #   [:twin, note]       - identical to a tagged item already identified on the
+  #                         character, so this one is an untagged copy
+  #   [:ambiguous, notes] - identical items in view; can't tell which is tagged
+  #   [:none]             - no note matches this name
+  def self.resolve(exist_id, tag_text, long_name, context, location:, container_id: nil, stacked: false)
+    candidates = name_candidates(long_name, tag_text)
+    return [:none] if candidates.empty?
+    # One tag standing for several identical items can't be pinned to any.
+    return [:ambiguous, candidates] if stacked && !(candidates.size == 1 && candidates.first[:interchangeable])
+
+    # Fingerprinted as indistinguishable: any copy may carry the note.
+    if candidates.size == 1 && candidates.first[:interchangeable]
+      return [:bind, candidates.first]
+    end
+
+    entries = carried_entries
+    live = candidates.select { |c| bound_elsewhere_on_person?(c[:id], exist_id, entries) }
+    return [:twin, live.first] if live.size == candidates.size
+
+    unresolved = candidates - live
+    # Twins already bound to a note are accounted for; only unidentified
+    # copies make this item ambiguous.
+    twins = twin_ids(exist_id, tag_text, context, entries, container_id: container_id)
+            .reject { |eid| @exist_bindings.key?(eid) }
+    return [:ambiguous, unresolved] unless unresolved.size == 1 && twins.empty?
+
+    note = unresolved.first
+    agrees = container_agrees?(note[:container], location, on_person_names(entries))
+    [agrees ? :bind : :maybe, note]
+  end
+
   ## ---- annotator downstream hook --------------------------------------------
   # Runs on the socket-reading thread - must never block on game I/O.
 
+  # Lich runs downstream hooks in order, and a hook that returns nil hides the
+  # line from every hook after it. The annotator returns nil for the whole
+  # startup preload and holds back and re-emits locker manifests, so it must
+  # run AFTER every other script's hooks: otherwise a script waiting on a reply
+  # that lands in that window (lumnismon's "lumnis info" scoop) never sees it
+  # and its hook stays registered, swallowing prompts and blank lines forever.
+  # Lich 5.19+ lets a hook declare persist:, 5.22+ also priority: (higher runs
+  # first); older Lich takes a plain add and keeps registration order.
   def self.install_annotator
-    DownstreamHook.add(ANNOTATOR_HOOK_ID, proc { |line| annotate_line(line) })
+    action = proc { |line| annotate_line(line) }
+    params = DownstreamHook.method(:add).parameters.map { |_type, name| name }
+    options = {}
+    options[:persist]  = false if params.include?(:persist)
+    options[:priority] = ANNOTATOR_PRIORITY if params.include?(:priority)
+    DownstreamHook.add(ANNOTATOR_HOOK_ID, action, **options)
   end
 
   def self.remove_annotator
     DownstreamHook.remove(ANNOTATOR_HOOK_ID)
   end
 
+  # A locker manifest arrives one item per line, so a duplicate further down
+  # can't be known while annotating the first copy. The whole manifest is
+  # held back and annotated as one block once its end marker arrives. Its
+  # items are trusted as the player's own even though their regenerated ids
+  # are not in GameObj.inv. Flushed early on timeout or size cap so a missed
+  # end marker can never swallow output for long.
   def self.annotate_line(line)
-    return nil if @startup_suppress
+    return nil if startup_suppressed?
+
+    if @manifest_buffer
+      @manifest_buffer << line
+      expired = Time.now.to_f - @manifest_started > MANIFEST_TIMEOUT ||
+                @manifest_buffer.size > MANIFEST_MAX_LINES
+      return nil unless line =~ MANIFEST_END_RX || expired
+
+      block = @manifest_buffer
+      @manifest_buffer = nil
+      @manifest_count += 1
+      process_manifest(block, @manifest_where)
+      # A sweep run for ;isharpie list cull is invisible to the player.
+      return nil if @sweeping
+
+      return annotate_block(block, manifest: true)
+    end
+
+    if (m = MANIFEST_START_RX.match(line))
+      @manifest_where   = m[1].strip.sub(/\Alocker in\s+/i, '')
+      @manifest_buffer  = [line]
+      @manifest_started = Time.now.to_f
+      return nil
+    end
+
+    annotate_block([line], manifest: false)
+  end
+
+  # A manifest browse: every listed item counts as a sighting of any note it
+  # matches by name, and a stale note last known in this locker that is not
+  # listed goes into culling.
+  def self.process_manifest(lines, town)
+    names = lines.join.scan(ITEM_TAG_RX).map { |_eid, _noun, tag, trailing|
+      [tag.strip, "#{tag}#{sanitize_trailing(trailing)}".strip]
+    }
+    seen = Set.new
+    names.each { |tag, long| name_candidates(long, tag).each { |c| seen << c[:id] } }
+    seen.each { |id| mark_seen(id, town) }
+    notes.each do |n|
+      next unless n[:status] == 'stale' && !seen.include?(n[:id])
+
+      enter_culling(n) if where_for(n).casecmp?(town.to_s)
+    end
+  rescue StandardError => e
+    say "manifest error: #{e.class}: #{e.message}"
+  end
+
+  def self.annotate_block(lines, manifest:)
+    text = lines.join
+    return text unless text.include?('<a ')
+    return text if notes.empty?
+
+    context = context_ids(text)
+    lines.map { |l| annotate_one(l, context, manifest) }.join
+  rescue StandardError => e
+    say "annotator error: #{e.class}: #{e.message}"
+    lines.join
+  end
+
+  def self.annotate_one(line, context, manifest)
     return line unless line.include?('<a ')
-    return line if notes.empty? && @exist_bindings.empty?
+
     line.gsub(ITEM_TAG_RX) do |whole_match|
       exist_id, _noun, tag_text, trailing = $1, $2, $3, $4
+      post_match = $~.post_match
       next whole_match if exist_id.to_i < 0
       long_name = "#{tag_text}#{sanitize_trailing(trailing)}".strip
       next whole_match if long_name.empty?
 
       tag_only = whole_match[0, whole_match.length - trailing.length]
+      stacked  = post_match[STACK_COUNT_RX, 1].to_i >= 2
 
-      if exist_bound?(exist_id)
+      if exist_bound?(exist_id) && stacked
+        note = bound_note_for(exist_id)
+        ann = note && format_ambiguous([note])
+        ann ? (tag_only + ann + trailing) : whole_match
+      elsif exist_bound?(exist_id)
         if @inventory_only
           id = exist_id.to_s
           # Items in hand appear in combat/action text - suppress those.
@@ -444,6 +880,7 @@ module ISharpie
           check_names = [long_name, tag_text.strip].uniq
           plausible = check_names.any? { |n| candidates_for(n).any? { |c| c[:id] == note[:id] } }
           if plausible
+            mark_seen(note[:id], manifest ? @manifest_where : nil)
             ann = format_annotation(note, confirmed: true)
             ann ? (tag_only + ann + trailing) : whole_match
           else
@@ -455,28 +892,29 @@ module ISharpie
         end
       else
         # Only attempt to match/bind items that are in the player's own
-        # inventory. Skips other players' items that share a name with a
-        # tagged item (e.g. Folwer's backpack, someone's orb brooch).
-        next whole_match unless player_item?(exist_id)
-        candidates = candidates_for(long_name)
-        # If the trailing clause ("with a rippling green sheen...") prevented a
-        # match, retry using only the tag text itself - the trailing clause is
-        # narrative description, not part of the item's identity.
-        if candidates.empty? && !tag_text.strip.empty? && tag_text.strip != long_name
-          candidates = candidates_for(tag_text.strip)
-        end
-        if candidates.size == 1
-          bind!(exist_id, candidates.first[:id])
-          ann = format_annotation(candidates.first, confirmed: true)
-          ann ? (tag_only + ann + trailing) : whole_match
-        else
-          whole_match
-        end
+        # inventory (or a manifest of it). Skips other players' items that
+        # share a name with a tagged item (e.g. Folwer's backpack).
+        next whole_match unless manifest || player_item?(exist_id)
+
+        location = if manifest
+                     :manifest
+                   else
+                     entry = carried_entries.find { |o, _| o.id.to_s == exist_id.to_s }
+                     entry ? entry[1] : 'carried'
+                   end
+        kind, result = resolve(exist_id, tag_text.strip, long_name, context, location: location, stacked: stacked)
+        ann = case kind
+              when :bind
+                bind!(exist_id, result[:id], where: manifest ? @manifest_where : nil)
+                format_annotation(result, confirmed: true)
+              when :maybe
+                format_annotation(result, confirmed: false)
+              when :ambiguous
+                format_ambiguous(result)
+              end
+        ann ? (tag_only + ann + trailing) : whole_match
       end
     end
-  rescue StandardError => e
-    say "annotator error: #{e.class}: #{e.message}"
-    line
   end
 
   ## ---- container tracker downstream hook ------------------------------------
@@ -495,46 +933,369 @@ module ISharpie
   end
 
   def self.handle_container_line(line)
-    return unless line.include?('You put') || line.include?('You remove')
+    refresh_contents_fingerprints(line)
+    moved = line.include?('You put') || line.include?('You remove')
+    # put/remove lines carry a container refresh too, but that's the item
+    # moving, not the player browsing - only a plain listing counts.
+    process_container_browse(line) unless moved
+    return unless moved
 
     if (m = PUT_RX.match(line))
       item = extract_tagged(m[1])
       return unless item
 
-      handle_deposit(item[:exist_id], item[:long_name], extract_container_name(m[2]))
+      handle_deposit(item[:exist_id], extract_container_name(m[2]))
     elsif (m = REMOVE_RX.match(line))
       item = extract_tagged(m[1])
       return unless item
 
-      handle_withdrawal(item[:exist_id], item[:long_name], extract_container_name(m[2]))
+      source = extract_tagged(m[2])
+      handle_withdrawal(item, extract_container_name(m[2]), source && source[:exist_id], context_ids(line))
     end
   rescue StandardError => e
     say "container tracker error: #{e.class}: #{e.message}"
   end
 
-  def self.handle_deposit(exist_id, long_name, container)
-    candidates = exist_bound?(exist_id) ? [bound_note_for(exist_id)].compact : candidates_for(long_name)
-    return unless candidates.size == 1
+  # Keeps a tagged container's contents fingerprint current: whenever the
+  # server sends a full refresh of a bound container's contents, store it.
+  def self.refresh_contents_fingerprints(line)
+    return unless line.include?('clearContainer')
 
-    update_note(candidates.first[:id], container: container)
+    line.scan(CLEAR_CONTAINER_RX).flatten.uniq.each do |cid|
+      note = bound_note_for(cid)
+      next unless note
+
+      names = line.scan(INV_LIST_RX).select { |c, _e, _t| c == cid }.map { |_c, _e, t| t.strip.downcase }.sort
+      next if note[:contents_fp] == names
+
+      note[:contents_fp] = names
+      @dirty = true
+    end
   end
 
-  def self.handle_withdrawal(exist_id, long_name, container)
-    if exist_bound?(exist_id)
-      note = bound_note_for(exist_id)
-      update_note(note[:id], container: 'carried') if note
+  # A container the player just looked in: everything listed is a sighting,
+  # and a stale note last known in this container that isn't listed goes
+  # into culling.
+  def self.process_container_browse(line)
+    return unless line.include?('clearContainer')
+
+    line.scan(CLEAR_CONTAINER_RX).flatten.uniq.each do |cid|
+      header = line.match(/<inv id='#{Regexp.escape(cid)}'>In the <a exist="\d+" noun="[^"]*">([^<]*)<\/a>:/)
+      next unless header
+
+      cname  = normalize_container_name(header[1])
+      listed = line.scan(INV_LIST_RX).select { |c, _e, _t, _r| c == cid }
+      seen   = Set.new
+      listed.each do |_c, _e, tag, trailing|
+        long = "#{tag}#{sanitize_trailing(trailing)}".strip
+        name_candidates(long, tag.strip).each { |n| seen << n[:id] }
+      end
+      seen.each { |id| mark_seen(id, cname) }
+      notes.each do |n|
+        next unless n[:status] == 'stale' && !seen.include?(n[:id])
+
+        enter_culling(n) if container_name_match?(where_for(n), cname)
+      end
+    end
+  rescue StandardError => e
+    say "container browse error: #{e.class}: #{e.message}"
+  end
+
+  # Only a bound item updates its note's container - an unidentified
+  # identical copy being put away must not overwrite where the tagged one is.
+  def self.handle_deposit(exist_id, container)
+    note = bound_note_for(exist_id)
+    return unless note
+
+    update_note(note[:id], container: container)
+    mark_seen(note[:id], container)
+  end
+
+  def self.handle_withdrawal(item, container, container_id, context)
+    exist_id = item[:exist_id]
+    if (note = bound_note_for(exist_id))
+      update_note(note[:id], container: 'carried')
+      mark_seen(note[:id], 'carried')
       return
     end
 
-    candidates = candidates_for(long_name, container)
-    return if candidates.empty?
+    kind, result = resolve(exist_id, item[:tag_text], item[:long_name], context,
+                           location: container, container_id: container_id)
+    case kind
+    when :bind
+      bind!(exist_id, result[:id], where: 'carried')
+      update_note(result[:id], container: 'carried')
+    when :twin
+      CONFIRM_QUEUE.push({ notice: "#{item[:long_name]} is identical to your tagged \"#{label_for(result)}\" " \
+                                   "(already identified) - this one is untagged" })
+    when :maybe
+      CONFIRM_QUEUE.push({ exist_id: exist_id, name: item[:long_name], candidates: [result], ambiguous: false })
+    when :ambiguous
+      # Container evidence: the note was last put into exactly this
+      # container, and no identical copy is left in it.
+      in_container = result.select { |n| n[:container] == container }
+      same_container_twins = Set.new(context.select { |tag, _| same_item_name?(tag, item[:tag_text]) }.values.flat_map(&:to_a))
+      Array(GameObj.containers[container_id.to_s]).each do |o|
+        same_container_twins << o.id.to_s if same_item_name?(o.name, item[:tag_text])
+      end if container_id
+      same_container_twins.delete(exist_id)
+      if in_container.size == 1 && same_container_twins.empty? && !ON_PERSON.include?(container)
+        bind!(exist_id, in_container.first[:id], where: 'carried')
+        update_note(in_container.first[:id], container: 'carried')
+        CONFIRM_QUEUE.push({ notice: "matched #{item[:long_name]} to \"#{label_for(in_container.first)}\" by its container" })
+        return
+      end
 
-    if candidates.size == 1
-      bind!(exist_id, candidates.first[:id])
-      update_note(candidates.first[:id], container: 'carried')
-    else
-      CONFIRM_QUEUE.push({ exist_id: exist_id, candidates: candidates })
+      # Contents evidence, if this item's contents are already known.
+      known = known_contents(exist_id)
+      by_contents = result.select { |n| contents_match?(n[:contents_fp], known) }
+      if by_contents.size == 1
+        bind!(exist_id, by_contents.first[:id], where: 'carried')
+        update_note(by_contents.first[:id], container: 'carried')
+        CONFIRM_QUEUE.push({ notice: "matched #{item[:long_name]} to \"#{label_for(by_contents.first)}\" by its contents" })
+        return
+      end
+
+      CONFIRM_QUEUE.push({ exist_id: exist_id, name: item[:long_name], candidates: result, ambiguous: true })
     end
+  end
+
+  ## ---- fingerprints ------------------------------------------------------------
+
+  def self.known_contents(exist_id)
+    known = GameObj.containers[exist_id.to_s]
+    known&.map { |o| o.name.to_s.strip.downcase }&.sort
+  end
+
+  # Contents drift as items come and go, so this is an overlap test rather
+  # than equality. Two empty containers prove nothing either way.
+  def self.contents_match?(stored, found)
+    return false if stored.nil? || found.nil? || (stored.empty? && found.empty?)
+
+    pool = found.dup
+    overlap = stored.count { |name| (i = pool.index(name)) && pool.delete_at(i) }
+    overlap.to_f / [stored.size, found.size].max >= CONTENTS_MATCH_RATIO
+  end
+
+  # Isolating a command's response from everything else the game is printing
+  # (the approach merchantical settled on, because a bare <prompt/> proves
+  # nothing - the game emits them for roundtime ticks and the like):
+  #   * right after the command, send SENTINEL_CMD - "look at #0", which can
+  #     never succeed. The game answers a character's commands in order, so
+  #     seeing its failure line proves the real response already arrived.
+  #   * lines inside <pushStream>..<popStream> (exp, thoughts, vitals windows)
+  #     are not part of a command response.
+  #   * chat (LNet) and ambient broadcast lines are filtered out by shape.
+  # If the command itself fails the same way, the first failure line is its
+  # own response and we wait for the sentinel's.
+  #
+  # isolate: use the sentinel capture (capped at 4s) instead of a fixed pause.
+  # hide: the response never reaches the player's screen and nothing is
+  # echoed; only lines belonging to the response are hidden, never anything
+  # else that happens to arrive meanwhile. Requires isolate.
+  SENTINEL_CMD = 'look at #0'.freeze
+  SENTINEL_RX  = /could not find what you were referring to/i.freeze
+  LNET_LINE_RX      = /\A\[[A-Za-z][\w' -]*\]\s+[A-Za-z][\w' -]*:\s*"/.freeze
+  BROADCAST_LINE_RX = /\A\*\s*[A-Za-z].*[.!]\s*\z/.freeze
+
+  def self.capture_command(cmd, wait = 0.8, isolate: false, hide: false)
+    hide &&= isolate
+    captured = []
+    done = false
+    first_miss = false
+    in_push = false
+    DownstreamHook.add(RECALL_CAPTURE_HOOK_ID, proc { |line|
+      if !isolate
+        captured << line
+        next line
+      end
+      next line if done
+
+      was_in_push = in_push
+      in_push = true  if line =~ /<pushStream/
+      in_push = false if line =~ /<popStream/
+      stripped = line.gsub(/<[^>]*>/, '').gsub('&gt;', '').strip
+      if was_in_push || line =~ /<pushStream/ || line =~ /<prompt[\s>]/ || stripped.empty? ||
+         stripped =~ LNET_LINE_RX || stripped =~ BROADCAST_LINE_RX
+        next line
+      end
+
+      if stripped =~ SENTINEL_RX
+        if captured.empty? && !first_miss
+          # The command's own failure, not the sentinel's.
+          first_miss = true
+          captured << line
+          next(hide ? nil : line)
+        end
+        done = true
+        next nil # the sentinel's own line is never shown
+      end
+
+      captured << line
+      hide ? nil : line
+    })
+    previous_silent = Script.current.silent
+    begin
+      Script.current.silent = true if hide
+      fput cmd
+      if isolate
+        Script.current.silent = true # the sentinel is never echoed either
+        fput SENTINEL_CMD
+        started = Time.now
+        pause 0.05 until done || Time.now - started > 4
+        waitrt?
+        pause 0.1
+      else
+        waitrt?
+        pause wait
+      end
+    ensure
+      Script.current.silent = previous_silent
+      DownstreamHook.remove(RECALL_CAPTURE_HOOK_ID)
+    end
+    captured.join("\n")
+  end
+
+  # Sorted, downcased tag texts inside a container; [] when empty, nil when
+  # it can't be looked in.
+  def self.look_in_contents(exist_id, hide: false)
+    text  = capture_command("look in ##{exist_id}", isolate: true, hide: hide)
+    names = text.scan(INV_LIST_RX).select { |c, _e, _t, _r| c == exist_id.to_s }.map { |_c, _e, t, _r| t.strip.downcase }
+    return names.sort unless names.empty?
+    return [] if text =~ /There is nothing in/i
+
+    known_contents(exist_id)
+  end
+
+  def self.container_item?(item)
+    item.type.to_s.include?('container') || !known_contents(item.id).nil?
+  end
+
+  ## ---- full fingerprints ---------------------------------------------------------
+  # "Kitchen sink": look, recall, analyze and examine are each run against the
+  # item's exist id, plus look in for containers. Recall is often identical or
+  # useless, so no single field is trusted - items match only when every field
+  # they can both be read for agrees. Texts are stored as short digests.
+
+  RECALL_INFORMATIVE_RX = /\+\d|\bCER:|Script:|Imbed:|ENH:|Spiked|\b[SE]\d/.freeze
+  FINGERPRINT_REFUSAL_RX = /\b(?:unable|can't|cannot|couldn't|could not|don't know|nothing to|what were you)\b/i.freeze
+  FINGERPRINT_NOISE_RX = /Also here:|just (?:arrived|went|came|left)|^\s*\*|^\s*\[|Roundtime|^\s*(?:Health|Mana|Spirit|Stamina):/i.freeze
+
+  def self.normalize_fp_text(plain)
+    plain.to_s.gsub(/&gt;|&lt;|&amp;|&quot;/, ' ')
+         .each_line.reject { |l| l =~ FINGERPRINT_NOISE_RX }.join(' ')
+         .gsub(/\s+/, ' ').strip.downcase
+  end
+
+  # One verb's digest, or nil when the game gave nothing usable.
+  def self.fingerprint_field(key, exist_id, hide: false)
+    plain = capture_command(format(FINGERPRINT_VERBS.fetch(key), exist_id), isolate: true, hide: hide).gsub(/<[^>]+>/, ' ')
+    text =
+      if key == :recall
+        summary = summarize_recall(plain).to_s
+        summary =~ RECALL_INFORMATIVE_RX ? summary : ''
+      else
+        normalize_fp_text(plain)
+      end
+    return nil if text.empty?
+    return nil if key != :recall && (text.length < FINGERPRINT_MIN_TEXT || (text.length < 90 && text =~ FINGERPRINT_REFUSAL_RX))
+
+    Digest::MD5.hexdigest(text)[0, 12]
+  end
+
+  # => { fp: { look: 'ab12..', ... }, contents: [names] | nil }
+  def self.fingerprint_item(exist_id, container: false, hide: false)
+    fp = {}
+    FINGERPRINT_VERBS.each_key do |key|
+      digest = fingerprint_field(key, exist_id, hide: hide)
+      fp[key] = digest if digest
+    end
+    { fp: fp, contents: container ? look_in_contents(exist_id, hide: hide) : nil }
+  rescue StandardError => e
+    say "fingerprint warning: #{e.message}" unless hide
+    { fp: {}, contents: nil }
+  end
+
+  # :same | :different | :unknown for a stored note fingerprint vs a fresh one.
+  # Returns [verdict, [fields that differ]].
+  def self.compare_fingerprint(stored_fp, stored_contents, found)
+    stored_fp ||= {}
+    shared = FINGERPRINT_VERBS.keys.select { |k| stored_fp[k] && found[:fp][k] }
+    differ = shared.reject { |k| stored_fp[k] == found[:fp][k] }
+    return [:different, differ] unless differ.empty?
+
+    informative = shared.size
+    if stored_contents && found[:contents] && !(stored_contents.empty? && found[:contents].empty?)
+      if contents_match?(stored_contents, found[:contents])
+        informative += 1
+      elsif informative.zero?
+        # Contents alone drift as things are added and removed - not proof.
+        return [:unknown, ['contents']]
+      end
+    end
+    [informative >= FINGERPRINT_MIN_SHARED ? :same : :unknown, []]
+  end
+
+  def self.store_fingerprint(note_id, result)
+    changes = { fp_at: Time.now.to_i }
+    changes[:fp] = result[:fp] unless result[:fp].empty?
+    changes[:contents_fp] = result[:contents] if result[:contents]
+    update_note(note_id, **changes)
+  end
+
+  # Fingerprints the held item for its note, then every identical copy on
+  # the character: copies that match on every field are indistinguishable,
+  # so the note is marked :interchangeable and any of them may carry it.
+  def self.fingerprint_for_note(item, note_id, hide: true)
+    result = fingerprint_item(item.id, container: container_item?(item), hide: hide)
+    store_fingerprint(note_id, result)
+
+    twins = twin_ids(item.id, item.name, nil, carried_entries)
+    return result if twins.empty?
+
+    verdicts = twins.map do |tid|
+      twin = carried_entries.find { |o, _| o.id.to_s == tid }&.first
+      compare_fingerprint(result[:fp], result[:contents],
+                          fingerprint_item(tid, container: twin && container_item?(twin), hide: hide))
+    end
+    # Nothing is announced: identical copies that prove interchangeable show
+    # "(note - identical copy)", the rest show the Multiple Identical marker.
+    update_note(note_id, interchangeable: verdicts.all? { |v, _| v == :same })
+    result
+  end
+
+  ## ---- automatic fingerprinting ------------------------------------------------
+  # Fingerprints are only worth having when identical items exist, so they are
+  # taken then and only then - silently, with nothing for the player to run.
+  # At tag time that is immediate (see tag_item). A duplicate that turns up
+  # later (a second copy bought or crafted after tagging) is rare, so it is
+  # checked once per login rather than watched for: one pass, started by the
+  # main loop as soon as it is safe, then never again until the next login.
+
+  FINGERPRINT_RETRY_SECONDS = 20
+
+  def self.auto_fingerprint_scan
+    return if @fp_scan_done
+    return if @pending_confirmation || @sweeping || @manifest_buffer
+    return if Time.now.to_f - @last_fp_scan.to_f < FINGERPRINT_RETRY_SECONDS
+
+    @last_fp_scan = Time.now.to_f
+    # Never put extra commands (and roundtime) in the way of a fight; the
+    # pass simply waits until the room is quiet.
+    return if defined?(GameObj.targets) && GameObj.targets.to_a.any?
+
+    @fp_scan_done = true
+    entries = carried_entries
+    entries.each do |item, _|
+      note = bound_note_for(item.id.to_s)
+      next if note.nil? || note[:fp] || note[:fp_tried_day] == @played_days
+      next if twin_ids(item.id, item.name, nil, entries).empty?
+
+      update_note(note[:id], fp_tried_day: @played_days)
+      fingerprint_for_note(item, note[:id])
+    end
+  rescue StandardError => e
+    say "fingerprint scan warning: #{e.message}"
   end
 
   ## ---- confirmation flow ----------------------------------------------------
@@ -547,27 +1308,99 @@ module ISharpie
   def self.drain_confirm_queue
     until CONFIRM_QUEUE.empty?
       req = CONFIRM_QUEUE.pop
-      start_confirmation(req[:exist_id], req[:candidates])
+      if req[:notice]
+        say req[:notice]
+      else
+        start_confirmation(req)
+      end
     end
   end
 
-  def self.start_confirmation(exist_id, candidates)
+  def self.start_confirmation(req)
     say "dropping an earlier unanswered confirmation to ask about a new one" if @pending_confirmation
 
-    @pending_confirmation = { exist_id: exist_id, candidates: candidates, index: 0 }
+    @pending_confirmation = req.merge(index: 0)
     ask_current_candidate
   end
 
   def self.ask_current_candidate
-    return unless @pending_confirmation
+    pc = @pending_confirmation
+    return unless pc
 
-    candidate = @pending_confirmation[:candidates][@pending_confirmation[:index]]
+    candidate = pc[:candidates][pc[:index]]
     unless candidate
+      say "no more candidates - #{pc[:name] || 'that item'} stays untagged"
       @pending_confirmation = nil
       return
     end
 
-    say "is this the one noted \"#{candidate[:note]}\"? (;isharpie yes / ;isharpie no)"
+    if pc[:ambiguous]
+      say "you picked up #{pc[:name]} - you own identical ones and at least one is tagged \"#{label_for(candidate)}\""
+    else
+      where = candidate[:container].to_s
+      say "is this the one noted \"#{label_for(candidate)}\"?#{where.empty? ? '' : " (last tracked in: #{where})"}"
+    end
+    say 'run ;isharpie verify to check it against the tagged item (look, recall, analyze, examine, look in)'
+    say 'then ;isharpie yes (this is the tagged one) / ;isharpie no  -  or verify <recall|look|analyze|examine|contents> for one check'
+  end
+
+  # Fingerprints the pending item and compares it with what was stored when
+  # the candidate was tagged. A clear match confirms automatically; a clear
+  # mismatch is reported (answer ;isharpie no to move on).
+  def self.verify_pending(kind = 'all')
+    pc = @pending_confirmation
+    return say('nothing to verify - no confirmation is pending') unless pc
+
+    candidate = pc[:candidates][pc[:index]]
+    kind = kind.to_s.downcase
+    kind = 'contents' if kind == 'in'
+
+    case kind
+    when '', 'all'
+      held = carried_entries.find { |o, _| o.id.to_s == pc[:exist_id].to_s }&.first
+      container = !candidate[:contents_fp].nil? || (held && container_item?(held))
+      say 'fingerprinting...'
+      found = fingerprint_item(pc[:exist_id], container: container)
+      verdict, differ = compare_fingerprint(candidate[:fp], candidate[:contents_fp], found)
+      case verdict
+      when :same
+        say "matches the tagged item (#{found[:fp].keys.join(', ')}#{found[:contents] ? ', contents' : ''})"
+        answer_confirmation(true)
+      when :different
+        say "does NOT match the tagged item - differs on: #{differ.join(', ')} - answer ;isharpie no"
+      else
+        say "not enough stored detail to be sure#{differ.empty? ? '' : " (#{differ.join(', ')} differs)"} - decide by hand"
+      end
+    when 'recall', 'look', 'analyze', 'examine'
+      key = kind.to_sym
+      digest = fingerprint_field(key, pc[:exist_id])
+      stored = candidate[:fp] && candidate[:fp][key]
+      if digest.nil?
+        say "#{kind}: nothing usable from the game for this item"
+      elsif stored.nil?
+        say "#{kind}: nothing stored to compare (note: \"#{label_for(candidate)}\")"
+      elsif digest == stored
+        say "#{kind} matches the tagged item"
+        answer_confirmation(true)
+      else
+        say "#{kind} differs from the tagged item"
+      end
+    when 'contents'
+      found  = look_in_contents(pc[:exist_id])
+      stored = candidate[:contents_fp]
+      if found.nil?
+        say "couldn't see inside it"
+      elsif stored.nil?
+        say "it holds #{found.size} item(s) - no stored contents to compare (note: \"#{label_for(candidate)}\")"
+      elsif contents_match?(stored, found)
+        say 'contents match the tagged item'
+        answer_confirmation(true)
+      else
+        say "contents differ - tagged item held #{stored.size} item(s), this one holds #{found.size}"
+      end
+    else
+      say 'usage: verify [recall | look | analyze | examine | contents]'
+    end
   end
 
   def self.answer_confirmation(yes)
@@ -624,10 +1457,26 @@ module ISharpie
       show_colors
     when /^list$/i
       list_notes
+    when /^list\s+cull$/i
+      list_cull
+    when /^save\s+(.+)$/i
+      cull_save($1, true)
+    when /^unsave\s+(.+)$/i
+      cull_save($1, false)
+    when /^perm\s+(\S+)(?:\s+(off))?$/i
+      set_perm($1, $2.nil?)
+    when /^cull$/i
+      cull_preview
+    when /^cull\s+confirm$/i
+      cull_confirm
     when /^(?:yes|y)$/i
       answer_confirmation(true)
     when /^(?:no|n)$/i
       answer_confirmation(false)
+    when /^verify(?:\s+(\w+))?$/i
+      verify_pending($1 || 'all')
+    when /^why(?:\s+(\S+))?$/i
+      explain($1)
     when /^tag\s+(.+)$/i
       handle_tag_command($1)
     when /^(?:recall|r)\s+(.+)$/i
@@ -651,24 +1500,54 @@ module ISharpie
     say "command error: #{e.class}: #{e.message}"
   end
 
-  def self.handle_tag_command(body)
+  TAG_USAGE = 'usage: tag <noun> ["<note>"] [SN "<silent note>"] [<color> | color <name>] [perm]  (options in any order)'.freeze
+
+  # Quoted text is pulled out first (SN "..." is the silent note, the other
+  # quoted text is the visible note) so words inside a note are never mistaken
+  # for options. What remains are bare options in any order: a color name
+  # (or "color <name>"), and "perm".
+  def self.parse_tag_args(body)
     noun = body[/\A([^\s"]+)/, 1]
-    unless noun
-      say 'usage: tag <noun> ["<note>"] [SN "<silent note>"] [color <name>]'
+    return nil unless noun
+
+    rest   = body.sub(/\A[^\s"]+\s*/, '')
+    silent = rest[/\bSN\s+"([^"]+)"/i, 1]
+    rest   = rest.sub(/\bSN\s+"[^"]+"/i, ' ')
+    note   = rest[/"([^"]+)"/, 1]
+    rest   = rest.gsub(/"[^"]*"/, ' ')
+
+    color = nil
+    perm  = false
+    unknown = []
+    words = rest.split
+    until words.empty?
+      word = words.shift
+      if word.casecmp?('perm') || word.casecmp?('permanent')
+        perm = true
+      elsif word.casecmp?('color')
+        color = words.shift
+        unknown << 'color (needs a name)' unless color
+      elsif VALID_COLORS.include?(word.downcase)
+        color = word
+      else
+        unknown << word
+      end
+    end
+
+    { noun: noun, note: note, silent: silent, color: color, perm: perm, unknown: unknown }
+  end
+
+  def self.handle_tag_command(body)
+    args = parse_tag_args(body)
+    return say(TAG_USAGE) unless args
+    return say(TAG_USAGE) if args[:note].nil? && args[:silent].nil?
+
+    unless args[:unknown].empty?
+      say "unrecognized option(s): #{args[:unknown].join(', ')} - valid colors: #{VALID_COLORS.join(', ')}; or perm"
       return
     end
-    rest      = body.sub(/\A[^\s"]+\s*/, '')
-    color     = rest[/\bcolor\s+(\w+)\b/i, 1]
-    silent    = rest[/\bSN\s+"([^"]+)"/i, 1]
-    cleaned   = rest.gsub(/\bcolor\s+\w+\b/i, '').gsub(/\bSN\s+"[^"]+"/i, '').strip
-    note_text = cleaned[/"([^"]+)"/, 1]
 
-    if note_text.nil? && silent.nil?
-      say 'usage: tag <noun> ["<note>"] [SN "<silent note>"] [color <name>]'
-      return
-    end
-
-    tag_held_item(noun, note_text, color, silent)
+    tag_held_item(args[:noun], args[:note], args[:color], args[:silent], perm: args[:perm])
   end
 
   def self.handle_recall_command(body)
@@ -689,7 +1568,7 @@ module ISharpie
     end
 
     note_text, silent_note = recall_note_parts(summary)
-    tag_item(item, note_text, nil, silent_note)
+    tag_item(item, note_text, nil, silent_note, recall_fp: summary)
   end
 
   # Captures via a temporary DownstreamHook rather than reget - reget scrapes
@@ -703,16 +1582,7 @@ module ISharpie
   # inner text) instead.
   def self.fetch_recall_text(noun)
     target = noun.to_s.strip.empty? ? 'item' : noun.to_s.strip
-    captured = []
-    DownstreamHook.add(RECALL_CAPTURE_HOOK_ID, proc { |line| captured << line; line })
-    begin
-      fput "recall #{target}"
-      waitrt?
-      pause 0.8
-    ensure
-      DownstreamHook.remove(RECALL_CAPTURE_HOOK_ID)
-    end
-    captured.join("\n").gsub(/<[^>]+>/, '')
+    capture_command("recall #{target}").gsub(/<[^>]+>/, '')
   end
 
   def self.recall_note_parts(summary)
@@ -968,10 +1838,28 @@ module ISharpie
     name.to_s.strip.downcase
   end
 
-  def self.tag_item(item, note_text, color_name, silent_note = nil)
+  # Hand slots report a shortened name ("sack" for "large sack", "iron rapier"
+  # for "slender iron rapier"). A short stored name matches more items than
+  # it should, so look up the full name from a glance, which renders hands
+  # with their complete tagged names.
+  def self.full_name_for(item)
+    base = long_name_for(item)
+    text = capture_command('glance', 0.5)
+    text.scan(ITEM_TAG_RX) do |exist_id, _noun, tag_text, trailing|
+      next unless exist_id == item.id.to_s
+
+      full = "#{tag_text}#{sanitize_trailing(trailing)}".strip
+      return full unless full.empty?
+    end
+    base
+  rescue StandardError
+    base
+  end
+
+  def self.tag_item(item, note_text, color_name, silent_note = nil, recall_fp: nil, perm: false)
     return unless item
 
-    long_name = long_name_for(item)
+    long_name = full_name_for(item)
     existing  = bound_note_for(item.id)
     color     = color_name ? normalize_color(color_name) : (existing && existing[:color]) || 'none'
 
@@ -980,34 +1868,360 @@ module ISharpie
       return
     end
 
-    label = [note_text && "\"#{note_text.strip}\"",
-             silent_note && "SN: \"#{silent_note.strip}\""].compact.join(' ')
+    label = [("\"#{note_text.strip}\"" if note_text),
+             ("SN: \"#{silent_note.strip}\"" if silent_note),
+             ('[perm]' if perm)].compact.join(' ')
 
     if existing
       changes = { color: color }
       changes[:note]        = note_text.strip   if note_text
       changes[:silent_note] = silent_note.strip if silent_note
+      changes[:recall_fp]   = recall_fp         if recall_fp && !recall_fp.empty?
+      changes[:perm]        = true              if perm
       update_note(existing[:id], **changes)
-      @last_touched_note_id = existing[:id]
+      mark_seen(existing[:id], 'carried')
+      note_id = existing[:id]
+      @last_touched_note_id = note_id
       say "updated #{long_name}: #{label}"
     else
       record = add_note(long_name: long_name, container: 'carried',
                         note: note_text&.strip, color: color,
                         silent_note: silent_note&.strip)
-      bind!(item.id, record[:id])
-      @last_touched_note_id = record[:id]
+      extras = { seen_day: @played_days }
+      extras[:recall_fp] = recall_fp if recall_fp && !recall_fp.empty?
+      extras[:perm]      = true if perm
+      update_note(record[:id], **extras)
+      bind!(item.id, record[:id], where: 'carried')
+      note_id = record[:id]
+      @last_touched_note_id = note_id
       say "tagged #{long_name}: #{label}"
+    end
+
+    # Only when identical items are on you is a fingerprint worth taking -
+    # silently; auto_fingerprint_scan picks up a duplicate that arrives later.
+    unless twin_ids(item.id, item.name, nil, carried_entries).empty?
+      update_note(note_id, fp_tried_day: @played_days)
+      fingerprint_for_note(item, note_id)
     end
   end
 
-  def self.tag_held_item(noun, note_text, color_name, silent_note = nil)
+  # Diagnostics: how the item in hand is (or isn't) being matched.
+  def self.explain(noun)
+    item = held_item(noun)
+    return say("you're not holding #{noun ? "a #{noun}" : 'anything'}") unless item
+
+    long  = long_name_for(item)
+    note  = bound_note_for(item.id)
+    cands = name_candidates(long, item.name.to_s)
+    twins = twin_ids(item.id, item.name, nil, carried_entries)
+    say "#{long} (id #{item.id})"
+    say(note ? "identified as #{note[:id]} \"#{label_for(note)}\"" : 'not identified as a tagged item this session')
+    if cands.empty?
+      say 'no note matches this name'
+    else
+      cands.each do |c|
+        fps = (c[:fp] || {}).keys.map(&:to_s)
+        fps << "contents(#{c[:contents_fp].size})" if c[:contents_fp]
+        flags = []
+        flags << 'identical copies share it' if c[:interchangeable]
+        flags << 'perm' if perm?(c)
+        flags << c[:status] if c[:status]
+        say "  name match #{c[:id]}: #{c[:long_name]} - last seen #{where_for(c).empty? ? '?' : where_for(c)}, " \
+            "fingerprints: #{fps.empty? ? 'none' : fps.join(', ')}#{flags.empty? ? '' : " [#{flags.join(', ')}]"}"
+      end
+    end
+    say "identical items on you: #{twins.size}"
+  end
+
+  ## ---- culling -------------------------------------------------------------------
+  # Tagged items get sold or lost without their notes being deleted. A note
+  # unseen for STALE_PLAYED_DAYS days played goes stale; once its last-known
+  # location is browsed without it, it is culling. The player reviews the
+  # culling list with ;isharpie list cull.
+
+  # After the startup preload: stale notes last known on the character that
+  # aren't on the character any more are culling. Anything present is a
+  # sighting.
+  def self.evaluate_carried_stale
+    entries = carried_entries
+    present = Set.new
+    entries.each do |o, loc|
+      name_candidates(long_name_for(o), o.name.to_s).each do |c|
+        present << c[:id]
+        mark_seen(c[:id], loc)
+      end
+    end
+    person = on_person_names(entries)
+    notes.each do |n|
+      next unless n[:status] == 'stale' && !present.include?(n[:id])
+
+      w = where_for(n)
+      on_person = ON_PERSON.include?(w) || person.any? { |pn| container_name_match?(w, pn) }
+      enter_culling(n) if on_person
+    end
+  rescue StandardError => e
+    say "stale check warning: #{e.message}"
+  end
+
+  # Reads invdb's database (read-only, nothing is printed or run) for items it
+  # has seen since this note was last seen - lockers, vaults, anywhere invdb
+  # scans. Returns the number of notes it found. Anything invdb has not seen
+  # recently simply isn't found; the database is only as fresh as its last run.
+  def self.invdb_check
+    return 0 unless File.exist?(INVDB_PATH)
+
+    targets = notes.select { |n| %w[stale culling].include?(n[:status]) && !perm?(n) }
+    return 0 if targets.empty?
+
+    begin
+      require 'sqlite3'
+    rescue LoadError
+      return 0
+    end
+
+    found = 0
+    db = SQLite3::Database.new(INVDB_PATH, readonly: true)
+    rows = db.execute(<<~SQL, [XMLData.name.to_s])
+      SELECT i.name, i.timestamp, COALESCE(l.name, '')
+      FROM item i
+      JOIN character c ON c.id = i.character_id
+      LEFT JOIN location l ON l.id = i.location_id
+      WHERE c.name = ? COLLATE NOCASE
+    SQL
+    rows.each do |name, ts, loc|
+      name_candidates(name.to_s, name.to_s).each do |n|
+        next unless targets.include?(n) && n[:status]
+        next unless ts.to_i > n[:last_seen].to_i
+
+        mark_seen(n[:id], loc.to_s.empty? ? nil : loc)
+        found += 1
+      end
+    end
+    found
+  rescue StandardError => e
+    say "invdb check skipped: #{e.class}"
+    0
+  ensure
+    db&.close
+  end
+
+  # Silently runs "locker manifest <town>" for every locker the character has,
+  # so culling candidates in lockers are cleared (or confirmed missing) before
+  # the list is shown. Nothing the sweep triggers reaches the screen.
+  def self.sweep_lockers
+    return if @sweeping
+
+    @sweeping = true
+    previous = Script.current.silent
+    Script.current.silent = true
+    errors = capture_command_quietly('locker manifest', /You must specify which locker/)
+    towns = errors.scan(/cmd='locker manifest ([^']+)'/).flatten.uniq
+    towns.each do |town|
+      before = @manifest_count
+      fput "locker manifest #{town}"
+      started = Time.now
+      pause 0.1 until @manifest_count > before || Time.now - started > 4
+      pause 0.1 until @manifest_buffer.nil? || Time.now - started > MANIFEST_TIMEOUT
+    end
+  rescue StandardError => e
+    say "locker sweep warning: #{e.message}"
+  ensure
+    Script.current.silent = previous
+    @sweeping = false
+  end
+
+  # Like capture_command, but drops lines matching +hide+ from what the player
+  # sees. Only that one narrow pattern is ever hidden.
+  def self.capture_command_quietly(cmd, hide)
+    captured = []
+    DownstreamHook.add(RECALL_CAPTURE_HOOK_ID, proc { |line|
+      captured << line
+      line =~ hide ? nil : line
+    })
+    begin
+      fput cmd
+      pause 0.6
+    ensure
+      DownstreamHook.remove(RECALL_CAPTURE_HOOK_ID)
+    end
+    captured.join("\n")
+  end
+
+  def self.announce_culling
+    count = culling_notes.size
+    return if count.zero?
+
+    _respond "<pushBold/>[ISharpie: #{count} tagged item#{count == 1 ? '' : 's'} can't be found (MIA). " \
+             "Use ;isharpie list cull to review #{count == 1 ? 'it' : 'them'}.]<popBold/>"
+  end
+
+  def self.list_cull
+    say 'checking lockers and invdb for your missing items...'
+    sweep_lockers
+    found = invdb_check
+    save_notes!
+    @cull_listed = true
+
+    list = culling_notes
+    if list.empty?
+      say 'nothing is missing - the culling list is empty'
+      return
+    end
+
+    say "#{found} item(s) were located and removed from the list" if found.positive?
+    saved = list.count { |n| n[:cull_saved] }
+    _respond ''
+    _respond "  Missing tagged items (#{list.size}):"
+    list.each do |n|
+      seen = n[:last_seen] ? Time.at(n[:last_seen]).strftime('%Y-%m-%d') : 'unknown'
+      where = where_for(n)
+      line = "  #{n[:cull_no]}) #{n[:long_name]} - \"#{label_for(n)}\" - last seen #{seen}#{where.empty? ? '' : " in #{where}"}" \
+             "#{n[:cull_saved] ? '  [saved]' : ''}"
+      _respond(n[:cull_saved] ? "<preset id='roomDesc'>#{line}</preset>" : line)
+    end
+    _respond ''
+    _respond '  These notes went unseen for 7 days played and were not in their last known location.'
+    _respond "  #{ISharpie.fmt(';isharpie save 2,5,8')}  keep the listed numbers - grey notes will not be culled"
+    _respond "  #{ISharpie.fmt(';isharpie unsave 2,5')}  un-grey them"
+    _respond "  #{ISharpie.fmt(';isharpie perm 3')}  never cull that note (also: ;isharpie perm n52, or perm <noun> in hand; add 'off' to undo)"
+    _respond "  #{ISharpie.fmt(';isharpie cull')}  preview, then #{ISharpie.fmt(';isharpie cull confirm')} to delete every non-grey note above"
+    _respond '  Saved notes leave this list and start the 7 day cycle again.'
+    _respond "  Tip: run ;invdb now and then - it lets isharpie find items in lockers and vaults on its own." if File.exist?(INVDB_PATH) == false || found.zero?
+    _respond ''
+    say "#{saved} of #{list.size} saved" if saved.positive?
+  end
+
+  def self.fmt(text)
+    Lich::Messaging.msg_format('whisper', text, encode: true)
+  end
+
+  # "2,5, 8" -> cull list entries by number
+  def self.cull_entries(token_text)
+    nums = token_text.to_s.scan(/\d+/).map(&:to_i)
+    return [] if nums.empty?
+
+    culling_notes.select { |n| nums.include?(n[:cull_no].to_i) }
+  end
+
+  def self.cull_save(token_text, saved)
+    entries = cull_entries(token_text)
+    return say('no culling-list entries match those numbers - see ;isharpie list cull') if entries.empty?
+
+    entries.each { |n| saved ? n[:cull_saved] = true : n.delete(:cull_saved) }
+    save_notes!
+    say "#{saved ? 'saved' : 'un-saved'}: #{entries.map { |n| n[:cull_no] }.join(', ')}"
+  end
+
+  # perm <cull#> | <note id> | <noun in hand> [off]
+  def self.set_perm(token, on)
+    note = nil
+    if token =~ /\An\d+\z/i
+      note = notes.find { |n| n[:id].casecmp?(token) }
+    elsif token =~ /\A\d+\z/
+      note = cull_entries(token).first
+    else
+      item = held_item(token)
+      note = item && (bound_note_for(item.id) || name_candidates(long_name_for(item), item.name.to_s).first)
+    end
+    return say("no note found for #{token.inspect} - use a cull number, a note id (n52), or an item in hand") unless note
+
+    if on
+      note[:perm] = true
+      mark_seen(note[:id])
+    else
+      note.delete(:perm)
+    end
+    save_notes!
+    say "#{note[:long_name]} \"#{label_for(note)}\" is #{on ? 'now permanent - it will never be culled' : 'no longer permanent'}"
+  end
+
+  def self.cull_preview
+    list = culling_notes
+    return say('the culling list is empty') if list.empty?
+
+    doomed = list.reject { |n| n[:cull_saved] }
+    kept   = list - doomed
+    unless @cull_listed
+      say 'review the list first with ;isharpie list cull'
+      return
+    end
+
+    say "#{doomed.size} note(s) will be deleted#{doomed.empty? ? '' : ': ' + doomed.map { |n| "#{n[:cull_no]}) #{n[:long_name]}" }.join(', ')}"
+    say "#{kept.size} saved note(s) will return to the 7 day cycle" unless kept.empty?
+    say 'run ;isharpie cull confirm to proceed' unless doomed.empty? && kept.empty?
+  end
+
+  def self.cull_confirm
+    unless @cull_listed
+      say 'review the list first with ;isharpie list cull'
+      return
+    end
+
+    list = culling_notes
+    return say('the culling list is empty') if list.empty?
+
+    doomed = list.reject { |n| n[:cull_saved] }
+    kept   = list - doomed
+    doomed.each { |n| remove_note(n[:id]) }
+    kept.each do |n|
+      n[:status] = nil
+      n[:seen_day] = @played_days
+      n.delete(:cull_no)
+      n.delete(:cull_saved)
+    end
+    @exist_bindings.delete_if { |_eid, nid| doomed.any? { |n| n[:id] == nid } }
+    save_notes!
+    say "culled #{doomed.size} note(s); #{kept.size} saved note(s) restarted the 7 day cycle - the list is now empty"
+  end
+
+  # After the startup container preload, re-identify tagged items on the
+  # character. Ids don't survive a login, so this uses the name, then the
+  # contents fingerprint, then the container each note was last tracked in -
+  # and binds only when exactly one item fits.
+  def self.restore_bindings
+    entries  = carried_entries
+    restored = 0
+    unsure   = 0
+    notes.each do |note|
+      next if @exist_bindings.value?(note[:id])
+
+      matches = entries.select do |o, _|
+        name_candidates(long_name_for(o), o.name.to_s).any? { |c| c[:id] == note[:id] }
+      end
+      next if matches.empty?
+
+      pick = nil
+      if matches.size > 1
+        by_contents = matches.select { |o, _| contents_match?(note[:contents_fp], known_contents(o.id)) }
+        pick = by_contents.first if by_contents.size == 1
+        unless pick
+          by_container = matches.select { |_, loc| loc == note[:container] }
+          pick = by_container.first if by_container.size == 1
+        end
+      elsif container_agrees?(note[:container], matches.first[1], on_person_names(entries))
+        pick = matches.first
+      end
+
+      if pick && !@exist_bindings.key?(pick[0].id.to_s)
+        bind!(pick[0].id, note[:id], where: 'carried')
+        restored += 1
+      elsif matches.size > 1
+        unsure += 1
+      end
+    end
+    say "re-identified #{restored} tagged item(s)#{unsure.positive? ? ", #{unsure} ambiguous (identical copies)" : ''}" if restored + unsure > 0
+  rescue StandardError => e
+    say "restore warning: #{e.message}"
+  end
+
+  def self.tag_held_item(noun, note_text, color_name, silent_note = nil, perm: false)
     item = held_item(noun)
     unless item
       say "you're not holding a #{noun}"
       return
     end
 
-    tag_item(item, note_text, color_name, silent_note)
+    tag_item(item, note_text, color_name, silent_note, perm: perm)
   end
 
   def self.set_color(color_name)
@@ -1093,8 +2307,14 @@ module ISharpie
       label_parts << Lich::Messaging.msg_format('teal', visible, encode: false) unless visible.empty?
       label_parts << "SN: #{silent}" unless silent.empty?
       label = label_parts.join(' | ')
-      
-      line = "#{n[:id]}: #{item_name} #{container} -> #{label} (#{n[:color]})"
+
+      flags = []
+      flags << 'perm' if perm?(n)
+      flags << 'identical copies' if n[:interchangeable]
+      flags << 'MIA' if n[:status] == 'culling'
+      flag_text = flags.empty? ? '' : " [#{flags.join(', ')}]"
+
+      line = "#{n[:id]}: #{item_name} #{container} -> #{label} (#{n[:color]})#{flag_text}"
       _respond line
     }
   end
@@ -1118,13 +2338,21 @@ module ISharpie
     _respond '  Track your weapon and armor CER services in a hidden note, viewed through the list function!'
     _respond '  List the enhancive benefits of your items right next to their name!'
     _respond ''
-    _respond b.call('  -- Usage --') + '  (hold item first. You can add tag, SN, and color all in one command)'
+    _respond b.call('  -- Usage --') + '  (hold item first. You can add tag, SN, color and perm all in one command)'
     _respond "  #{w.call(';isharpie tag <noun> "<note>"')}  tag item in hand"
+    _respond "  #{w.call(';isharpie tag <noun> "<note>" green perm')}  options go in any order: a color name (or color <name>) and/or perm"
+    _respond '       perm = this note is never flagged as missing (for items you rarely visit, like a player house)'
     _respond "  #{w.call(';isharpie tag <noun> SN "<note>"')}  silent note - shows in list only, no inline tag"
     _respond "  #{w.call(';isharpie recall <noun>')}  recall item and automatically add summary notes based off toggle logic below"
     _respond "  #{w.call(';isharpie color <name>')}  update color on last tagged"
     _respond "  #{w.call(';isharpie delete <noun>')}  remove note from item in hand (or ;isharpie d <noun>)"
     _respond "  #{w.call(';isharpie list')}  list all stored notes"
+    _respond "  #{w.call(';isharpie why <noun>')}  explain how the item in hand is being matched"
+    _respond ''
+    _respond b.call('  -- Identical Items --')
+    _respond "  When you own identical copies, each shows (#{AMBIGUOUS_TEXT}) until one is identified."
+    _respond '  Copies that match on every fingerprint are interchangeable and share the note (identical copy).'
+    _respond "  Picking up an unidentified copy asks you to check it: #{w.call(';isharpie verify')}, then #{w.call(';isharpie yes')} or #{w.call(';isharpie no')}"
     _respond ''
     _respond b.call('  -- Toggles --')
     _respond "  #{w.call(';isharpie set recall loud')}      - notes appear inline with item names (default)"
@@ -1144,7 +2372,7 @@ module ISharpie
     _respond ''
     _respond b.call('  -- Notes --')
     _respond '  item id resets each login, after locker storage, or scripted item mutations - matched automatically by name'
-    _respond '  Otherwise, confirmation prompt only fires when two tagged items share the same name'
+    _respond '  Otherwise, confirmation prompt only fires when identical items make the match uncertain'
     _respond '  If struggling with syntax, ensure note text is in quotes and include "color" when changing it'
     _respond ''
   end
@@ -1156,7 +2384,8 @@ module ISharpie
               else
                 "no confirmation pending"
               end
-    say "v#{VERSION} - #{notes.size} note(s) stored - #{pending}"
+    missing = culling_notes.size
+    say "v#{VERSION} - #{notes.size} note(s) stored - #{pending}#{missing.positive? ? " - #{missing} missing (;isharpie list cull)" : ''}"
   end
 
   ## ---- misc -------------------------------------------------------------------
@@ -1170,6 +2399,12 @@ module ISharpie
       begin
         drain_cmd_queue
         drain_confirm_queue
+        tick_played_day # also catches the script running across midnight
+        auto_fingerprint_scan
+        if @dirty
+          @dirty = false
+          save_notes!
+        end
       rescue StandardError => e
         say "error in main loop: #{e.class}: #{e.message}"
       end
@@ -1193,6 +2428,12 @@ before_dying do
   ISharpie.remove_upstream_hook
 end
 
+ISharpie.tick_played_day
 ISharpie.preload_containers
+ISharpie.restore_bindings
+ISharpie.evaluate_carried_stale
+ISharpie.invdb_check
+ISharpie.save_notes!
 respond("ISharpie is running!")
+ISharpie.announce_culling
 ISharpie.main_loop
