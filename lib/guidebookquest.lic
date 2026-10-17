@@ -17,9 +17,15 @@
   Author: Claude Code(Creator and Feature Additions), Codex(Bug Fixes and Review), RuseofFools (Very Little)
   Required: Lich >= 5.20.0
   Tags: eg, ebon gate, ebon, guidebook, guide, quest, evermore hollow
-  Version: 1.47.0
+  Version: 1.50.0
 
   Recently changed:
+    v1.50.0  (2026-10-17)
+      - Chapter 8 walks the Moorlyn ring to find the wandering ghoul and asks him by #id before searching piles.
+    v1.49.0  (2026-10-16)
+      - Quest items (glass, wine, bear items, monocle, relics, paper, lily, votive) are tracked and used by their #id instead of by name.
+    v1.48.0  (2026-10-16)
+      - Chapter 8 now WEIGHs each pile item as it's found, logs it, and places the exact 10 lb combination (trial and error only as a fallback).
     v1.47.0  (2026-10-11)
       - Fixed the quest-complete exit not firing reliably: confirmed
         live the script kept going past "You have completed Welcome to
@@ -166,13 +172,57 @@ MOORLYN_PILE_ITEM_POOL = [
   "crystal fishhook", "purple plate", "fractured cup"
 ].freeze
 
-# Confirmed live: this exact combination balances the scale ("It is
-# positioned perfectly on the 'BALANCED' indicator."). Not necessarily
-# the ONLY combination that works -- the pile pool is a random subset
-# each run, so this specific set of five won't always be available --
-# but when it is, placing exactly these skips both the rest of the pile
-# search and the backtracking search entirely.
-MOORLYN_SCALE_SOLUTION = ["red ewer", "dirty dice", "fractured file", "black flask", "mildewed knife"].freeze
+require 'yaml'
+require 'fileutils'
+
+# Chapter 8's scale wants exactly this many pounds on the right pan (the
+# quest's own spoiler text: "load it up with *exactly* 10 lbs").
+MOORLYN_SCALE_TARGET = 10
+
+# Every pile item pulled this chapter, persisted per character as
+# [{ "id", "name", "noun", "weight", "exact" }, ...] so an interrupted run
+# resumes with its weights intact. Tracked by GameObj id, never by name --
+# confirmed live the item names are random per character (Kighte got "red
+# ewer"/"dirty dice", Jymondow "mildewed cup"/"split ewer", Daenamaryllis
+# "chunky brooch"/"dirty fork"), so no fixed name list can recognize them.
+def guidebookquest_moorlyn_state_path
+  dir = File.join($data_dir.to_s, XMLData.game.to_s, Char.name.to_s)
+  FileUtils.mkdir_p(dir) unless Dir.exist?(dir)
+  File.join(dir, "guidebookquest_moorlyn.yaml")
+end
+
+def guidebookquest_load_moorlyn_items
+  path = guidebookquest_moorlyn_state_path
+  data = File.exist?(path) ? YAML.load_file(path) : []
+  Array(data).select { |item| item.is_a?(Hash) && item["id"] }
+rescue StandardError
+  []
+end
+
+def guidebookquest_save_moorlyn_items(items)
+  File.write(guidebookquest_moorlyn_state_path, items.to_yaml)
+rescue StandardError => e
+  echo "guidebookquest: couldn't save Moorlyn item weights (#{e.message})."
+end
+
+def guidebookquest_clear_moorlyn_items
+  path = guidebookquest_moorlyn_state_path
+  File.delete(path) if File.exist?(path)
+rescue StandardError
+  nil
+end
+
+# Appends every WEIGH result (raw game text included) to a per-character
+# log, so the exact wording and each item's weight are on record.
+def guidebookquest_log_weight(item, raw)
+  dir = File.join($data_dir.to_s, XMLData.game.to_s, Char.name.to_s)
+  File.open(File.join(dir, "guidebookquest_weights.log"), "a") do |f|
+    f.puts "#{Time.now.strftime('%Y-%m-%d %H:%M:%S')} | #{item['name']} | ##{item['id']} | #{item['weight'].inspect} lb | #{item['exact'] ? 'exact' : 'approx'} | #{raw.to_s.strip}"
+  end
+rescue StandardError
+  nil
+end
+
 
 CONTAINER_NOUN_REGEX = /pack|bag|pouch|case|sack|satchel|box|chest|coffer|robe|mandelion/i.freeze
 
@@ -227,260 +277,350 @@ end
 # confirmed live, just GETting one each produces its own disintegration
 # message ("Since there's no reason to hold onto the lever any longer, it
 # disintegrates into a fine dust."), no drop/stow needed afterward.
+# Tracked items are fetched by id; the name scan below is a fallback for
+# anything carried over from before items were tracked by id.
 def guidebookquest_discard_pile_items
-  items = guidebookquest_held_pile_items
-  return if items.empty?
+  tracked = guidebookquest_load_moorlyn_items
+  tracked.each do |item|
+    fput "get ##{item['id']}"
+    sleep 0.3
+  end
+  guidebookquest_clear_moorlyn_items
+  File.delete(guidebookquest_items_path) if File.exist?(guidebookquest_items_path)
 
+  items = guidebookquest_held_pile_items
   items.each do |item|
     fput "get #{item}"
     sleep 0.3
   end
-  echo "guidebookquest: discarded #{items.size} leftover Moorlyn pile item(s) now that the quest is complete."
+  total = tracked.size + items.size
+  echo "guidebookquest: discarded #{total} leftover Moorlyn pile item(s) now that the quest is complete." if total.positive?
 end
 
-# Chapter 8's scale puzzle: a fixed weight sits on the left pan and the
-# right pan needs some subset of the items pulled from Moorlyn's debris
-# piles to land exactly on "BALANCED". There's no numeric weight exposed,
-# only a qualitative pointer position/overshoot message -- and with up to
-# 16 known pile items (2^16 - 1 = 65,535 possible subsets), exhaustively
-# trying every combination isn't practical. Known wording (confirmed
-# live): "positioned to the left/right of the "BALANCED" indicator" and
-# "There is too much weight on the <pan> pan." -- treated as balanced
-# only when "BALANCED" appears WITHOUT either of those.
+# Chapter 8's scale puzzle: a large silver ingot sits on the left pan and
+# the right pan needs some subset of the items pulled from Moorlyn's debris
+# piles to land exactly on "BALANCED". Each item is WEIGHed the moment it
+# comes out of a pile, so the right subset can be worked out on paper
+# (guidebookquest_scale_solution) and placed in one go, instead of trying
+# combinations on the scale itself. Known wording (confirmed live):
+# "positioned to the left/right of the "BALANCED" indicator" and "There is
+# too much/not enough weight on the right pan." -- treated as balanced only
+# when "BALANCED" appears WITHOUT either of those.
 def guidebookquest_scale_balanced?(result)
   text = result.to_s
-  text =~ /BALANCED/i && text !~ /to the (?:left|right) of|too much weight/i
+  text =~ /BALANCED/i && text !~ /to the (?:left|right) of|too much weight|not enough weight/i
 end
 
-# The game's own removal phrasing -- confirmed live -- only parses with
-# the bare trailing noun ("get knife from scale"); the full two-word
-# descriptor in that same slot ("get mildewed knife from scale") gets
-# "Get what?" every time, even though that same full descriptor works
-# fine for GET-from-pack and PUT-on-scale. Only removal needs this.
-def guidebookquest_scale_removal_noun(item)
-  item.to_s.split.last
+# Pulls the pound figure out of a WEIGH response. Normal gear only ever
+# gives an estimate ("determine that the weight is about 99 pounds", "less
+# than 2 pounds" -- confirmed live), while eg_docent.lic expects these
+# quest items to say "exactly N pounds". Both are handled: only a bare
+# number or "exactly" counts as exact; anything else is kept, but flagged
+# approximate so the solver prefers exact weights when it has them.
+def guidebookquest_parse_weight(raw)
+  match = raw.to_s.match(/\b(exactly|about|roughly|approximately|around|less than|more than|over|under)?\s*(\d+)\s+pounds?\b/i)
+  return [nil, false] unless match
+
+  qualifier = match[1].to_s.downcase
+  weight = match[2].to_i
+  weight = [weight - 1, 1].max if qualifier == "less than" || qualifier == "under"
+  [weight, qualifier.empty? || qualifier == "exactly"]
 end
 
-# Tries MOORLYN_SCALE_SOLUTION directly when every item in it is
-# available, instead of running the backtracking search. Confirmed
-# live to balance once; if it doesn't this time (the pile pool differs
-# run to run, so this isn't guaranteed), the scale is cleared back out
-# before falling through to the real search.
-def guidebookquest_apply_known_solution(items)
-  return false unless MOORLYN_SCALE_SOLUTION.all? { |item| items.include?(item) }
+# Smallest-first subset sum over the item weights (all small positive
+# integers, so a reachable-sums table up to the target is instant).
+# Exact weights are tried on their own first; approximate ones only join in
+# if the exact ones can't reach the target alone.
+def guidebookquest_scale_solution(items, target = MOORLYN_SCALE_TARGET)
+  solve = lambda do |pool|
+    reachable = { 0 => [] }
+    pool.each do |item|
+      weight = item["weight"]
+      next unless weight.is_a?(Integer) && weight.positive?
 
-  MOORLYN_SCALE_SOLUTION.each do |item|
-    fput "get #{item}"
-    sleep 0.3
-    fput "put #{item} on scale"
-    sleep 0.3
+      reachable.to_a.each do |sum, subset|
+        new_sum = sum + weight
+        next if new_sum > target || reachable.key?(new_sum)
+
+        reachable[new_sum] = subset + [item]
+      end
+    end
+    reachable[target]
   end
 
-  result = dothistimeout "look on scale", 5, /BALANCED|pan\./i
-  if guidebookquest_scale_balanced?(result)
-    echo "guidebookquest: scale balanced with the known solution (#{MOORLYN_SCALE_SOLUTION.join(', ')})."
-    return true
-  end
-
-  echo "guidebookquest: known solution didn't balance this time -- clearing the scale and falling back to search."
-  MOORLYN_SCALE_SOLUTION.each do |item|
-    fput "get #{guidebookquest_scale_removal_noun(item)} from scale"
-    sleep 0.3
-    fput "stow right"
-    sleep 0.3
-  end
-  false
+  solve.call(items.select { |item| item["exact"] }) || solve.call(items)
 end
 
-# This is a real subset-sum search, not a one-shot greedy pass: items
-# are added depth-first, and every item's weight is positive (it's a
-# physical object), so once a branch overshoots into "too much weight"
-# no amount of ADDING more items to it can ever come back down --
-# that branch is pruned immediately (taken back off, not explored
-# further) without needing to finish building out the full subset
-# first. But unlike a pure greedy pass, failing to find a solution
-# with an item included still backtracks and retries WITHOUT it
-# (branch 2 below), rather than discarding it for good -- so a
-# solution that needs an earlier item skipped in favor of a later
-# one is still found. Worst case is still every subset (2^N), but the
-# overshoot prune cuts off most branches long before they're complete.
-def guidebookquest_balance_scale(items)
-  if items.empty?
-    echo "guidebookquest: no pile items were found to try on the scale."
-    return false
+def guidebookquest_describe_items(items)
+  items.map { |item| "#{item['name']} (#{item['weight'] || '?'} lb#{item['exact'] ? '' : ' approx'})" }.join(', ')
+end
+
+# Puts one tracked item on the scale by id. Returns the game's response,
+# which already says where the pointer landed.
+def guidebookquest_place_on_scale(item)
+  fput "get ##{item['id']}"
+  sleep 0.3
+  result = dothistimeout "put ##{item['id']} on scale", 5, /onto the right pan|What were you|could not find|can't/i
+  sleep 0.3
+  result
+end
+
+# Takes one tracked item back off the scale and stows it. By id first; the
+# bare trailing noun is the confirmed-live fallback ("get knife from scale"
+# works where the full descriptor "get mildewed knife from scale" doesn't).
+def guidebookquest_remove_from_scale(item)
+  result = dothistimeout "get ##{item['id']}", 3, /You lift|Get what|What were you|could not find|already/i
+  unless result =~ /You lift/i
+    fput "get #{item['noun'].to_s.empty? ? guidebookquest_scale_removal_noun(item['name']) : item['noun']} from scale"
   end
+  sleep 0.3
+  fput "stow ##{item['id']}"
+  sleep 0.3
+end
 
-  return true if guidebookquest_apply_known_solution(items)
+# The game's own removal phrasing only parses with the bare trailing noun.
+def guidebookquest_scale_removal_noun(name)
+  name.to_s.split.last
+end
 
+# Trial-and-error fallback, used only when the weights can't produce a
+# solution (WEIGH was approximate, or the target isn't really 10). Items
+# are added depth-first; since every weight is positive, a branch that
+# overshoots ("too much weight") is pruned immediately, and a branch that
+# finds nothing backtracks and retries without that item.
+def guidebookquest_search_scale(items)
   on_scale = []
   solved = false
-
-  remove_last = lambda do
-    item = on_scale.pop
-    fput "get #{guidebookquest_scale_removal_noun(item)} from scale"
-    sleep 0.3
-    fput "stow right"
-    sleep 0.3
-  end
 
   search = lambda do |index|
     next false if solved
     next false if index >= items.size
 
     item = items[index]
-
-    # Branch 1: add this item, then either recurse deeper or prune.
-    fput "get #{item}"
-    sleep 0.3
-    fput "put #{item} on scale"
-    sleep 0.3
+    result = guidebookquest_place_on_scale(item)
     on_scale << item
 
-    result = dothistimeout "look on scale", 5, /BALANCED|pan\./i
     if guidebookquest_scale_balanced?(result)
       solved = true
       next true
-    elsif result.to_s =~ /too much weight/i
-      # Overshot -- this item can't be part of any solution built on
-      # top of the current on_scale set; back it off and fall through
-      # to branch 2 (skip it) without recursing deeper.
-      remove_last.call
+    elsif result.to_s =~ /too much weight|to the right of/i
+      guidebookquest_remove_from_scale(on_scale.pop)
     else
-      # Still light -- recurse to try adding more on top of it.
       next true if search.call(index + 1)
-      # That subtree found nothing -- back this item off too before
-      # falling through to branch 2.
-      remove_last.call
+
+      guidebookquest_remove_from_scale(on_scale.pop)
     end
 
-    # Branch 2: skip this item entirely, try the rest of the list.
     search.call(index + 1)
   end
 
   search.call(0)
+  solved ? on_scale : nil
+end
 
-  if solved
-    echo "guidebookquest: scale balanced with #{on_scale.join(', ')}."
+def guidebookquest_balance_scale(items)
+  if items.empty?
+    echo "guidebookquest: no pile items were found to try on the scale."
+    return false
+  end
+
+  solution = guidebookquest_scale_solution(items)
+  if solution
+    echo "guidebookquest: weights add up to #{MOORLYN_SCALE_TARGET} lb with #{guidebookquest_describe_items(solution)} -- placing them."
+    result = nil
+    solution.each { |item| result = guidebookquest_place_on_scale(item) }
+    result = dothistimeout("look on scale", 5, /BALANCED|pan\./i) unless guidebookquest_scale_balanced?(result)
+
+    if guidebookquest_scale_balanced?(result)
+      echo "guidebookquest: scale balanced on the first try."
+      guidebookquest_clear_moorlyn_items
+      return true
+    end
+
+    echo "guidebookquest: the weighed combination didn't balance (#{result.to_s.strip}) -- clearing the scale and falling back to trial and error."
+    solution.reverse_each { |item| guidebookquest_remove_from_scale(item) }
+  else
+    echo "guidebookquest: no combination of the weighed items makes #{MOORLYN_SCALE_TARGET} lb (#{guidebookquest_describe_items(items)}) -- falling back to trial and error."
+  end
+
+  balanced_with = guidebookquest_search_scale(items)
+  if balanced_with
+    echo "guidebookquest: scale balanced with #{guidebookquest_describe_items(balanced_with)}."
+    guidebookquest_clear_moorlyn_items
     true
   else
-    echo "guidebookquest: no combination of #{items.join(', ')} balanced the scale."
+    echo "guidebookquest: no combination of #{guidebookquest_describe_items(items)} balanced the scale."
     false
   end
 end
 
-# Chapter 8's pile-search-and-scale-balance sequence, shared between the
-# normal INCOMPLETE branch (after it goes to Moorlyn and asks the ghoul)
-# and the CHAPTER 8 RECOVERY branch below (QUEST INFO's "Thoroughly look
-# around Moorlyn for a way to balance the scales." means the character
-# is already there, so that entry point skips straight to this instead
-# of going back to the entrance).
-# Pulls whatever's in the current room's debris pile, if anything, and
-# stows it. Confirmed live "get pile" is a no-op ("Get what?") in every
-# room without a pile, and ("You already found something from this
-# debris pile. There must be others around somewhere.") in a room
-# that's already been searched.
+# Pulls whatever's in the current room's debris pile, if anything, then
+# WEIGHs it while it's still in hand, logs it, and stows it. Confirmed live
+# "get pile" is a no-op ("Get what?") in every room without a pile, and
+# ("You already found something from this debris pile. There must be others
+# around somewhere.") in a room that's already been searched. Returns the
+# tracked item hash, or nil.
 def guidebookquest_moorlyn_search_room
   pile_result = dothistimeout "get pile", 3, /pull out|Get what\?|already found something/i
-  return nil unless pile_result =~ /pull out (?:a|an) ([a-z][a-z' -]*)\./i
+  return nil unless pile_result =~ /pull out (?:a|an|some) ([a-z][a-z' -]*)\./i
 
-  item_name = Regexp.last_match(1).strip
+  name = Regexp.last_match(1).strip
+  noun = name.split.last
+  held = nil
+  20.times do
+    held = [GameObj.right_hand, GameObj.left_hand].compact.find { |obj| obj.noun.to_s == noun && obj.name.to_s !~ /guidebook/i }
+    break if held
+
+    sleep 0.1
+  end
+
+  unless held
+    echo "guidebookquest: pulled a #{name} from the pile but couldn't find it in hand to weigh it."
+    fput "stow right"
+    return nil
+  end
+
+  raw = dothistimeout "weigh ##{held.id}", 6, /pounds?\b|gauging its weight|Weigh what|What were you/i
+  waitrt?
+  weight, exact = guidebookquest_parse_weight(raw)
+  item = { "id" => held.id.to_s, "name" => name, "noun" => held.noun.to_s, "weight" => weight, "exact" => exact }
+  guidebookquest_log_weight(item, raw)
+  echo "guidebookquest: #{name} weighs #{weight ? "#{weight} lb" : 'an unknown amount'}#{exact ? '' : ' (approximate)'}."
+
+  fput "stow ##{held.id}"
   sleep 0.3
-  fput "stow right"
-  sleep 0.3
-  item_name
+  item
 end
 
-# Confirmed live the hardcoded sw/east/nw walk recorded from one run
-# didn't hold up on another -- "You can't go there" on several of the
-# recorded steps, meaning Moorlyn's ring, like Gleyminn's river, is a
-# different layout per character/run, not a fixed one worth hardcoding.
-# What IS fixed: the scale's own room (Tree of Justice, u8083068) --
-# confirmed across multiple runs. go2 still can't path anywhere in this
-# zone at all, so this walks the ring one step at a time using whatever
-# directions XMLData.room_exits_string actually lists at each room
-# (same technique as guidebookquest_gleyminn_explore), always moving
-# away from the direction just arrived from since every room here has
-# exactly two exits -- there's no branching to get lost in, just a
-# closed loop back to the start. Collects pile items and records the
-# scale room's position in the walk as it's discovered, so the walk
-# back to the scale afterward (handled by the caller) can go the short
-# way regardless of which direction the items happened to be found in.
-def guidebookquest_moorlyn_walk_ring(pile_items, max_steps: 20)
-  moves = []
-  scale_position = 0 if XMLData.room_id == 8083068
-  item = guidebookquest_moorlyn_search_room
-  pile_items << item if item && !pile_items.include?(item)
+# Steps once around Moorlyn's ring. go2 can't path inside this zone and
+# the ring's layout varies per character/run (confirmed live), so this
+# reads XMLData.room_exits_string at each room and always leaves by the
+# exit it didn't arrive from -- every ring room has exactly two exits.
+def guidebookquest_moorlyn_step(came_from)
+  exits = guidebookquest_room_exits
+  next_dir = exits.find { |dir| dir != came_from } || exits.first
+  return nil unless next_dir
+
+  fput next_dir
+  sleep 1
+  next_dir
+end
+
+# Moorlyn's wandering ghoul (Chapter 8's quest giver) roams the ring
+# rather than staying put -- confirmed live the ring is one 16-room loop
+# out of River's End (u8083054), two exits per room:
+#   River's End -se-> Hope Village -se-> Honor's Row -se-> 8083060
+#   -se-> Faith's Juncture -w-> Tree of Justice (scale) -w-> 8083067
+#   -w-> 8083066 -w-> Dignity Point -w-> 8083064 -w-> Bravery's Plight
+#   -w-> 8083062 -w-> Loyal Point -ne-> 8083059 -ne-> 8083057
+#   -ne-> 8083055 -ne-> River's End
+# Walks it (same exit-following as the pile search) until the ghoul is in
+# the room. Two full laps, since he can wander ahead of us.
+MOORLYN_RING_SIZE = 16
+
+def guidebookquest_moorlyn_ghoul
+  GameObj.npcs.find { |npc| npc.noun.to_s =~ /ghoul/i }
+end
+
+def guidebookquest_moorlyn_find_ghoul(max_steps: MOORLYN_RING_SIZE * 2)
+  came_from = nil
+  max_steps.times do
+    ghoul = guidebookquest_moorlyn_ghoul
+    return ghoul if ghoul
+
+    dir = guidebookquest_moorlyn_step(came_from)
+    return nil unless dir
+
+    came_from = GLEYMINN_OPPOSITE_DIRECTION[dir]
+  end
+  guidebookquest_moorlyn_ghoul
+end
+
+# Confirmed live the ghoul takes two asks: the first only gets "...Weigh
+# dem opshuns." and the second "...Weigh dem opshuhs 'n bring some balance
+# back.", which is what opens the pile search. Re-finds him between asks
+# in case he wanders off mid-conversation.
+def guidebookquest_moorlyn_ask_ghoul
+  4.times do
+    ghoul = guidebookquest_moorlyn_find_ghoul
+    unless ghoul
+      echo "guidebookquest: couldn't find the wandering ghoul after two laps of Moorlyn."
+      return false
+    end
+
+    result = dothistimeout "ask ##{ghoul.id} about quest", 5, /ghoul|balance|opshu|What were you|could not find/i
+    sleep 1
+    return true if result =~ /balance back/i
+  end
+  echo "guidebookquest: asked the ghoul several times without getting his \"bring some balance back\" line -- trying the piles anyway."
+  true
+end
+
+def guidebookquest_moorlyn_scale_room?
+  XMLData.room_id.to_i == 8083068
+end
+
+# Walks the ring searching each pile, weighing as it goes, and stops as
+# soon as both the scale's room has been seen AND the weights collected so
+# far can make the target -- or after one full lap (back at the starting
+# room), since every pile only gives one item per character. Then keeps
+# walking forward to the scale's room (Tree of Justice, u8083068 -- the one
+# fixed point confirmed across runs).
+def guidebookquest_moorlyn_walk_ring(items, max_steps: 40)
+  start_room = XMLData.room_id.to_i
+  seen_scale = guidebookquest_moorlyn_scale_room?
+  came_from = nil
+
+  add_item = lambda do
+    item = guidebookquest_moorlyn_search_room
+    return unless item
+
+    items << item
+    guidebookquest_save_moorlyn_items(items)
+  end
+
+  add_item.call
+  max_steps.times do |step|
+    break if seen_scale && guidebookquest_scale_solution(items)
+
+    dir = guidebookquest_moorlyn_step(came_from)
+    break unless dir
+
+    came_from = GLEYMINN_OPPOSITE_DIRECTION[dir]
+    seen_scale ||= guidebookquest_moorlyn_scale_room?
+    break if step.positive? && XMLData.room_id.to_i == start_room && seen_scale
+
+    add_item.call
+  end
 
   max_steps.times do
-    break if scale_position && MOORLYN_SCALE_SOLUTION.all? { |i| pile_items.include?(i) }
+    break if guidebookquest_moorlyn_scale_room?
 
-    exits = guidebookquest_room_exits
-    came_from = moves.empty? ? nil : GLEYMINN_OPPOSITE_DIRECTION[moves.last]
-    next_dir = exits.find { |d| d != came_from } || exits.first
-    fput next_dir
-    sleep 1
-    moves << next_dir
+    dir = guidebookquest_moorlyn_step(came_from)
+    break unless dir
 
-    scale_position = moves.size if scale_position.nil? && XMLData.room_id == 8083068
-
-    item = guidebookquest_moorlyn_search_room
-    pile_items << item if item && !pile_items.include?(item)
+    came_from = GLEYMINN_OPPOSITE_DIRECTION[dir]
   end
 
-  [moves, scale_position]
+  guidebookquest_moorlyn_scale_room?
 end
 
+# Chapter 8's pile search, weighing, and scale balance -- shared between the
+# normal INCOMPLETE branch (after it goes to Moorlyn and asks the ghoul) and
+# the CHAPTER 8 RECOVERY branch (QUEST INFO's "Thoroughly look around
+# Moorlyn for a way to balance the scales." means the character is already
+# there). Items weighed on an earlier, interrupted run are reloaded from
+# disk, so they aren't weighed or searched for again.
 def guidebookquest_moorlyn_resume
-  # Resume safety: recover any pile items already carried over from an
-  # earlier interrupted run (checked by actually looking inside worn/
-  # held containers, not just GameObj's own top-level view -- see
-  # guidebookquest_held_pile_items). If anything turns up, the pile
-  # search is skipped entirely and this goes straight to the scale
-  # instead of walking the whole swamp again for nothing.
-  pile_items = guidebookquest_held_pile_items
+  items = guidebookquest_load_moorlyn_items
+  echo "guidebookquest: resuming with #{items.size} item(s) already weighed: #{guidebookquest_describe_items(items)}." unless items.empty?
 
-  # Always walk the ring, even if items were already recovered above --
-  # guidebookquest_moorlyn_walk_ring breaks as soon as both the items
-  # are complete AND the scale room has been seen, so if the items are
-  # already complete this just walks forward (collecting nothing new)
-  # until it reaches the scale and stops there; it never backtracks or
-  # risks oscillating in place the way a naive "step toward it" fallback
-  # would.
-  moves, scale_position = guidebookquest_moorlyn_walk_ring(pile_items)
-
-  # Safety net: guidebookquest_moorlyn_walk_ring caps itself at 20 steps,
-  # which covers every ring length confirmed live so far, but Moorlyn's
-  # layout is now known to vary per character/run -- if a longer ring
-  # ever means the scale room wasn't seen within that cap, keep walking
-  # in fresh batches (each one resuming from wherever the last left off)
-  # rather than let the ring math below divide-by-nil and crash the
-  # script outright.
-  attempts = 1
-  while scale_position.nil? && attempts < 5
-    more_moves, scale_position = guidebookquest_moorlyn_walk_ring(pile_items)
-    moves += more_moves
-    attempts += 1
-  end
-
-  unless scale_position
-    echo "guidebookquest: couldn't find the scale's room after an extensive walk of Moorlyn -- stopping here instead of risking getting stuck."
+  unless guidebookquest_moorlyn_walk_ring(items)
+    echo "guidebookquest: couldn't find the scale's room after walking Moorlyn -- stopping here instead of risking getting stuck."
     return
   end
 
-  # Walk from wherever the loop above stopped to the scale's own room --
-  # the shortest remaining stretch of the ring.
-  stopped_at = moves.size
-  remaining_to_scale = if stopped_at <= scale_position
-                          moves[stopped_at...scale_position]
-                        else
-                          moves[stopped_at..-1] + moves[0...scale_position]
-                        end
-  remaining_to_scale.each do |dir|
-    fput dir
-    sleep 1
-  end
-
-  guidebookquest_balance_scale(pile_items)
+  guidebookquest_balance_scale(items)
 
   fput "get my guidebook"
   sleep 1
@@ -622,31 +762,101 @@ GRAVEYARD_TEMPORALIS_GRAVE_ROOMS = %w[
   8083354 8083357
 ].freeze
 
+# Quest items are referred to by their GameObj id ("#12345"), never by
+# adjective + noun. Confirmed live that names break: "get sash" grabbed an
+# unrelated "pewter-pinned auroralaen sash", and "pony pendant" didn't
+# resolve to the "cracked agate pony pendant" at all. Each item's id is
+# captured the moment it lands in hand and saved per character
+# (guidebookquest_items.yaml), so a restarted run still knows it.
+def guidebookquest_items_path
+  dir = File.join($data_dir.to_s, XMLData.game.to_s, Char.name.to_s)
+  FileUtils.mkdir_p(dir) unless Dir.exist?(dir)
+  File.join(dir, "guidebookquest_items.yaml")
+end
+
+def guidebookquest_saved_items
+  path = guidebookquest_items_path
+  data = File.exist?(path) ? YAML.load_file(path) : {}
+  data.is_a?(Hash) ? data : {}
+rescue StandardError
+  {}
+end
+
+def guidebookquest_remember_item(label, obj)
+  return unless label && obj&.id
+
+  items = guidebookquest_saved_items
+  items[label.to_s] = { "id" => obj.id.to_s, "name" => obj.name.to_s }
+  File.write(guidebookquest_items_path, items.to_yaml)
+  echo "guidebookquest: tracking #{obj.name} as ##{obj.id}."
+rescue StandardError => e
+  echo "guidebookquest: couldn't save item #{label} (#{e.message})."
+end
+
+def guidebookquest_forget_item(label)
+  items = guidebookquest_saved_items
+  return unless items.delete(label.to_s)
+
+  File.write(guidebookquest_items_path, items.to_yaml)
+rescue StandardError
+  nil
+end
+
+def guidebookquest_saved_item(label)
+  guidebookquest_saved_items[label.to_s]
+end
+
+# "#<id>" for a saved item, or the given fallback text when its id was
+# never captured (e.g. a run started before ids were tracked).
+def guidebookquest_item_ref(label, fallback)
+  item = guidebookquest_saved_item(label)
+  item ? "##{item['id']}" : fallback
+end
+
+def guidebookquest_saved_labels(prefix)
+  guidebookquest_saved_items.keys.select { |label| label.start_with?(prefix) }.sort
+end
+
+def guidebookquest_hand_items
+  [GameObj.right_hand, GameObj.left_hand].compact.select { |obj| obj.id }
+end
+
+# Runs the block, then returns whichever item showed up in hand that wasn't
+# there before it ran (guidebook excluded), saving its id under label.
+def guidebookquest_capture_new_item(label = nil, timeout: 3)
+  before = guidebookquest_hand_items.map(&:id)
+  yield
+  item = nil
+  (timeout * 10).to_i.times do
+    item = guidebookquest_hand_items.find { |obj| !before.include?(obj.id) && obj.name.to_s !~ /guidebook/i }
+    break if item
+
+    sleep 0.1
+  end
+  guidebookquest_remember_item(label, item) if label && item
+  item
+end
+
 # Confirmed live wording for the graveyard item-placement puzzle: a wrong
 # spot either rejects outright ("This doesn't look like the right spot
 # to place...", "You decide not to disturb this particular grave, as it
 # looks a bit fresh.") or just drops the item on the ground, while the
 # correct spot has an NPC spirit immediately take it ("With the utmost
-# care and respect, you place a ... beside ..."). The bare noun is
-# ambiguous for at least one of these items -- confirmed live "get sash"
-# picked up the WRONG item ("You already have that." / "You are not
-# holding that." on the follow-up "place sash", since this character
-# also carries an unrelated "pewter-pinned auroralaen sash") -- so this
-# always uses a two-word descriptor, never the bare noun.
-def guidebookquest_graveyard_try_place(descriptor)
-  fput "get #{descriptor}"
+# care and respect, you place a ... beside ...").
+def guidebookquest_graveyard_try_place(ref)
+  fput "get #{ref}"
   sleep 0.3
-  result = dothistimeout "place #{descriptor}", 5, /With the utmost care and respect|doesn't look like the right spot|decide not to disturb/i
+  result = dothistimeout "place #{ref}", 5, /With the utmost care and respect|doesn't look like the right spot|decide not to disturb/i
   result =~ /With the utmost care and respect/i
 end
 
-def guidebookquest_graveyard_place_item(descriptor)
+def guidebookquest_graveyard_place_item(ref, name = ref)
   GRAVEYARD_TEMPORALIS_GRAVE_ROOMS.each do |room|
     Script.run("go2", go2_room("u#{room}"))
     sleep 1
-    return true if guidebookquest_graveyard_try_place(descriptor)
+    return true if guidebookquest_graveyard_try_place(ref)
   end
-  echo "guidebookquest: couldn't find a resting spot for the #{descriptor} in any known grave/gravestone room -- leaving it for a manual PLACE."
+  echo "guidebookquest: couldn't find a resting spot for the #{name} in any known grave/gravestone room -- leaving it for a manual PLACE."
   false
 end
 
@@ -843,7 +1053,7 @@ def guidebookquest_dispatch(line)
     end
 
     if find_bellhop.call
-      fput "ask bellhop about quest"
+      guidebookquest_capture_new_item("glass") { fput "ask bellhop about quest" }
     else
       echo "guidebookquest: bellhop not found on a full circuit of the hotel -- Chapter 3's room list may need another pass added."
     end
@@ -856,12 +1066,13 @@ def guidebookquest_dispatch(line)
     painting_rooms = %w[8087160 8087161 8087149]
     painting_rooms.each do |room|
       Script.run("go2", go2_room("u#{room}"))
-      fput "wave glass at painting"
+      fput "wave #{guidebookquest_item_ref('glass', 'glass')} at painting"
     end
 
     if find_bellhop.call
-      fput "get my glass" unless GameObj.right_hand && GameObj.right_hand.noun =~ /glass/i
-      fput "give bellhop"
+      glass = guidebookquest_item_ref("glass", "my glass")
+      fput "get #{glass}"
+      fput "give #{glass} to bellhop"
     else
       echo "guidebookquest: bellhop not found for the magnifying glass hand-in."
     end
@@ -894,12 +1105,13 @@ def guidebookquest_dispatch(line)
     painting_rooms = %w[8087160 8087161 8087149]
     painting_rooms.each do |room|
       Script.run("go2", go2_room("u#{room}"))
-      fput "wave glass at painting"
+      fput "wave #{guidebookquest_item_ref('glass', 'glass')} at painting"
     end
 
     if find_bellhop.call
-      fput "get my glass" unless GameObj.right_hand && GameObj.right_hand.noun =~ /glass/i
-      fput "give bellhop"
+      glass = guidebookquest_item_ref("glass", "my glass")
+      fput "get #{glass}"
+      fput "give #{glass} to bellhop"
     else
       echo "guidebookquest: bellhop not found for the magnifying glass hand-in."
     end
@@ -920,7 +1132,7 @@ def guidebookquest_dispatch(line)
     # Fate's Holding, The Cauldron -- asking the gjenganger about drink
     # hands over a corked bottle of wine directly.
     Script.run("go2", go2_room("u8083133"))
-    fput "ask gjeng about drink"
+    guidebookquest_capture_new_item("wine") { fput "ask gjeng about drink" }
     sleep 1
     Script.run("go2", go2_room("u8083134"))
     # Giving the wine prompts a 30-second confirmation window ("please do
@@ -929,9 +1141,9 @@ def guidebookquest_dispatch(line)
     # He ends up too distracted to hand over the promised pages either
     # way; this step is still "the chapter's done" per the guidebook, not
     # a failure to recover from.
-    fput "give skeleton"
+    fput "give #{guidebookquest_item_ref('wine', 'my bottle')} to skeleton"
     sleep 1
-    fput "give skeleton"
+    fput "give #{guidebookquest_item_ref('wine', 'my bottle')} to skeleton"
     sleep 1
     fput "get my guidebook"
     sleep 1
@@ -954,16 +1166,16 @@ def guidebookquest_dispatch(line)
     # in the old version just got "I don't need any help right now."
     bear_room = "u8083123"
     Script.run("go2", go2_room(bear_room))
-    fput "ask bear about quest"
+    guidebookquest_capture_new_item("seeds") { fput "ask bear about quest" }
     sleep 1
 
     # Task 1: plant the seeds by the otter-shaped fountain in The
     # Zoophilist.
     Script.run("go2", go2_room("u8083119"))
-    fput "bury seeds"
+    fput "bury #{guidebookquest_item_ref('seeds', 'seeds')}"
     waitrt?
     Script.run("go2", go2_room(bear_room))
-    fput "ask bear about quest"
+    guidebookquest_capture_new_item("flag") { fput "ask bear about quest" }
     sleep 1
 
     # Task 2: wave the flag at the ship-shaped buildings in The
@@ -972,16 +1184,16 @@ def guidebookquest_dispatch(line)
     # wave your white flag around.") -- only this room actually
     # completes the task.
     Script.run("go2", go2_room("u8083122"))
-    fput "wave flag"
+    fput "wave #{guidebookquest_item_ref('flag', 'flag')}"
     waitrt?
     Script.run("go2", go2_room(bear_room))
-    fput "ask bear about quest"
+    guidebookquest_capture_new_item("boat") { fput "ask bear about quest" }
     sleep 1
 
     # Task 3: wave the toy boat in The Destroyed to coax the hiding
     # children out.
     Script.run("go2", go2_room("u8083116"))
-    fput "wave my boat"
+    fput "wave #{guidebookquest_item_ref('boat', 'my boat')}"
     waitrt?
 
     fput "get my guidebook"
@@ -996,7 +1208,7 @@ def guidebookquest_dispatch(line)
     # Vigil's End, Armistice Avenue -- the legionnaire hands over a
     # mithril-edged monocle directly; only one ask is needed.
     Script.run("go2", go2_room("u8083102"))
-    fput "ask legion about quest"
+    guidebookquest_capture_new_item("monocle") { fput "ask legion about quest" }
     sleep 1
 
     # "Observe mithril monocle" at each of these five rooms finds one
@@ -1008,11 +1220,13 @@ def guidebookquest_dispatch(line)
     # pendant, and a fractured vultite armband. The game itself announces
     # "You found all the items" after the fifth.
     monocle_item_rooms = %w[8083101 8083098 8083089 8083096 8083097]
-    monocle_item_rooms.each do |room|
+    monocle_item_rooms.each_with_index do |room, idx|
       Script.run("go2", go2_room("u#{room}"))
-      fput "observe mithril monocle"
+      relic = guidebookquest_capture_new_item("relic_#{idx + 1}") do
+        fput "observe #{guidebookquest_item_ref('monocle', 'mithril monocle')}"
+      end
       sleep 1
-      fput "stow left"
+      fput "stow ##{relic.id}" if relic
       sleep 1
     end
 
@@ -1020,11 +1234,20 @@ def guidebookquest_dispatch(line)
     # Graveyard Temporalis -- a spirit NPC shows up and takes it the
     # moment it's placed in the right spot (see
     # GRAVEYARD_TEMPORALIS_GRAVE_ROOMS above for why which room is which
-    # isn't hardcoded). Two-word descriptors, not bare nouns -- "sash"
-    # alone is ambiguous with an unrelated item this character also
-    # carries.
-    ["vultite armband", "elesine sash", "pony pendant", "linen toqua", "leather headband"].each do |descriptor|
-      guidebookquest_graveyard_place_item(descriptor)
+    # isn't hardcoded). Each relic is placed by its own id; a relic
+    # that's been laid to rest is forgotten so a rerun doesn't go hunting
+    # for it again. The two-word descriptors are only a fallback for a run
+    # that found its relics before ids were tracked.
+    relic_labels = guidebookquest_saved_labels("relic_")
+    if relic_labels.empty?
+      ["vultite armband", "elesine sash", "pony pendant", "linen toqua", "leather headband"].each do |descriptor|
+        guidebookquest_graveyard_place_item(descriptor)
+      end
+    else
+      relic_labels.each do |label|
+        relic = guidebookquest_saved_item(label)
+        guidebookquest_forget_item(label) if guidebookquest_graveyard_place_item("##{relic['id']}", relic['name'])
+      end
     end
 
     Script.run("go2", go2_room("u8083102"))
@@ -1034,9 +1257,10 @@ def guidebookquest_dispatch(line)
     # point during the graveyard placement loop above (which repeatedly
     # swaps hands for other items) -- make sure it's actually in hand
     # first.
-    fput "get my mithril monocle"
+    monocle = guidebookquest_item_ref("monocle", "my mithril monocle")
+    fput "get #{monocle}"
     sleep 1
-    fput "give legionnaire"
+    fput "give #{monocle} to legionnaire"
     fput "get my guidebook"
     sleep 1
     fput "read my guidebook"
@@ -1058,9 +1282,10 @@ def guidebookquest_dispatch(line)
   elsif line == "RETURN MONOCLE TO LEGIONNAIRE"
     Script.run("go2", go2_room("u8083102"))
     sleep 1
-    fput "get my mithril monocle"
+    monocle = guidebookquest_item_ref("monocle", "my mithril monocle")
+    fput "get #{monocle}"
     sleep 1
-    fput "give legionnaire"
+    fput "give #{monocle} to legionnaire"
     sleep 1
   ##############################################################################
   # CHAPTER 7 INCOMPLETE
@@ -1081,7 +1306,7 @@ def guidebookquest_dispatch(line)
       fput "drop my white paper"
       sleep 1
       Script.run("go2", go2_room("u8083070"))
-      fput "ask snowman about quest"
+      guidebookquest_capture_new_item("paper") { fput "ask snowman about quest" }
       sleep 1
     end
     fput "whisper my white paper 1 snowman"
@@ -1096,7 +1321,7 @@ def guidebookquest_dispatch(line)
     sleep 1
     fput "whisper my white paper 6 aconite"
     sleep 1
-    fput "give snowman"
+    fput "give #{guidebookquest_item_ref('paper', 'my white paper')} to snowman"
     fput "get my guidebook"
     sleep 1
     fput "read my guidebook"
@@ -1107,8 +1332,8 @@ def guidebookquest_dispatch(line)
     fput "stow my guidebook"
     sleep 1
     Script.run("go2", go2_room("u8083054"))
-    fput "ask ghoul about quest"
     sleep 1
+    guidebookquest_moorlyn_ask_ghoul
     guidebookquest_moorlyn_resume
   ##############################################################################
   # CHAPTER 8 RECOVERY (QUEST INFO only -- see QUEST_INFO_TRIGGER_MAP)
@@ -1133,32 +1358,32 @@ def guidebookquest_dispatch(line)
     sleep 1
 
     lily_found = false
-    5.times do
-      break if lily_found
+    guidebookquest_capture_new_item("lily", timeout: 2) do
+      5.times do
+        break if lily_found
 
-      # Confirmed live command is "forage black lily" (the item that comes
-      # back is "a matte black vampire lily").
-      lily = dothistimeout "forage black lily", 5, /You forage around but find nothing of interest|You forage briefly and manage to find a matte black vampire lily/
-      if lily =~ /You forage briefly and manage to find a matte black vampire lily/
-        lily_found = true
+        # Confirmed live command is "forage black lily" (the item that comes
+        # back is "a matte black vampire lily").
+        lily = dothistimeout "forage black lily", 5, /You forage around but find nothing of interest|You forage briefly and manage to find a matte black vampire lily/
+        if lily =~ /You forage briefly and manage to find a matte black vampire lily/
+          lily_found = true
+          waitrt?
+        end
+      end
+      unless lily_found
+        fput "forage black lily"
         waitrt?
       end
     end
-    unless lily_found
-      fput "forage black lily"
-      waitrt?
-    end
 
-    fput "get my black lily"
-    sleep 0.3
     # Confirmed live: a plain "give spirit" with the guidebook in the
     # wrong hand gives the GUIDEBOOK instead ("This is not quite what I
-    # desire.") -- make sure the lily is in hand, not the book, first.
-    if GameObj.right_hand && GameObj.right_hand.noun !~ /lily/i
-      fput "swap"
-      sleep 0.3
-    end
-    fput "give spirit"
+    # desire.") -- giving the lily by its own id sidesteps which hand
+    # it's in entirely.
+    lily = guidebookquest_item_ref("lily", "my black lily")
+    fput "get #{lily}"
+    sleep 0.3
+    fput "give #{lily} to spirit"
     sleep 1
     fput "get my guidebook"
     sleep 1
@@ -1321,7 +1546,7 @@ def guidebookquest_dispatch(line)
     waitrt?
     fput "stand"
     sleep 1
-    fput "get votive"
+    guidebookquest_capture_new_item("votive") { fput "get votive" }
     sleep 1
 
     Script.run("go2", go2_room("exit"))
@@ -1355,11 +1580,12 @@ def guidebookquest_dispatch(line)
       pause_script "guidebookquest"
     end
 
-    fput "put votive in jack"
+    votive = guidebookquest_item_ref("votive", "votive")
+    fput "put #{votive} in jack"
     sleep 1
-    fput "light votive"
+    fput "light #{votive}"
     sleep 1
-    fput "light votive"
+    fput "light #{votive}"
     sleep 1
     waitrt?
     # The game doesn't auto-claim this -- confirmed live: "Welcome to
