@@ -29,12 +29,15 @@
     *pwbuttons                   - Hide/show filter buttons
     *pwstatus                    - Cycle Saga status display: text -> unicode -> emoji -> text
     *pwmove                      - Toggle player movement filtering
-    *pwflare                     - Toggle flare-message filtering
+    *pwflare                     - Cycle Flare Filter: ALL (hides every flare) -> 3P (hides
+                                    only flares naming another player) -> OFF
     *pwcombat                    - Cycle Combat Filter: ALL (hides everything, even AS/DS/
-                                    CS/TD/SMR rolls and damage) -> NUMBERS (keeps attack
-                                    rolls/resolutions visible, combines every damage line in
-                                    a round into one "N points of damage total" summary) ->
-                                    OFF (no combat filtering)
+                                    CS/TD/SMR rolls and damage) -> NUM (keeps attack rolls/
+                                    resolutions and every damage line, uncondensed) -> DMG
+                                    (same, but damage lines are combined into one "N points
+                                    of damage total" summary per round) -> OFF (no combat
+                                    filtering). In NUM/DMG, attacks aimed at you are never
+                                    filtered or condensed. Flares follow *filterflares only
     *pwclaim                     - Hide/show claim status
     *pwgtk                       - Enable GTK window
     *pwgroup                     - Hide/show the group display
@@ -48,14 +51,19 @@
                                     *pwparse stays tracked but hidden until you switch back
     *pwprofession all             - Clear the filter, showing every parsed profession again
     *pwparse <profession>        - Look up who's currently playing a profession (via WHO PROFESSION)
-                                    and remember it for the icon display, e.g. "*pwparse warrior"
+                                    and remember it for the icon display, e.g. "*pwparse warrior".
+                                    Adds to what's already saved; offline players are kept
     *pwparse all                  - Queue all 10 professions for lookup, one per loop tick, in
                                     order, so the window stays responsive between them
 
   Author: Phocosoen, ChatGPT
   Tags: wrayth, saga, frontend, mod, window, players, spam, filter, group, avalon, wizard, gtk3
-  Version: 2.14.0
+  Version: 2.18.0
   Recently changed:
+    v2.18.0 (2026-10-15) - *pwparse roster is now shared by all characters (data/<game>/playerwindow_professions.yaml) and only ever adds players.
+    v2.17.0 (2026-10-14) - Flare Filter is now ALL / 3P (only other players' flares) / OFF.
+    v2.16.0 (2026-10-14) - Combat Filter gained a 4th mode: NUM now leaves damage lines uncondensed, new DMG mode condenses them.
+    v2.15.0 (2026-10-14) - Combat Filter passes attacks aimed at you through uncondensed; flares in any attack follow only the Flare toggle.
     v2.14.0 (2026-10-12) - Combat Filter (*pwcombat/*filtercombat) is now
       a 3-state cycle instead of a single on/off toggle: ALL (hides every
       recognized combat line, including AS/DS/CS/TD/SMR resolution rolls
@@ -214,7 +222,7 @@ module PlayerWindow
                   :use_gtk_playerwindow,
                   :filter_spam,
                   :filter_animals,
-                  :filter_flares,
+                  :flare_filter_mode,
                   :combat_filter_mode,
                   :single_column,
                   :columns,
@@ -244,7 +252,7 @@ module PlayerWindow
       "single_column"        => false,
       "columns"              => 2,
       "filter_animals"       => false,
-      "filter_flares"        => false,
+      "flare_filter_mode"    => "off",
       "combat_filter_mode"   => "off",
       "filter_spam"          => true,
       "show_filter_buttons"  => true,
@@ -260,7 +268,6 @@ module PlayerWindow
       "saga_status_mode"     => "unicode",
       "show_profession_icons" => false,
       "profession_display_filter" => nil,
-      "profession_map"       => {},
       "show_group_display"   => true,
       "show_headers"         => true
     },
@@ -373,8 +380,61 @@ module PlayerWindow
     end
   end
 
+  # One profession roster shared by every character on this game instance
+  # (data/<game>/playerwindow_professions.yaml), instead of each character's
+  # own lichwindows.yaml -- a *pwparse on any character now shows up on all
+  # of them.
+  def shared_profession_map_path
+    File.join("#{$data_dir}#{XMLData.game}", "playerwindow_professions.yaml")
+  end
+
+  def sanitize_profession_map(raw)
+    return {} unless raw.is_a?(Hash)
+
+    raw.each_with_object({}) do |(name, profession), map|
+      name = name.to_s.strip.downcase
+      profession = profession.to_s
+      next if name.empty? || !PlayerWindow::PROFESSION_NAMES.include?(profession)
+
+      map[name] = profession
+    end
+  end
+
+  def read_shared_profession_map
+    path = shared_profession_map_path
+    File.exist?(path) ? sanitize_profession_map(YAML.load_file(path)) : {}
+  rescue StandardError
+    {}
+  end
+
+  # First run with no shared file yet: fold every character's old
+  # per-character profession_map into it, so nothing already parsed is lost.
+  def load_shared_profession_map
+    SETTINGS_MUTEX.synchronize do
+      path = shared_profession_map_path
+      return read_shared_profession_map if File.exist?(path)
+
+      map = {}
+      Dir.glob(File.join("#{$data_dir}#{XMLData.game}", "*", "lichwindows.yaml")).each do |file|
+        data = YAML.load_file(file) rescue nil
+        map.merge!(sanitize_profession_map(data.is_a?(Hash) ? data.dig("playerwindow", "profession_map") : nil))
+      end
+      File.write(path, map.to_yaml)
+      map
+    end
+  rescue StandardError
+    {}
+  end
+
+  # Merges into whatever's on disk rather than overwriting it, so two
+  # characters running at once never erase each other's parses -- and
+  # picks up the other session's additions in memory while it's at it.
   def save_profession_map!
-    update_player_setting("profession_map", profession_map)
+    SETTINGS_MUTEX.synchronize do
+      merged = read_shared_profession_map.merge(profession_map)
+      PlayerWindow.profession_map = merged
+      File.write(shared_profession_map_path, merged.to_yaml)
+    end
   end
 
   def gtk_enabled?
@@ -469,13 +529,23 @@ module PlayerWindow
       end
     end
 
-    # @return [Symbol, nil] the first family that recognizes line, or nil
+    # @return [Array(Symbol, Object), nil] the first family that recognizes
+    #   line plus that matcher's own result (e.g. parse_attack's hash, whose
+    #   :inbound flag marks an attack aimed at us), or nil
     def self.classify(families, line)
       families.each do |family, matcher|
-        return family if matcher.call(line)
+        result = matcher.call(line)
+        return [family, result] if result
       end
       nil
     end
+  end
+
+  INBOUND_ATTACK_TEXT = /\b(?:at|toward|towards) you\b|\btries to \w+ you\b|\A\s*\.\.\. and hits for \d+ points? of damage/i.freeze
+
+  def inbound_attack_text?(plain_line)
+    return false if plain_line =~ /\A\s*You\b/ || plain_line =~ /\b(?:says|asks|exclaims|whispers),\s*["']/i
+    plain_line.match?(INBOUND_ATTACK_TEXT)
   end
 
   def combat_families
@@ -484,12 +554,15 @@ module PlayerWindow
     @combat_families = []
   end
 
-  # Three-state Combat Filter: "all" hides every recognized combat line,
-  # even AS/DS/CS/TD/SMR resolution rolls and damage numbers; "numbers"
-  # (the original single-toggle behavior) keeps attack/damage/resolution
-  # lines visible and drops only the flavor text in between; "off" is no
-  # filtering at all. Cycled in that order by *pwcombat/*filtercombat.
-  COMBAT_FILTER_MODES = %w[all numbers off].freeze
+  # Four-state Combat Filter, cycled in this order by *pwcombat/*filtercombat:
+  #   "all"     - hides every recognized combat line, even AS/DS/CS/TD/SMR
+  #               resolution rolls and damage numbers.
+  #   "numbers" - keeps attack/resolution lines and every damage line as-is
+  #               (uncondensed); drops only the combat flavor in between.
+  #   "damage"  - same as "numbers", but damage lines are rolled into one
+  #               "N points of damage total (M hits)!" line per round.
+  #   "off"     - no filtering or condensing at all.
+  COMBAT_FILTER_MODES = %w[all numbers damage off].freeze
 
   # Reads the persisted mode, migrating the old boolean "filter_combat_math"
   # setting (true -> "numbers", false/missing -> "off") for anyone upgrading
@@ -499,6 +572,60 @@ module PlayerWindow
     return mode if PlayerWindow::COMBAT_FILTER_MODES.include?(mode)
 
     pw["filter_combat_math"] ? "numbers" : "off"
+  end
+
+  # Three-state Flare Filter, cycled in this order by *pwflare/*filterflares:
+  #   "all" - hides every flare, yours and other players'.
+  #   "3p"  - hides only flares that name another player (any PC name in
+  #           the line that isn't Char.name); yours still show.
+  #   "off" - no flare filtering.
+  FLARE_FILTER_MODES = %w[all 3p off].freeze
+
+  # Reads the persisted mode, migrating the old boolean "filter_flares"
+  # setting (true -> "all", false/missing -> "off").
+  def normalize_flare_filter_mode(pw)
+    mode = pw["flare_filter_mode"]
+    return mode if PlayerWindow::FLARE_FILTER_MODES.include?(mode)
+
+    pw["filter_flares"] ? "all" : "off"
+  end
+
+  def cycle_flare_filter_mode!
+    modes = PlayerWindow::FLARE_FILTER_MODES
+    current = modes.include?(PlayerWindow.flare_filter_mode) ? PlayerWindow.flare_filter_mode : "off"
+    PlayerWindow.flare_filter_mode = modes[(modes.index(current) + 1) % modes.length]
+  end
+
+  def flare_filter_label
+    case PlayerWindow.flare_filter_mode
+    when "all" then "Flare ALL"
+    when "3p" then "Flare 3P"
+    else "Flare OFF"
+    end
+  end
+
+  def flare_line?(line)
+    PlayerWindow.flare_patterns.any? { |pattern| line =~ pattern }
+  end
+
+  # True when a flare names a player other than us -- a linked PC
+  # (<a exist="-..." noun="Name">) or any PC in the room whose name appears
+  # in the text.
+  def other_player_flare?(line, plain_line)
+    me = Char.name.to_s.downcase
+    names = line.scan(/<a exist="-\d+" noun="([^"]+)"/i).flatten
+    names.concat(GameObj.pcs.map { |pc| pc.noun.to_s }.select { |n| !n.empty? && plain_line =~ /\b#{Regexp.escape(n)}\b/ })
+    names.any? { |n| n.downcase != me }
+  rescue StandardError
+    false
+  end
+
+  def hide_flare?(line, plain_line)
+    case PlayerWindow.flare_filter_mode
+    when "all" then true
+    when "3p" then other_player_flare?(line, plain_line)
+    else false
+    end
   end
 
   def cycle_combat_filter_mode!
@@ -511,6 +638,7 @@ module PlayerWindow
     case PlayerWindow.combat_filter_mode
     when "all" then "Combat ALL"
     when "numbers" then "Combat NUM"
+    when "damage" then "Combat DMG"
     else "Combat OFF"
     end
   end
@@ -615,7 +743,7 @@ player_window_settings = window_settings["playerwindow"] || {}
 PlayerWindow.use_gtk_playerwindow = player_window_settings["use_gtk_playerwindow"] || false
 PlayerWindow.filter_spam      = player_window_settings["filter_spam"]      || false
 PlayerWindow.filter_animals   = player_window_settings["filter_animals"]   || false
-PlayerWindow.filter_flares    = player_window_settings["filter_flares"]    || false
+PlayerWindow.flare_filter_mode = PlayerWindow.normalize_flare_filter_mode(player_window_settings)
 PlayerWindow.combat_filter_mode = PlayerWindow.normalize_combat_filter_mode(player_window_settings)
 PlayerWindow.columns = begin
   c = player_window_settings["columns"].to_i
@@ -638,20 +766,7 @@ PlayerWindow.profession_display_filter = begin
     filtered.empty? ? nil : filtered
   end
 end
-PlayerWindow.profession_map = begin
-  saved = player_window_settings["profession_map"]
-  if saved.is_a?(Hash)
-    saved.each_with_object({}) do |(name, profession), map|
-      name = name.to_s.strip.downcase
-      profession = profession.to_s
-      next if name.empty? || !PlayerWindow::PROFESSION_NAMES.include?(profession)
-
-      map[name] = profession
-    end
-  else
-    {}
-  end
-end
+PlayerWindow.profession_map = PlayerWindow.load_shared_profession_map
 PlayerWindow.pending_parse_queue = []
 PlayerWindow.debug_filter_enabled = false # Toggle with *pwdebug
 PlayerWindow.flare_patterns = PlayerWindow.load_flare_filter_patterns
@@ -787,7 +902,7 @@ class PlayerWindowGtk
     pw       = settings["playerwindow"] ||= {}
     PlayerWindow.filter_spam    = pw["filter_spam"]    || false
     PlayerWindow.filter_animals = pw["filter_animals"] || false
-    PlayerWindow.filter_flares  = pw["filter_flares"]  || false
+    PlayerWindow.flare_filter_mode = PlayerWindow.normalize_flare_filter_mode(pw)
     PlayerWindow.combat_filter_mode = PlayerWindow.normalize_combat_filter_mode(pw)
     @font_size = pw["font_size"] || 14
     pw["palette"] || "White on Black"
@@ -816,19 +931,19 @@ class PlayerWindowGtk
     header.pack_start(spam_toggle)
 
     # - Flare Filter toggle -
-    flare_toggle = Gtk::ToggleButton.new(label: "Flare")
+    # Plain Button cycling all -> 3p -> off, same as the Combat button.
+    flare_toggle = Gtk::Button.new(label: PlayerWindow.flare_filter_label)
     flare_toggle.style_context.add_class("header-toggle")
-    flare_toggle.active = PlayerWindow.filter_flares
-    flare_toggle.signal_connect("toggled") do |btn|
-      if btn.active? && PlayerWindow.flare_patterns.empty?
-        btn.active = false
+    flare_toggle.signal_connect("clicked") do |btn|
+      if PlayerWindow.flare_patterns.empty?
         respond "Flare filtering unavailable. flare_patterns.rb not loaded."
         next
       end
 
-      PlayerWindow.filter_flares = btn.active?
-      respond "Flare filtering #{PlayerWindow.filter_flares ? 'ENABLED' : 'DISABLED'}."
-      PlayerWindow.update_player_setting("filter_flares", PlayerWindow.filter_flares)
+      PlayerWindow.cycle_flare_filter_mode!
+      btn.label = PlayerWindow.flare_filter_label
+      respond "Flare filtering is now #{PlayerWindow.flare_filter_mode.upcase}."
+      PlayerWindow.update_player_setting("flare_filter_mode", PlayerWindow.flare_filter_mode)
       update_players(GameObj.pcs.reject { |pc| pc.name == Char.name })
     end
     header.pack_start(flare_toggle)
@@ -1419,7 +1534,7 @@ def PlayerWindow.push_players_to_window(pcs, group_display = nil)
     xmark = "&#x2717;" # U+2717 ballot x
     toggles = [
       ["filter_toggle",      "Spam #{PlayerWindow.filter_spam ? check : xmark}",        "*filterspam",    "Toggling Spam Filter..."],
-      ["flare_toggle",       "Flare #{PlayerWindow.filter_flares ? check : xmark}",      "*filterflares",  "Toggling Flare Filter..."],
+      ["flare_toggle",       PlayerWindow.flare_filter_label,                            "*filterflares",  "Cycling Flare Filter..."],
       ["combat_math_toggle", PlayerWindow.combat_filter_label, "*filtercombat",  "Cycling Combat Filter..."],
       ["animal_toggle",      "Animal #{PlayerWindow.filter_animals ? check : xmark}",    "*filteranimals", "Toggling Animal Filter..."],
     ]
@@ -1557,9 +1672,9 @@ upstream_proc = proc do |command|
       next nil
     end
 
-    PlayerWindow.filter_flares = !PlayerWindow.filter_flares
-    respond "Flare filtering is now #{PlayerWindow.filter_flares ? 'ENABLED' : 'DISABLED'}."
-    PlayerWindow.update_player_setting("filter_flares", PlayerWindow.filter_flares)
+    PlayerWindow.cycle_flare_filter_mode!
+    respond "Flare filtering is now #{PlayerWindow.flare_filter_mode.upcase}."
+    PlayerWindow.update_player_setting("flare_filter_mode", PlayerWindow.flare_filter_mode)
 
     pcs = GameObj.pcs.reject { |pc| pc.name == Char.name }
     PlayerWindow.push_players_to_window(pcs)
@@ -1787,6 +1902,7 @@ end
 @pw_combat_block_active = false
 @pw_damage_total = 0
 @pw_damage_hits = 0
+@pw_inbound_attack_active = false
 
 downstream_proc = proc { |line, _server_string|
   line = line.to_s # Ensure line is always a String.
@@ -1794,6 +1910,7 @@ downstream_proc = proc { |line, _server_string|
 
   if PlayerWindow.prompt_line?(line)
     @pw_combat_block_active = false
+    @pw_inbound_attack_active = false
     if @pw_damage_total > 0
       hits = @pw_damage_hits
       respond "   ... #{@pw_damage_total} points of damage total (#{hits} hit#{'s' unless hits == 1})!"
@@ -1806,12 +1923,16 @@ downstream_proc = proc { |line, _server_string|
   # Combat message filtering -- recognized via lich-5's own Gemstone combat
   # definitions (PlayerWindow::CombatClassifier, built the same way
   # combatstream.lic builds its own), not the hand-rolled "You swing/
-  # slash/..." + AS:/CS:/SSR/SMR regex this used before. Three modes,
+  # slash/..." + AS:/CS:/SSR/SMR regex this used before. Four modes,
   # cycled by *pwcombat/*filtercombat:
   #   "off"     - no combat filtering at all.
   #   "numbers" - an attack (self or otherwise) or an AS/DS/CS/TD/SMR
-  #               resolution roll stays visible and opens a block; every
-  #               damage line in that block is combined into a single
+  #               resolution roll stays visible and opens a block; damage
+  #               lines in that block also show as-is, one per hit;
+  #               everything else the classifier recognizes as combat is
+  #               dropped until the next death line or prompt.
+  #   "damage"  - same as "numbers", except every damage line in the
+  #               block is combined into a single
   #               "N points of damage total (M hits)!" summary emitted at
   #               the next prompt instead of showing each hit separately
   #               (same idea as combatbrief.lic/combatfilter_sagapanel.lic's
@@ -1826,9 +1947,40 @@ downstream_proc = proc { |line, _server_string|
   # this filter only omits.
   mode = PlayerWindow.combat_filter_mode
   if mode != "off"
-    family, = PlayerWindow::CombatClassifier.classify(PlayerWindow.combat_families, line)
+    family, result = PlayerWindow::CombatClassifier.classify(PlayerWindow.combat_families, line)
+
+    # An attack aimed at us (lich's own parser flags it :inbound) turns all
+    # combat filtering off until the next prompt: the attack, its roll, every
+    # damage line, crits and flavor text all show uncondensed.
+    # Fallback for creature attacks lich has no def for yet (e.g. "a
+    # behemothic gorefrost golem ... swings a mighty arm ... down at you!"):
+    # someone else's line aimed "at/toward you", or the inbound-only
+    # "... and hits for N points of damage!" phrasing.
+    @pw_inbound_attack_active = true if (family == :attack && result.is_a?(Hash) && result[:inbound]) ||
+                                        PlayerWindow.inbound_attack_text?(plain_line)
+
+    # Flares follow the Flare toggle alone, for attacks at creatures and at
+    # us alike: hidden when it's on, shown when it's off -- never swallowed
+    # by the combat filter or let through by the inbound pass-through below.
+    if family == :flare || PlayerWindow.flare_line?(line)
+      if PlayerWindow.hide_flare?(line, plain_line)
+        PlayerWindow.debug_filter("FLARE (...)", line)
+        next nil
+      end
+      next line
+    end
+
+    if @pw_inbound_attack_active && mode != "all"
+      PlayerWindow.debug_filter("COMBAT (inbound attack, pass-through)", line)
+      next line
+    end
 
     if family == :damage && mode == "numbers"
+      @pw_combat_block_active = true
+      next line
+    end
+
+    if family == :damage && mode == "damage"
       @pw_combat_block_active = true
       amount = PlayerWindow.parse_damage_amount(plain_line)
       if amount
@@ -1839,7 +1991,7 @@ downstream_proc = proc { |line, _server_string|
       next nil
     end
 
-    if (family == :attack || family == :resolution) && mode == "numbers"
+    if (family == :attack || family == :resolution) && (mode == "numbers" || mode == "damage")
       @pw_combat_block_active = true
       next line
     end
@@ -1953,8 +2105,8 @@ downstream_proc = proc { |line, _server_string|
     end
   end
 
-  if PlayerWindow.filter_flares && !PlayerWindow.flare_patterns.empty?
-    if PlayerWindow.flare_patterns.any? { |pattern| line =~ pattern }
+  if PlayerWindow.flare_filter_mode != "off" && PlayerWindow.flare_line?(line)
+    if PlayerWindow.hide_flare?(line, plain_line)
       PlayerWindow.debug_filter("FLARE (...)", line)
       next nil
     end
@@ -1973,7 +2125,7 @@ downstream_proc = proc { |line, _server_string|
   any_filter_enabled = (
     PlayerWindow.filter_spam ||
     PlayerWindow.filter_animals ||
-    PlayerWindow.filter_flares ||
+    PlayerWindow.flare_filter_mode != "off" ||
     PlayerWindow.combat_filter_mode != "off"
   )
   if any_filter_enabled && line.strip.empty?
@@ -2419,7 +2571,11 @@ downstream_proc = proc { |line, server_string|
   result = downstream_proc_filtered.call(line, server_string)
   next result unless result.nil?
 
-  preserved = line.to_s.scan(/<output class="[^"]*"\s*\/>|<prompt\b[^>]*>.*?<\/prompt>|<(?:pushBold|popBold)\s*\/>/).join
+  # Roundtime/casttime and stream open/close tags ride along on combat
+  # lines too (confirmed live: "<roundTime value='...'/>Bloodstained light
+  # spills..."), so they're kept for the same reason -- a dropped
+  # <popStream/> leaves later text routed to the wrong window.
+  preserved = line.to_s.scan(/<output class="[^"]*"\s*\/>|<prompt\b[^>]*>.*?<\/prompt>|<(?:pushBold|popBold|popStream)\s*\/>|<(?:roundTime|castTime|pushStream|clearStream)\b[^>]*\/>/).join
   preserved.empty? ? nil : preserved
 }
 
@@ -2484,7 +2640,7 @@ loop do
   current_filter_state = [
     PlayerWindow.filter_spam,
     PlayerWindow.filter_animals,
-    PlayerWindow.filter_flares,
+    PlayerWindow.flare_filter_mode,
     PlayerWindow.combat_filter_mode,
     PlayerWindow.show_claim_status,
     PlayerWindow.hidden_player_detected
@@ -2521,7 +2677,11 @@ loop do
     if roster == :invalid
       respond "Playerwindow: the game rejected '#{profession}' as a profession."
     else
-      PlayerWindow.profession_map.delete_if { |_name, prof| prof == profession }
+      # Merge, never replace: WHO PROFESSION only lists who's online right
+      # now, so wiping the profession first dropped everyone parsed earlier
+      # who happened to be logged off at the time (Kighte, a paladin, lost
+      # after three later parses ran while he was offline). Professions
+      # never change, so an existing entry is never wrong just for missing.
       roster.each { |name| PlayerWindow.profession_map[name.downcase] = profession }
       PlayerWindow.save_profession_map!
       remaining = PlayerWindow.pending_parse_queue.size
