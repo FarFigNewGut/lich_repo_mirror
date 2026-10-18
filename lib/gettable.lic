@@ -1,0 +1,149 @@
+=begin
+  gettable.lic
+
+  Gets you a seat at a table. Tries every set of tables in reach, nearest
+  first, instead of giving up when the closest set happens to be full.
+
+  Public inns (rooms the map tags 'table') are tried before guild and CHE
+  lounges, which you may not be able to walk into. In each room it types
+  GO TABLE; if the tables there are full, it moves on to the next set.
+
+  ;gettable             walk the sets in this town, nearest first
+  ;gettable <seconds>   widen the search radius (default 20s of travel)
+  ;gettable list        show the sets it would try, without moving
+                        (takes a radius too: ;gettable list 60)
+  ;gettable help        show this help
+
+  Requirements: a recent Lich 5, an up-to-date map and ;go2.
+
+  How the radius works:
+    Radius is travel time the way the map database scores it, which keeps
+    the search in town without reasoning about town names (the mapdb has
+    several per town: "Solhaven" and "the free port of Solhaven" are the
+    same place, "Ta'Vaalor Inns" and "the Moonglae Inn" are inns inside
+    one). Against the current mapdb, the widest in-town cluster is
+    Ta'Illistim's five inns at 15.4s, while the nearest out-of-town set
+    from anywhere is 24.4s, so 20s separates the two cleanly. Urchin guide
+    hops only price themselves in while go2 is running, so they can't drag
+    an out-of-town set inside the radius.
+
+       author: Mara
+         game: Gemstone
+         tags: table, tables, inn, seat, sit, dining, go2
+      contact: mara.lilly on Discord, @Lillymara on GitHub
+    co-author: Claude (Anthropic) - claude.ai/code
+      version: 1.1.0
+
+  Changelog:
+    1.1.0 (2026-10-18) - Added this header and ;gettable help. Unrecognized
+      arguments show the help instead of being ignored. Stops cleanly if
+      your current room isn't in the map.
+    1.0.0 (2026-09-09) - Initial release.
+
+  Tests: ruby scripts/gettable_test.rb (checks list mode against the mapdb).
+=end
+
+DEFAULT_RADIUS = 20.0 unless defined?(DEFAULT_RADIUS)
+
+def gettable_help
+  respond <<~HELP
+    gettable - gets you a seat at a table, trying every set in town.
+
+    Tries the sets of tables nearest you first, public inns before guild
+    and CHE lounges, and moves on to the next set whenever one is full.
+
+      ;gettable             walk the sets in this town, nearest first
+      ;gettable <seconds>   widen the search radius (default #{DEFAULT_RADIUS.to_i}s of travel)
+      ;gettable list        show the sets it would try, without moving
+                            (takes a radius too: ;gettable list 60)
+      ;gettable help        show this help
+
+    Needs a recent Lich 5, an up-to-date map and ;go2.
+  HELP
+end
+
+args = script.vars[1..].to_a.map { |a| a.to_s.strip }.reject(&:empty?)
+list_only = false
+max_travel = DEFAULT_RADIUS
+args.each { |arg|
+  case arg
+  when /^(?:list|dry)$/i       then list_only = true
+  when /^\d+(?:\.\d+)?$/       then max_travel = arg.to_f
+  else
+    gettable_help
+    exit
+  end
+}
+
+here = Room.current
+unless here
+  echo "can't tell where you are - your current room isn't in the map"
+  exit
+end
+
+# wayto entries are Strings or StringProcs; StringProc#_dump is its source.
+wayto_source = proc { |w| w.respond_to?(:_dump) ? w._dump.to_s : w.to_s }
+tagged = proc { |room| room.tags.include?('table') }
+
+# A room is a set of tables if you can actually GO to a table from it. The
+# 'table' tag alone is wrong in both directions: Sablecross tags the individual
+# tables rather than the dining room they hang off, and real dining rooms
+# (Helgreth's Taproom, the Krawling Kraken) carry no tag at all. The tag is
+# still worth having as a sort key - tagged rooms are the public inns, untagged
+# ones are mostly guild and CHE lounges you may not be able to walk into.
+# ponytail: full scan of ~37k rooms plus one whole-map dijkstra, both once per
+# run and both about as cheap as go2's own pathing. If it ever needs to be
+# cheaper, cache the set list keyed on Map.tag_index_generation.
+sets = Map.list.select { |room|
+  room.wayto.values.any? { |w| wayto_source.call(w) =~ /\bgo\b.*\btable\b/i }
+}
+
+_, travel_time = here.dijkstra
+travel_time ||= {}
+candidates = sets.select { |room| (t = travel_time[room.id]) && t.to_f <= max_travel }
+                 .sort_by { |room| [tagged.call(room) ? 0 : 1, travel_time[room.id]] }
+
+if list_only
+  respond "gettable: #{candidates.length} set(s) within #{max_travel}s of room #{here.id}"
+  candidates.each { |room|
+    respond format('  %6d  %5.1fs  %-8s %s', room.id, travel_time[room.id],
+                   tagged.call(room) ? 'tagged' : '', room.title.first)
+  }
+  exit
+end
+
+if candidates.empty?
+  echo "no tables within #{max_travel}s of here - try ;gettable <a bigger number>"
+  exit
+end
+
+seated = candidates.any? { |room|
+  unless Room.current.id == room.id
+    Script.run('go2', room.id.to_s)
+    # go2 gives up quietly when a room is unreachable or something interrupts
+    # the walk; don't type GO TABLE at whatever room we actually ended up in.
+    next false unless Room.current.id == room.id
+  end
+  waitrt?
+  line = dothistimeout('go table', 15,
+                       /head over to the|all the tables here are occupied|Where are you trying to go\?/i)
+  case line
+  when /head over to the/i
+    true
+  when /occupied/i
+    echo "#{room.title.first} is full - trying the next set"
+    false
+  when /Where are you trying to go/i
+    echo "no tables to sit at in #{room.title.first} - trying the next set"
+    false
+  else
+    echo "no answer to GO TABLE in #{room.title.first} - trying the next set"
+    false
+  end
+}
+
+if seated
+  echo "seated at #{Room.current.title.first} (u#{Room.current.uid&.first})"
+else
+  respond "--- gettable: all #{candidates.length} set(s) of tables within #{max_travel}s are full."
+end
