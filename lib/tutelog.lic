@@ -4,7 +4,7 @@
     author: Mystienne
    credits: Peggyanne - preset-colored report style inspiration
       game: GemStone
-   version: 1.7.10
+   version: 1.8.1
       tags: utility, experience, lumnis, tutelage
 
   Watches your live experience gains in the background and records each pulse.
@@ -39,7 +39,9 @@ command = script.vars[0].to_s.downcase.strip
 command_value = script.vars[1].to_s.downcase.strip
 tutelog_close_dock_now = proc do
   xml = "<dialogData id='Xp2TutelogDock' clear='t'><label id='xp2dock_off' value='Dock off' justify='1' left='6' top='5' height='16' width='178'/></dialogData>"
-  if defined?(_respond)
+  if defined?(Lich::Messaging) && Lich::Messaging.respond_to?(:msg)
+    Lich::Messaging.msg('plain', xml, encode: false)
+  elsif defined?(_respond)
     _respond xml
   elsif defined?(respond)
     respond xml
@@ -399,6 +401,10 @@ tutelog_changelog_text = proc do
   output.concat "   1.7.9 fix(lumnis): count base Lumnis points from pulses even when Tutelage is inactive.\n"
   output.concat "09-19-2026\n"
   output.concat "   1.7.10 fix(dock): send the Wrayth Dock off state only once after shutdown.\n"
+  output.concat "   1.7.11 fix(dock): send dock XML through Lich messaging when available.\n"
+  output.concat "10-20-2026\n"
+  output.concat "   1.8.0 feat(experience): track the Enlightened base experience bonus in pulse calculations.\n"
+  output.concat "   1.8.1 fix(experience): stop the Enlightened expiration parser at the time-zone text.\n"
   output
 end
 if [ 'help', '--help', '-h', '?' ].include?(command)
@@ -1728,7 +1734,9 @@ dock_xml_escape = proc do |text|
 end
 
 dock_send_xml = proc do |xml|
-  if defined?(_respond)
+  if defined?(Lich::Messaging) && Lich::Messaging.respond_to?(:msg)
+    Lich::Messaging.msg('plain', xml, encode: false)
+  elsif defined?(_respond)
     _respond xml
   elsif defined?(respond)
     respond xml
@@ -2236,6 +2244,11 @@ lumnis_total_multiplier = proc do
   end
 end
 
+base_exp_bonus_multiplier = proc do
+  rate = [ Vars['xp2_base_exp_bonus_rate'].to_i, 0 ].max
+  1.0 + (rate / 100.0)
+end
+
 decode_absorb_pulse = proc do |pulse, reward_pulse, tutelage_state|
   tags = current_room_tags.call
   logic_bonus = current_logic_bonus.call
@@ -2275,7 +2288,8 @@ decode_absorb_pulse = proc do |pulse, reward_pulse, tutelage_state|
   expected = if logic_piece && pool_bonus
                base + logic_piece + pool_bonus + group_bonus + super_bonus
              end
-  known_multiplier = tutelage_state.to_s == 'active' ? 5.0 : lumnis_total_multiplier.call
+  absorb_multiplier = tutelage_state.to_s == 'active' ? 5.0 : lumnis_total_multiplier.call
+  known_multiplier = absorb_multiplier * base_exp_bonus_multiplier.call
   observed_multiplier = expected && expected > 0 ? (pulse.to_f / expected.to_f) : nil
   expected_known = expected && expected > 0 ? expected.to_f * known_multiplier.to_f : nil
   extra_multiplier = expected_known && expected_known > 0 ? (pulse.to_f / expected_known) : nil
@@ -2295,6 +2309,7 @@ decode_absorb_pulse = proc do |pulse, reward_pulse, tutelage_state|
   note_bits << "known=tutelage" if tutelage_state.to_s == 'active'
   note_bits << "known=lumnis_#{Vars['xp2_lumnis_phase']}" if tutelage_state.to_s != 'active' && known_multiplier.to_f > 1.0
   note_bits << 'rpa_seen' if Vars['xp2_rpa_active'].to_s =~ /^(on|yes|true|1)$/i
+  note_bits << "base_exp_bonus_#{Vars['xp2_base_exp_bonus_rate']}pct" if Vars['xp2_base_exp_bonus_rate'].to_i > 0
   note_bits << "roommode_override=#{override_mode}:#{room_id}" unless override_mode == 'auto'
   note_bits << 'ship_captains_quarters_supernode' if ship_captains_supernode && override_mode == 'auto'
   note_bits << 'town_from_location' if location_town && !tags.include?('town') && override_mode == 'auto'
@@ -2549,12 +2564,23 @@ startup_experience_check = proc do
   if exp_text =~ /\bAscension Exp:\s*([0-9,]+)/
     startup_ascension_exp = $1.gsub(',', '').to_i
   end
+  base_exp_bonus_rate = Vars['xp2_base_exp_bonus_rate'].to_i
+  base_exp_bonus_until = Vars['xp2_base_exp_bonus_until'].to_s
+  if exp_text =~ /You currently are enlightened, earning \+(\d+)% base experience until ([0-9\/]+\s+at\s+[0-9:]+)\s+elven time standard\./i
+    base_exp_bonus_rate = $1.to_i
+    base_exp_bonus_until = $2.strip
+  elsif exp_text =~ /\b(?:Level|Experience):/i
+    base_exp_bonus_rate = 0
+    base_exp_bonus_until = ''
+  end
   if exp_text =~ /\bTotal Exp:\s*([0-9,]+)/
     startup_total_exp = $1.gsub(',', '').to_i
   elsif startup_regular_exp
     startup_total_exp = startup_regular_exp.to_i + startup_ascension_exp.to_i
   end
   Vars['xp2_rpa_active'] = exp_text =~ /recent adventures echo powerfully in your mind/i ? 'on' : 'off'
+  Vars['xp2_base_exp_bonus_rate'] = base_exp_bonus_rate.to_s
+  Vars['xp2_base_exp_bonus_until'] = base_exp_bonus_until
   if exp_text =~ /heightened understanding of events around you|Knowledge that is not your own teases/i
     Vars['xp2_tutelage_state'] = 'active'
     Vars['xp2_tutelage_state_at'] = Time.now.to_i.to_s
@@ -3049,7 +3075,7 @@ loop do
       sync_lumnis_est.call
       lumnis_before = lumnis_remaining_est
       if lumnis_before > 0
-        lumnis_multiplier = [ lumnis_total_multiplier.call.to_f, 1.0 ].max
+        lumnis_multiplier = [ lumnis_total_multiplier.call.to_f * base_exp_bonus_multiplier.call, 1.0 ].max
         lumnis_spent = [ (pulse.to_f / lumnis_multiplier).round, 1 ].max
         lumnis_remaining_est = [ lumnis_remaining_est - lumnis_spent, 0 ].max
         save_lumnis_est.call
