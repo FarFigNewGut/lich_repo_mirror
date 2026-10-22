@@ -1,0 +1,609 @@
+=begin
+      author: Fizzleworth
+        name: summond
+        game: gemstone
+        tags: sorcerer, demon, minor summoning, 725, runestone
+    requires: Lich > 5.14.2
+     version: 0.2
+        note: Written with assistance from Claude (Anthropic).
+
+  Summons a Minor Summoning (725) demon of the valence or archetype you ask for.
+
+  It goes to the nearest Sorcerer Guild summoning chamber (+25% to summon), casts
+  at the best runestone in your runestonesack, and checks what came through the rift:
+
+    - A specific runestone (e.g. lorae'tyr-igaesha) targets that archetype. If
+      you know that rune (RUNE UNCOMMON) but have no stone, it makes one.
+    - Otherwise it uses the plain valence runestone (e.g. lorae'tyr). That
+      always pulls a demon of the valence, but the archetype is random, so when
+      you ask for an archetype it sends back the wrong ones (TELL MDEMON LEAVE)
+      and tries again after the 5-minute post-summon cooldown. The game doesn't show
+      that cooldown anywhere (and it seems to count only time logged in), so summond
+      counts it down; a cast that comes too soon ("you feel weak from your recent
+      forays into interplanar summoning") is retried every minute and doesn't count
+      as a try.
+    - Missing runestones are made on the spot, only for runes you know (RUNE COMMON /
+      RUNE UNCOMMON): bank (only if you carry less than 15,000 silvers), the nearest
+      alchemist for a runestone (plus ink, a cup to rinse a dried brush, or a rune
+      brush if you have none), draw the rune, then deposit what's left.
+
+  Valences and archetypes (gswiki Minor Summoning (725)):
+    grik'tyr   - grik, imp
+    lorae'tyr  - abyran, grantris, igaesha, verlok
+    shien'tyr  - aishan, shien, arashan
+
+  Usage:
+    ;summond <valence>                  any demon of that valence
+    ;summond <archetype>                e.g. ;summond verlok
+    ;summond <valence> <archetype>      e.g. ;summond lorae'tyr igaesha
+    ;summond list                       valences, archetypes, and the summoning runes you know
+    ;summond help                       usage, how it works, and your current settings
+
+  Options (after the demon):
+    --here       cast where you are instead of travelling to a summoning chamber
+    --tries=N    give up after N casts (default 10)
+    --yes        replace your current demon without asking (for other scripts, e.g. fizzarts)
+
+  Where your runestones and rune tools (brush, ink, cup) live:
+    ;vars set runestonesack=<container name>
+  (falls back to infusesack, so fizzfuse users don't need to set anything)
+=end
+
+module Summond
+  # === config (edit to taste) ===================================================
+  DEFAULT_TRIES        = 10
+  NOD_TIMEOUT_SECONDS  = 20
+  # gswiki: 5 minutes after a successful summon, 10 after a failed cast
+  SUCCESS_COOLDOWN     = 5 * 60
+  FAILURE_COOLDOWN     = 10 * 60
+  # A too-soon cast doesn't restart the cooldown (one 4 minutes after a summon was refused, a
+  # cast 97 seconds later worked), so retry every minute. The cooldown also seems to count only
+  # time logged in, so summond can't know how much is left from a summon before it started.
+  TOO_SOON_RETRY       = 60
+  MAX_TOO_SOON         = 7
+  # Runestones were 8,100-10,000 silvers; this also covers ink or a cup if needed
+  RUNESTONE_SILVER     = 15_000
+
+  VALENCES = {
+    "grik'tyr"  => %w[grik imp],
+    "lorae'tyr" => %w[abyran grantris igaesha verlok],
+    "shien'tyr" => %w[aishan shien arashan],
+  }.freeze
+
+  # The map tags the Sorcerer Guild chambers "summoning chamber"; FWI's isn't tagged
+  EXTRA_CHAMBERS = [34780].freeze
+
+  PULL_REGEX    = /you succeed in opening an interplanar rift from which you manage to pull (?:an? )?(.+?)\.\s*$/
+  SHATTER_REGEX = /runestone shatters into a thousands? fragments/
+  # Casting before the post-summon cooldown is up (seen in-game 4 minutes after a summon)
+  TOO_SOON_REGEX = /you feel weak from your recent forays into interplanar summoning/
+
+  # === helpers ===================================================================
+  def self.msg(text)
+    respond "[summond] #{text}"
+  end
+
+  def self.sack
+    [UserVars.runestonesack, UserVars.infusesack].find { |name| name && !name.strip.empty? }
+  end
+
+  # "an igaesha", "an iron verlok'asha", "a grantris"
+  def self.a(phrase)
+    "#{phrase.to_s =~ /\A[aeiou]/i ? 'an' : 'a'} #{phrase}"
+  end
+
+  def self.minutes(count)
+    "#{count} minute#{count == 1 ? '' : 's'}"
+  end
+
+  # "Lorae'Tyr", "loraetyr", "lorae" -> "lorae'tyr". A bare prefix that's also an
+  # archetype name ("grik", "shien") means the archetype, not the valence.
+  def self.normalize_valence(word)
+    key = word.downcase
+    VALENCES.keys.find { |valence|
+      valence == key || valence.delete("'") == key.delete("'") ||
+        (valence.split("'").first == key && !VALENCES.values.flatten.include?(key))
+    }
+  end
+
+  def self.valence_for(archetype)
+    VALENCES.find { |_valence, types| types.include?(archetype.split("'").first) }&.first
+  end
+
+  # How each archetype's name ends in game (gswiki Minor demon messaging, Igaesha). Most nouns
+  # start with the archetype (verlok'cina, grik'pwal, abyran'sa); shien are darklings or
+  # shadowlings, and an igaesha's noun is haze, fog, smoke, ... It's summoned as "a cloud of pale
+  # turquoise smoke" but TELL MDEMON calls it "your pale turquoise smoke", so don't require "cloud"
+  ARCHETYPE_NOUNS = {
+    'grik'     => /\Agrik/,
+    'imp'      => /\Aimp\z/,
+    'abyran'   => /\Aabyran/,
+    'grantris' => /\Agrantris/,
+    'igaesha'  => /\A(?:haze|rouk|brume|haar|murk|nyle|mist|smoke|vapor|fog)\z/,
+    'verlok'   => /\Averlok/,
+    'aishan'   => /\Aaishan/,
+    'shien'    => /\A(?:darkling|shadowling)/,
+    'arashan'  => /\Aarashan/,
+  }.freeze
+
+  def self.archetype_of(name)
+    words = name.to_s.downcase.split
+    noun = words.last.to_s
+    ARCHETYPE_NOUNS.find { |_type, pattern| noun =~ pattern }&.first
+  end
+
+  def self.wanted?(name, valence, archetype)
+    type = archetype_of(name)
+    return false if type.nil?
+    # abyran'a / abyran'sa: the whole noun has to match, not just "abyran"
+    return name.to_s.split.last.downcase.start_with?(archetype) if archetype&.include?("'")
+    return type == archetype if archetype
+
+    VALENCES[valence].include?(type)
+  end
+
+  # put, not fput: fput would swallow the first response line, which can be the one we need
+  def self.collect_lines(action, terminator, timeout = 8)
+    waitrt?
+    waitcastrt?
+    end_time = Time.now.to_f + timeout
+    lines = []
+    Script.current.clear
+    put action
+    loop do
+      line = get?
+      if line
+        lines << line
+        break if line =~ terminator
+      else
+        sleep 0.1
+      end
+      break if Time.now.to_f > end_time
+    end
+    lines
+  end
+
+  def self.wait_for_nod(seconds)
+    end_time = Time.now + seconds
+    Script.current.clear
+    while Time.now < end_time
+      line = get?
+      return true if line =~ /^You nod/
+      sleep 0.1 unless line
+    end
+    false
+  end
+
+  # Name of the current minor demon, or nil
+  def self.current_demon
+    line = dothistimeout "tell mdemon follow", 5, /You have no minor demon at this time|is already following you|You command your|acknowledges your order/
+    return nil if line =~ /You have no minor demon/
+
+    name = line.to_s[/(?:^Your|You command your) (.+?) (?:is already following|to follow|acknowledges your order)/, 1]
+    # Unrecognized reply but the spell's up: some demon is here, we just don't know which
+    name || (Spell[725].active? ? 'minor demon' : nil)
+  end
+
+  def self.dismiss_demon
+    fput "tell mdemon leave"
+    20.times {
+      break unless Spell[725].active?
+      sleep 0.5
+    }
+  end
+
+  # Takes a runestone with this rune out of the sack and returns it in hand, or nil. Rummage
+  # matches the rune exactly: asking for lorae'tyr with only a lorae'tyr-verlok stone finds nothing.
+  def self.take_runestone(rune)
+    line = dothistimeout "rummage in my #{sack} runestone #{rune}", 5, /drawn on it|can't seem to locate|What were you referring to/
+    return nil unless line =~ /rune drawn on it/
+
+    wait_for_hand { |hand| hand.noun == 'runestone' }
+  end
+
+  # Runes this character can draw, from RUNE COMMON / RUNE UNCOMMON ("    - lorae'tyr   - vakra ...")
+  def self.known_runes
+    @known_runes ||= %w[common uncommon].flat_map { |kind|
+      Lich::Util.quiet_command_xml("rune #{kind}", /Runes:|rune/i).join("\n")
+                .gsub(/<[^>]+>/, '').gsub('&apos;', "'")
+                .scan(/-\s+([a-z][a-z'-]+)/i).flatten.map(&:downcase)
+    }
+  end
+
+  # If RUNE COMMON couldn't be read, assume the plain valence runes (every sorcerer's
+  # common runes) and nothing uncommon
+  def self.knows_rune?(rune)
+    known_runes.empty? ? !rune.include?('-') : known_runes.include?(rune)
+  end
+
+  # === runestone making ==========================================================
+  def self.go2(place)
+    Script.run('go2', "#{place} --disable-confirm")
+  end
+
+  def self.wait_for_hand(&match)
+    20.times {
+      item = [GameObj.right_hand, GameObj.left_hand].find { |hand| hand.id && match.call(hand) }
+      return item if item
+      sleep 0.1
+    }
+    nil
+  end
+
+  def self.put_away(item)
+    return if item.nil?
+
+    fput "put ##{item.id} in my #{sack}"
+    @tools.delete(item.id)
+  end
+
+  # Takes a tool out of the sack by noun and returns it in hand, or nil
+  def self.get_tool(noun)
+    line = dothistimeout "get my #{noun} in my #{sack}", 5, /You remove|You get|You grab|You pull|Get what|What were you referring to|can't find/
+    return nil unless line =~ /You remove|You get|You grab|You pull/
+
+    item = wait_for_hand { |hand| hand.noun == noun }
+    @tools << item.id if item
+    item
+  end
+
+  # Rune ink's noun varies by town (Sorena's in Icemule sells an "ink bottle"), so make sure a
+  # "bottle" really is ink and not a potion
+  def self.get_ink
+    %w[ink bottle].each { |noun|
+      item = get_tool(noun)
+      next if item.nil?
+      return item if item.name =~ /ink/i
+
+      put_away(item)
+    }
+    nil
+  end
+
+  # Buys the first catalog item whose name matches pattern and returns it in hand, or nil
+  def self.buy(pattern, what)
+    number = nil
+    Lich::Util.quiet_command_xml("order", /Welcome to|catalog/i).each { |line|
+      line.gsub(/<[^>]+>/, '').scan(/(\d+)\.\s+(.+?)(?=\s{2,}\d+\.|\s*\z)/) { |num, name| number ||= num if name =~ pattern }
+    }
+    if number.nil?
+      msg "This shop doesn't sell #{what}."
+      return nil
+    end
+
+    held = [GameObj.right_hand.id, GameObj.left_hand.id]
+    fput "order #{number}"
+    result = dothistimeout "buy", 5, /Sold for|hands you|need a free hand|enough|afford|What were you referring to/
+    unless result =~ /Sold for|hands you/
+      msg "Couldn't buy #{what}: #{result || 'no answer from the shop'}"
+      return nil
+    end
+
+    item = wait_for_hand { |hand| !held.include?(hand.id) }
+    @tools << item.id if item && what !~ /runestone/
+    item
+  end
+
+  # At an alchemist: get the brush inked, buy a runestone, draw the rune. Returns the stone in hand.
+  # Brush states, from fizzfuse runs: "covered in a rich <color> ink" (ready), "covered with dry
+  # <color> ink" (rinse in a cup, then ink), "clean and smooth" (ink)
+  def self.draw_runestone(rune)
+    brush = get_tool('brush') || buy(/\bbrush\b/, 'a rune brush')
+    return nil if brush.nil?
+
+    state = dothistimeout "look at my brush", 5, /covered in a rich|covered with dry|clean and smooth/
+    if state =~ /covered with dry/
+      cup = get_tool('cup') || buy(/\bcup\b/, 'a cup to rinse your brush')
+      return nil if cup.nil?
+
+      fput "dip brush in my cup"
+      # Sorena's (Icemule) spoils the cup's water after one rinse and sets it aside, so this can fail harmlessly
+      put_away(cup)
+    end
+    unless state =~ /covered in a rich/
+      ink = get_ink || buy(/rune ink|ink bottle/, 'rune ink')
+      return nil if ink.nil?
+
+      fput "dip brush in my #{ink.noun}"
+      put_away(ink)
+    end
+
+    stone = buy(/runestone/, 'a runestone')
+    return nil if stone.nil?
+
+    line = dothistimeout "draw #{rune} rune on runestone", 5, /you draw the|trace out the shape|cleaned off first|will need ink|Roundtime/
+    waitrt?
+    unless line =~ /you draw the|trace out the shape/
+      msg "Drawing the #{rune} rune didn't work: #{line || 'no response'}"
+      return nil
+    end
+    stone
+  end
+
+  # Bank (only if needed), alchemist, draw, deposit what's left. Returns the new stone in hand.
+  def self.make_runestone(rune)
+    msg "No #{rune} runestone in your #{sack}. Making one (bank if needed, then the alchemist)."
+    withdrew = false
+    if Lich::Util.silver_count < RUNESTONE_SILVER
+      go2('bank')
+      line = dothistimeout "withdraw #{RUNESTONE_SILVER} silvers", 5, /hands you|don't have|not have|insufficient|only have/i
+      unless line =~ /hands you/
+        msg "Couldn't withdraw #{RUNESTONE_SILVER} silvers for a runestone: #{line || 'no answer from the teller'}"
+        return nil
+      end
+      withdrew = true
+    end
+
+    go2('alchemist')
+    stone = draw_runestone(rune)
+    [GameObj.right_hand, GameObj.left_hand].each { |hand| put_away(hand) if @tools.include?(hand.id) }
+
+    if withdrew
+      go2('bank')
+      fput "deposit all"
+    end
+    stone
+  end
+
+  # Best runestone for the request: the specific archetype rune if you have one, else the valence rune
+  def self.get_runestone(valence, archetype)
+    if archetype
+      rune = "#{valence}-#{archetype}"
+      stone = take_runestone(rune)
+      stone ||= make_runestone(rune) if knows_rune?(rune)
+      return [stone, true] if stone
+
+      msg "You don't know the #{rune} rune (RUNE UNCOMMON), so using a plain #{valence} runestone." unless knows_rune?(rune)
+    end
+
+    stone = take_runestone(valence)
+    if stone.nil? && !knows_rune?(valence)
+      msg "You have no #{valence} runestone and don't know the #{valence} rune (RUNE COMMON)."
+      return [nil, false]
+    end
+    stone ||= make_runestone(valence)
+    [stone, false]
+  end
+
+  def self.go_to_chamber
+    chambers = Map.list.select { |room| room&.tags&.include?('summoning chamber') }.map(&:id) + EXTRA_CHAMBERS
+    target = Room.current.find_nearest(chambers)
+    if target.nil?
+      msg "Couldn't find a path to a summoning chamber. Casting here instead (25% lower odds)."
+      return
+    end
+    Script.run('go2', "#{target} --disable-confirm") unless Room.current.id == target
+  end
+
+  # The game doesn't list 725's cooldown anywhere (SPELL ACTIVE shows none), so count it down here
+  def self.wait_until(time, reason)
+    minutes_left = lambda { ((time - Time.now) / 60.0).ceil }
+    return if Time.now >= time
+
+    shown = minutes_left.call
+    msg "Waiting #{minutes(shown)} for the #{reason} cooldown."
+    while Time.now < time
+      sleep 1
+      left = minutes_left.call
+      next unless left < shown && left.positive?
+
+      shown = left
+      msg "#{minutes(left)} until the next summon."
+    end
+  end
+
+  def self.wait_for_cooldown_effect
+    name = Effects::Cooldowns.to_h.keys.find { |key| key.is_a?(String) && key =~ /summon/i }
+    return unless name && Effects::Cooldowns.active?(name)
+
+    msg "Waiting for the #{name} cooldown."
+    sleep 1 while Effects::Cooldowns.active?(name)
+  end
+
+  def self.wait_for_mana
+    cost = Spell[725].mana_cost
+    return if checkmana >= cost && Spell[725].affordable?
+
+    msg "Waiting for #{cost} mana (you have #{checkmana})."
+    sleep 1 until checkmana >= cost && Spell[725].affordable?
+  end
+
+  # Returns [demon name or nil, runestone shattered?, all response lines]
+  def self.cast_at(stone)
+    wait_for_mana
+    fput "release" unless checkprep == "None"
+    dothistimeout "prep 725", 5, /Your spell is ready|already have/
+    lines = collect_lines("cast ##{stone.id}", /Roundtime/)
+    waitcastrt?
+    name = lines.map { |line| line[PULL_REGEX, 1] }.compact.first
+    [name, lines.any? { |line| line =~ SHATTER_REGEX }, lines]
+  end
+
+  def self.help
+    respond
+    respond "summond - summons a Minor Summoning (725) demon of the kind you ask for."
+    respond
+    respond "Usage:"
+    respond "  ;summond <valence>                any demon of that valence (e.g. ;summond lorae'tyr)"
+    respond "  ;summond <archetype>              that archetype (e.g. ;summond verlok)"
+    respond "  ;summond <valence> <archetype>    the same, valence spelled out (e.g. ;summond lorae'tyr igaesha)"
+    respond "  ;summond list                     valences, archetypes, and the summoning runes you know"
+    respond "  ;summond help                     this help"
+    respond
+    respond "Options (after the demon):"
+    respond "  --here       cast where you are instead of going to the nearest summoning chamber (-25% odds)"
+    respond "  --tries=N    give up after N casts (default #{DEFAULT_TRIES})"
+    respond "  --yes        replace your current demon without asking (for other scripts, e.g. fizzarts)"
+    respond
+    respond "What it does:"
+    respond "  1. If you already have a demon: stops if it's what you asked for, otherwise asks you to"
+    respond "     NOD within #{NOD_TIMEOUT_SECONDS} seconds before sending it back (TELL MDEMON LEAVE)."
+    respond "  2. Picks a runestone from your infusesack:"
+    respond "       - the archetype's runestone (e.g. lorae'tyr-igaesha) if you have one, or know that"
+    respond "         rune (RUNE UNCOMMON) and it can make one"
+    respond "       - otherwise the plain valence runestone (e.g. lorae'tyr): always a demon of that"
+    respond "         valence, but the archetype is random"
+    respond "     Missing runestones are made on the spot (bank if needed, the alchemist, draw the rune),"
+    respond "     only for runes you know. It brings your rune brush and buys ink, a cup or a brush as needed."
+    respond "  3. Goes to the nearest Sorcerer Guild summoning chamber (+25% odds), waits for mana, casts."
+    respond "  4. Wrong archetype? Sends it back and re-rolls after the #{SUCCESS_COOLDOWN / 60}-minute cooldown."
+    respond "     The game doesn't show that cooldown, so summond counts it down. A cast that's too soon"
+    respond "     is retried every minute; a failed cast waits #{FAILURE_COOLDOWN / 60}. A shattered runestone gets replaced."
+    respond "  5. Tells the demon to FOLLOW and GUARD, and puts the runestone back."
+    respond
+    respond "Settings:"
+    respond "  runestonesack   #{sack || '(not set)'}   runestones and rune tools (brush, ink, cup)"
+    respond "                  set with ;vars set runestonesack=<container name> (falls back to infusesack)"
+    respond
+  end
+
+  def self.list
+    respond
+    VALENCES.each { |valence, types| respond "  #{valence.ljust(10)} #{types.join(', ')}" }
+    summoning = known_runes.select { |rune| VALENCES.keys.any? { |valence| rune.start_with?(valence) } }
+    respond
+    respond "  Summoning runes you know: #{summoning.empty? ? '(none found)' : summoning.join(', ')}"
+    respond
+  end
+
+  # === main ======================================================================
+  def self.run(args)
+    # Module state survives between runs (Lich re-opens the same module), so reset it
+    @cleaned_up = false
+    @emptied_hands = false
+    @known_runes = nil
+    @tools = []
+    @stone = nil
+
+    words = args.reject { |arg| arg.start_with?('--') }.map(&:downcase)
+    here = args.include?('--here')
+    yes = args.include?('--yes')
+    tries = (args.find { |arg| arg =~ /^--tries=\d+$/ }&.split('=')&.last || DEFAULT_TRIES).to_i
+
+    if words.empty? || words.first =~ /^(help|\?)$/
+      help
+      exit
+    elsif words.first == 'list'
+      list
+      exit
+    end
+
+    if sack.nil?
+      msg "Set your runestone container first: ;vars set runestonesack=<container name>"
+      exit
+    end
+
+    valence = normalize_valence(words[0])
+    archetype = valence ? words[1] : words[0]
+    valence ||= archetype && valence_for(archetype)
+
+    if valence.nil?
+      msg "Don't know the demon '#{words.join(' ')}'."
+      list
+      exit
+    end
+    if archetype && !VALENCES[valence].include?(archetype.split("'").first)
+      msg "#{archetype} isn't a #{valence} demon. #{valence}: #{VALENCES[valence].join(', ')}"
+      exit
+    end
+    wanted = archetype || "#{valence} demon"
+
+    demon = current_demon
+    if demon && wanted?(demon, valence, archetype)
+      msg "You already have #{a(demon)}."
+      exit
+    elsif demon
+      if yes
+        msg "Sending back your #{demon} to summon #{a(wanted)}."
+      else
+        msg "You already have #{a(demon)}. Type NOD within #{NOD_TIMEOUT_SECONDS} seconds to send it back and summon #{a(wanted)}."
+        exit unless wait_for_nod(NOD_TIMEOUT_SECONDS)
+      end
+      dismiss_demon
+    end
+
+    # before_dying, not ensure: on ;kill the script's thread dies first and fput from its
+    # ensure fails ("waitfor: Unable to identify calling script"); before_dying runs after
+    before_dying { Summond.cleanup }
+    empty_hands
+    @emptied_hands = true
+
+    @stone, targeted = get_runestone(valence, archetype)
+    if @stone.nil?
+      msg "Couldn't get a #{valence} runestone. Stopping."
+      exit
+    end
+    msg "Using a #{targeted ? "#{valence}-#{archetype}" : valence} runestone#{archetype && !targeted ? " (random archetype, will re-roll until it's #{a(archetype)})" : ''}."
+
+    go_to_chamber unless here
+
+    next_cast = Time.now
+    casts = 0
+    refusals = 0
+    while casts < tries
+      if @stone.nil?
+        msg "Your runestone shattered. Getting another."
+        fput "release" unless checkprep == "None"
+        @stone, targeted = get_runestone(valence, archetype)
+        if @stone.nil?
+          msg "Couldn't get another #{valence} runestone. Stopping."
+          exit
+        end
+        go_to_chamber unless here
+      end
+
+      wait_until(next_cast, casts.zero? ? 'summoning' : 're-summon')
+      wait_for_cooldown_effect
+
+      name, shattered, lines = cast_at(@stone)
+      @stone = nil if shattered
+
+      # Still on the post-summon cooldown: not a real attempt
+      if lines.any? { |line| line =~ TOO_SOON_REGEX }
+        refusals += 1
+        if refusals >= MAX_TOO_SOON
+          msg "The game refused #{refusals} casts in a row as too soon after your last summon. Stopping."
+          exit
+        end
+        msg "Too soon after your last summon (the cooldown only counts down while you're logged in). Trying again in #{minutes(TOO_SOON_RETRY / 60)}."
+        next_cast = Time.now + TOO_SOON_RETRY
+        next
+      end
+      refusals = 0
+      casts += 1
+
+      if name.nil?
+        msg "Cast #{casts} didn't summon anything. The game said:"
+        lines.each { |line| respond "    #{line}" }
+        next_cast = Time.now + FAILURE_COOLDOWN
+      elsif wanted?(name, valence, archetype)
+        msg "Summoned #{a(name)} on cast #{casts}."
+        fput "tell mdemon follow"
+        fput "tell mdemon guard"
+        return
+      elsif archetype_of(name).nil?
+        msg "Summoned #{a(name)}, which isn't an archetype I recognize. Keeping it so you can check what it is."
+        return
+      else
+        msg "Summoned #{a(name)}, not #{a(wanted)}. Sending it back."
+        dismiss_demon
+        next_cast = Time.now + SUCCESS_COOLDOWN
+      end
+    end
+
+    msg "No #{wanted} after #{tries} casts. Stopping."
+  end
+
+  # Puts the runestone and any rune tools in hand back in the sack and re-equips what was in hand
+  def self.cleanup
+    return if @cleaned_up
+
+    @cleaned_up = true
+    fput "release" unless checkprep == "None"
+    fput "put ##{@stone.id} in my #{sack}" if @stone && [GameObj.right_hand, GameObj.left_hand].any? { |hand| hand.id == @stone.id }
+    [GameObj.right_hand, GameObj.left_hand].each { |hand| fput "put ##{hand.id} in my #{sack}" if @tools.to_a.include?(hand.id) }
+    fill_hands if @emptied_hands
+  end
+end
+
+Summond.run(Script.current.vars[1..] || [])
