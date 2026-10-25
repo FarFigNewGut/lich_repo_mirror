@@ -8,10 +8,10 @@ The following inputs are available:
   ;merchantical       - open merchant item manager
 
         author: Kyrandos
-        Other scripts: Combatical, VolnRestore2, Loresang
+        Other scripts: Combatical, VolnRestore2, Loresang, isharpie
         game: gs
-        tags: utility, economy, merchant, loresang, sell, pawnshop, shop, item, management
-        version: 1.6.0
+        tags: utility, economy, merchant, loresang, sell, pawnshop, shop, item, management, playershop, shop, sales
+        version: 1.7.0
         required: Lich > 5.0
 
         \Version\
@@ -78,6 +78,7 @@ The following inputs are available:
         1.6.0 09/18/2026 - Edit Items For Sale: per-item editable price, ctrl/shift-click
                           multi-select with bulk +/-% and remove buttons. Added ? help
                           popups for Loresang and Shop Inventory Management.
+        1.7.0 10/23/2026 - Scan Shop aborts if travel/entry fails instead of logging false sales; added Undo Last Scan to the Ledger.
 
 
 =end
@@ -1435,6 +1436,31 @@ module Merchantical
       week_cutoff  = (now - 7 * 24 * 60 * 60).strftime('%Y-%m-%d')
       month_prefix = now.strftime('%Y-%m')
       year_prefix  = now.strftime('%Y')
+
+      if (undo = @shop_state['last_scan_undo'])
+        undo_ids = undo['ledger_event_ids'] || []
+        undo_lbl = Gtk::Label.new
+        undo_lbl.markup = "<span foreground='#cc5555'>Undo Last Scan</span>"
+        undo_btn = Gtk::Button.new
+        undo_btn.add(undo_lbl)
+        undo_btn.halign = :start
+        undo_btn.set_tooltip_text(
+          "Revert the scan from #{undo['time']}: restores Shop Inventory to what it was\n" \
+          "before that scan and deletes the #{undo_ids.length} ledger entr#{undo_ids.length == 1 ? 'y' : 'ies'} it recorded.\n" \
+          "Any listing/removal done since that scan is rolled back too -- rescan after."
+        )
+        undo_btn.signal_connect('clicked') do
+          @shop_state['shop_inventory'] = undo['shop_inventory'] || {}
+          @shop_state['shop_paths']     = undo['shop_paths'] || {}
+          (@shop_state['ledger_events'] || []).reject! { |ev| undo_ids.include?(ev['id']) }
+          @shop_state.delete('last_scan_undo')
+          persist_shop_state
+          Lich::Messaging.msg("yellow",
+            "[Merchantical] Undid scan from #{undo['time']} (#{undo_ids.length} ledger entr#{undo_ids.length == 1 ? 'y' : 'ies'} removed).")
+          apply_shop_state(@shop_state)
+        end
+        @ledger_box.pack_start(undo_btn, expand: false, fill: false, padding: 4)
+      end
 
       stats_row = Gtk::Box.new(:horizontal, 20)
       stats_row.halign = :start
@@ -4814,7 +4840,9 @@ module Merchantical
           this week/month/year totals, a 6-month income-vs-upkeep table (upkeep is
           the game's real 10,000-silver-per-room monthly shop fee), and the raw
           recent-sales list -- click the X on an entry to delete it (e.g. one you
-          actually pulled back out by hand instead of selling).
+          actually pulled back out by hand instead of selling). Undo Last Scan (top
+          of the tab) reverts the most recent scan entirely: inventory goes back to
+          how it was before it, and every sale that scan recorded is deleted.
 
         Export Shop HTML (main toolbar, next to the #{SHOP_ICON} toggle) is separate
         from this notebook -- it saves every item you've flagged with #{SHOP_ICON} in
@@ -5047,13 +5075,16 @@ module Merchantical
       can.t\s+(accept|use|buy)    |   # refusal
       don.t\s+want                |   # refusal
       shakes.*head                |   # refusal
+      not\s+buying                |   # refusal: "not buying anything this valuable today"
+      maybe\s+tomorrow            |   # refusal (daily buy cap reached)
       what\s+were\s+you\s+referring  # item not in hands or not found
     /xi
 
     SELL_REFUSED = /
       hands\s+it\s+back|not\s+interested|can.t\s+say|interested\s+in\s+that|
       worthless|wouldn.t\s+give|find\s+a\s+buyer|no\s+thank|
-      can.t\s+(accept|use|buy)|don.t\s+want|shakes.*head
+      can.t\s+(accept|use|buy)|don.t\s+want|shakes.*head|
+      not\s+buying|maybe\s+tomorrow
     /xi
 
     # capture_command's end-of-response marker (see below): "look at #0" always
@@ -7051,7 +7082,20 @@ module Merchantical
     # Uses Merchantical's own loresong_* settings (see show_gear's Loresong tab) --
     # no dependence on Loresang's UserVars.
     # Returns true if singing completed (permanently unlocked), false otherwise.
-    def sing_item_to_unlock(noun, opts)
+    def sing_item_to_unlock(noun, opts, item_id = nil)
+      # Shields (e.g. aegis) may land in the left hand on GET. Loresing works on the
+      # right-hand item, so swap the item over if it is only in the left hand.
+      held_id = lambda { |h| o = GameObj.send(h); (o.nil? || o.name == "Empty") ? nil : o.id.to_s }
+      if item_id && held_id.call(:right_hand) != item_id.to_s && held_id.call(:left_hand) == item_id.to_s
+        fput "swap"
+        pause 0.5
+      end
+      if item_id && held_id.call(:right_hand) != item_id.to_s
+        Lich::Messaging.msg("yellow", "[Merchantical] Sing: item ##{item_id} not in right hand " \
+                                      "(right=#{held_id.call(:right_hand).inspect}, left=#{held_id.call(:left_hand).inspect}) -- cannot sing.")
+        return false
+      end
+
       verse1 = opts['loresong_verse1'].to_s.strip
       verse1 = "that I hold in my hand; Tell your secrets and don't be bland;" \
                "Share your power and make it grand; I seek the knowledge lost in the sand" if verse1.empty?
@@ -7059,6 +7103,7 @@ module Merchantical
       verse2 = "of power that I hold;Speak of secrets left untold; Show me now for I am bold;" \
                "Spare no detail don't leave me cold" if verse2.empty?
       max_cycles   = (opts['loresong_max_cycles'] || 10).to_i
+      max_cycles   = 10 if max_cycles < 1
       use_guild    = opts['loresong_use_guildspeak'] || false
       rt_skew      = (opts['loresong_rt_skew_enabled'] ? opts['loresong_rt_skew'].to_f : 0.0)
       done_rx      = /permanently unlocked|reached the end of .* song|learn nothing new|nothing new about/i
@@ -7302,7 +7347,7 @@ module Merchantical
 
           if still_locked
             Lich::Messaging.msg("yellow", "[Merchantical] Singing to #{full_name}...")
-            unlocked = sing_item_to_unlock(noun, opts)
+            unlocked = sing_item_to_unlock(noun, opts, gi.id)
             recall_text  = capture_recall(noun, gi.id)
             still_locked = !unlocked || recall_text =~ /must reveal the entire loresong|you have not yet unlocked/i
           end
@@ -7553,11 +7598,28 @@ module Merchantical
     # scan your own containers (worn or held) for items to sell, and list them there.
     # ---------------------------------------------------------------------------
 
-    # Travel to a room by go2-compatible id/name and wait for arrival.
+    # Travel to a room by go2-compatible id/name and wait for arrival. Returns
+    # whether we actually ended up there (go2 can stop short -- e.g. a failed
+    # bank detour for travel silvers -- without the caller ever knowing).
     def go2_to(room)
       start_script("go2", [room.to_s])
       while running?("go2"); pause 0.5; end
       waitrt?
+      at_room?(room)
+    end
+
+    # Best-effort "are we standing in `room`?" -- handles plain map ids and
+    # uNNNNNN game ids; anything else (go2 tags like "bank") can't be checked
+    # cheaply, so it's assumed fine.
+    def at_room?(room)
+      target = room.to_s.strip
+      if target =~ /\Au(\d+)\z/i
+        XMLData.room_id.to_s == $1
+      elsif target =~ /\A\d+\z/
+        (Map.current_room_id rescue nil).to_s == target
+      else
+        true
+      end
     end
 
     OPPOSITE_DIRECTION = {
@@ -7579,12 +7641,22 @@ module Merchantical
     # like a failure (wrong noun, not close enough, etc.) -- callers should abort
     # rather than run "shop inventory" from outside the shop.
     def enter_player_shop(location, shop_name)
-      go2_to(location)
+      unless go2_to(location)
+        Lich::Messaging.msg("yellow",
+          "[Merchantical] Travel to #{location} failed (go2 stopped short) -- not entering the shop.")
+        return false
+      end
       pause 0.3
+      before_room = XMLData.room_id.to_s
       go_resp = fput "go #{shop_name}"
       waitrt?; pause 0.3
-      !(go_resp.to_s =~ /don.t see|can.t go|nothing happens|what were you referring|you can.t/i)
+      return false if go_resp.to_s =~ /don.t see|can.t go|nothing happens|what were you referring|you can.t|where are you trying to go/i
+      # Didn't actually move anywhere -- whatever the response said, we're not inside.
+      XMLData.room_id.to_s != before_room
     end
+
+    # The game's own refusal when `shop inventory` is run outside your shop.
+    NOT_IN_SHOP_RE = /must be in your shop/i
 
     def leave_player_shop
       fput "out"
@@ -7619,7 +7691,15 @@ module Merchantical
         title_line  = look_lines.find { |l| l =~ /\A\[(.+)\]\s*\z/ }
         titles[room_id] = title_line ? title_line[/\A\[(.+)\]\s*\z/, 1] : room_id
 
-        results[room_id] = parse_shop_inventory(capture_command("shop inventory"))
+        inv_lines = capture_command("shop inventory")
+        # Not one of our shop rooms -- record nothing for it and don't explore
+        # onward from it (we've wandered outside, or never got in at all).
+        if inv_lines.join(' ') =~ NOT_IN_SHOP_RE
+          paths.delete(room_id)
+          titles.delete(room_id)
+          return
+        end
+        results[room_id] = parse_shop_inventory(inv_lines)
         signs[room_id]   = parse_sign_text(capture_command("read sign"))
         return if visited_ids.length >= max_rooms
 
@@ -7825,11 +7905,20 @@ module Merchantical
         return msg unless msg.empty?
       end
 
-      # The expected "In the <language> language, it reads:" wrapper didn't match
-      # (or produced nothing) -- that's a parsing gap, NOT proof there's no sign.
-      # A sign that's genuinely absent gets caught by the "don't see" check above;
-      # anything else that reaches here came back with actual content, so show
-      # the raw response rather than silently claiming "no sign" and hiding it.
+      # capture_command's capture window isn't scoped to just this command --
+      # it grabs everything that streams through until the sentinel response,
+      # which in practice has included unrelated output from OTHER concurrent
+      # Lich scripts (confirmed: a vitals summary from a hunting script landed
+      # here instead of an actual sign). The disclaimer banner above is fixed
+      # boilerplate the GAME itself always adds to a real sign response -- a
+      # shop owner's message can't omit it -- so its absence is a much more
+      # reliable signal of "this capture got polluted" than "unrecognized sign
+      # format". Only fall back to showing the raw text when the banner IS
+      # present but the "In the <language> language, it reads:" line itself
+      # didn't match for some other reason; otherwise bail out entirely so a
+      # bad capture can't get mistaken for -- or overwrite -- a real sign.
+      return nil unless text =~ /posted by the shop owner/i
+
       text
     end
 
@@ -7857,6 +7946,14 @@ module Merchantical
 
       room_results, paths, signs, titles = crawl_shop_rooms(max_rooms: 3)
 
+      # Every room refused `shop inventory` -- we never made it into the shop.
+      # Bail before touching saved state, or every listed item reads as sold.
+      if room_results.empty?
+        Lich::Messaging.msg("yellow",
+          "[Merchantical] Shop scan: not inside your shop -- nothing saved, ledger untouched.")
+        return
+      end
+
       # Snapshot what we believed was in the shop BEFORE overwriting it below,
       # so we can tell what quietly vanished since the last scan -- our own
       # actions (List Items For Sale, Commit removal) already keep this cache
@@ -7864,20 +7961,35 @@ module Merchantical
       # do ourselves was bought by someone else. Skipped on the very first
       # scan ever (nothing to compare against yet).
       old_inventory = shop_state['shop_inventory'] || {}
+      old_paths     = shop_state['shop_paths'] || {}
 
       shop_state['shop_inventory'] = {}
       room_results.each do |room_id, containers|
         item_count = containers.sum { |c| c['items'].length }
+        # A nil sign here means THIS scan's read sign either found nothing or
+        # (per parse_sign_text) looked like a corrupted/unrelated capture --
+        # either way, that's not proof the room's sign changed, so keep
+        # whatever was last known-good rather than blanking it out.
+        sign_text = signs[room_id] || old_inventory.dig(room_id, 'sign_text')
         shop_state['shop_inventory'][room_id] = {
           'room_label' => titles[room_id] || room_id,
           'containers' => containers,
-          'sign_text'  => signs[room_id]
+          'sign_text'  => sign_text
         }
         Lich::Messaging.msg("yellow",
           "[Merchantical] Shop scan: #{room_id} -- #{item_count} item(s) across #{containers.length} container(s).")
       end
+      # A previously-known room this crawl didn't reach isn't proof it emptied
+      # out -- carry its last listing (and path) forward untouched.
+      (old_inventory.keys - room_results.keys).each do |room_id|
+        shop_state['shop_inventory'][room_id] = old_inventory[room_id]
+        paths[room_id] ||= old_paths[room_id] if old_paths[room_id]
+        Lich::Messaging.msg("yellow",
+          "[Merchantical] Shop scan: #{room_id} not reached this scan -- kept its previous listing.")
+      end
       shop_state['shop_paths'] = paths
 
+      events = []
       if old_inventory.any?
         events = detect_shop_sales(old_inventory, shop_state['shop_inventory'])
         if events.any?
@@ -7889,6 +8001,15 @@ module Merchantical
             "[Merchantical] Ledger: #{sold_qty} item(s) sold since last scan for #{formatted} silvers.")
         end
       end
+
+      # One-level undo for the Ledger tab's Undo Last Scan: what the inventory
+      # and paths looked like before this scan, plus the ledger entries it added.
+      shop_state['last_scan_undo'] = {
+        'time'             => Time.now.strftime('%Y-%m-%d %H:%M'),
+        'shop_inventory'   => old_inventory,
+        'shop_paths'       => old_paths,
+        'ledger_event_ids' => events.map { |e| e['id'] }
+      }
 
       # Deliberately NOT leaving the shop or navigating home here -- stay put in
       # whichever room the crawl finished in, since the player will likely want
@@ -7912,6 +8033,8 @@ module Merchantical
       events = []
       today = Time.now.strftime('%Y-%m-%d')
       old_inv.each do |room_id, room_data|
+        # Never scanned this time -- can't say anything about what's there.
+        next unless new_inv.key?(room_id)
         new_containers = (new_inv.dig(room_id, 'containers') || [])
         (room_data['containers'] || []).each do |old_cont|
           new_cont  = new_containers.find { |c| c['name'] == old_cont['name'] }
@@ -7967,7 +8090,19 @@ module Merchantical
       waitrt?; pause 0.3
 
       shop_state['shop_inventory'][room_id] ||= { 'room_label' => room_id }
-      shop_state['shop_inventory'][room_id]['sign_text'] = parse_sign_text(capture_command("read sign"))
+      confirmed = parse_sign_text(capture_command("read sign"))
+      if confirmed
+        shop_state['shop_inventory'][room_id]['sign_text'] = confirmed
+      else
+        # Falling back to the OLD sign text here would be misleading too --
+        # the user just changed it, so stale pre-edit text is no more
+        # trustworthy than a corrupted capture. Our own best guess (what was
+        # just sent) is more likely right than either, but flag it as
+        # unconfirmed rather than passing it off as a verified read.
+        Lich::Messaging.msg("yellow",
+          "[Merchantical] Set sign: couldn't confirm the new text came back cleanly -- re-check the sign manually.")
+        shop_state['shop_inventory'][room_id]['sign_text'] = clear ? nil : message
+      end
 
       path.reverse.each { |dir| fput opposite_direction(dir); waitrt?; pause 0.3 }
       leave_player_shop
