@@ -1,5 +1,5 @@
 =begin
-	   OSACommander Version: '4.1.5 (October 11, 2026)
+	   OSACommander Version: '4.1.6 (October 25, 2026)
 	
 	   Usage: 
 	
@@ -49,6 +49,11 @@
 	   ;osacommander combat                                 Tells entire crew to start OSACombat.
 	   ;osacommander combat <name>                          Tells a specific crew member to start OSACombat.
 	   ;osacommander loot <name>                            Tells a specific crew member to turn on looting and the rest to turn off looting.
+	   ;osacommander help                                   Shows this list of commands
+	   ;osacommander checkpoint                             Shows the saved encounter checkpoint (stage, enemy ship and how long ago)
+	   ;osacommander resume                                 Continues the current encounter from its last saved checkpoint
+	   ;osacommander resume force                           Resumes even if the checkpoint is more than 30 minutes old
+	   osacommander setup|help|checkpoint                   (no semicolon) Same commands, typed while osacommander is running
 	
 	   This is the OSA Commander script. It is ran from your ship captain to give orders to the crew. 
 	   Enjoy 
@@ -98,6 +103,20 @@
                              now refresh the in-memory settings they write so nothing keeps reading stale values.
           October 11, 2026 - Fixed the "Attention To Quarters" recite on exit reading the ship name from osacrew's
                              settings instead of osacommander's, so it recited a blank or old name.
+          October 25, 2026 - Fixed Task Time (and other orders) not waiting for Task Complete. The new task round
+                             was only started when the commander's own crew-channel message echoed back, so a
+                             wait called right after an order (e.g. Task Time! after loot sharing) still counted
+                             the Task Completes from the previous round and finished at once. The round now
+                             starts the moment the order is sent.
+                             Added encounter checkpoints. Each stage from enemy detection to the encounter stats
+                             (1 Detected, 2 Approach, 3 Boarded, 4 Cleanup, 5 Repairs, 6 Treasure, 7 Raze, 8 Sell,
+                             9 Crew Share, 10 Stats, S Sunk) saves its checkpoint to osacommander.yaml, and
+                             ;osacommander resume picks the encounter up from there after a crash. Steps that must
+                             not repeat are guarded: the supply crate move, mooring, the starting bank balance and
+                             sharing silver. Checkpoints over 30 minutes old need ;osacommander resume force.
+                             New commands: ;osacommander checkpoint, ;osacommander resume and ;osacommander help.
+                             While osacommander is running, "osacommander setup", "osacommander help" and
+                             "osacommander checkpoint" can be typed without a semicolon.
 =end 
 
 def commander_load_yaml_file(path)
@@ -146,6 +165,10 @@ def commander_lnet_crew(msg)
 		respond "--- OSACommander: Crew channel is not defined. Please run ;osacrew setup and set your Crew Channel before continuing."
 		return
 	end
+	# Every crew order (except mana requests) starts a new Task Complete round. Stamped here, at
+	# send time, so a commander_task_complete called right after this can't count reports left
+	# over from the previous round.
+	$osa_task_round_start = Time.now unless msg.to_s =~ /^I Need .* Mana!/
 	LNet.send_message(attr = { 'type' => 'channel', 'channel' => crew_channel }, msg)
 end
 
@@ -235,6 +258,15 @@ def commander_help_display
 	respond "   ;osacommander combat                                 Tells entire crew to start OSACombat."
 	respond "   ;osacommander combat <name>                          Tells a specific crew member to start OSACombat."
 	respond "   ;osacommander loot <name>                            Tells a specific crew member to turn on looting and the rest to turn off looting."
+	respond "   ;osacommander help                                   Shows this list of commands"
+	respond "   ;osacommander checkpoint                             Shows the saved encounter checkpoint (stage, enemy ship and how long ago)"
+	respond "   ;osacommander resume                                 Continues the current encounter from its last saved checkpoint"
+	respond "   ;osacommander resume force                           Resumes even if the checkpoint is more than 30 minutes old"
+	respond "   osacommander setup|help|checkpoint                   (no semicolon) Same commands, typed while osacommander is running"
+	respond ""
+	respond "   Encounter checkpoints: 1 Detected, 2 Approach, 3 Boarded, 4 Cleanup, 5 Repairs, 6 Treasure, 7 Raze,"
+	respond "   8 Sell, 9 Crew Share, 10 Stats, S Sunk (cannon sinking). The checkpoint clears when the encounter"
+	respond "   stats are shown, after a cannon sinking, or with ;osacommander stop."
 	respond ""
 	respond "   This is the OSA Commander script. It is ran from your ship captain to give orders to the crew. "
 	respond "   Enjoy "
@@ -1325,21 +1357,18 @@ end
 # Task Complete tracking (used by every commander_task_complete wait).
 # A small exec script runs for the life of osacommander and logs every
 # "Task Complete" report with the time it arrived. It has its own line buffer,
-# so the commander's own fput/casting can no longer wipe reports out. It also
-# notes the time of the commander's last crew-channel broadcast (ignoring mana
-# requests); that marks the start of the current task round.
+# so the commander's own fput/casting can no longer wipe reports out. The start
+# of the current task round is stamped by commander_lnet_crew when an order is
+# sent (not when its echo comes back, which raced the wait that follows it).
 def commander_start_task_listener
 	commander_stop_task_listener
 	$osa_task_log = []
-	$osa_task_round_start = Time.now
+	$osa_task_round_start ||= Time.now
 	$osa_task_channel = commander_osacrew_data["crew"].to_s
 	@task_listener = start_exec_script(<<~'LISTENER', { quiet: true })
-		chan = Regexp.escape($osa_task_channel.to_s)
 		loop do
 			line = get
-			if line =~ /^\[#{chan}\]-You: "(?!I Need .* Mana!)/
-				$osa_task_round_start = Time.now
-			elsif line =~ /^\[Private\]-GSIV:([^:]+): "Task Complete"/
+			if line =~ /^\[Private\]-GSIV:([^:]+): "Task Complete"/
 				$osa_task_log << [$1.strip, Time.now]
 				$osa_task_log.shift while $osa_task_log.size > 200
 			end
@@ -1669,6 +1698,7 @@ def commander_final_approach
 	commander_enemy_main_deck
 	commander_save_to_commander("helmsman_endtime", Time.now)
 	commander_save_to_commander("boardingtime", ((@commander_data["helmsman_endtime"] - @commander_data["helmsman_start_time"])/60))
+	commander_checkpoint(3)
 	return
 end
 
@@ -1677,6 +1707,7 @@ def commander_final_approach_2
 	commander_enemy_main_deck
 	commander_save_to_commander("helmsman_endtime", Time.now)
 	commander_save_to_commander("boardingtime", ((@commander_data["helmsman_endtime"] - @commander_data["helmsman_start_time"])/60))
+	commander_checkpoint(3)
 	return
 end
 
@@ -1804,6 +1835,7 @@ def commander_helmsman
 end
 
 def commander_check_role
+	commander_checkpoint(2)
 	commander_save_to_crew("boarding", true)
 	commander_save_to_crew("sunk_ship", false, push: false)
 	if @commander_data["cannon_engage"]
@@ -2174,7 +2206,11 @@ def commander_right_hand
 end
 
 def commander_sell_loot
-	commander_begin_balance
+	# The silver total is measured from this balance, so a resume must not take it again
+	unless commander_checkpoint_step?("balance_taken")
+		commander_begin_balance
+		commander_checkpoint_step("balance_taken")
+	end
 	if @commander_data["use_security_officer"]
 		start_script("eloot", ['start'])
 		wait_while { running?("eloot") }
@@ -2375,6 +2411,7 @@ checktask = Lich::Util.quiet_command("osa task", /OSA TASK/, end_pattern = /Expe
 end
 
 def commander_crew_share
+	commander_checkpoint(9)
 	commander_captains_quarters
 	commander_task_complete
 	commander_check_task
@@ -2415,6 +2452,7 @@ def commander_crew_share
 			fput "turn my #{Vars.mapdb_fwi_trinket}"
 			wait_until {Room.current != @bank_room}
 			fput "share all"
+			commander_checkpoint(10) # silver is shared; a resume must never share it again
 			pause 0.5
 			@bank_room = Room.current
 			fput "turn my #{Vars.mapdb_fwi_trinket}"
@@ -2437,6 +2475,7 @@ def commander_crew_share
 				pause 0.5
 			end
 			fput "share all"
+			commander_checkpoint(10) # silver is shared; a resume must never share it again
 			pause 0.5
 			fput "depo all"
 			$whisper_message = "Please desposit your silvers and let me know when you're all set"
@@ -2448,6 +2487,12 @@ def commander_crew_share
 		commander_after_balance
 		commander_save_to_commander("endbalance", (@commander_data["afterbalance"].to_i - @commander_data["beginbalance"].to_i))
 	end
+	commander_crew_share_finish
+end
+
+# After the silver is shared: spellup check, encounter stats, then the checkpoint is cleared.
+def commander_crew_share_finish
+	commander_checkpoint(10) unless commander_checkpoint_data && commander_checkpoint_data["number"].to_i == 10
 	pause 2
 	commander_captains_quarters
 	#do_client ";eloot load"
@@ -2460,6 +2505,7 @@ def commander_crew_share
 		respond ""
 	end
 	end_of_encounter
+	commander_clear_checkpoint
 	if (@commander_data["crewsize"] || []).count == 0
 		do_client ";force osacrew repairs"
 	end
@@ -2484,6 +2530,7 @@ def commander_go_gangplank
 end
 
 def commander_after_raze
+	commander_checkpoint(8)
 	waitrt?
 	commander_helm
 	wait_until { commander_osacrew_data["sunk_ship"] }
@@ -2496,6 +2543,7 @@ def commander_after_raze
 	commander_lnet_crew("Moored!")
 	waitrt?
 	fput "yell Moored!"
+	commander_checkpoint_step("moored")
 	commander_cargo_hold
 	fput "take supply crate"
 	multifput "put my crate in wood", "put my crate in balls"
@@ -2517,6 +2565,7 @@ def commander_after_raze
 end
 
 def commander_raze_it
+	commander_checkpoint(7)
 	result = dothistimeout "raze", 3, /You grab a nearby|Are you sure you|You cannot raze/
 	if result.to_s =~ /You grab a nearby/
 		commander_after_raze
@@ -2616,6 +2665,7 @@ def commander_get_treasure
 end
 
 def commander_prep_it
+		commander_checkpoint(6)
 		move "down"
 		fput "drag supply crate"
 		move "up"
@@ -2627,6 +2677,7 @@ def commander_prep_it
 		fput "drag stop"
 		get_straggler_boxes
 		commander_save_to_commander("straggler_boxes", Array.new)
+		commander_checkpoint_step("crate_moved")
 		commander_enemy_quarters
 		fput "stow set #{Vars.lootsack}"
 		commander_get_treasure
@@ -3322,7 +3373,9 @@ def cleanup_on
 end
 
 def commander_end_routine
-	commander_save_to_commander("clearing_end_time", Time.now)
+	commander_checkpoint(5)
+	# On a resume the clearing time was already recorded; recording it again would inflate it
+	commander_save_to_commander("clearing_end_time", Time.now) unless $osa_commander_resuming && @commander_data["clearing_end_time"]
 	if @commander_data["enemyship"] == nil
 		commander_save_to_commander("enemyship", "a pirate ship")
 	end
@@ -3384,6 +3437,7 @@ def commander_avg_sink_time
 end
 
 def commander_sunk_ship
+	commander_checkpoint(11)
 	# Calculate total encounter duration from helm start to now
 	start_time = @commander_data["helmsman_start_time"]
 	if start_time.is_a?(Time)
@@ -3416,6 +3470,11 @@ def commander_sunk_ship
 	if @commander_data["stowaways"]
 		fput "whisper ooc group #{msg}"
 	end
+	commander_sunk_ship_finish
+end
+
+# Second half of a cannon sinking (after the stats). Also where resume picks up "Sunk".
+def commander_sunk_ship_finish
 	commander_save_to_commander("cleanup", false)
 	commander_save_to_commander("piratehunter", false)
 	wait_until { commander_osacrew_data["sunk_ship"] }
@@ -3444,6 +3503,7 @@ def commander_sunk_ship
 	GameObj.pcs.each{|pc|;fput "hold ##{pc.id}"}
 	commander_save_to_commander("cleanup", true)
 	commander_save_to_commander("piratehunter", true)
+	commander_clear_checkpoint
 	exit
 end
 
@@ -3704,13 +3764,179 @@ def check_for_crate
 	end
 end
 
+# Rest of ;osacommander start after blessings: General Quarters, osacombat, then the approach.
+# Also where ;osacommander resume picks up a "Detected" checkpoint.
+def commander_encounter_engage
+	commander_vessel_messaging
+	cleanup_on
+	if @commander_data["cannon_engage"]
+		commander_lnet_crew("Enemy Vessel Detected, #{@commander_data["enemyship"].split(/\b/).map(&:capitalize).join} Inbound. Sound General Quarters! Gunners Man Your Irons!")
+	else
+		commander_lnet_crew("Enemy Vessel Detected, #{@commander_data["enemyship"].split(/\b/).map(&:capitalize).join} Inbound. Sound General Quarters!")
+	end
+	@start_time = Time.now
+	commander_ensure_osacombat
+	commander_ship_map
+	commander_helm
+	commander_save_to_commander("helmsman_start_time", Time.now)
+	commander_check_role
+	enemy_counter
+end
+
+def commander_ensure_osacombat
+	return if running? "osacombat"
+	start_script "osacombat"
+	pause 3
+	commander_wait_rt
+	pause 0.1
+end
+
+# ---------- ENCOUNTER CHECKPOINTS ----------
+# Each stage of an encounter saves a checkpoint to osacommander.yaml as it starts, so a crash
+# or killed script can carry on with ;osacommander resume. "steps" records parts of a stage
+# that must not run twice (moving the supply crate, mooring, taking the starting bank balance).
+COMMANDER_CHECKPOINTS = {
+	1 => "Detected", 2 => "Approach", 3 => "Boarded", 4 => "Cleanup", 5 => "Repairs",
+	6 => "Treasure", 7 => "Raze", 8 => "Sell", 9 => "Crew Share", 10 => "Stats", 11 => "Sunk"
+} unless defined?(COMMANDER_CHECKPOINTS)
+COMMANDER_CHECKPOINT_STALE = 30 * 60 unless defined?(COMMANDER_CHECKPOINT_STALE)
+
+def commander_checkpoint(num)
+	commander_save_to_commander("encounter_checkpoint", {
+		"number" => num,
+		"name"   => COMMANDER_CHECKPOINTS[num],
+		"at"     => Time.now,
+		"enemy"  => @commander_data["enemyship"].to_s,
+		"steps"  => []
+	})
+end
+
+def commander_checkpoint_data
+	cp = (@commander_data || {})["encounter_checkpoint"]
+	(cp.is_a?(Hash) && cp["number"]) ? cp : nil
+end
+
+def commander_checkpoint_step(step)
+	cp = commander_checkpoint_data
+	return unless cp
+	commander_save_to_commander("encounter_checkpoint", cp.merge("steps" => (Array(cp["steps"]) | [step])))
+end
+
+def commander_checkpoint_step?(step)
+	cp = commander_checkpoint_data
+	!!(cp && Array(cp["steps"]).include?(step))
+end
+
+def commander_clear_checkpoint
+	commander_save_to_commander("encounter_checkpoint", nil)
+end
+
+def commander_checkpoint_label(cp)
+	num = cp["number"].to_i
+	num == 11 ? "S (#{cp["name"]})" : "#{num}/10 (#{cp["name"]})"
+end
+
+def commander_checkpoint_age(cp)
+	cp["at"].is_a?(Time) ? (Time.now - cp["at"]) : nil
+end
+
+def commander_show_checkpoint
+	cp = commander_osacommander_data["encounter_checkpoint"]
+	cp = nil unless cp.is_a?(Hash) && cp["number"]
+	if cp.nil?
+		respond "--- OSACommander: No encounter checkpoint is saved."
+		return
+	end
+	age = commander_checkpoint_age(cp)
+	age_text = age ? "#{(age / 60).floor} min #{(age % 60).floor} sec ago" : "at an unknown time"
+	enemy = cp["enemy"].to_s.empty? ? "unknown ship" : cp["enemy"].to_s.split(/\b/).map(&:capitalize).join
+	respond ""
+	respond "--- OSACommander: Encounter checkpoint #{commander_checkpoint_label(cp)}"
+	respond "    Enemy: #{enemy} | Saved #{age_text}"
+	respond "    Completed steps: #{Array(cp["steps"]).join(', ')}" unless Array(cp["steps"]).empty?
+	respond "    Use ;osacommander resume to continue from here."
+	respond ""
+end
+
+def commander_resume
+	cp = commander_checkpoint_data
+	if cp.nil?
+		respond "--- OSACommander: No encounter checkpoint is saved, nothing to resume."
+		return
+	end
+	age = commander_checkpoint_age(cp)
+	if age && age > COMMANDER_CHECKPOINT_STALE && variable[2].to_s !~ /force/i
+		commander_show_checkpoint
+		respond "--- OSACommander: This checkpoint is over #{COMMANDER_CHECKPOINT_STALE / 60} minutes old. Use ;osacommander resume force if you still want to continue it."
+		return
+	end
+	respond "--- OSACommander: Resuming from checkpoint #{commander_checkpoint_label(cp)}."
+	$osa_commander_resuming = true
+	case cp["number"].to_i
+	when 1
+		commander_encounter_engage
+	when 2
+		commander_ensure_osacombat
+		commander_helm
+		commander_check_role
+		enemy_counter
+	when 3
+		cleanup_on
+		commander_ensure_osacombat
+		enemy_counter
+		respond "--- OSACommander: Boarded. Cleanup starts when the enemy captain appears, or run ;osacommander cleanup."
+	when 4
+		cleanup_on
+		commander_ensure_osacombat
+		cleanup_begin_routine
+	when 5
+		commander_end_routine
+	when 6
+		if commander_checkpoint_step?("crate_moved")
+			commander_enemy_quarters
+			fput "stow set #{Vars.lootsack}"
+			commander_get_treasure
+		else
+			commander_enemy_main_deck
+			commander_prep_it
+		end
+	when 7
+		commander_enemy_main_deck
+		commander_raze_it
+	when 8
+		commander_checkpoint_step?("moored") ? commander_sell_loot : commander_after_raze
+	when 9
+		commander_crew_share
+	when 10
+		commander_crew_share_finish
+	when 11
+		commander_sunk_ship_finish
+	else
+		respond "--- OSACommander: Unknown checkpoint #{cp["number"].inspect}, clearing it."
+		commander_clear_checkpoint
+	end
+ensure
+	$osa_commander_resuming = false
+end
+
 def commander_begin_it
+	if variable[1] =~ /^resume/i
+		commander_resume
+		return
+	elsif variable[1] =~ /^checkpoint/i
+		commander_show_checkpoint
+		return
+	elsif variable[1] =~ /^help/i
+		commander_help_display
+		return
+	end
 	if variable[1] =~ /start/
 		commander_save_to_commander("straggler_boxes", Array.new)
 		commander_helm
 		determine_enemy_type
 		determine_to_engage
 		if @commander_data["engage"]
+			commander_checkpoint(1)
 			if !commander_osacrew_data["enemy_type"] == "undead" && @commander_data["no_bless"]
 				$whisper_message = "If you need any weapon blesses, speak now then let me know when you're all set"
 				if (@commander_data["crewsize"] || []).count == 0
@@ -3722,25 +3948,7 @@ def commander_begin_it
 					pause 1
 				end
 			end	
-			commander_vessel_messaging
-			cleanup_on
-			if @commander_data["cannon_engage"]
-				commander_lnet_crew("Enemy Vessel Detected, #{@commander_data["enemyship"].split(/\b/).map(&:capitalize).join} Inbound. Sound General Quarters! Gunners Man Your Irons!")
-			else
-				commander_lnet_crew("Enemy Vessel Detected, #{@commander_data["enemyship"].split(/\b/).map(&:capitalize).join} Inbound. Sound General Quarters!")
-			end
-			@start_time = Time.now
-			if !running? "osacombat"
-				start_script "osacombat"
-				pause 3
-				commander_wait_rt
-				pause 0.1
-			end
-			commander_ship_map
-			commander_helm
-			commander_save_to_commander("helmsman_start_time", Time.now)
-			commander_check_role
-			enemy_counter
+			commander_encounter_engage
 		else
 			do_not_board
 		end
@@ -3759,6 +3967,7 @@ def commander_begin_it
 	respond ""
 	exit
 	elsif variable[1] =~ /stop/
+		commander_clear_checkpoint
 		commander_lnet_crew("Stop")
 		commander_save_to_commander("cleanup", false)
 		commander_save_to_commander("piratehunter", false)
@@ -3889,6 +4098,7 @@ def commander_begin_it
 		elsif variable[2] =~ /off/
 			cleanup_off
 		else
+			commander_checkpoint(4)
 			cleanup_begin_routine
 		end
 	elsif variable[1] =~ /unkick/
@@ -4690,7 +4900,7 @@ def self.load_commander_yaml
 	path
 end
 
-commander_save_to_commander("commanderversion", "4.1.5 (October 11, 2026)", push: false)
+commander_save_to_commander("commanderversion", "4.1.6 (October 25, 2026)", push: false)
 TITLE = "OSACommander: v. (#{@commander_data["commanderversion"]})"
 require "yaml"
 require "gtk3"
@@ -4717,7 +4927,33 @@ if commander_osacrew_data["commander"].empty?
 	exit
 end
 @mana_watcher = nil
+
+# Typing "osacommander setup", "osacommander help" or "osacommander checkpoint" (no semicolon)
+# while osacommander is running is handled here instead of going to the game.
+$osa_commander_hook_name = "osa_commander_typed_commands"
+UpstreamHook.remove($osa_commander_hook_name)
+$osa_commander_interceptor = proc do |xml|
+	next xml unless xml.start_with?('<c>')
+	next xml if xml =~ /^<c>_/i
+	cmd = xml.sub(/\A<c>/i, '').sub(/<\/c>\z/i, '').strip
+	case cmd.downcase
+	when 'osacommander setup'
+		self.commandersetup
+		nil
+	when 'osacommander help', 'osacommander ?'
+		commander_help_display
+		nil
+	when 'osacommander checkpoint'
+		commander_show_checkpoint
+		nil
+	else
+		xml
+	end
+end
+UpstreamHook.add($osa_commander_hook_name, $osa_commander_interceptor)
+
 before_dying {
+	UpstreamHook.remove($osa_commander_hook_name)
 	@mana_watcher.kill if @mana_watcher&.alive?
 	commander_stop_task_listener
 	@warning = false
@@ -4726,7 +4962,8 @@ before_dying {
 @commander_lowered_sail = false
 @warning = false
 @done_with_sec_off = false
-commander_save_to_commander("cleanup_type", nil)
+$osa_commander_resuming = false
+commander_save_to_commander("cleanup_type", nil) unless variable[1].to_s =~ /^(resume|checkpoint|help)/i
 commander_mana_share
 commander_start_task_listener
 commander_begin_it
