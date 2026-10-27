@@ -1,0 +1,403 @@
+=begin
+  lifeweaver.lic -- Faellin's battle-empath brain. pixieheal v2 + the best of Healbot2025.
+
+    ;lifeweaver            heal the team, heal herself, PAUSE attack2 while there is healing to do
+    ;lifeweaver quiet      same, without the touch/whisper roleplay
+    ;lifeweaver invasion   faster: rank-1 and scars skipped mid-fight
+
+  How it works (Billy 10/26: "full on pause attack2 and heal the team"):
+    - Healing ALWAYS beats casting. The moment there is a hurt teammate (or she is hurt herself),
+      attack2 is paused, she waits out RT, heals, and attack2 is unpaused when the queue is empty.
+      She only unpauses what SHE paused (upkeep's orb rub pauses attack2 too).
+    - Damage detection is built from the real hunt logs (10/14-10/26), not guessed:
+        hit     "A shan warrior swings ... at Arlend!" / "... slashes at Arlend's right leg!"
+                followed within 4 lines by "... and hits for 12 points of damage!" / "... 6 points of
+                damage!" / "Warding failed!". "A clean miss." / "Warded off!" / dodge-evade lines cancel.
+        crit    indented "   Slash to Arlend's left leg hits high!" / "Broken finger on X's right hand!"
+        bleed   "Blood sprays from X's ..." / "Blood continues to stream from X's wounded ..." /
+                "X's right leg drips as he continues to bleed." / "Trickles of blood course from X's ..."
+        status  "X is stunned!" / "remains helplessly stunned" / "X falls down!" / "loses her balance and
+                falls over" / "knocked to the ground" / "drops dead" / "shivers as the cold settles"
+      Stuns, knockdowns, crits and deaths jump the queue.
+    - Sweeps the party every SWEEP seconds anyway (the game never shows other people's wound ranks).
+    - Healbot2025 features (TEAM ONLY): heal requests ("heal", "bleed", "patch", ...), shoulder taps,
+      bard gem shatters, rogue trap accidents, scarab poison/disease/blood.
+    - Billy 10/26: NEVER heal or raise anyone outside the group (the Starmizt incident). Strangers are
+      ignored completely -- requests, taps, accidents, afflictions, bodies.
+    - Self-heal: in combat rank 2+ (head/nerves always); room clear = everything incl. scars.
+      1150 emergency once per game day, 1116 before a big cleanup.
+    - pixieheal stays as-is (Billy 10/26: "keep pixieheal, that works"). One healer at a time:
+      lifeweaver won't start while pixieheal runs.
+    - DEAD friend: 213 sanct, touch, heal the body, write healed_<name>.txt so Tollwick can raise.
+    - NEVER sends anything while she is dead (Billy 10/17: a dead empath's STAND broke a 308 link).
+    - No COL signs: the group is Voln.
+
+  author: Kitac (Billy) with Claude   version: 2.0.0 (2026-10-26)   tags: empath, heal, group
+=end
+
+ROSTER      = %w[Tollwick Elixx Llaan Arlend Dihya Salida Tiddlywinx Aethelflaed]   # Marchelle SOLD 10/26
+SWEEP       = 20      # seconds between full party appraisal sweeps
+RECHECK     = 4       # don't re-appraise the same person more often than this
+BLOOD_FLOOR = 60      # stop taking blood below this % of her own health
+SAFE_FLOOR  = 45      # below this % she heals herself before touching anyone else
+FUSS_EVERY  = 120     # seconds between roleplay lines for the same person
+HIT_WINDOW  = 4       # lines after an attack line in which a damage line counts as a hit
+CANT_SKIP   = 1800    # scar transfers ride on Transference lore (Faellin has 0): skip that spot 30 min
+roleplay    = !(script.vars[0].to_s =~ /quiet/i)
+$lw_invasion = script.vars[0].to_s =~ /invasion/i
+
+# the party = roster + whoever shares my line in data/hunt_groups.txt ("Leader: A B C")
+group_line = (File.read(File.join($data_dir.to_s, 'hunt_groups.txt')).lines rescue [])
+               .map { |l| l.split(':', 2) }.find { |ld, mem| ld.strip == Char.name || mem.to_s.split.include?(Char.name) }
+PARTY = (ROSTER + (group_line ? [group_line[0].strip] + group_line[1].to_s.split : [])).uniq - [Char.name]
+P = PARTY.join('|')
+
+FUSS_LINES = [
+  "Oh darling, you look positively ill. Whatever shall we do?",
+  "Hold still, dearest, you're bleeding all over the good silk.",
+  "Tsk. Look at you. Come here and let me take that.",
+  "Poor thing. Give it here, I'll carry it for you.",
+  "Darling, that bruise clashes terribly with your dress.",
+]
+
+AREA_ORDER = ['nerves', 'head', 'neck', 'chest', 'abdomen', 'back', 'right eye', 'left eye',
+              'right arm', 'left arm', 'right hand', 'left hand', 'right leg', 'left leg']
+
+$lw_queue  = []            # names waiting for a heal, urgent ones at the front
+$lw_last   = {}
+$lw_fuss   = {}
+$lw_cant   = Hash.new { |h, k| h[k] = {} }
+$lw_events = []            # [:poison|:disease|:blood, name] from the hook, handled in the main loop
+$lw_paused = false
+$lw_att    = nil           # [name, lines_left] -- an attack on a teammate waiting for hit/miss
+
+lw_queue = proc { |n, urgent|
+  next unless PARTY.include?(n)
+  $lw_cant.delete(n)       # a fresh hit can reopen a skipped scar spot; transferring it clears the scar too
+  $lw_queue.delete(n)
+  urgent ? $lw_queue.unshift(n) : $lw_queue.push(n)
+}
+
+PART  = /(?:head|neck|chest|back|abdomen|stomach|right|left|eyes?|arms?|legs?|hands?|skull|ribs|throat|spine|face|thigh|shoulder|knee|wrist|finger)/
+HEALS = /looks? (?:a little )?better|coax|takes hold|gently|last desperate|cuts on|bruises|scar on|glows faintly|lifeless|body decays|kicks at|hand on|rests|fingers\.|veins|subtle light|glint|amber|snowdrop|filaments|corpse|prone form/
+
+DownstreamHook.add('lifeweaver', proc { |s|
+  begin
+    t = s.gsub(/<[^>]+>/, '')
+    speech = t =~ /^\[|says,|asks,|exclaims,|whispers|thinks,|"/
+    if $lw_att
+      if t =~ /\.\.\. (?:and hits for )?\d+ points? of damage!|Warding failed!/
+        lw_queue.call($lw_att[0], false); $lw_att = nil
+      elsif t =~ /A clean miss\.|Warded off!|evades? the attack|dodges|avoids the attack|parries|deflect|interposes|blocks the attack|pass harmlessly|absorbs the oncoming blow|beats back the attack/
+        $lw_att = nil
+      else
+        $lw_att[1] -= 1
+        $lw_att = nil if $lw_att[1] <= 0
+      end
+    end
+    unless speech
+      if t =~ /^\s*(?:An?|The) .+? at (#{P})(?:'s [a-z ]+)?!/
+        $lw_att = [$1, HIT_WINDOW]
+      elsif t =~ /\b(#{P}) (?:is stunned!|falls down!|loses (?:his|her) balance|is buffeted.*knocked to the ground|drops dead)|helplessly stunned|^\s*\* (#{P}) drops dead/
+        n = $1 || $2 || (t[/\b(#{P})\b/, 1])
+        lw_queue.call(n, true) if n
+      elsif t =~ /\b(#{P}) shivers as the cold settles/
+        lw_queue.call($1, false)
+      elsif t =~ /(?:Blood (?:sprays|continues to stream) from|Trickles of blood course from|Fresh blood drips down) (#{P})'s/ ||
+            t =~ /\b(#{P})'s (?:wounded )?[a-z ]+ (?:drips as|oozes fresh blood)/
+        lw_queue.call($1, false)
+      elsif t =~ /^\s{2,}.*\b(#{P})'s #{PART}/ && t !~ HEALS
+        lw_queue.call($1, true)                                   # indented crit line
+      elsif t =~ /(?:at|of|into|on|toward|bites|pecks|whacks|strikes|slashes) (#{P})'s #{PART}/ && t !~ HEALS && t !~ /to no effect/
+        lw_queue.call($1, false)
+      elsif t =~ /vesicles temporarily disfigures (#{P})'s face/
+        $lw_events << [:disease, $1]
+      elsif t =~ /\. (\w+) looks ill as (?:his|her) skin takes on a sickly greenish hue/
+        $lw_events << [:poison, $1]
+      elsif t =~ /\. (\w+?) moans to (?:him|her)self and (?:his|her) skin takes on a yellowish tint/
+        $lw_events << [:disease, $1]
+      elsif t =~ /(\w+) gasps in pain and shock as .* drawing the blood from (?:his|her) body/
+        $lw_events << [:blood, $1]
+      elsif t =~ /(\w+)'s voice focuses on the .* which quickly shatters into thousands of fragments/ ||
+            t =~ /(\w+) is severely perforated|The ground beneath (\w+) begins to boil violently/
+        n = $1 || $2
+        lw_queue.call(n, true)
+      elsif t =~ /(\w+) taps you lightly on the shoulder/
+        lw_queue.call($1, true)
+      end
+    else
+      # Healbot2025 "Speaking Heal" regex (Gib): someone asking for a heal
+      if t =~ /(?:^Speaking .*to )?(?:you, |[A-Z][a-z]+, )?(?:The ghostly voice of |The ghost of )?([A-Z][a-z]+).*(whispers,|asks,|exclaims,|says,)(?i).*?(heal[^t]|bleed|minor|'?ealing?|lacerations|cuts|wound|patch|empath|poison|disease|medic).*?(?:\.|\!|\?)"/i
+        n, verb = $1, $2
+        if (t !~ /Speaking .*to/ || t =~ /Speaking .*to you/) && n != Char.name && n !~ /Speaking/
+          lw_queue.call(n, true)
+        end
+      end
+    end
+  rescue StandardError => e
+    respond "lifeweaver hook: #{e.message}"
+  end
+  s
+})
+
+def lw_attack2
+  Script.list.find { |x| x.name == 'attack2' }
+end
+
+# Billy 10/26: healing beats casting -- pause attack2, wait out RT, then heal
+def lw_hold
+  return if $lw_paused
+  a = lw_attack2
+  return unless a && !a.paused?
+  a.pause
+  $lw_paused = true
+  waitrt?; waitcastrt?
+end
+
+def lw_release
+  return unless $lw_paused
+  a = lw_attack2
+  a.unpause if a && a.paused?
+  $lw_paused = false
+end
+
+before_dying {
+  DownstreamHook.remove('lifeweaver')
+  lw_release
+}
+
+def cure_spell(area, type)
+  if area =~ /arm|hand|leg/        then type == :wound ? 1102 : 1111
+  elsif area =~ /nsys|nerves/      then type == :wound ? 1103 : 1112
+  elsif area =~ /head|neck/        then type == :wound ? 1104 : 1113
+  else                                  type == :wound ? 1105 : 1114   # chest, abdomen, back, eyes
+  end
+end
+
+def trolls_blood
+  return unless Spell[1125].known? && !Spell[1125].active? && Spell[1125].affordable?
+  waitcastrt?
+  Spell[1125].cast
+  waitcastrt?
+end
+
+def combat?
+  GameObj.targets.to_a.any? { |t| t.status.to_s !~ /dead|gone/ }
+end
+
+def self_hurt?(full)
+  return true if percenthealth < (full ? 100 : SAFE_FLOOR)
+  XMLData.injuries.to_a.any? { |k, v|
+    w = v['wound'].to_i; sc = v['scar'].to_i
+    full ? (w > 0 || sc > 0) : (w >= 2 || (w > 0 && %w[head nsys].include?(k)))
+  }
+end
+
+def self_blood
+  while percenthealth < 80 && checkmana(1)
+    waitrt?; waitcastrt?
+    if mana?((maxhealth - checkhealth) / 10)
+      fput 'cure'
+    else
+      fput 'cure blood'
+    end
+    waitcastrt?
+  end
+end
+
+# wounds/scars on herself from XMLData; in combat only rank 2+ (head and nerves always)
+def self_heal(full)
+  full = false if $lw_invasion && combat?
+  # 1150 Regeneration: 1-4 uses per GAME DAY -- emergencies only, one try per day
+  emergency = [Wounds.head, Wounds.nsys].max.to_i >= 3 || percenthealth < 30
+  today = Time.now.utc.strftime('%Y-%m-%d')
+  if emergency && $lw_1150_day != today && Spell[1150].known? && Spell[1150].affordable? && !Spell[1150].active?
+    $lw_1150_day = today
+    waitrt?; waitcastrt?
+    Spell[1150].cast
+    waitcastrt?
+  end
+  # 1116 Rapid Healing halves healing RT for 60 s (30-min cooldown): cast it before a full cleanup
+  hurt = XMLData.injuries.to_a.count { |k, v| v['wound'].to_i > 0 || v['scar'].to_i > 0 }
+  if full && hurt >= 2 && Spell[1116].known? && Spell[1116].affordable? &&
+     (!$lw_1116_at || Time.now - $lw_1116_at > 1800)
+    $lw_1116_at = Time.now
+    waitrt?; waitcastrt?
+    Spell[1116].cast
+    waitcastrt?
+  end
+  [:wound, :scar].each { |type|
+    next if type == :scar && !full
+    20.times {
+      todo = XMLData.injuries.to_a.select { |k, v|
+        rank = v[type.to_s].to_i
+        rank > 0 && (full || rank >= 2 || %w[head nsys].include?(k))
+      }.sort_by { |k, v| [%w[nsys head neck].include?(k) ? 0 : 1, -v[type.to_s].to_i] }
+      break if todo.empty?
+      area = todo.first[0].sub(/^(left|right)(\w)/) { "#{$1} #{$2.downcase}" }
+      spell = Spell[cure_spell(area, type)]
+      unless spell.affordable?
+        echo "lifeweaver: waiting on mana for #{spell.num}"
+        wait_until { spell.affordable? || dead? }
+        return if dead?
+      end
+      waitrt?; waitcastrt?
+      spell.cast
+      waitcastrt?
+    }
+  }
+  self_blood
+end
+
+def injuries_of(name)
+  waitrt?
+  lines = []
+  clear
+  put "appraise #{name}"
+  ttl = Time.now + 3
+  got_at = nil
+  while Time.now < ttl
+    break if got_at && Time.now - got_at > 0.6   # appraisal text arrives together; stop shortly after
+    line = get?
+    if line.nil?
+      sleep 0.1
+      next
+    end
+    break if line =~ /Appraise what\?|I could not find|What were you/
+    if line =~ /You take a quick app/
+      lines << line
+      got_at = Time.now
+    elsif got_at && line =~ /\b(?:has|have)\b/
+      lines << line
+    end
+  end
+  text = lines.join(' ')
+  return [] if text.empty? || text =~ /no apparent (?:injuries|wounds)/i
+  found = text.scan(/((?:right |left )?(?:hand|arm|face|leg|chest|abdominal|eye|back|neck|head)|convulsions|twitching|slurred speech|muscle spasms)/i).flatten.map { |a|
+    a = a.downcase
+    if a =~ /convulsions|twitching|slurred|spasms/ then 'nerves'
+    elsif a =~ /abdominal|abdomen/              then 'abdomen'
+    elsif a =~ /face/                           then 'head'
+    else a
+    end
+  }.uniq
+  found.sort_by { |a| AREA_ORDER.index(a) || 99 }
+end
+
+def fuss(name)
+  return if $lw_fuss[name] && Time.now - $lw_fuss[name] < FUSS_EVERY
+  $lw_fuss[name] = Time.now
+  fput "touch #{name}"
+  fput "whisper #{name} #{FUSS_LINES.sample}"
+end
+
+# returns true if she actually healed something
+def heal_target(name, roleplay)
+  return false if $lw_last[name] && Time.now - $lw_last[name] < RECHECK
+  $lw_last[name] = Time.now
+  return false unless GameObj.pcs.to_a.any? { |pc| pc.noun == name }
+  areas = injuries_of(name)
+  return false if areas.empty?
+  lw_hold                                           # there is work: attack2 waits
+  fuss(name) if roleplay
+  trolls_blood
+  areas.reject! { |a| $lw_cant[name][a] && Time.now - $lw_cant[name][a] < CANT_SKIP }
+  areas.each { |area|
+    break if percenthealth < SAFE_FLOOR || dead?
+    # "You coax Marchelle's chest wound into your keeping, ..." / "You strain to do the transfer, but it doesn't work."
+    r = dothistimeout "transfer #{name} #{area}", 2, /You coax|reaching out to|As you probe the wound|gradually fades|You close your eyes|Nothing happens|from whom|doesn't work/i
+    r = dothistimeout("transfer #{name} #{area}", 2, /You coax|reaching out to|gradually fades|Nothing happens|doesn't work/i) if r =~ /As you probe the wound/
+    $lw_cant[name][area] = Time.now if r =~ /doesn't work/i
+  }
+  # blood: "You share your warmth with Salida, ..." until "Nothing happens.  X does not appear to be suffering from a lack of blood."
+  6.times {
+    break if percenthealth < BLOOD_FLOOR || dead?
+    r = dothistimeout "transfer #{name}", 2, /Nothing happens|share your warmth|You take (?:some|all)|from whom/i
+    break if r.nil? || r =~ /Nothing happens|You take all|from whom/i
+  }
+  true
+end
+
+def handle_event(kind, name)
+  return unless PARTY.include?(name)               # Billy 10/26: team only
+  return unless GameObj.pcs.to_a.any? { |pc| pc.noun == name }
+  lw_hold
+  case kind
+  when :poison  then (Spell[114].cast(name) if Spell[114].known? && Spell[114].affordable?)
+  when :disease then (Spell[113].cast(name) if Spell[113].known? && Spell[113].affordable?)
+  when :blood
+    5.times { break if percenthealth < BLOOD_FLOOR; fput "transfer #{name}"; fput 'cure blood'; waitcastrt? }
+  end
+  waitcastrt?
+  $lw_last.delete(name)
+  heal_target(name, false)
+end
+
+unless Char.prof == 'Empath'
+  echo 'lifeweaver: empaths only.'
+  exit
+end
+if Script.running?('pixieheal')
+  echo 'lifeweaver: pixieheal is already running -- one healer at a time. ;k pixieheal first if you want lifeweaver.'
+  exit
+end
+
+echo "lifeweaver: weaving for #{PARTY.join(', ')}#{roleplay ? '' : ' (quiet)'}#{$lw_invasion ? ' -- INVASION' : ''}"
+last_sweep = Time.at(0)
+loop {
+  if dead? || stunned?
+    $lw_paused = false if dead?          # upkeep kills attack2 on death; nothing to unpause
+    wait_while { dead? || stunned? }
+    next
+  end
+  trolls_blood
+
+  # 1. herself first when she's in danger -- a dead empath heals nobody
+  if self_hurt?(false)
+    lw_hold
+    self_heal(false)
+  end
+
+  # 2. afflictions (poison/disease/blood scarab) on anyone
+  until $lw_events.empty?
+    kind, n = $lw_events.shift
+    handle_event(kind, n)
+  end
+
+  # 3. the team queue (urgent first)
+  until $lw_queue.empty? || dead?
+    heal_target($lw_queue.shift, roleplay)
+    self_heal(false) if self_hurt?(false)
+  end
+
+  # 4. sweep: dead friends first, then everyone, then a self cleanup
+  if Time.now - last_sweep >= SWEEP
+    last_sweep = Time.now
+    Dir.glob(File.join($data_dir.to_s, 'dead_*.txt')).each { |f|
+      n = File.basename(f, '.txt').sub('dead_', '')
+      next unless PARTY.include?(n) && GameObj.pcs.to_a.any? { |pc| pc.noun == n }
+      hf = File.join($data_dir.to_s, "healed_#{n}.txt")
+      next if File.exist?(hf)
+      respond "lifeweaver: #{n} is DEAD here -- 213 sanct, touch and heal before the raise"
+      lw_hold
+      if Spell[213].known? && Spell[213].affordable? && !(Room.current.tags.to_a.include?('sanctuary') rescue false)
+        waitrt?; waitcastrt?
+        Spell[213].cast
+        waitcastrt?
+      end
+      fput "touch #{n}"
+      $lw_last.delete(n)
+      heal_target(n, roleplay)
+      File.write(hf, Time.now.to_i.to_s) rescue nil
+    }
+    PARTY.each { |n| heal_target(n, roleplay) if GameObj.pcs.to_a.any? { |pc| pc.noun == n } }
+    if self_hurt?(!combat?)
+      lw_hold
+      self_heal(!combat?)
+    end
+  end
+
+  # nothing left to do: let attack2 cast again
+  lw_release if $lw_queue.empty? && $lw_events.empty? && !self_hurt?(false)
+  sleep 0.25
+}
