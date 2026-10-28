@@ -1,0 +1,1386 @@
+# frozen_string_literal: true
+
+=begin
+
+scriv.lic (Scroll Inventory) keeps a running ledger of every scroll you own, and allows you to easy call it. 
+You can also hunt individual spells and work with multiple containers for pristine, normal, and infused.
+
+The following inputs are available:
+  ;scriv                       - refresh (read any new scrolls) and print the spell summary
+  ;scriv <spell number>        - ONLY the scrolls on you holding that spell (e.g. ;scriv 1115)
+  ;scriv stored                - tracked scrolls that are not on you, with what we know about them
+  ;scriv search <spell>        - every tracked scroll holding that spell, on you or not, with locations
+  ;scriv spell <num|name>      - same as above, by number or part of the spell name
+  ;scriv scan                  - re-read every scroll you are carrying, not just new ones
+  ;scriv scan container <name> - track the scrolls in a bag or locker outside your set containers;
+                                 skips reading if its contents are unchanged (add "force" to re-read)
+  ;scriv setup                 - show the setup options and their current values
+  ;scriv set pristine <bags>   - bags of never-invoked scrolls, shown teal as *name
+  ;scriv set normal <bags>     - bags of used scrolls, shown plain
+  ;scriv set infused <bags>    - bags of sorcerer-infused scrolls, shown green as !name
+  ;scriv set show <kinds>      - which of pristine, normal, infused ;scriv lists (any combination)
+  ;scriv forget <#>            - drop one scroll from the ledger (the # shown by ;scriv <spell>)
+  ;scriv prune                 - drop every scroll marked stored (lockers etc.) from the ledger
+  ;scriv help                  - command list
+
+Enhanced by ;invdb (Xanlin): when its database exists, scriv reads it (read-only) to retire stored scrolls
+that have left your lockers, to show where in your lockers a stored scroll is, and to tell you about locker
+scrolls it has not read yet. Your bags are always searched directly, quietly, on every run.
+
+      author: Kyrandos
+      Other scripts: Combatical, VolnRestore2, Loresang, Merchantical, isharpie
+      game: gs
+      tags: scrolls, spells, inventory, tracking, management
+      version: 1.4.0
+      required: Lich > 5.0
+
+      \\Version\\
+      1.0.0 10/28/2026 - initial release: scroll ledger keyed by name + spell set, invoke/use tracking,
+                         spell summary with scroll names and cumulative counts, run as ;scriv
+      1.1.0 10/28/2026 - pristine/normal/infused bags (*teal, !green), set show, ;scriv <spell number>, setup,
+                         invdb pruning of stale stored scrolls and locker locations
+      1.2.0 10/28/2026 - clickable scroll names read the scroll; fast batched bag scans; lists only scrolls on
+                         you, with Stored scrolls and Search tracked scrolls links for everything else
+      1.3.0 10/28/2026 - ;scriv scan container <name> reads and tracks scrolls in lockers or bags outside your
+                         set containers, one at a time, skipping a container that has not changed
+      1.4.0 10/28/2026 - locker reads use the names the game accepts and are checked against its reply; blank
+                         scrolls tracked, failed reads shown; category-list bags and scroll stacks handled
+
+=end
+
+module ScrollInventory
+  VERSION = '1.4.0'.freeze
+
+  SCROLL_NOUNS = %w[scroll vellum paper papyrus parchment palimpsest].freeze
+  ALIASES      = %w[scriv].freeze # the script's own name
+
+  # Players keep scrolls in separate bags by condition: never invoked (pristine),
+  # already used (normal), and sorcerer-infused (see gswiki Scroll_Infusion_(714)).
+  KINDS       = %w[pristine normal infused].freeze
+  KIND_MARK   = { 'pristine' => '*', 'normal' => '', 'infused' => '!' }.freeze
+  KIND_PRESET = { 'pristine' => 'whisper', 'infused' => 'speech' }.freeze # teal / green, as isharpie's colors
+
+  EDUBARBARIAN_DIR = File.join(LICH_DIR, 'EduBarbarian').freeze
+  INVDB_PATH       = File.join(LICH_DIR, 'data', 'inv.db3').freeze
+
+  CAPTURE_HOOK_ID  = 'scriv_capture'.freeze
+  OBSERVER_HOOK_ID = 'scriv_observer'.freeze
+  UPSTREAM_HOOK_ID = 'scriv_upstream'.freeze
+
+  # $lich_char_regex (','|';') because Lich uses ',' as the script-trigger
+  # character on the Genie frontend (the mac-compatible client).
+  HOOK_CMD_RX = /^(?:<c>)?#{$lich_char_regex}(?:#{ALIASES.map { |a| Regexp.escape(a) }.join('|')})(?:\s+(.*))?$/i
+
+  # One entry of a server-side container listing:
+  #   <inv id='CONTAINER'> a <a exist="ID" noun="NOUN">TAG_TEXT</a></inv>
+  INV_LIST_RX = /<inv id='([^']+)'>\s*(?:an?|some|the)?\s*<a exist="(\d+)" noun="([^"]*)">([^<]*)<\/a>/.freeze
+
+  # Any item tag, whichever way the container is displayed (per-item lines or
+  # the categorized "Scrolls [1]: ..." block).
+  ITEM_TAG_RX = /<a exist="(-?\d+)" noun="([^"]*)">([^<]*)<\/a>/.freeze
+
+  # Isolating a command's response (same approach as isharpie/merchantical):
+  # right after the command a sentinel that can never succeed is sent; the game
+  # answers in order, so seeing its failure line proves the real response ended.
+  SENTINEL_CMD      = 'look at #0'.freeze
+  SENTINEL_RX       = /could not find what you were referring to/i.freeze
+  LNET_LINE_RX      = /\A\[[A-Za-z][\w' -]*\]\s+[A-Za-z][\w' -]*:\s*"/.freeze
+  BROADCAST_LINE_RX = /\A\*\s*[A-Za-z].*[.!]\s*\z/.freeze
+
+  # Invoke messaging (gswiki Scroll / Arcane Symbols).
+  INVOKE_OK_RX  = /You raise (?:the |your |an? )?(.+?) and gesture to invoke the (.+?) spell\./.freeze
+  VIBRANT_OK_RX = /the ink leaps from the page and seeps into your skin/i.freeze
+  BLANK_RX      = /leaving a blank space where the (.+?) spell had previously been written/i.freeze
+  INVOKE_CMD_RX = /\Ainvoke\s+(\d{2,4})\b/i.freeze
+  PENDING_TTL   = 15 # seconds an upstream "invoke <num>" stays attributable
+  READ_BATCH    = 12 # scrolls read per round trip
+
+  CMD_QUEUE   = Queue.new
+  EVENT_QUEUE = Queue.new
+
+  @data            = nil
+  @dirty           = false
+  @non_containers  = Set.new
+  @pending_invoke  = nil
+  @used_uids       = Set.new # scrolls seen invoked this session; never saved
+  @warned_closed   = Set.new
+
+  ## ---- persisted ledger --------------------------------------------------
+
+  def self.data_path
+    char = XMLData.name.to_s.downcase.gsub(/[^a-z0-9]+/, '_').gsub(/\A_+|_+\z/, '')
+    File.join(EDUBARBARIAN_DIR, "scrollinventory_#{char}.json") # name kept from before the rename so existing ledgers load
+  end
+
+  def self.data
+    @data ||= load_data
+  end
+
+  def self.load_data
+    blank = { next_uid: 1, records: [], usage: {}, scans: {}, settings: { pristine: [], normal: [], infused: [], show: [] } }
+    return blank unless File.exist?(data_path)
+
+    loaded = JSON.parse(File.read(data_path), symbolize_names: true)
+    loaded = blank.merge(loaded)
+    s = loaded[:settings] ||= {}
+    s[:normal] ||= Array(s.delete(:containers)) # 1.1.0 kept one undifferentiated container list
+    s[:pristine] ||= []
+    s[:infused] ||= []
+    s[:show] ||= []
+    loaded
+  rescue StandardError => e
+    say "could not read #{data_path} (#{e.class}) - starting a fresh ledger"
+    blank
+  end
+
+  def self.save_data!
+    FileUtils.mkdir_p(EDUBARBARIAN_DIR)
+    File.write(data_path, JSON.pretty_generate(data))
+  rescue StandardError => e
+    say "could not save to #{data_path}: #{e.class}"
+  end
+
+  def self.records
+    data[:records]
+  end
+
+  def self.usage
+    data[:usage]
+  end
+
+  # Every container the player named, whatever its kind.
+  def self.configured_containers
+    KINDS.flat_map { |k| kind_containers(k) }
+  end
+
+  def self.kind_containers(kind)
+    Array(data.dig(:settings, kind.to_sym))
+  end
+
+  # Pristine bags win over infused, infused over normal; anything unnamed is normal.
+  def self.kind_for(item)
+    %w[pristine infused].find { |k| kind_containers(k).any? { |c| name_match?(item, c) } } || 'normal'
+  end
+
+  # The bag decides a scroll's kind, except a pristine bag can't hold a scroll
+  # we have watched being invoked.
+  def self.effective_kind(rec, bag_kind)
+    bag_kind == 'pristine' && @used_uids.include?(rec[:uid]) ? 'normal' : bag_kind
+  end
+
+  # Clickable text that runs ";scriv read <uids>". The ledger number, not the
+  # game id, goes in the link: ids change when a scroll visits a locker, so the
+  # current id is looked up when the link is clicked. $clean_lich_char is the
+  # frontend's script trigger (',' on Genie).
+  def self.link(uids, text)
+    cmd_link("read #{uids.join(' ')}", text)
+  end
+
+  def self.cmd_link(cmd, text)
+    trigger = defined?($clean_lich_char) && $clean_lich_char ? $clean_lich_char : ';'
+    "<d cmd=\"#{trigger}#{ALIASES.last} #{cmd}\">#{text}</d>"
+  end
+
+  def self.read_linked(text)
+    text.scan(/\d+/).map(&:to_i).uniq.each_with_index do |uid, i|
+      rec = records.find { |r| r[:uid] == uid }
+      next say("scroll ##{uid} is no longer in the ledger - run ;scriv to refresh") unless rec
+      next say("#{rec[:name]} is stored - take it out of storage to read it") unless rec[:status] == 'carried' && rec[:id]
+
+      pause 0.3 if i.positive?
+      fput "read ##{rec[:id]}"
+      waitrt?
+    end
+  end
+
+  def self.shown_kinds
+    shown = Array(data.dig(:settings, :show)).map(&:to_s) & KINDS
+    shown.empty? ? KINDS : shown
+  end
+
+  # Scroll text for the summary: "*inky vellum" (pristine, teal), "!inky vellum"
+  # (infused, green), plain for normal.
+  def self.paint(kind, text)
+    preset = KIND_PRESET[kind]
+    marked = "#{KIND_MARK[kind]}#{text}"
+    preset ? "<preset id='#{preset}'>#{marked}</preset>" : marked
+  end
+
+  def self.key(num)
+    num.to_s.to_sym
+  end
+
+  ## ---- helpers -------------------------------------------------------------
+
+  def self.say(message)
+    _respond Lich::Messaging.msg_format('whisper', "[ScrollInventory: #{message}]", encode: false)
+  end
+
+  def self.strip_tags(line)
+    line.to_s.gsub(/<[^>]*>/, '').gsub('&gt;', '>').gsub('&lt;', '<').gsub('&amp;', '&').strip
+  end
+
+  def self.scroll_obj?(obj)
+    obj && SCROLL_NOUNS.include?(obj.noun.to_s)
+  end
+
+  def self.spell_nums(spells)
+    spells.map { |s| s[:num] }.sort
+  end
+
+  def self.find_spell(rec, num, name)
+    rec[:spells].find do |s|
+      (num && s[:num] == num.to_i) || (name && s[:name].to_s.casecmp?(name.to_s))
+    end
+  end
+
+  def self.lookup_num(name)
+    hit = usage.find { |_k, v| v[:name].to_s.casecmp?(name.to_s) }
+    return hit[0].to_s.to_i if hit && hit[0].to_s =~ /\A\d+\z/
+
+    records.each { |r| r[:spells].each { |s| return s[:num] if s[:name].to_s.casecmp?(name.to_s) } }
+    nil
+  end
+
+  ## ---- command capture -------------------------------------------------------
+
+  # Raw response lines for one command, never shown to the player.
+  def self.capture(cmd)
+    capture_many([cmd]).first
+  end
+
+  # Raw response lines for each command, one array per command, never shown to
+  # the player. Every command is sent at once, each followed by the sentinel;
+  # the game answers in order, so the sentinel's failure line closes each
+  # command's response. One batch costs one round trip rather than one per
+  # command - reading a whole satchel of scrolls takes about a second. A silent
+  # game (no sentinel within the limit) leaves the remaining arrays empty.
+  def self.capture_many(cmds)
+    results = cmds.map { [] }
+    return results if cmds.empty?
+
+    own_miss = Array.new(cmds.size, false)
+    idx = 0
+    in_push = false
+    last_activity = Time.now
+    DownstreamHook.add(CAPTURE_HOOK_ID, proc { |line|
+      next line if idx >= cmds.size
+      next nil if line.strip.empty? # bare blank lines carry nothing; hiding them keeps the window clean
+
+      was_in_push = in_push
+      in_push = true  if line =~ /<pushStream/
+      in_push = false if line =~ /<popStream/
+      stripped = strip_tags(line)
+      if was_in_push || line =~ /<pushStream/ || line =~ /<prompt[\s>]/ || stripped.empty? ||
+         stripped =~ LNET_LINE_RX || stripped =~ BROADCAST_LINE_RX
+        next line
+      end
+
+      last_activity = Time.now
+      if stripped =~ SENTINEL_RX
+        if results[idx].empty? && !own_miss[idx]
+          # The command's own failure (e.g. a stale id), not the sentinel's.
+          own_miss[idx] = true
+          results[idx] << line
+        else
+          idx += 1
+        end
+        next nil
+      end
+
+      results[idx] << line
+      nil
+    })
+    previous_silent = Script.current.silent
+    begin
+      Script.current.silent = true
+      # fput waits out roundtime and the game's queue limit, so a lone command
+      # (every locker read) uses it. Only a batch uses put, for speed - and only
+      # reads that carry no roundtime (by id, in your own bags) are ever batched.
+      send_cmd = cmds.size == 1 ? method(:fput) : method(:put)
+      cmds.each do |cmd|
+        send_cmd.call(cmd)
+        send_cmd.call(SENTINEL_CMD)
+      end
+      started = Time.now
+      limit = 4 + cmds.size * 0.5
+      pause 0.05 until idx >= cmds.size || Time.now - started > limit || Time.now - last_activity > 3
+      waitrt?
+      pause 0.05
+    ensure
+      Script.current.silent = previous_silent
+      DownstreamHook.remove(CAPTURE_HOOK_ID)
+    end
+    results
+  end
+
+  ## ---- finding and reading scrolls -----------------------------------------
+
+  # Scrolls in your hands and in the top level of every container you wear.
+  # Returns [scrolls, complete]; complete is false when any container could
+  # not be inspected, so a scroll that merely wasn't seen is never declared stored.
+  def self.gather_scrolls
+    found = []
+    complete = true
+    searched = Set.new
+
+    [GameObj.right_hand, GameObj.left_hand].each do |obj|
+      found << { id: obj.id.to_s, name: obj.name.to_s, where: 'hand' } if scroll_obj?(obj)
+    end
+
+    items = search_items.reject { |item| @non_containers.include?(item.id.to_s) }
+    replies = capture_many(items.map { |item| "look in ##{item.id}" })
+
+    items.each_with_index do |item, i|
+      searched << item.name.to_s
+      raw = replies[i].join("\n")
+      # Players see a container either as one <inv> line per item or as a
+      # categorized list ("Scrolls [1]: a burnt scroll"); every item is an
+      # <a exist=".." noun="..">name</a> tag in both, so read the tags.
+      tags = raw.scan(ITEM_TAG_RX)
+      scrolls = tags.select { |_eid, noun, _text| SCROLL_NOUNS.include?(noun) }.uniq(&:first)
+      listing = raw =~ INV_LIST_RX || strip_tags(raw) =~ /^(?:In|On|Inside)\s+(?:the|your|an?)\s|Total items:/i
+
+      if scrolls.any? || listing
+        scrolls.each do |eid, _noun, text|
+          found << { id: eid, name: text.strip, where: item.name.to_s, kind: kind_for(item) }
+        end
+      elsif raw =~ /nothing in|is empty|There is nothing/i
+        next
+      elsif raw =~ /\bclosed\b|need to open/i
+        complete = false
+        say "your #{item.noun} is closed - open it so its scrolls can be seen" if @warned_closed.add?(item.id.to_s)
+      elsif raw.strip.empty?
+        complete = false
+      else
+        @non_containers << item.id.to_s # armor, weapons, etc. - nothing to look in
+      end
+    end
+
+    [found, complete, searched]
+  end
+
+  # "silver backpack" matches a worn item whose name holds every word (or whose
+  # noun is the word), so an adjective narrows it and a bare noun still works.
+  def self.name_match?(item, pattern)
+    words = pattern.to_s.downcase.split
+    return false if words.empty?
+
+    name = item.name.to_s.downcase
+    words.all? { |w| name.include?(w) || item.noun.to_s.downcase == w }
+  end
+
+  # Which worn items to look inside: the containers set with ;scriv set ..., if
+  # any, otherwise every worn item.
+  def self.search_items
+    inv = GameObj.inv.to_a
+    unless configured_containers.empty?
+      matched = inv.select { |i| configured_containers.any? { |c| name_match?(i, c) } }
+      configured_containers.reject { |c| inv.any? { |i| name_match?(i, c) } }.each do |c|
+        say "container \"#{c}\" isn't something you're wearing" if @warned_closed.add?("cfg:#{c}")
+      end
+      return matched
+    end
+
+    inv
+  end
+
+  ## ---- invdb (optional, read-only) -----------------------------------------
+
+  # This character's scroll rows from invdb's database, or nil when invdb has
+  # never been run / sqlite3 is unavailable / the character isn't in it.
+  def self.invdb_rows
+    return @invdb_cache if @invdb_cache_at && Time.now - @invdb_cache_at < 5
+    return nil unless File.exist?(INVDB_PATH)
+
+    begin
+      require 'sqlite3'
+    rescue LoadError
+      return nil
+    end
+
+    rows = nil
+    db = SQLite3::Database.new(INVDB_PATH, readonly: true)
+    char = db.get_first_value('SELECT id FROM character WHERE name = ? COLLATE NOCASE', [XMLData.name.to_s])
+    if char
+      sql = 'SELECT i.name, i.noun, i.amount, i.path, COALESCE(l.type, \'\'), COALESCE(l.name, \'\'), i.timestamp ' \
+            'FROM item i LEFT JOIN location l ON l.id = i.location_id WHERE i.character_id = ?'
+      rows = []
+      db.execute(sql, [char]).each do |name, noun, amount, path, ltype, lname, ts|
+        next unless SCROLL_NOUNS.include?(noun)
+
+        rows << { name: name.to_s, amount: amount.to_i, path: path.to_s, carried: ltype == 'inv', where: lname.to_s, ts: ts.to_i }
+      end
+    end
+    @invdb_cache = rows
+    @invdb_cache_at = Time.now
+    rows
+  rescue StandardError
+    nil
+  ensure
+    db&.close
+  end
+
+  # Retires "stored" scrolls that invdb says have left the lockers, and counts
+  # locker scrolls invdb can see that the ledger has never read. A stored scroll
+  # is only retired when invdb scanned your lockers after the scroll was stored.
+  def self.reconcile_with_invdb
+    @locker_unread = nil
+    rows = invdb_rows
+    return unless rows
+
+    lockers = rows.reject { |r| r[:carried] }
+    return if lockers.empty?
+
+    verified_at = lockers.map { |r| r[:ts] }.max
+    held = Hash.new(0)
+    lockers.each { |r| held[r[:name].downcase] += r[:amount] }
+
+    records.select { |r| r[:status] == 'stored' && !r[:unreadable] }.group_by { |r| r[:name].downcase }.each do |name, recs|
+      checked = recs.select { |r| (r[:stored_at] || r[:last_seen]).to_i < verified_at }
+      excess = [recs.size - held[name], checked.size].min
+      next unless excess.positive?
+
+      checked.sort_by { |r| r[:stored_at] || r[:last_seen] }.first(excess).each { |r| records.delete(r) }
+      @dirty = true
+    end
+
+    ledger = Hash.new(0)
+    records.each { |r| ledger[r[:name].downcase] += 1 if r[:status] == 'stored' }
+    @locker_unread = held.sum { |name, n| [n - ledger[name], 0].max }
+  end
+
+  # [] when the scroll showed no spells (blank or unreadable), nil when the
+  # game never answered.
+  def self.read_scroll(id)
+    read_scrolls([id])[id]
+  end
+
+  # {id => spells} for every id, read in batches so a bag of scrolls is not
+  # read one round trip at a time.
+  def self.read_scrolls(ids)
+    out = read_batch(ids.to_h { |id| [id, "read ##{id}"] })
+    # A read the game bounced or never answered is redone alone; a scroll that is
+    # simply gone ("could not find") is left as no answer.
+    out.each_key do |id|
+      reply = (@read_trace[id] || {})[:reply].to_s
+      out[id] = read_one(id, ["read ##{id}"]) if out[id].nil? && (reply.empty? || reply =~ /type ahead/i)
+    end
+    out
+  end
+
+  # {key => spells} for a {key => read command} hash, sent in batches. Commands
+  # other than "read #id" are for scrolls the id can't reach, e.g. in a locker.
+  #
+  # expect is an optional {key => scroll name}. A read reply says which item it
+  # read ("On the charred parchment you see"); a reply naming a different item
+  # is treated as no answer, so a read that landed on the wrong scroll is never
+  # recorded against the right one.
+  def self.read_batch(commands, expect = {})
+    out = {}
+    commands.each_slice(READ_BATCH) do |slice|
+      capture_many(slice.map { |_key, cmd| cmd }).each_with_index do |raw, i|
+        key = slice[i][0]
+        lines = raw.map { |l| strip_tags(l) }.reject(&:empty?)
+        gone = lines.all? { |l| l =~ SENTINEL_RX } # the scroll isn't there any more: no answer, not a blank scroll
+        spells = gone ? nil : parse_spells(lines)
+        got = read_item_name(lines)
+        spells = nil if spells && expect[key] && got && !same_item?(got, expect[key])
+        # No spells is only "blank" when the reply names the very scroll we asked
+        # for; an unrelated or unnamed reply is a failed read.
+        spells = nil if spells&.empty? && expect[key] && !(got && same_item?(got, expect[key]))
+        (@read_trace ||= {})[key] = { cmd: slice[i][1], reply: lines.first(3).join(' / ') }
+        out[key] = spells
+      end
+    end
+    out
+  end
+
+  # The item a read reply says it read: "On the charred parchment you see" or
+  # "It takes you a moment to focus on the charred parchment."
+  def self.read_item_name(lines)
+    lines.each do |l|
+      m = l.match(/\AOn (?:the |an? |some )?(.+?) you see/i) || l.match(/focus on (?:the |an? |some )?(.+?)\.?\z/i)
+      return m[1] if m
+    end
+    nil
+  end
+
+  def self.same_item?(a, b)
+    norm = ->(s) { s.to_s.downcase.sub(/\A(?:a|an|the|some)\s+/, '').strip }
+    x = norm.call(a)
+    y = norm.call(b)
+    x == y || x.include?(y) || y.include?(x)
+  end
+
+  # Read output lists spells as "(101) Spirit Warding I"; spells written in
+  # vibrant ink carry an "in vibrant ink" tail.
+  def self.parse_spells(lines)
+    spells = lines.filter_map do |text|
+      if (m = text.match(/\((\d{2,4})\)\s+(\S.*)\z/))
+        num = m[1]
+        name = m[2]
+      elsif (m = text.match(/\A(\S.*?)\s+\((\d{2,4})\)\z/))
+        name = m[1]
+        num = m[2]
+      else
+        next
+      end
+      vibrant = name.match?(/vibrant ink/i)
+      name = name.sub(/\s*,?\s*(?:written\s+)?in vibrant ink\.?\z/i, '').sub(/[.,]\z/, '').strip
+      { num: num.to_i, name: name, vibrant: vibrant }
+    end
+    spells.uniq { |s| s[:num] }
+  end
+
+  ## ---- the refresh pass ------------------------------------------------------
+
+  def self.refresh(deep: false)
+    found, complete, searched = gather_scrolls
+    now = Time.now.to_i
+    claimed = Set.new
+    to_read = []
+
+    found.each do |scroll|
+      rec = records.find { |r| r[:id] == scroll[:id] && r[:name].to_s.casecmp?(scroll[:name]) }
+      if rec
+        claimed << rec[:uid]
+        rec[:status] = 'carried'
+        rec[:container] = scroll[:where]
+        rec[:kind] = effective_kind(rec, scroll[:kind]) if scroll[:kind] # a scroll in hand keeps its bag's kind
+        rec[:last_seen] = now
+        to_read << [scroll, rec] if deep || rec[:stale]
+      else
+        to_read << [scroll, nil]
+      end
+    end
+
+    # Anything we thought was carried and can no longer be seen has gone into a
+    # locker (or elsewhere). Its id is meaningless now; it keeps its history.
+    # Only scrolls from a place we actually searched can be judged missing.
+    if complete
+      records.each do |r|
+        next unless r[:status] == 'carried' && !claimed.include?(r[:uid])
+        next unless r[:container] == 'hand' || searched.include?(r[:container])
+
+        r[:last_container] = r[:container]
+        r[:status] = 'stored'
+        r[:id] = nil
+        r[:container] = 'stored'
+        r[:stored_at] = now
+      end
+    end
+
+    read_spells = read_scrolls(to_read.map { |scroll, _rec| scroll[:id] })
+    to_read.each do |scroll, rec|
+      spells = read_spells[scroll[:id]]
+      if rec
+        apply_reread(rec, spells)
+      else
+        register_new(scroll, spells, claimed, now)
+      end
+    end
+
+    reconcile_with_invdb
+    @dirty = true
+    say 'some containers could not be inspected - stored/carried status may be out of date' unless complete
+  end
+
+  def self.apply_reread(rec, spells)
+    return if spells.nil? # no answer; stays stale for next time
+
+    if spells.empty?
+      if rec[:unreadable]
+        rec[:stale] = false
+      else
+        records.delete(rec) # every charge was used up
+        say "#{rec[:name]} is spent - removed from the ledger"
+      end
+      return
+    end
+
+    rec[:spells] = spells
+    rec[:unreadable] = false
+    rec[:stale] = false
+  end
+
+  def self.register_new(scroll, spells, claimed, now)
+    return if spells.nil?
+
+    if spells.empty?
+      add_record(scroll, [], now, unreadable: true)
+      return
+    end
+
+    # Same name + same spells as a scroll we lost track of: it's that scroll,
+    # back under a new id, so its use history carries over.
+    twin = records.find do |r|
+      r[:status] == 'stored' && !r[:unreadable] && !claimed.include?(r[:uid]) &&
+        r[:name].to_s.casecmp?(scroll[:name]) && spell_nums(r[:spells]) == spell_nums(spells)
+    end
+    if twin
+      claimed << twin[:uid]
+      twin.merge!(id: scroll[:id], status: 'carried', container: scroll[:where], last_seen: now, stale: false, stored_at: nil, stored_in: nil)
+      twin[:kind] = effective_kind(twin, scroll[:kind]) if scroll[:kind]
+      twin[:spells] = spells
+    else
+      claimed << add_record(scroll, spells, now)[:uid]
+    end
+  end
+
+  def self.add_record(scroll, spells, now, unreadable: false)
+    rec = {
+      uid: data[:next_uid], id: scroll[:id], name: scroll[:name], status: 'carried',
+      container: scroll[:where], kind: scroll[:kind] || 'normal', spells: spells, used: {}, unreadable: unreadable,
+      stale: false, first_seen: now, last_seen: now
+    }
+    data[:next_uid] += 1
+    records << rec
+    rec
+  end
+
+  ## ---- invoke tracking (hooks only observe; the main loop does the work) ----
+
+  def self.install_hooks
+    UpstreamHook.add(UPSTREAM_HOOK_ID, proc { |command| parse_upstream(command) })
+    DownstreamHook.add(OBSERVER_HOOK_ID, proc { |line| observe_line(line) })
+  end
+
+  def self.remove_hooks
+    UpstreamHook.remove(UPSTREAM_HOOK_ID)
+    DownstreamHook.remove(OBSERVER_HOOK_ID)
+    DownstreamHook.remove(CAPTURE_HOOK_ID)
+  end
+
+  # Runs on the input thread: remember which spell number is being invoked
+  # (vibrant-ink invokes never name the spell in their reply) and swallow our
+  # own ;commands.
+  def self.parse_upstream(command)
+    if (m = HOOK_CMD_RX.match(command))
+      CMD_QUEUE.push(m[1])
+      nil
+    else
+      if (m = INVOKE_CMD_RX.match(command.to_s.strip))
+        @pending_invoke = [m[1].to_i, Time.now]
+      end
+      command
+    end
+  end
+
+  # Runs on the socket thread - never blocks, never alters the line.
+  def self.observe_line(line)
+    return line unless line.include?('invoke') || line.include?('ink leaps') || line.include?('blank space')
+
+    text = strip_tags(line)
+    if (m = INVOKE_OK_RX.match(text))
+      push_event(:ok, m[2])
+    elsif VIBRANT_OK_RX.match?(text)
+      push_event(:vibrant, nil)
+    elsif (m = BLANK_RX.match(text))
+      push_event(:blank, m[1])
+    end
+    line
+  end
+
+  def self.push_event(kind, spell_name)
+    pending = @pending_invoke
+    num = pending && (Time.now - pending[1]) < PENDING_TTL ? pending[0] : nil
+    hands = [GameObj.right_hand, GameObj.left_hand].select { |o| scroll_obj?(o) }
+                                                    .map { |o| { id: o.id.to_s, name: o.name.to_s } }
+    EVENT_QUEUE.push({ kind: kind, spell_name: spell_name, num: num, hands: hands })
+  end
+
+  def self.drain_events
+    handle_event(EVENT_QUEUE.pop) until EVENT_QUEUE.empty?
+  end
+
+  def self.handle_event(ev)
+    held = ev[:hands].filter_map { |h| records.find { |r| r[:id] == h[:id] } }
+    @unknown_invoke = true if held.empty? && !ev[:hands].empty?
+
+    case ev[:kind]
+    when :ok, :vibrant
+      rec = held.find { |r| find_spell(r, ev[:num], ev[:spell_name]) } || (held.first if held.size == 1)
+      spell = rec && find_spell(rec, ev[:num], ev[:spell_name])
+      spell ||= rec[:spells].find { |s| s[:vibrant] } if rec && ev[:kind] == :vibrant && ev[:num].nil?
+      num = spell&.dig(:num) || ev[:num] || (ev[:spell_name] && lookup_num(ev[:spell_name]))
+      name = spell&.dig(:name) || ev[:spell_name]
+      record_use(rec, num, name)
+    when :blank
+      rec = held.find { |r| find_spell(r, nil, ev[:spell_name]) }
+      return unless rec
+
+      rec[:spells].delete_if { |s| s[:name].to_s.casecmp?(ev[:spell_name]) }
+      records.delete(rec) if rec[:spells].empty?
+      @dirty = true
+    end
+  end
+
+  def self.record_use(rec, num, name)
+    k = key(num || name)
+    entry = (usage[k] ||= { name: name.to_s, count: 0, last: 0 })
+    entry[:name] = name.to_s if entry[:name].to_s.empty?
+    entry[:count] += 1
+    entry[:last] = Time.now.to_i
+    if rec
+      rec[:used] ||= {}
+      rec[:used][k] = rec[:used].fetch(k, 0) + 1
+      rec[:stale] = true # next refresh re-reads it: spent spells drop off
+      # Once we've seen a scroll used it is no longer pristine, whatever bag it
+      # goes back into. Held in memory only: it is forgotten when the script stops.
+      @used_uids << rec[:uid]
+      rec[:kind] = 'normal' if rec[:kind] == 'pristine'
+    end
+    @dirty = true
+  end
+
+  ## ---- output ----------------------------------------------------------------
+
+  def self.live_records
+    records.reject { |r| r[:unreadable] || r[:spells].empty? }
+  end
+
+  # Readable scrolls of the kinds ;scriv set show allows.
+  def self.visible_records
+    shown = shown_kinds
+    live_records.select { |r| r[:status] == 'carried' && shown.include?(r[:kind] || 'normal') }
+  end
+
+  def self.scroll_label(group)
+    label = link(group.map { |r| r[:uid] }, paint(group.first[:kind] || 'normal', group.first[:name]))
+    label << " x#{group.size}" if group.size > 1
+    label
+  end
+
+  # Only scrolls on the character are listed. query is the player's own spell
+  # text, passed on to the "Search tracked scrolls" link of a single-spell view.
+  def self.show_summary(only = nil, query = nil)
+    t = proc { |s| Lich::Messaging.msg_format('thought', s, encode: false) }
+    b = proc { |s| Lich::Messaging.msg_format('bold', s, encode: false) }
+
+    by_spell = {}
+    visible_records.each do |r|
+      r[:spells].each do |s|
+        next if only && !only.call(s)
+
+        (by_spell[s[:num]] ||= { name: s[:name], vibrant: s[:vibrant], recs: [] })[:recs] << r
+      end
+    end
+
+    unread = records.count { |r| r[:unreadable] && r[:status] == 'carried' }
+    hidden = KINDS - shown_kinds
+    _respond t.call("  Scroll Inventory v#{VERSION}  -  #{visible_records.size} scroll(s) on you" \
+                    "#{hidden.empty? ? '' : "  (hiding #{hidden.join(', ')})"}")
+
+    if by_spell.empty?
+      _respond(only ? '  None of the scrolls you are carrying hold that spell.' : '  No scroll spells on you. Run ;scriv to read your scrolls.')
+      footer_links(only, query)
+      return
+    end
+
+    by_spell.sort.each do |num, info|
+      groups = info[:recs].group_by { |r| [r[:name].downcase, r[:kind] || 'normal'] }.values
+                          .sort_by { |g| [g.first[:name].downcase, KINDS.index(g.first[:kind] || 'normal')] }
+      used = usage.dig(key(num), :count).to_i
+      count = info[:recs].size
+      tags = []
+      tags << 'vibrant' if info[:vibrant]
+      tags << "used #{used}" if used.positive?
+      suffix = tags.empty? ? '' : "  [#{tags.join(', ')}]"
+      _respond "  #{b.call("(#{num})")} #{info[:name]} #{count} #{count == 1 ? 'scroll' : 'scrolls'} - " \
+               "#{groups.map { |g| scroll_label(g) }.join(', ')}#{suffix}"
+      next unless only
+
+      # A single-spell view lists each of those scrolls with where it is and
+      # how many times this spell has been invoked from it.
+      info[:recs].sort_by { |r| [r[:name].downcase, r[:uid]] }.each do |r|
+        where = r[:container] == 'hand' ? 'in hand' : "in #{r[:container]}"
+        scroll_used = r.dig(:used, key(num)).to_i
+        _respond "         #{link([r[:uid]], paint(r[:kind] || 'normal', r[:name]))}  ##{r[:uid]}  -  #{where}, used #{scroll_used}"
+      end
+    end
+
+    if only
+      footer_links(only, query)
+      return
+    end
+
+    total_used = usage.values.sum { |v| v[:count].to_i }
+    foot = "  #{by_spell.size} spell(s), #{visible_records.size} scroll(s), #{total_used} use(s) tracked"
+    foot += ", #{unread} unreadable/blank" if unread.positive?
+    _respond t.call(foot)
+    if @locker_unread&.positive?
+      _respond t.call("  invdb sees #{@locker_unread} more scroll(s) in your lockers that haven't been read - " \
+                      'take them out and run ;scriv to add them')
+    end
+    footer_links(only, query)
+  end
+
+  def self.footer_links(only, query)
+    if only
+      _respond "  #{cmd_link("search #{query}", 'Search tracked scrolls')}"
+    else
+      off_hand = records.count { |r| r[:status] != 'carried' }
+      _respond "  #{cmd_link('stored', "Stored scrolls (#{off_hand})")}" if off_hand.positive?
+    end
+  end
+
+  def self.seen_text(rec)
+    on_you = rec[:last_seen] ? "last on you #{fmt_date(rec[:last_seen])}" : 'never seen on you'
+    "first tracked #{fmt_date(rec[:first_seen])}, #{on_you}"
+  end
+
+  def self.fmt_date(ts)
+    ts.to_i.positive? ? Time.at(ts.to_i).strftime('%m/%d/%Y') : '?'
+  end
+
+  # invdb's view of where a scroll with this name sits outside your inventory
+  # ("Icemule Trace (bin)"), or nil when invdb is missing or has none.
+  def self.invdb_locations(name)
+    rows = invdb_rows
+    return nil unless rows
+
+    hits = rows.reject { |r| r[:carried] }.select { |r| r[:name].casecmp?(name) }
+    return nil if hits.empty?
+
+    hits.group_by { |r| [r[:where], r[:path]] }.map do |(where, path), rs|
+      n = rs.sum { |r| r[:amount] }
+      "#{where}#{path.empty? ? '' : " (#{path})"}#{n > 1 ? " x#{n}" : ''}"
+    end.join('; ')
+  end
+
+  def self.location_text(rec)
+    return(rec[:container] == 'hand' ? 'carried, in hand' : "carried, in #{rec[:container]}") if rec[:status] == 'carried'
+
+    bits = []
+    bits << "last carried in #{rec[:last_container]}" if rec[:last_container] && rec[:last_container] != 'stored'
+    if rec[:stored_in]
+      bits << "in #{rec[:stored_in]} (scanned #{fmt_date(rec[:stored_at])})"
+    elsif rec[:stored_at]
+      bits << "put away #{fmt_date(rec[:stored_at])}"
+    end
+    loc = invdb_locations(rec[:name])
+    bits << "invdb places a scroll of this name in: #{loc}" if loc
+    bits.empty? ? 'not on you (location unknown)' : "not on you - #{bits.join('; ')}"
+  end
+
+  def self.spells_text(rec)
+    return 'unreadable or blank' if rec[:unreadable] || rec[:spells].empty?
+
+    rec[:spells].map do |s|
+      used = rec.dig(:used, key(s[:num])).to_i
+      "(#{s[:num]}) #{s[:name]}#{s[:vibrant] ? ' [vibrant]' : ''}#{used.positive? ? " - used #{used}" : ''}"
+    end.join(', ')
+  end
+
+  # Every tracked scroll that is not on you, with everything we know about it.
+  # Ignores the ;scriv set show filter: this is the full record.
+  def self.show_stored
+    t = proc { |s| Lich::Messaging.msg_format('thought', s, encode: false) }
+    recs = records.reject { |r| r[:status] == 'carried' }.sort_by { |r| [r[:name].downcase, r[:uid]] }
+    _respond t.call("  Stored scrolls  -  #{recs.size} tracked scroll(s) not on you")
+    if recs.empty?
+      _respond '  None.'
+    else
+      recs.each do |r|
+        _respond "  ##{r[:uid]}  #{paint(r[:kind] || 'normal', r[:name])}  -  #{location_text(r)}"
+        _respond "         #{spells_text(r)}  -  #{seen_text(r)}"
+      end
+    end
+    _respond "  #{cmd_link('', 'Back to the scrolls on you')}"
+  end
+
+  # ;scriv scan container <name> - look inside a bag or locker that is not one of
+  # the set containers (one you hold, wear, or can see in the room, such as a
+  # locker you are standing in), read the scrolls in it, and track them as stored
+  # in that container. Scrolls are matched by name + spells like any other, so
+  # they join the Stored scrolls list and keep their history.
+  # A container you name that isn't in Lich's object lists (lockers often aren't)
+  # still answers to its name, so it is scanned by that name.
+  Spot = Struct.new(:id, :name, :noun)
+
+  # An item tag with an optional stack count: "a scorched scroll (2)". Notes in
+  # parentheses (isharpie's) may sit between the tag and the count.
+  STACK_TAG_RX = /<a exist="(-?\d+)" noun="([^"]*)">([^<]*)<\/a>(?:\s*\((?!\d+\))[^)]*\))*(?:\s*\((\d+)\))?/.freeze
+
+  # Every item copy in a container listing, in order, with its place among the
+  # items of the same noun and of the same name: what an ordinal in a command
+  # ("read 2nd parchment in locker") counts. A stack shows as one tag but is
+  # several items, so it yields one entry per copy.
+  def self.container_entries(raw)
+    by_noun = Hash.new(0)
+    by_name = Hash.new(0)
+    entries = []
+    # The game describes a container's contents more than once (the categorized
+    # text and a per-item list), so counting every tag doubles everything. The
+    # "Scrolls [N]: ..." line is the one authoritative list, in container order;
+    # without it, fall back to all tags but count each item id once.
+    line = raw.lines.find { |l| strip_tags(l) =~ /\bScrolls \[\d+\]/ }
+    tags = (line || raw).scan(STACK_TAG_RX)
+    unless line
+      merged = {}
+      tags.each do |eid, noun, text, count|
+        (merged[eid] ||= [eid, noun, text, count])[3] = [merged[eid][3].to_i, count.to_i].max.to_s
+      end
+      tags = merged.values.map { |eid, noun, text, count| [eid, noun, text, count == '0' ? nil : count] }
+    end
+    tags.each do |eid, noun, text, count|
+      name = text.strip
+      (count ? count.to_i : 1).times do |copy|
+        by_noun[noun] += 1
+        by_name[name.downcase] += 1
+        entries << { key: "#{eid}:#{copy}", eid: eid, noun: noun, name: name,
+                     ord_noun: by_noun[noun], ord_name: by_name[name.downcase] }
+      end
+    end
+    entries
+  end
+
+  # "2nd", "3rd", "11th". The game does not refuse an ordinal it can't use - it
+  # may quietly read a different item - so every read is checked against the
+  # item name in its reply (see read_batch) rather than trusted.
+  def self.ordinal_prefix(n)
+    return '' if n == 1
+
+    suffix = if (11..13).cover?(n % 100) then 'th'
+             else { 1 => 'st', 2 => 'nd', 3 => 'rd' }.fetch(n % 10, 'th') end
+    "#{n}#{suffix} "
+  end
+
+  # How the game names a scroll when you read it by name: it ignores a leading
+  # measure phrase ("sheet of", "piece of", "scrap of", "sheaf of") and takes the
+  # first word of what is left as its one adjective. "neatly inked scroll" is
+  # "neatly scroll", "sheet of burnt vellum" is "burnt vellum"; "inked scroll",
+  # "piece paper" and full names with "of" are refused ("You can't do that.").
+  # nil when the scroll has no adjective ("scroll").
+  def self.short_form(entry)
+    tokens = entry[:name].downcase.split
+    tokens = tokens[(tokens.rindex('of') + 1)..] if tokens.include?('of')
+    adj = tokens.first
+    adj == entry[:noun].downcase ? nil : adj
+  end
+
+  # Read commands to try, best first, for an item inside the container called
+  # ref: "read burnt vellum in locker", with an ordinal ("read 2nd obscure scroll
+  # in locker") counted among the scrolls that share that short form. The noun
+  # and its position ("read second vellum in locker") is the fallback. Each is
+  # verified against the reply, so a wrong guess is only a retry.
+  def self.locker_read_commands(entry, ref, all)
+    cmds = []
+    if (adj = short_form(entry))
+      same = all.select { |e| e[:noun] == entry[:noun] && short_form(e) == adj }
+      n = (same.index { |e| e[:key] == entry[:key] } || 0) + 1
+      cmds << "read #{ordinal_prefix(n)}#{adj} #{entry[:noun]} in #{ref}"
+    end
+    cmds << "read #{ordinal_prefix(entry[:ord_noun])}#{entry[:noun]} in #{ref}"
+    cmds.uniq
+  end
+
+  # One scroll, one command at a time. The game lets you queue a single command,
+  # so reading in a locker can't be batched: wait out roundtime first, redo a
+  # command the game bounced ("Sorry, you may only type ahead 1 command.") or
+  # never answered, and only then move on to the next form.
+  def self.read_one(key, cmds, expect = {})
+    cmds.each do |cmd|
+      3.times do
+        waitrt?
+        spells = read_batch({ key => cmd }, expect)[key]
+        return spells if spells # spells, or [] for a scroll that answered with nothing on it
+
+        reply = (@read_trace[key] || {})[:reply].to_s
+        break unless reply.empty? || reply =~ /type ahead/i # a real refusal: try the next form
+
+        pause 1
+      end
+    end
+    nil
+  end
+
+  # {key => spells} for {key => [command, alternates...]}: one batch of first
+  # choices (fine for reads that carry no roundtime), then whatever failed one
+  # at a time with all its forms.
+  def self.read_with_fallback(options, expect = {})
+    options = options.reject { |_k, cmds| cmds.empty? }
+    results = read_batch(options.transform_values(&:first), expect)
+    options.each { |key, cmds| results[key] = read_one(key, cmds, expect) if results[key].nil? }
+    results
+  end
+
+  def self.scan_container(query)
+    query = query.dup
+    force = !query.sub!(/\s+force\z/i, '').nil? # ;scriv scan container locker force
+    pool = (GameObj.inv.to_a + Array(GameObj.loot) + Array(GameObj.room_desc)).flatten.compact
+    targets = pool.select { |o| name_match?(o, query) }.uniq { |o| o.id.to_s }
+    targets = [Spot.new(nil, query, query.split.last)] if targets.empty?
+
+    now = Time.now.to_i
+    # Things you wear or hold answer to their id. A locker, bin or chest in the
+    # room is reached by name - "read paper in locker" - so those commands name
+    # the container (as you typed it, or its full name if two share a noun).
+    worn_ids = GameObj.inv.to_a.map { |o| o.id.to_s }
+    ref = lambda do |o|
+      (o.is_a?(Spot) || targets.count { |t| t.noun == o.noun } > 1) ? o.name.to_s : o.noun.to_s
+    end
+    replies = capture_many(targets.map { |o| worn_ids.include?(o.id.to_s) ? "look in ##{o.id}" : "look in #{ref.call(o)}" })
+    carried_ids = records.select { |r| r[:status] == 'carried' }.map { |r| r[:id] }
+    claimed = Set.new
+
+    targets.each_with_index do |obj, i|
+      raw = replies[i].join("\n")
+      label = obj.name.to_s
+      worn = worn_ids.include?(obj.id.to_s)
+      entries = container_entries(raw).select { |e| SCROLL_NOUNS.include?(e[:noun]) }
+      listing = raw =~ INV_LIST_RX || strip_tags(raw) =~ /^(?:In|On|Inside)\s+(?:the|your|an?)\s|Total items:/i
+      if entries.empty? && !listing
+        say(if raw =~ SENTINEL_RX then "can't find anything called \"#{label}\" here - stand where it is, or wear or hold it"
+            elsif raw =~ /\bclosed\b|need to open/i then "#{label} is closed - open it first"
+            else "#{label} has nothing to look in" end)
+        next
+      end
+
+      expected = strip_tags(raw.lines.find { |l| strip_tags(l) =~ /\bScrolls \[\d+\]/ }.to_s)[/\bScrolls \[(\d+)\]/, 1]
+      if expected && expected.to_i != entries.size
+        say "#{label} lists #{expected} scroll(s) but #{entries.size} were counted - some reads may land on the wrong scroll"
+      end
+
+      if worn
+        # By id. A stack shows as one tag with one id, so only one copy of it can be told apart.
+        unique = entries.uniq { |e| e[:eid] }.reject { |e| carried_ids.include?(e[:eid]) }
+        say "#{entries.size - entries.uniq { |e| e[:eid] }.size} scroll(s) in #{label} are in stacks and can't be tracked by id" if entries.size > entries.uniq { |e| e[:eid] }.size
+        entries = unique
+        options = entries.to_h { |e| [e[:key], ["read ##{e[:eid]}"]] }
+      else
+        options = entries.to_h { |e| [e[:key], locker_read_commands(e, ref.call(obj), entries)] }
+      end
+
+      # A scroll in storage can't change while it sits there, so a container whose
+      # listing is identical to the last scan, and whose every scroll was recorded
+      # then, needs no reading at all. A scroll that couldn't be read last time
+      # leaves the counts unequal, so it is tried again.
+      sig = entries.map { |e| e[:name].downcase }
+      filed = records.select { |r| r[:status] == 'stored' && r[:stored_in] == label }
+      prior = data[:scans][key(label)]
+      if !force && prior && prior[:sig] == sig && filed.size == entries.size
+        filed.each do |r|
+          r[:stored_at] = now
+          claimed << r[:uid]
+        end
+        @dirty = true
+        say "#{label}: unchanged since #{fmt_date(prior[:at])} (#{entries.size} scroll(s)) - skipped reading; " \
+            "add \"force\" to read them again"
+        next
+      end
+
+      expect = entries.to_h { |e| [e[:key], e[:name]] }
+      if worn
+        read = read_with_fallback(options, expect)
+      else
+        # Reads in a locker carry roundtime and the game queues one command, so no batching.
+        say "reading #{entries.size} scroll(s) in #{label}, one at a time..." if entries.size > 3
+        read = options.to_h { |k, cmds| [k, read_one(k, cmds, expect)] }
+      end
+      data[:scans][key(label)] = { sig: sig, at: now }
+      fresh = unreadable = blank = 0
+      shown_trace = 0
+      entries.each do |e|
+        spells = read[e[:key]]
+        scroll = { id: e[:eid], name: e[:name], where: label, kind: kind_for(obj) }
+        if spells.nil? || spells.empty?
+          trace = (@read_trace || {})[e[:key]]
+          if trace && shown_trace < 8
+            shown_trace += 1
+            say "  #{e[:name]}: #{trace[:cmd]} -> #{trace[:reply].empty? ? '(no reply)' : trace[:reply]}"
+          end
+          if spells.nil?
+            unreadable += 1 # the read failed or landed on another scroll: nothing recorded
+            next
+          end
+
+          # The right scroll answered with no spells on it: blank, or spent. Track it as such.
+          blank_rec = records.find do |r|
+            r[:status] == 'stored' && r[:unreadable] && !claimed.include?(r[:uid]) &&
+              r[:stored_in] == label && r[:name].to_s.casecmp?(e[:name])
+          end
+          unless blank_rec
+            blank_rec = add_record(scroll, [], now, unreadable: true)
+            blank_rec[:last_seen] = nil
+          end
+          blank_rec.merge!(status: 'stored', id: nil, container: 'stored', stored_in: label, stored_at: now,
+                           kind: scroll[:kind])
+          claimed << blank_rec[:uid]
+          blank += 1
+          next
+        end
+
+        twin = records.find do |r|
+          r[:status] == 'stored' && !r[:unreadable] && !claimed.include?(r[:uid]) &&
+            r[:name].to_s.casecmp?(scroll[:name]) && spell_nums(r[:spells]) == spell_nums(spells)
+        end
+        unless twin
+          twin = add_record(scroll, spells, now)
+          twin[:last_seen] = nil # found in storage: never seen on you
+          fresh += 1
+        end
+        twin.merge!(status: 'stored', id: nil, container: 'stored', stored_in: label, stored_at: now,
+                    spells: spells, kind: scroll[:kind], stale: false)
+        claimed << twin[:uid]
+      end
+
+      # Anything we had filed in this container that wasn't in it this time has moved on.
+      records.each do |r|
+        r[:stored_in] = nil if r[:stored_in] == label && !claimed.include?(r[:uid])
+      end
+
+      tail = []
+      tail << "#{fresh} new" if fresh.positive?
+      tail << "#{blank} blank or spent" if blank.positive?
+      tail << "#{unreadable} couldn't be read" if unreadable.positive?
+      say "#{label}: #{entries.size} scroll(s) found#{tail.empty? ? '' : " (#{tail.join(', ')})"}"
+    end
+
+    reconcile_with_invdb
+    @dirty = true
+    _respond "  #{cmd_link('stored', 'Stored scrolls')}"
+  end
+
+  # Every tracked scroll holding the spell, on you or not, carried ones first.
+  def self.show_search(query)
+    t = proc { |s| Lich::Messaging.msg_format('thought', s, encode: false) }
+    matcher = spell_matcher(query)
+    recs = records.reject { |r| r[:unreadable] }.select { |r| r[:spells].any? { |s| matcher.call(s) } }
+    recs = recs.sort_by { |r| [r[:status] == 'carried' ? 0 : 1, r[:name].downcase, r[:uid]] }
+    _respond t.call("  Tracked scrolls holding #{query}  -  #{recs.size} found (#{recs.count { |r| r[:status] == 'carried' }} on you)")
+    if recs.empty?
+      _respond '  None.'
+      return
+    end
+
+    recs.each do |r|
+      used = r[:spells].select { |s| matcher.call(s) }.sum { |s| r.dig(:used, key(s[:num])).to_i }
+      name = paint(r[:kind] || 'normal', r[:name])
+      name = link([r[:uid]], name) if r[:status] == 'carried'
+      _respond "  ##{r[:uid]}  #{name}  -  #{location_text(r)}"
+      _respond "         used #{used} from this scroll  -  #{seen_text(r)}  -  all spells: #{spells_text(r)}"
+    end
+  end
+
+  def self.show_help
+    t = proc { |s| Lich::Messaging.msg_format('thought', s, encode: false) }
+    b = proc { |s| Lich::Messaging.msg_format('bold', s, encode: false) }
+    w = proc { |s| Lich::Messaging.msg_format('whisper', s, encode: true) }
+
+    _respond t.call("  Scroll Inventory v#{VERSION}  -  Help Notes")
+    _respond ''
+    _respond '  Keeps a ledger of your scrolls and the spells on them, and counts every invoke you make.'
+    _respond '  It only reads and observes - it never invokes or casts anything.'
+    _respond ''
+    _respond b.call('  -- Usage --')
+    _respond "  #{w.call(';scriv')}                 refresh (reads any new scrolls) and print the spell summary"
+    _respond "  #{w.call(';scriv 1115')}            ONLY the scrolls on you holding that spell number"
+    _respond "  #{w.call(';scriv stored')}          scrolls tracked but not on you, with what we know about them"
+    _respond "  #{w.call(';scriv search 1115')}     every tracked scroll with that spell, on you or not, with locations"
+    _respond "  #{w.call(';scriv setup')}           show setup options and their current values"
+    _respond "  #{w.call(';scriv set pristine <bags>')}  bags of never-invoked scrolls   (shown teal, *name)"
+    _respond "  #{w.call(';scriv set normal <bags>')}    bags of used scrolls           (shown plain)"
+    _respond "  #{w.call(';scriv set infused <bags>')}   bags of sorcerer-infused scrolls (shown green, !name)"
+    _respond "  #{w.call(';scriv set show pristine, normal, infused')}  choose which kinds ;scriv lists (any combination)"
+    _respond "  #{w.call(';scriv spell 101')}       one spell (number or part of the name) and the scrolls holding it"
+    _respond "  #{w.call(';scriv scan')}            re-read every scroll you carry, not only new ones"
+    _respond "  #{w.call(';scriv scan container <name>')}  track the scrolls in a bag or locker outside your set containers"
+    _respond '       skips reading when its contents are unchanged since the last scan; add "force" to read them again'
+    _respond "  #{w.call(';scriv forget <#>')}      drop one scroll from the ledger (# shown by ;scriv <spell>)"
+    _respond "  #{w.call(';scriv prune')}           drop all scrolls marked stored"
+    _respond "  #{w.call(';scriv stop')}            stop the script (it stays running to track invokes)"
+    _respond ''
+    _respond '  Notes'
+    _respond '  - Scroll names are links: click one to READ it. A name shared by several scrolls holding that'
+    _respond '    spell (x2, x3...) reads each of them in turn. Stored scrolls must be taken out first.'
+    _respond '  - Scrolls that leave you are remembered by name + spell set and shown as "stored" until they'
+    _respond '    turn up again under a new id. To read scrolls where they sit, stand at the locker (or hold the'
+    _respond '    bag) and use ;scriv scan container <locker|bin|chest|bag name> - it reads them with "read paper'
+    _respond '    in locker" style commands.'
+    _respond '  - Amounts are scrolls holding the spell (each is at least one cast). Per-spell charges are'
+    _respond '    not visible to most professions, so "used" is what this script has watched you invoke.'
+    _respond '  - Only top-level contents of your worn containers are searched.'
+    _respond '  - Enhanced by ;invdb: run it now and then. With its database scriv retires stored scrolls that'
+    _respond '    have left your lockers and shows where in the lockers they are. Bags are always searched'
+    _respond '    directly and quietly on each run, with or without it.'
+  end
+
+  def self.show_setup
+    t = proc { |s| Lich::Messaging.msg_format('thought', s, encode: false) }
+    w = proc { |s| Lich::Messaging.msg_format('whisper', s, encode: true) }
+
+    _respond t.call("  Scroll Inventory v#{VERSION}  -  Setup")
+    _respond ''
+    _respond "  Scroll bags - keep unused, used and infused scrolls apart and scriv will tell them apart:"
+    { 'pristine' => 'never invoked  (shown teal, *name)', 'normal' => 'used / ordinary  (shown plain)',
+      'infused' => 'sorcerer-infused  (shown green, !name)' }.each do |kind, blurb|
+      names = kind_containers(kind)
+      _respond "  #{kind.ljust(9)} #{names.empty? ? '(none)' : names.join(', ')}   - #{blurb}"
+      _respond "     #{w.call(";scriv set #{kind} <bag>, <bag>")}"
+    end
+    _respond '  Bag names may carry an adjective (silver backpack). Give no names to clear a list.'
+    _respond '  If no bags are named at all, every worn container is searched and all scrolls count as normal.'
+    _respond ''
+    _respond "  show        #{shown_kinds.join(', ')}"
+    _respond "     #{w.call(';scriv set show pristine, normal, infused')}  which kinds ;scriv lists - any combination, any case"
+    _respond ''
+    if File.exist?(INVDB_PATH)
+      _respond "  invdb       found - used to retire stored scrolls that left your lockers and to show locker locations"
+    else
+      _respond "  invdb       not found - this script is enhanced by ;invdb (stale stored scrolls then need ;scriv prune)"
+    end
+  end
+
+  def self.set_containers(kind, list)
+    names = list.to_s.split(',').map(&:strip).reject(&:empty?)
+    data[:settings][kind.to_sym] = names
+    @dirty = true
+
+    inv = GameObj.inv.to_a
+    names.reject { |n| inv.any? { |i| name_match?(i, n) } }.each { |n| say "note: you aren't wearing anything matching \"#{n}\"" }
+
+    all = configured_containers
+    if all.empty?
+      say "#{kind} list cleared - no bags named, so every worn container is searched"
+      return
+    end
+
+    # Scrolls remembered in bags that are no longer searched can't be kept honest.
+    hit_names = inv.select { |i| all.any? { |n| name_match?(i, n) } }.map { |i| i.name.to_s }
+    unless hit_names.empty?
+      records.reject! { |r| r[:status] == 'carried' && r[:container] != 'hand' && !hit_names.include?(r[:container]) }
+    end
+    say names.empty? ? "#{kind} list cleared" : "#{kind} bags: #{names.join(', ')}"
+    say "searching only: #{all.join(', ')}"
+  end
+
+  def self.set_show(list)
+    words = list.to_s.downcase.split(/[\s,]+/).reject(&:empty?)
+    words = KINDS if words.empty? || words == ['all']
+    bad = words - KINDS
+    return say("unknown kind(s) #{bad.join(', ')} - choose from #{KINDS.join(', ')}") unless bad.empty?
+
+    data[:settings][:show] = KINDS & words # canonical order, no repeats
+    @dirty = true
+    say "showing: #{shown_kinds.join(', ')}"
+  end
+
+  ## ---- commands --------------------------------------------------------------
+
+  def self.drain_cmd_queue
+    handle_command(CMD_QUEUE.pop) until CMD_QUEUE.empty?
+  end
+
+  def self.handle_command(msg)
+    text = msg.to_s.strip
+
+    case text
+    when ''
+      refresh
+      show_summary
+    when /\Ahelp\z/i
+      show_help
+    when /\Asetup\z/i
+      show_setup
+    when /\Astored\z/i
+      show_stored
+    when /\Asearch\s+(.+)\z/i
+      show_search($1.strip)
+    when /\Aread\s+(\d[\d\s]*)\z/i
+      read_linked($1)
+    when /\Aset\s+(pristine|normal|infused)\b\s*(.*)\z/i
+      set_containers($1.downcase, $2)
+    when /\Aset\s+containers?\b\s*(.*)\z/i # 1.1.0 spelling: the used/ordinary list
+      set_containers('normal', $1)
+    when /\Aset\s+show\b\s*(.*)\z/i
+      set_show($1)
+    when /\Aset\b/i
+      say 'nothing to set there - try ;scriv setup'
+    when /\A\d{2,4}\z/
+      refresh
+      show_spell(text)
+    when /\Ascan\s+containers?\s+(.+)\z/i
+      scan_container($1.strip)
+    when /\Ascan\z/i
+      refresh(deep: true)
+      show_summary
+    when /\Aspell\s+(.+)\z/i
+      refresh
+      show_spell($1.strip)
+    when /\Aforget\s+#?(\d+)\z/i
+      forget($1.to_i)
+    when /\Aprune\z/i
+      prune
+    when /\A(?:stop|quit|exit)\z/i
+      say 'stopping.'
+      exit
+    else
+      say "unknown command #{text.inspect} - try ;scriv help"
+    end
+  end
+
+  def self.spell_matcher(query)
+    if query =~ /\A\d+\z/
+      ->(s) { s[:num] == query.to_i }
+    else
+      ->(s) { s[:name].to_s.downcase.include?(query.downcase) }
+    end
+  end
+
+  def self.show_spell(query)
+    show_summary(spell_matcher(query), query)
+  end
+
+  def self.forget(uid)
+    rec = records.find { |r| r[:uid] == uid }
+    return say("no scroll ##{uid} in the ledger") unless rec
+
+    records.delete(rec)
+    @dirty = true
+    say "forgot ##{uid} (#{rec[:name]})"
+  end
+
+  def self.prune
+    gone = records.select { |r| r[:status] == 'stored' }
+    records.reject! { |r| r[:status] == 'stored' }
+    @dirty = true
+    say "pruned #{gone.size} stored scroll(s)"
+  end
+
+  def self.main_loop
+    loop do
+      begin
+        drain_events
+        drain_cmd_queue
+        if @unknown_invoke
+          @unknown_invoke = false
+          say 'you invoked a scroll that is not in the ledger yet - run ;scriv to read it' if records.any?
+        end
+        if @dirty
+          @dirty = false
+          save_data!
+        end
+      rescue StandardError => e
+        say "error in main loop: #{e.class}: #{e.message}"
+      end
+      pause 0.25
+    end
+  end
+end
+
+if Script.current.vars[1] =~ /\Ahelp\z/i
+  ScrollInventory.show_help
+  exit
+end
+
+ScrollInventory.install_hooks
+
+before_dying do
+  ScrollInventory.remove_hooks
+  ScrollInventory.save_data!
+end
+
+ScrollInventory::CMD_QUEUE.push(Script.current.vars[1..-1].to_a.join(' '))
+ScrollInventory.main_loop

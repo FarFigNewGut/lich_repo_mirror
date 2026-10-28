@@ -1,0 +1,316 @@
+# frozen_string_literal: true
+
+=begin
+  gsd.lic - Greater ShadowDeath weapon automation
+
+  Keeps a Greater ShadowDeath (GSD) weapon working while you hunt:
+
+    WAVE   (Umbral Crescent)  - sent the moment its cooldown is up, only when
+                                a live creature is in the room.
+    RAISE  (Gloomform)        - sent at most once per cooldown, and (by
+                                default) only when the weapon is fully sated,
+                                so the 25 satiety it costs is never wasted:
+                                the next WAVE refills it.
+
+  The script watches the game text, so its timers stay right even when you
+  (or another script) WAVE or RAISE by hand. Roundtime ("...wait") is waited
+  out and the command resent. It never acts while you are dead or stunned,
+  or when the weapon isn't in your hands.
+
+  Quick start:
+    ;gsd set weapon spikestar      (the noun of YOUR ShadowDeath weapon)
+    ;gsd                           (run it - or add "gsd" to Bigshot, below)
+
+  Bigshot:
+    Add  gsd  to the "Hunting Scripts" field, and REMOVE any
+    "wave <weapon>" / "raise <weapon>" entries from your hunting commands,
+    otherwise both will send them.
+
+  Commands:
+    ;gsd                     run
+    ;gsd help                this help
+    ;gsd list                show current settings
+    ;gsd set weapon <noun>   weapon noun (spikestar, greatsword, ...)
+    ;gsd set wave on|off     use WAVE (Umbral Crescent)          default on
+    ;gsd set raise on|off    use RAISE (Gloomform)               default on
+    ;gsd set sated on|off    only RAISE when fully sated         default on
+    ;gsd set wave_cd <sec>   WAVE cooldown in seconds            default 62
+    ;gsd set raise_cd <sec>  RAISE cooldown in seconds           default 305
+    ;gsd set miss_cd <sec>   wait after a WAVE that hit nothing  default 15
+    ;gsd set debug on|off    explain why it is waiting           default off
+    ;gsd reset               restore all defaults
+
+  Settings are saved per character.
+
+        author: Durgrimst
+          game: Gemstone
+          tags: shadowdeath, gsd, greater shadowdeath, weapon, hunting, bigshot
+       version: 1.0.1
+      required: Lich >= 5.12.0
+
+  Changelog:
+    v1.0.1 (2026-10-28)
+      - a WAVE that hits nothing ("threatening sweep") now waits miss_cd
+        (15s) instead of being resent every few seconds
+      - no WAVE while go2 or eloot is running
+      - fixed RAISE being resent constantly with 'sated' off and low satiety
+    v1.0.0 (2026-10-28)
+      - initial release: combines gsdwave (WAVE on cooldown) and
+        spikeraise (RAISE only when sated) into one configurable script
+=end
+
+module GSD
+  DEFAULTS = {
+    'weapon'   => '',
+    'wave'     => true,
+    'raise'    => true,
+    'sated'    => true,
+    'wave_cd'  => 62,
+    'raise_cd' => 305,
+    'miss_cd'  => 15,
+    'debug'    => false,
+  }.freeze
+
+  POLL = 0.3
+  BUSY_SCRIPTS = %w[go2 eloot].freeze
+
+  def self.msg(text, type = 'info')
+    Lich::Messaging.msg(type, "gsd: #{text}")
+  end
+
+  # ---------------------------------------------------------------- settings
+
+  def self.settings
+    DEFAULTS.each { |key, value| CharSettings[key] = value if CharSettings[key].nil? }
+    CharSettings
+  end
+
+  def self.list
+    s = settings
+    weapon = s['weapon'].to_s.empty? ? '(not set)' : s['weapon']
+    respond ''
+    respond '  gsd settings'
+    respond "    weapon    #{weapon}"
+    respond "    wave      #{s['wave'] ? 'on' : 'off'}   (cooldown #{s['wave_cd']}s)"
+    respond "    miss      #{s['miss_cd']}s before re-waving after a sweep that hit nothing"
+    respond "    raise     #{s['raise'] ? 'on' : 'off'}   (cooldown #{s['raise_cd']}s)"
+    respond "    sated     #{s['sated'] ? 'on' : 'off'}   (RAISE only when fully sated)"
+    respond "    debug     #{s['debug'] ? 'on' : 'off'}"
+    respond ''
+  end
+
+  def self.help
+    respond ''
+    respond '  gsd - Greater ShadowDeath weapon automation (WAVE + RAISE)'
+    respond ''
+    respond "  #{$clean_lich_char}gsd                     run"
+    respond "  #{$clean_lich_char}gsd list                show settings"
+    respond "  #{$clean_lich_char}gsd set weapon <noun>   your ShadowDeath weapon's noun"
+    respond "  #{$clean_lich_char}gsd set wave on|off     WAVE (Umbral Crescent) on cooldown"
+    respond "  #{$clean_lich_char}gsd set raise on|off    RAISE (Gloomform) on cooldown"
+    respond "  #{$clean_lich_char}gsd set sated on|off    only RAISE when the weapon is fully sated"
+    respond "  #{$clean_lich_char}gsd set wave_cd <sec>   WAVE cooldown (default 62)"
+    respond "  #{$clean_lich_char}gsd set raise_cd <sec>  RAISE cooldown (default 305)"
+    respond "  #{$clean_lich_char}gsd set miss_cd <sec>   wait after a WAVE that hit nothing (default 15)"
+    respond "  #{$clean_lich_char}gsd set debug on|off    say why it is waiting"
+    respond "  #{$clean_lich_char}gsd reset               restore defaults"
+    respond ''
+    respond '  Bigshot: put "gsd" in Hunting Scripts and remove any wave/raise'
+    respond '  entries from your hunting commands.'
+    respond ''
+  end
+
+  def self.set(key, value)
+    key = key.to_s.downcase
+    unless DEFAULTS.key?(key)
+      msg("unknown setting '#{key}'. See #{$clean_lich_char}gsd help", 'warn')
+      return
+    end
+    case DEFAULTS[key]
+    when true, false
+      unless value.to_s =~ /\A(on|off|true|false|yes|no)\z/i
+        msg("#{key} must be on or off", 'warn')
+        return
+      end
+      CharSettings[key] = !!(value.to_s =~ /\A(on|true|yes)\z/i)
+    when Integer
+      unless value.to_s =~ /\A\d+\z/ && value.to_i.positive?
+        msg("#{key} must be a number of seconds", 'warn')
+        return
+      end
+      CharSettings[key] = value.to_i
+    else
+      CharSettings[key] = value.to_s.strip.downcase
+    end
+    msg("#{key} set to #{CharSettings[key]}")
+  end
+
+  def self.reset
+    DEFAULTS.each { |key, value| CharSettings[key] = value }
+    msg('settings reset to defaults')
+  end
+
+  # ------------------------------------------------------------- game state
+
+  def self.weapon_in_hand?(noun)
+    [GameObj.right_hand, GameObj.left_hand].any? { |hand| hand && hand.noun == noun }
+  end
+
+  def self.live_targets?
+    Array(GameObj.targets).any? { |t| t.status.to_s !~ /dead|gone/ }
+  end
+
+  def self.strip(line)
+    line.to_s.gsub(/<[^>]*>/, '')
+  end
+
+  # Sends cmd, waits out roundtime, resends on "...wait". Returns the matched
+  # line (tags stripped) or nil.
+  def self.send_and_read(cmd, pattern)
+    3.times do
+      waitrt?
+      waitcastrt?
+      clear
+      reply = strip(dothistimeout(cmd, 4, Regexp.union(pattern, /\.\.\.wait (\d+)|Wait (\d+) sec/i)))
+      if reply =~ /wait (\d+)/i
+        sleep(Regexp.last_match(1).to_i + 0.3)
+        next
+      end
+      return reply
+    end
+    nil
+  end
+
+  # ------------------------------------------------------------- main loop
+
+  def self.run
+    s = settings
+    noun = s['weapon'].to_s
+    if noun.empty?
+      held = GameObj.right_hand&.noun
+      if held.nil? || held == 'Empty'
+        msg("no weapon set. Hold your ShadowDeath weapon or use #{$clean_lich_char}gsd set weapon <noun>", 'warn')
+        exit
+      end
+      noun = held
+      msg("no weapon set - using the #{noun} in your right hand. Save it with #{$clean_lich_char}gsd set weapon #{noun}", 'warn')
+    end
+
+    wave_ok    = /You brandish your .*#{Regexp.escape(noun)} in a crescent/i
+    wave_miss  = /You brandish your .*#{Regexp.escape(noun)} in a threatening sweep/i
+    wave_no    = /not yet recovered from its last attempt to feed/i
+    sated_line = /#{Regexp.escape(noun)} is fully sated/i
+    raise_ok   = /opening yourself to the wholeness/i
+    raise_cd   = /not yet ready to infuse/i
+    raise_low  = /hunger unsated/i
+
+    next_wave  = Time.now
+    next_raise = Time.now
+    sated      = true # resting normally tops the weapon up
+    last_note  = Time.now - 60
+
+    note = lambda do |text|
+      next unless s['debug'] && Time.now - last_note > 15
+
+      last_note = Time.now
+      msg(text)
+    end
+
+    msg("running (weapon: #{noun}, wave #{s['wave'] ? 'on' : 'off'}, raise #{s['raise'] ? 'on' : 'off'})")
+
+    loop do
+      sleep POLL
+
+      # Follow everything the game says so timers stay right even when
+      # WAVE/RAISE are used by hand or by another script.
+      while (line = get?)
+        text = strip(line)
+        if text =~ wave_ok
+          next_wave = Time.now + s['wave_cd']
+        elsif text =~ wave_miss
+          next_wave = Time.now + s['miss_cd']
+        elsif text =~ wave_no
+          next_wave = [next_wave, Time.now + 8].max
+        end
+        sated = true if text =~ sated_line
+        if text =~ raise_ok
+          next_raise = Time.now + s['raise_cd']
+          sated = false
+        end
+      end
+
+      next if checkdead || checkstunned
+
+      # Don't wave while travelling or looting: a creature glimpsed in a
+      # room go2 is passing through, or one that just died, only earns a
+      # wasted "threatening sweep" and 3 seconds of roundtime.
+      if BUSY_SCRIPTS.any? { |name| Script.running?(name) }
+        note.call('waiting - travelling or looting')
+        next
+      end
+
+      unless weapon_in_hand?(noun)
+        note.call("waiting - #{noun} not in hand")
+        next
+      end
+      unless live_targets?
+        note.call('waiting - no live creatures')
+        next
+      end
+
+      # ---- WAVE (Umbral Crescent)
+      if s['wave'] && Time.now >= next_wave
+        reply = send_and_read("wave #{noun}", Regexp.union(wave_ok, wave_miss, wave_no))
+        next_wave = if reply =~ wave_ok
+                      Time.now + s['wave_cd']
+                    elsif reply =~ wave_miss
+                      Time.now + s['miss_cd']
+                    elsif reply =~ wave_no
+                      Time.now + 8
+                    else
+                      Time.now + 5 # no clear answer (target died, etc.)
+                    end
+        sated = true if reply =~ sated_line
+        next
+      end
+
+      # ---- RAISE (Gloomform)
+      next unless s['raise'] && Time.now >= next_raise
+
+      if s['sated'] && !sated
+        note.call('waiting - RAISE needs a fully sated weapon (next WAVE refills it)')
+        next
+      end
+
+      reply = send_and_read("raise #{noun}", Regexp.union(raise_ok, raise_cd, raise_low))
+      if reply =~ raise_ok
+        next_raise = Time.now + s['raise_cd']
+        sated = false
+        msg('Gloomform started')
+      elsif reply =~ raise_cd
+        next_raise = Time.now + 45
+      elsif reply =~ raise_low
+        sated = false
+        next_raise = Time.now + 30 # keeps it from resending RAISE when 'sated' is off
+        note.call('not enough satiety for RAISE - waiting for a full WAVE')
+      else
+        next_raise = Time.now + 15
+      end
+    end
+  end
+end
+
+case Script.current.vars[1].to_s.downcase
+when 'help', '?'
+  GSD.help
+when 'list', 'show', 'settings'
+  GSD.list
+when 'set'
+  GSD.set(Script.current.vars[2], Script.current.vars[3..].to_a.join(' '))
+when 'reset'
+  GSD.reset
+when ''
+  GSD.run
+else
+  GSD.help
+end

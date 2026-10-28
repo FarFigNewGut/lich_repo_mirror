@@ -1,8 +1,5 @@
 # frozen_string_literal: true
 
-require 'json'
-require 'fileutils'
-require 'set'
 require 'digest'
 
 =begin
@@ -25,12 +22,13 @@ The following inputs are available:
   ;isharpie list                         - list all stored notes
   ;isharpie colors                       - list valid color names
   ;isharpie help                         - command list
+  <noun> can also be left or right - picks a hand when both hold the same noun
 
       author: Kyrandos
-      Other scripts: Combatical, Merchantical, Loresang, VolnRestore2
+      Other scripts: Combatical, VolnRestore2, Loresang, Merchantical, scriv
       game: gs
       tags: items, inventory, notes, highlight, Sharpie
-      version: 1.4.2
+      version: 1.4.3
       required: Lich > 5.0
 
       \\Version\\
@@ -56,11 +54,13 @@ The following inputs are available:
                          tag options in any order (color, perm); sentinel-based command capture filters chat/stream noise
                          fixed a stray "false" in the tag confirmation message
       1.4.2 10/13/2026 - annotator hook now runs after all other downstream hooks so it can't starve them of replies
+      1.4.3 10/28/2026 - duplicate names: same-noun containers preloaded by id, recall reads the held item by id
+                         left/right picks a hand; locker manifests count copies, so a missing identical twin is culled
 
 =end
 
 module ISharpie
-  VERSION = '1.4.2'.freeze
+  VERSION = '1.4.3'.freeze
 
   VALID_COLORS = %w[orange teal green yellow none].freeze
   DEFAULT_RECALL_MODE = 'loud'.freeze
@@ -581,13 +581,12 @@ module ISharpie
     silence_me  # toggles script.silent = true, suppresses [script]>command echo
     begin
       say 'examining inventory...'
-      noun_counts = Hash.new(0)
+      # A noun shared by two carried items is looked in by id - "my <noun>"
+      # would open the same one every time.
+      noun_totals = GameObj.inv.to_a.map(&:noun).tally
       GameObj.inv.to_a.each do |item|
         next if item.contents  # already populated this session, skip
-        noun_counts[item.noun] += 1
-        n       = noun_counts[item.noun]
-        ordinal = n == 1 ? '' : "#{n}#{n == 2 ? 'nd' : n == 3 ? 'rd' : 'th'} "
-        fput "look in #{ordinal}my #{item.noun}"
+        fput(noun_totals[item.noun] > 1 ? "look in ##{item.id}" : "look in my #{item.noun}")
       end
       say 'done!'
     rescue => e
@@ -819,11 +818,25 @@ module ISharpie
   # matches by name, and a stale note last known in this locker that is not
   # listed goes into culling.
   def self.process_manifest(lines, town)
-    names = lines.join.scan(ITEM_TAG_RX).map { |_eid, _noun, tag, trailing|
-      [tag.strip, "#{tag}#{sanitize_trailing(trailing)}".strip]
-    }
-    seen = Set.new
-    names.each { |tag, long| name_candidates(long, tag).each { |c| seen << c[:id] } }
+    text  = lines.join
+    tally = Hash.new(0) # note id => copies listed that match it by name
+    text.scan(ITEM_TAG_RX) do
+      m = Regexp.last_match
+      copies = [text[m.end(0), 12].to_s[STACK_COUNT_RX, 1].to_i, 1].max
+      name_candidates("#{m[3]}#{sanitize_trailing(m[4])}".strip, m[3].strip).each { |c| tally[c[:id]] += copies }
+    end
+    # A note bound to something carried is not in this locker.
+    carried   = carried_entries.map { |o, _| o.id.to_s }.to_set
+    on_person = @exist_bindings.select { |eid, _| carried.include?(eid) }.values.to_set
+    seen = tally.keys.reject { |id| on_person.include?(id) }.to_set
+    # Identical copies share a name, so a name match alone marks every note
+    # for them as seen. When the locker lists fewer copies than it has notes
+    # for that name, the longest-unseen notes are the missing ones.
+    notes.select { |n| seen.include?(n[:id]) && where_for(n).casecmp?(town.to_s) }
+         .group_by { |n| n[:long_name].to_s.downcase }.each_value do |group|
+      extra = group.size - group.map { |n| tally[n[:id]] }.max
+      group.sort_by { |n| n[:last_seen].to_i }.first(extra).each { |n| seen.delete(n[:id]) } if extra.positive?
+    end
     seen.each { |id| mark_seen(id, town) }
     notes.each do |n|
       next unless n[:status] == 'stale' && !seen.include?(n[:id])
@@ -1560,7 +1573,7 @@ module ISharpie
       return
     end
 
-    recall_text = fetch_recall_text(noun || item.noun.to_s)
+    recall_text = fetch_recall_text(item)
     summary = summarize_recall(recall_text)
     unless summary && !summary.empty?
       say 'no useful recall details found'
@@ -1580,9 +1593,10 @@ module ISharpie
   # reget silently threw the sentence away along with the tag. A hook sees
   # the raw line before any of that, so we strip tags ourselves (keeping the
   # inner text) instead.
-  def self.fetch_recall_text(noun)
-    target = noun.to_s.strip.empty? ? 'item' : noun.to_s.strip
-    capture_command("recall #{target}").gsub(/<[^>]+>/, '')
+  # Recalled by id, so another item with the same noun (other hand, worn, in
+  # a container) can never answer for the one held.
+  def self.fetch_recall_text(item)
+    capture_command("recall ##{item.id}").gsub(/<[^>]+>/, '')
   end
 
   def self.recall_note_parts(summary)
@@ -1826,12 +1840,23 @@ module ISharpie
 
   ## ---- command handlers -------------------------------------------------------
 
+  # <noun>, or "left"/"right" for a hand - the only way to reach the left one
+  # when both hands hold the same noun (the right is used otherwise).
   def self.held_item(noun = nil)
     both = [GameObj.right_hand, GameObj.left_hand].select { |g| g && g.name && g.name != 'Empty' }
     return both.first unless noun
 
-    both.find { |g| g.noun.to_s.casecmp?(noun) } ||
-      both.find { |g| g.name.to_s.downcase.include?(noun.downcase) }
+    word = noun.downcase
+    if %w[right left].include?(word)
+      hand = word == 'right' ? GameObj.right_hand : GameObj.left_hand
+      return both.find { |g| hand && g.id == hand.id }
+    end
+
+    by_noun = both.select { |g| g.noun.to_s.casecmp?(word) }
+    say "both hands hold a #{word} - using the right one ('left' picks the other)" if by_noun.size > 1
+    by_noun.first ||
+      both.find { |g| g.name.to_s.downcase.split.include?(word) } ||
+      both.find { |g| g.name.to_s.downcase.include?(word) }
   end
 
   def self.normalize_color(name)
@@ -2339,6 +2364,7 @@ module ISharpie
     _respond '  List the enhancive benefits of your items right next to their name!'
     _respond ''
     _respond b.call('  -- Usage --') + '  (hold item first. You can add tag, SN, color and perm all in one command)'
+    _respond '  <noun> can also be left or right - picks a hand when both hold the same noun'
     _respond "  #{w.call(';isharpie tag <noun> "<note>"')}  tag item in hand"
     _respond "  #{w.call(';isharpie tag <noun> "<note>" green perm')}  options go in any order: a color name (or color <name>) and/or perm"
     _respond '       perm = this note is never flagged as missing (for items you rarely visit, like a player house)'

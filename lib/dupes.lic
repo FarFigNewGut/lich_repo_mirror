@@ -1,0 +1,382 @@
+=begin
+	   Dupes Version: 1.0.0 (October 28, 2026)
+
+	   Usage:
+
+	   ;dupes                               Duplicates items on the ground and drops them back on the ground
+	   ;dupes ground <container>            Duplicates items on the ground and puts them in <container>
+	   ;dupes <container>                   Duplicates items from your whole inventory and puts them in <container>
+	   ;dupes <container> <container>       Duplicates items from the first container and puts them in the second
+	   ;dupes <container> ground            Duplicates items from <container> and drops them on the ground
+	   ;dupes setup                         Choose which items to duplicate (wands, blue crystals, ruby amulets)
+	   ;dupes help                          Shows this list
+
+	   Each item is picked up, 918 is cast on it, then whatever is in both hands (the item and its
+	   duplicate) goes to the destination. Wands are matched by the noun "wand"; blue crystals and ruby
+	   amulets by their exact name. Containers are the ones you are wearing, named by noun or name
+	   (backpack, "green backpack"). Your hands must be empty when you start.
+
+	   Dupes makes its list of items before it starts and works through that list only, so the copies it
+	   puts away are never duplicated again. With ;dupes <container>, items already in that container are
+	   left alone for the same reason. Inventory is read from a silent INVENTORY FULL, so containers don't
+	   need to have been looked in first.
+
+	   If you don't have the mana for 918, dupes waits until it can cast. If a crew channel is set (in
+	   ;osacrew setup) it also calls for mana there, using the same cooldown as osacombat (Mana Share
+	   Cooldown, default 90 seconds) and sharing its timer, so running both never doubles up the calls.
+
+	   ~Peggyanne
+
+	   Change Log:
+
+          October 28, 2026 - Initial release. Duplicates wands, blue crystals and ruby amulets, with a setup
+                             window to choose which, and can take items from the ground, a container or your
+                             whole inventory and put the results on the ground or in a container.
+=end
+
+require "yaml"
+require "timeout"
+require "fileutils"
+
+script.want_downstream_xml = true
+
+DUPES_SPELL = 918
+DUPES_KINDS = [
+	{ key: "dupe_wands",    label: "Wands",         test: ->(noun, name) { noun.to_s =~ /^wand$/i } },
+	{ key: "dupe_crystals", label: "Blue Crystals", test: ->(noun, name) { name.to_s.strip =~ /^(?:an? )?blue crystal$/i } },
+	{ key: "dupe_amulets",  label: "Ruby Amulets",  test: ->(noun, name) { name.to_s.strip =~ /^(?:an? )?ruby amulet$/i } }
+]
+# INVENTORY FULL line format (same as ;foreach): 1 = leading spaces (2 = worn/held, more = inside a container),
+# 2 = prename, 3 = id, 4 = noun, 5 = name
+DUPES_INVFULL    = /^( {2,})([^<]*)<a exist="(-?\d+)" noun="([^"]*)">([^<]*)<\/a>(?: ([^(]*)(?:$|(?= \()))?(?: (\(.*\)))?$/
+DUPES_INV_START  = /^(?:You are carrying nothing at this time|You are currently (?:wearing|holding))/
+DUPES_INV_END    = /(?:<prompt)|(?:.*items? displayed\.\)$)/
+
+# ---------- settings ----------
+
+def dupes_settings_path
+	File.join(DATA_DIR, XMLData.game, Char.name, "dupes.yaml")
+end
+
+def dupes_load_yaml(file)
+	path = File.join(DATA_DIR, XMLData.game, Char.name, file)
+	return {} unless File.exist?(path)
+	raw = File.read(path)
+	return {} if raw.strip.empty?
+	(YAML.safe_load(raw, permitted_classes: [Time, Symbol], aliases: true) || {}).transform_keys(&:to_s)
+rescue StandardError
+	{}
+end
+
+# Every kind defaults to on until it's unchecked in setup
+def dupes_settings
+	data = dupes_load_yaml("dupes.yaml")
+	DUPES_KINDS.each { |k| data[k[:key]] = true if data[k[:key]].nil? }
+	data
+end
+
+def dupes_save_settings(data)
+	FileUtils.mkdir_p(File.dirname(dupes_settings_path))
+	File.write(dupes_settings_path, YAML.dump(data))
+end
+
+def dupes_match?(noun, name, cfg)
+	DUPES_KINDS.any? { |k| cfg[k[:key]] && k[:test].call(noun, name) }
+end
+
+# ---------- setup window ----------
+
+def dupes_setup
+	require "gtk3"
+	$dupes_gc = []
+	$dupes_window_open = true
+	build = proc do
+		begin
+			cfg = dupes_settings
+			win = Gtk::Window.new("Dupes Setup")
+			win.set_default_size(260, 170)
+			win.set_border_width(12)
+			win.keep_above = true
+			box = Gtk::Box.new(:vertical, 8)
+			win.add(box)
+			title = Gtk::Label.new
+			title.set_markup("<b>Items to duplicate</b>")
+			title.set_halign(:start)
+			box.pack_start(title, expand: false, fill: false, padding: 0)
+			checks = {}
+			DUPES_KINDS.each do |k|
+				cb = Gtk::CheckButton.new(k[:label])
+				cb.active = cfg[k[:key]] ? true : false
+				box.pack_start(cb, expand: false, fill: false, padding: 0)
+				checks[k[:key]] = cb
+			end
+			btns = Gtk::Box.new(:horizontal, 8)
+			btns.set_halign(:end)
+			box.pack_start(btns, expand: false, fill: false, padding: 4)
+			save_btn  = Gtk::Button.new(label: "Save")
+			close_btn = Gtk::Button.new(label: "Close")
+			btns.pack_start(save_btn, expand: false, fill: false, padding: 0)
+			btns.pack_start(close_btn, expand: false, fill: false, padding: 0)
+			save_h = proc do
+				begin
+					data = dupes_settings
+					checks.each { |key, cb| data[key] = cb.active? }
+					dupes_save_settings(data)
+					respond "--- Dupes: Settings saved."
+				rescue StandardError => e
+					respond "--- Dupes: Save failed: #{e.message}"
+				end
+				true
+			end
+			close_h = proc { Gtk.queue { win.destroy unless win.destroyed? }; true }
+			destroy_h = proc { $dupes_window_open = false; false }
+			$dupes_gc.push(win, save_h, close_h, destroy_h)
+			save_btn.signal_connect("clicked", &save_h)
+			close_btn.signal_connect("clicked", &close_h)
+			win.signal_connect("destroy", &destroy_h)
+			win.show_all
+		rescue StandardError => e
+			respond "--- Dupes setup error: #{e.class}: #{e.message}"
+			$dupes_window_open = false
+		end
+		false
+	end
+	$dupes_gc << build
+	GLib::Idle.add(&build)
+	wait_until { !$dupes_window_open }
+	$dupes_gc = nil
+end
+
+# ---------- mana ----------
+
+# Same mana call osacombat sends, built from the mana types this character can take
+def dupes_mana_message
+	types = []
+	types << "Spiritual" if Skills.smc >= 24
+	types << "Mental"    if Skills.mmc >= 24
+	types << "Elemental" if Skills.emc >= 24
+	types = ["Spiritual"] if types.empty?
+	types[-1] = "or #{types[-1]}" if types.size > 1
+	case types.size
+	when 3 then "I Need #{types[0]}, #{types[1]} #{types[2]} Mana!"
+	when 2 then "I Need #{types[0]} #{types[1]} Mana!"
+	else        "I Need #{types[0]} Mana!"
+	end
+end
+
+# Calls for mana on the crew channel, at most once per cooldown (shares osacombat's timer).
+# Does nothing if no crew channel is set; dupes then just waits for mana to come back.
+def dupes_call_for_mana
+	channel = dupes_load_yaml("osacrew.yaml")["crew"].to_s.strip
+	return if channel.empty?
+	cooldown = (dupes_load_yaml("osacombat.yaml")["mana_share_cooldown"] || 90).to_i
+	return unless $osa_last_mana_share.nil? || (Time.now - $osa_last_mana_share) > cooldown
+	LNet.send_message({ 'type' => 'channel', 'channel' => channel }, dupes_mana_message)
+	$osa_last_mana_share = Time.now
+end
+
+def dupes_wait_for_mana
+	return if Spell[DUPES_SPELL].affordable?
+	respond "--- Dupes: Waiting for mana..."
+	until Spell[DUPES_SPELL].affordable?
+		dupes_call_for_mana
+		sleep 1
+	end
+end
+
+# ---------- inventory ----------
+
+# Runs a command and returns its output lines without showing them (adapted from foreach)
+def dupes_quiet_command(command, start_pattern, end_pattern, timeout = 5)
+	result = []
+	name = "dupes_quiet_#{rand(100000)}"
+	filter = false
+	begin
+		Timeout.timeout(timeout, Interrupt) do
+			DownstreamHook.add(name, proc { |xml|
+				if filter
+					if xml =~ end_pattern
+						DownstreamHook.remove(name)
+						filter = false
+					else
+						next(nil)
+					end
+				elsif xml =~ start_pattern
+					filter = true
+					next(nil)
+				else
+					xml
+				end
+			})
+			fput command
+			until (xml = get) =~ start_pattern; end
+			result << xml.rstrip
+			until (xml = get) =~ end_pattern
+				result << xml.rstrip
+			end
+			result << xml.rstrip
+		end
+	rescue Interrupt
+		nil
+	ensure
+		DownstreamHook.remove(name)
+	end
+	result
+end
+
+# Items inside your worn containers: [{ id, noun, name, container_id }]. Worn and held items are skipped.
+def dupes_inventory_items
+	items = []
+	container_id = nil
+	dupes_quiet_command("inventory full", DUPES_INV_START, DUPES_INV_END).each do |line|
+		next unless line =~ DUPES_INVFULL
+		if $1.length == 2
+			container_id = $3
+		elsif container_id
+			items << { id: $3, noun: $4, name: $5.strip, container_id: container_id }
+		end
+	end
+	items.uniq { |i| i[:id] }
+end
+
+# A worn container by noun or name ("backpack", "green backpack")
+def dupes_find_container(word)
+	w = word.to_s.strip.downcase
+	inv = GameObj.inv.to_a
+	inv.find { |o| o.noun.to_s.downcase == w } ||
+		inv.find { |o| o.name.to_s.downcase == w } ||
+		inv.find { |o| o.name.to_s.downcase =~ /\b#{Regexp.escape(w)}\b/ }
+end
+
+# ---------- moving items ----------
+
+def dupes_held_ids
+	[GameObj.right_hand.id, GameObj.left_hand.id].compact
+end
+
+# Puts both hands on the ground or into the destination container. Returns false if something didn't fit.
+def dupes_stow_hands(dest)
+	waitrt?
+	if dest == :ground
+		fput "drop right" if GameObj.right_hand.id
+		fput "drop left"  if GameObj.left_hand.id
+		return true
+	end
+	dupes_held_ids.each do |id|
+		result = dothistimeout "put ##{id} in ##{dest.id}", 3, /You put|You place|You tuck|won't fit|can't fit|no room|too full|can't put|What were you/
+		if result.to_s =~ /won't fit|can't fit|no room|too full|can't put|What were you/
+			respond "--- Dupes: Couldn't put an item in your #{dest.name}. Stopping with it still in your hand."
+			return false
+		end
+	end
+	true
+end
+
+# ---------- main ----------
+
+args = (1..3).map { |n| variable[n] }.compact.map(&:to_s).reject(&:empty?)
+
+if args.first.to_s =~ /^(?:help|\?)$/i
+	respond ""
+	respond "   ;dupes                               Items on the ground, dropped back on the ground"
+	respond "   ;dupes ground <container>            Items on the ground, put in <container>"
+	respond "   ;dupes <container>                   Items from your whole inventory, put in <container>"
+	respond "   ;dupes <container> <container>       Items from the first container, put in the second"
+	respond "   ;dupes <container> ground            Items from <container>, dropped on the ground"
+	respond "   ;dupes setup                         Choose which items to duplicate"
+	respond ""
+	exit
+end
+
+if args.first.to_s =~ /^setup$/i
+	dupes_setup
+	exit
+end
+
+# Source: :ground, :inventory or a container. Destination: :ground or a container.
+source = :ground
+dest   = :ground
+case args.size
+when 0
+	nil
+when 1
+	if args[0] =~ /^ground$/i
+		nil
+	else
+		source = :inventory
+		dest = args[0]
+	end
+else
+	source = args[0] =~ /^ground$/i ? :ground : args[0]
+	dest   = args[1] =~ /^ground$/i ? :ground : args[1]
+end
+
+[source, dest].uniq.each do |side|
+	next unless side.is_a?(String)
+	found = dupes_find_container(side)
+	unless found
+		respond "--- Dupes: You don't seem to be wearing a container called \"#{side}\"."
+		exit
+	end
+	source = found if source == side
+	dest = found if dest == side
+end
+
+unless Spell[DUPES_SPELL].known?
+	respond "--- Dupes: You don't know spell #{DUPES_SPELL}."
+	exit
+end
+if GameObj.right_hand.id || GameObj.left_hand.id
+	respond "--- Dupes: Please empty both hands first."
+	exit
+end
+
+cfg = dupes_settings
+if DUPES_KINDS.none? { |k| cfg[k[:key]] }
+	respond "--- Dupes: Nothing is selected to duplicate. Run ;dupes setup."
+	exit
+end
+
+# Make the list once, before anything is duplicated, so the copies are never picked up again
+if source == :ground
+	targets = GameObj.loot.to_a.select { |o| dupes_match?(o.noun, o.name, cfg) }.map { |o| { id: o.id, name: o.name } }
+	from_text = "on the ground"
+else
+	items = dupes_inventory_items
+	if source == :inventory
+		# Leave anything already in the destination alone (those may be earlier copies)
+		items.reject! { |i| dest.is_a?(GameObj) && i[:container_id] == dest.id }
+		from_text = "in your inventory"
+	else
+		items.select! { |i| i[:container_id] == source.id }
+		from_text = "in your #{source.name}"
+	end
+	targets = items.select { |i| dupes_match?(i[:noun], i[:name], cfg) }
+end
+
+wanted = DUPES_KINDS.select { |k| cfg[k[:key]] }.map { |k| k[:label].downcase }.join(", ")
+if targets.empty?
+	respond "--- Dupes: No #{wanted} #{from_text}."
+	exit
+end
+to_text = dest == :ground ? "the ground" : "your #{dest.name}"
+respond "--- Dupes: #{targets.size} item(s) #{from_text} (#{wanted}), results go to #{to_text}."
+
+targets.each_with_index do |item, i|
+	dupes_wait_for_mana
+	waitrt?
+	waitcastrt?
+	fput "get ##{item[:id]}"
+	pause 0.3
+	unless dupes_held_ids.include?(item[:id])
+		respond "--- Dupes: Couldn't get #{item[:name]} (#{i + 1}/#{targets.size}), skipping."
+		break unless dupes_stow_hands(dest)
+		next
+	end
+	respond "--- Dupes: Casting #{DUPES_SPELL} on #{item[:name]} (#{i + 1}/#{targets.size})"
+	Spell[DUPES_SPELL].cast("##{item[:id]}")
+	waitcastrt?
+	break unless dupes_stow_hands(dest)
+end
+
+respond "--- Dupes: Done."
