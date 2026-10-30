@@ -11,7 +11,8 @@
 
   Persistence:
     - Flare stats and combo history persist between sessions per character in
-      data/<game>/<char>/flarewindow_data.yaml.
+      data/<game>/<char>/flarewindow_data.json (an older flarewindow_data.yaml
+      is read once if no .json exists yet, then left in place as a backup).
     - The highest combo record is stored separately inside that file and survives
       resets (use ;send fwcombo reset to clear it explicitly).
     - The Discord webhook URL is saved in CharSettings (character-specific,
@@ -42,10 +43,31 @@
                                  URL may optionally be wrapped in parentheses.
     ;send fwdiscord status    - Show Discord webhook status (URL token is masked)
     ;send fwdiscord off       - Disable Discord sends and clear saved webhook
+    ;send fwecho on|off       - Turn the in-combat combo-capture notice's echo
+                                 to Story on/off (persisted per character).
+                                 Only affects the plain-echo fallback; routing
+                                 to the Combat Filter Saga Panel's own window,
+                                 when that's open, is unaffected either way.
+    ;send fwecho              - Show current echo-to-story status
 
   Author: Codex, ClaudeCode, Phocosoen
-  Tags: wrayth, frontend, flares, tracking, window
-  Version: 1.0.0
+  Tags: wrayth, saga, frontend, flares, tracking, window
+  Version: 1.2.0
+
+  Recently changed:
+    v1.2.0 (2026-10-06) - Added ;send fwecho on|off|status to silence the
+      combo-capture notice's plain-echo-to-Story fallback (persisted per
+      character via CharSettings, like the Discord webhook).
+    v1.1.1 (2026-09-22) - Guarded the CombatFilterSagaPanel.open? call with
+      respond_to?, so a combatfilter_sagapanel instance still running an
+      older build (predating .open? being added there) falls back to a
+      plain Story echo instead of raising NoMethodError.
+    v1.1.0 (2026-09-22) - The in-combat "captured N Combo" notice now
+      routes to the Combat Filter Saga Panel's own stream window (when
+      combatfilter_sagapanel is running and that window is open) instead
+      of always echoing to Story -- otherwise it was exactly the kind of
+      combat-text clutter that window exists to filter out. Falls back to
+      a plain Story echo when combatfilter_sagapanel isn't running.
 =end
 
 module FlareWindow
@@ -59,11 +81,21 @@ module FlareWindow
 
   WINDOW_ID = 'FlareWindow'
   WINDOW_TITLE = 'Flares'
+  # No width= was ever set on <openDialog> below (every other panel script
+  # in this codebase sets one), so Saga fell back to a default narrower
+  # than this panel's own content -- wrapping "HH:MM - N LABEL Combo"
+  # combo-history links onto a second line despite room on screen, and
+  # would do the same to the flare-stats grid's right column (starts at
+  # left=300; "100.00 pct equals 1 per 999 atks" needs ~230px past that).
+  # 550 comfortably covers both without changing either column's layout.
+  WINDOW_WIDTH = 550
   FLARE_PATTERNS_PATH = File.join($script_dir.to_s, 'flare_patterns.rb')
   SAVE_INTERVAL_SECONDS = 15
   SAVE_EVENT_THRESHOLD = 20
   MAX_STORED_COMBOS = 100
-  RENDER_THROTTLE_SECONDS = 0.15
+  # 0.5s matches playerwindow/creaturewindow -- every render resends the whole
+  # dialog, and at 0.15s heavy combat redrew it ~6x a second.
+  RENDER_THROTTLE_SECONDS = 0.5
   KI_COMBO_LABELS = {
     3  => 'TRIPLE',
     4  => 'SUPER',
@@ -108,7 +140,13 @@ module FlareWindow
     dir
   end
 
+  # JSON, not YAML: with ~900k stored flare entries, to_yaml took ~0.8s per
+  # save (every 15s in combat), freezing all of Lich; JSON writes it in ~10ms.
   def persisted_data_path
+    File.join(data_dir, 'flarewindow_data.json')
+  end
+
+  def legacy_yaml_data_path
     File.join(data_dir, 'flarewindow_data.yaml')
   end
 
@@ -135,9 +173,11 @@ module FlareWindow
   end
 
   def load_persisted_data(path)
-    return initial_persisted_data unless File.exist?(path)
-
-    raw = YAML.safe_load(File.read(path), permitted_classes: [Symbol])
+    raw = if File.exist?(path)
+            JSON.parse(File.read(path))
+          elsif File.exist?(legacy_yaml_data_path)
+            YAML.safe_load(File.read(legacy_yaml_data_path), permitted_classes: [Symbol])
+          end
     return initial_persisted_data unless raw.is_a?(Hash)
 
     merged = initial_persisted_data.merge(raw)
@@ -165,7 +205,7 @@ module FlareWindow
     }
 
     temp_path = "#{path}.tmp"
-    File.open(temp_path, 'w') { |f| f.write(payload.to_yaml) }
+    File.open(temp_path, 'w') { |f| f.write(JSON.generate(payload)) }
     File.rename(temp_path, path)
   rescue StandardError => e
     File.delete(temp_path) rescue nil if defined?(temp_path) && File.exist?(temp_path.to_s)
@@ -319,7 +359,7 @@ module FlareWindow
     "#{count} Combo"
   end
 
-  def summary_line(key, value, width = 19)
+  def summary_line(key, value, width = 25)
     "#{key.to_s.ljust(width)}: #{value}"
   end
 
@@ -379,7 +419,7 @@ module FlareWindow
   def open_window
     return unless %w[stormfront saga].include?($frontend.to_s.downcase)
 
-    _respond("<closeDialog id='#{WINDOW_ID}'/><openDialog type='dynamic' id='#{WINDOW_ID}' title='#{WINDOW_TITLE}' target='#{WINDOW_ID}' scroll='manual' location='main' justify='3' height='120' resident='true'><dialogData id='#{WINDOW_ID}'></dialogData></openDialog>")
+    _respond("<closeDialog id='#{WINDOW_ID}'/><openDialog type='dynamic' id='#{WINDOW_ID}' title='#{WINDOW_TITLE}' target='#{WINDOW_ID}' scroll='manual' location='main' justify='3' height='120' width='#{WINDOW_WIDTH}' resident='true'><dialogData id='#{WINDOW_ID}'></dialogData></openDialog>")
   end
 
   def close_window
@@ -400,47 +440,56 @@ module FlareWindow
     left_col = 0
     right_col = 100
     row_h = 20
-    output += "<label id='sum_l_1' value='Overall Rate' justify='left' left='#{left_col}' top='#{top}' />"
-    output += "<label id='sum_r_1' value='#{sanitize_xml("#{overall_rate} pct")}' justify='left' left='#{right_col}' top='#{top}' />"
+    # Every element below gets an explicit width= -- without one, Saga
+    # falls back to some narrow per-element default regardless of the
+    # dialog's own width=, which is what was actually wrapping the combo
+    # links onto a second line (the openDialog width= fix alone wasn't
+    # enough). left_col_width/right_col_width/full_width all leave a
+    # small margin inside WINDOW_WIDTH so nothing brushes the edge.
+    left_col_width = right_col - left_col - 8
+    right_col_width = WINDOW_WIDTH - right_col - 20
+    full_width = WINDOW_WIDTH - 20
+    output += "<label id='sum_l_1' value='Overall Rate' justify='left' left='#{left_col}' top='#{top}' width='#{left_col_width}' />"
+    output += "<label id='sum_r_1' value='#{sanitize_xml("#{overall_rate} pct")}' justify='left' left='#{right_col}' top='#{top}' width='#{right_col_width}' />"
     top += row_h
-    output += "<label id='sum_l_2' value='Total Attacks' justify='left' left='#{left_col}' top='#{top}' />"
-    output += "<label id='sum_r_2' value='#{sanitize_xml(fmt_int(total_attacks))}' justify='left' left='#{right_col}' top='#{top}' />"
+    output += "<label id='sum_l_2' value='Total Attacks' justify='left' left='#{left_col}' top='#{top}' width='#{left_col_width}' />"
+    output += "<label id='sum_r_2' value='#{sanitize_xml(fmt_int(total_attacks))}' justify='left' left='#{right_col}' top='#{top}' width='#{right_col_width}' />"
     top += row_h
-    output += "<label id='sum_l_3' value='Total Flares' justify='left' left='#{left_col}' top='#{top}' />"
-    output += "<label id='sum_r_3' value='#{sanitize_xml(fmt_int(total_flares))}' justify='left' left='#{right_col}' top='#{top}' />"
+    output += "<label id='sum_l_3' value='Total Flares' justify='left' left='#{left_col}' top='#{top}' width='#{left_col_width}' />"
+    output += "<label id='sum_r_3' value='#{sanitize_xml(fmt_int(total_flares))}' justify='left' left='#{right_col}' top='#{top}' width='#{right_col_width}' />"
     top += row_h
     combo_rate = if total_attacks > 0
                    format('%.2f pct', (total_combos.to_f / total_attacks.to_f) * 100.0)
                  else
                    '0.00 pct'
                  end
-    output += "<label id='sum_l_4' value='Combo Rate' justify='left' left='#{left_col}' top='#{top}' />"
-    output += "<label id='sum_r_4' value='#{sanitize_xml(combo_rate)}' justify='left' left='#{right_col}' top='#{top}' />"
+    output += "<label id='sum_l_4' value='Combo Rate' justify='left' left='#{left_col}' top='#{top}' width='#{left_col_width}' />"
+    output += "<label id='sum_r_4' value='#{sanitize_xml(combo_rate)}' justify='left' left='#{right_col}' top='#{top}' width='#{right_col_width}' />"
     top += row_h
-    output += "<label id='sum_l_5' value='Total Combos' justify='left' left='#{left_col}' top='#{top}' />"
-    output += "<label id='sum_r_5' value='#{sanitize_xml(fmt_int(total_combos))}' justify='left' left='#{right_col}' top='#{top}' />"
+    output += "<label id='sum_l_5' value='Total Combos' justify='left' left='#{left_col}' top='#{top}' width='#{left_col_width}' />"
+    output += "<label id='sum_r_5' value='#{sanitize_xml(fmt_int(total_combos))}' justify='left' left='#{right_col}' top='#{top}' width='#{right_col_width}' />"
     top += row_h
     streak_text = fmt_int(current_flare_streak)
-    output += "<label id='sum_l_6' value='Flare Streak' justify='left' left='#{left_col}' top='#{top}' />"
-    output += "<label id='sum_r_6' value='#{sanitize_xml(streak_text)}' justify='left' left='#{right_col}' top='#{top}' />"
+    output += "<label id='sum_l_6' value='Flare Streak' justify='left' left='#{left_col}' top='#{top}' width='#{left_col_width}' />"
+    output += "<label id='sum_r_6' value='#{sanitize_xml(streak_text)}' justify='left' left='#{right_col}' top='#{top}' width='#{right_col_width}' />"
     top += row_h
 
     if combos_only
-      output += "<label id='highscore_sep_top' value='-----------------------------------' justify='left' left='0' top='#{top}' />"
+      output += "<label id='highscore_sep_top' value='-----------------------------------' justify='left' left='0' top='#{top}' width='#{full_width}' />"
       top += row_h
-      output += "<link id='highscore_link' value='Click - High Scores' cmd=';send fwcombo highest' echo='Sending High Scores List...' justify='left' left='0' top='#{top}' />"
+      output += "<link id='highscore_link' value='Click - High Scores' cmd=';send fwcombo highest' echo='Sending High Scores List...' justify='left' left='0' top='#{top}' width='#{full_width}' />"
       top += row_h
-      output += "<label id='highscore_sep_bottom' value='-----------------------------------' justify='left' left='0' top='#{top}' />"
+      output += "<label id='highscore_sep_bottom' value='-----------------------------------' justify='left' left='0' top='#{top}' width='#{full_width}' />"
       top += row_h
 
       recent_combos = Array(combo_history).last(10).reverse
       if recent_combos.any?
-        output += "<label id='combo_hdr' value='Click - Recent Combos' justify='left' left='0' top='#{top}' />"
+        output += "<label id='combo_hdr' value='Click - Recent Combos' justify='left' left='0' top='#{top}' width='#{full_width}' />"
         top += 20
         recent_combos.each_with_index do |evt, idx|
           ts = evt['timestamp'].to_i > 0 ? Time.at(evt['timestamp'].to_i) : Time.now
           label = "#{ts.strftime('%H:%M')} - #{combo_display_text(evt['count'].to_i)}"
-          output += "<link id='combo_link_#{idx + 1}' value='#{sanitize_xml(label)}' cmd=';send fwcombo #{idx + 1}' echo='Copying combo #{idx + 1} to clipboard...' justify='left' left='0' top='#{top}' />"
+          output += "<link id='combo_link_#{idx + 1}' value='#{sanitize_xml(label)}' cmd=';send fwcombo #{idx + 1}' echo='Copying combo #{idx + 1} to clipboard...' justify='left' left='0' top='#{top}' width='#{full_width}' />"
           top += 20
         end
       end
@@ -462,21 +511,25 @@ module FlareWindow
 
     row_height = 20
     col_left = 0
-    col_right = 260
+    col_right = 300
+    col_left_width = col_right - col_left - 8
+    col_right_width = WINDOW_WIDTH - col_right - 20
 
     if stats.empty?
-      output += "<label id='empty' value='No flares tracked yet.' justify='left' left='0' top='#{top}' />"
+      output += "<label id='empty' value='No flares tracked yet.' justify='left' left='0' top='#{top}' width='#{WINDOW_WIDTH - 20}' />"
     else
       stats.each_slice(2).with_index do |pair, row|
         pair.each_with_index do |s, col|
           left = col == 0 ? col_left : col_right
+          width = col == 0 ? col_left_width : col_right_width
           value = "#{s[:name]}: #{fmt_int(s[:total])}"
-          output += "<label id='ft_#{row}_#{col}' value='#{sanitize_xml(value)}' justify='left' left='#{left}' top='#{top + (row * (row_height * 2))}' />"
+          output += "<label id='ft_#{row}_#{col}' value='#{sanitize_xml(value)}' justify='left' left='#{left}' top='#{top + (row * (row_height * 2))}' width='#{width}' />"
         end
         pair.each_with_index do |s, col|
           left = col == 0 ? col_left : col_right
+          width = col == 0 ? col_left_width : col_right_width
           value = "#{s[:pct]} pct equals 1 per #{s[:fpa]} atks"
-          output += "<label id='rp_#{row}_#{col}' value='#{sanitize_xml(value)}' justify='left' left='#{left}' top='#{top + (row * (row_height * 2)) + row_height}' />"
+          output += "<label id='rp_#{row}_#{col}' value='#{sanitize_xml(value)}' justify='left' left='#{left}' top='#{top + (row * (row_height * 2)) + row_height}' width='#{width}' />"
         end
       end
     end
@@ -670,6 +723,24 @@ module FlareWindow
     !discord_webhook_url.empty?
   end
 
+  # Persisted per-character, like the Discord webhook -- off by request,
+  # so the repeating in-combat combo-capture notice stops echoing to
+  # Story. Only gates the plain-echo fallback path below; routing to
+  # CombatFilterSagaPanel's own window (when that's open) was never
+  # Story in the first place, so it's unaffected either way.
+  def echo_enabled?
+    value = ::CharSettings['flarewindow_echo']
+    value.nil? ? true : !!value
+  rescue StandardError
+    true
+  end
+
+  def set_echo(enabled)
+    ::CharSettings['flarewindow_echo'] = !!enabled
+  rescue StandardError
+    nil
+  end
+
   def set_discord_webhook(value)
     ::CharSettings['flarewindow_discord_webhook'] = value.to_s
   rescue StandardError
@@ -752,6 +823,7 @@ module FlareWindow
     echo 'flarewindow: persisted data reset on startup.'
   when 'delete'
     File.delete(persist_path) if File.exist?(persist_path)
+    File.delete(legacy_yaml_data_path) if File.exist?(legacy_yaml_data_path)
     echo 'flarewindow: persisted data file deleted on startup.'
   when 'import'
     existing = load_persisted_data(persist_path)
@@ -941,7 +1013,25 @@ module FlareWindow
 
       stamp = Time.now.strftime('%Y-%m-%d %H:%M:%S %Z')
       last_combo_notice = "#{stamp} - #{combo_display_text(current_attack_flare_count)} captured. Click recent combo link to copy."
-      echo "flarewindow: captured #{combo_display_text(current_attack_flare_count)}."
+      combo_notice_text = "flarewindow: captured #{combo_display_text(current_attack_flare_count)}."
+      # Route to the Combat Filter side window instead of Story when it's
+      # open, same as combatfilter_sagapanel routes its own compressed
+      # combat summaries -- otherwise this notice just adds to the exact
+      # combat-text clutter that window exists to get out of Story.
+      # CombatFilterSagaPanel is a global module (like any top-level
+      # `module` in a .lic file), so it's reachable here as long as that
+      # script has been started this Lich session; defined? guards the
+      # case where it never has been. respond_to?(:open?) additionally
+      # guards a combatfilter_sagapanel instance that's running but
+      # predates .open? being added (module/class bodies only pick up new
+      # method defs when that script itself is restarted, not when this
+      # one is) -- without it, a stale instance raises NoMethodError here
+      # instead of just falling back to a plain Story echo.
+      if defined?(CombatFilterSagaPanel) && CombatFilterSagaPanel.respond_to?(:open?) && CombatFilterSagaPanel.open?
+        CombatFilterSagaPanel.append(combo_notice_text)
+      elsif echo_enabled?
+        echo combo_notice_text
+      end
       event_counter += 1
       dirty = true
     end
@@ -1020,6 +1110,21 @@ module FlareWindow
         target = Regexp.last_match(1).to_s.strip
         target = '1' if target.empty?
         handle_combo_copy.call(target)
+        next
+      end
+
+      if stripped =~ /^fwecho(?:\s+(on|off|status))?$/i
+        mode = Regexp.last_match(1).to_s.downcase
+        case mode
+        when 'on'
+          set_echo(true)
+          echo 'flarewindow: echo to story ON.'
+        when 'off'
+          set_echo(false)
+          echo 'flarewindow: echo to story OFF.'
+        else
+          echo "flarewindow: echo to story #{echo_enabled? ? 'ON' : 'OFF'}."
+        end
         next
       end
 
