@@ -1,0 +1,946 @@
+=begin  
+  ============================================================
+  EBON GATE 2026 CAROUSEL RIDING SCRIPT
+  VERSION 1
+  ============================================================
+  Original script Kaldonis
+  New version by Tenaro
+  Usage:
+  ;carousel2026
+  ;carousel2026 10000
+  ;carousel2026 [any number as a limit to how much you want to spend]
+  Features:
+  - Starts from anywhere
+  - Travels to starting room 36869
+  - Inspects hands before ticket deposit
+  - Deposits held tickets using get ticket
+  - Automatic banking, default 10k silver withdrawal
+  - Automatic return to carousel
+  - Spending limit support (will round down, use intervals of 500)
+  - Stops safely on ambiguous responses
+  ============================================================
+=end
+
+require 'timeout'
+
+silence_me
+
+# ------------------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------------------
+
+START_ROOM = '36869'
+CAROUSEL_ROOM = '23165'
+BANK_ROOM = 'bank'
+
+DEFAULT_BANKROLL = 10_000
+GAME_COST = 500
+
+RESPONSE_TIMEOUT = 20
+MAX_MOUNT_ATTEMPTS = 7
+
+CAROUSEL_ROOMS = %w[23169 23166 23165]
+
+# ------------------------------------------------------------
+# STARTING BANKROLL
+# ------------------------------------------------------------
+
+args = Script.current.vars
+bankroll_arg = args[1]
+
+begin
+  bankroll = if bankroll_arg.nil? || bankroll_arg.empty?
+               DEFAULT_BANKROLL
+             else
+               Integer(bankroll_arg, 10)
+             end
+rescue ArgumentError
+  #echo 'Invalid bankroll amount.'
+  exit
+end
+
+if bankroll <= 0
+  #echo 'Bankroll must be greater than zero.'
+  exit
+end
+
+if bankroll < GAME_COST
+  #echo "Bankroll must be at least #{GAME_COST} silver."
+  exit
+end
+
+# Only complete 500-silver games are permitted.
+bankroll = (bankroll / GAME_COST) * GAME_COST
+
+silver_spent = 0
+hook_name = 'carousel2026_v72'
+
+# ------------------------------------------------------------
+# RESPONSE PATTERNS
+# ------------------------------------------------------------
+
+PAYMENT_SUCCESS = /You hand over the coins/
+
+PAYMENT_FAILURE = /Finding that you do not have the coins|You do not have enough silver to play this game|If you ain't paying/i
+
+RIDE_RESULT = /Great job|miss the rings by several feet|lose your balance and go tumbling off|Since you fell off your carousel animal|pick up some Ebon Gate prize tickets|need at least one hand free|have too many items|unable to handle the additional load/i
+
+# ------------------------------------------------------------
+# PLAYER SPAM FILTER + GAME TEXT CAPTURE
+# ------------------------------------------------------------
+
+roomspam = /removes <a exist="\d+" noun="tickets">some Ebon Gate prize tickets|combines the value of|reaches away from (his|her) carousel animal|connects with the rings and comes away with|misses the rings by several feet and goes tumbling off|stands up|struggles to stand|climbs on top of|together before jumping off the moving platform of|put <a exist="\d+" noun="tickets">/i
+
+carousel_capture_active = false
+carousel_capture_text = +''
+
+DownstreamHook.add(
+  hook_name,
+  proc do |line|
+    if carousel_capture_active
+      carousel_capture_text << line.to_s << "\n"
+    end
+
+    line =~ roomspam ? nil : line
+  end,
+  persist: false
+)
+
+# ------------------------------------------------------------
+# HELPERS
+# ------------------------------------------------------------
+
+wait_for_line = lambda do |pattern, seconds = RESPONSE_TIMEOUT|
+  begin
+    Timeout.timeout(seconds) do
+      wait_until do
+        line = get
+        line && line.match?(pattern)
+      end
+    end
+  rescue Timeout::Error
+    nil
+  end
+end
+
+# ------------------------------------------------------------
+# SILVER BALANCE VERIFICATION
+# ------------------------------------------------------------
+
+verify_silver = lambda do
+
+  actual_silver = Lich::Util.silver_count(5)
+
+  echo "Current carried silver: #{actual_silver}"
+  #echo "Required game cost: #{GAME_COST}"
+
+  if actual_silver < GAME_COST
+    #echo 'Insufficient carried silver.'
+    false
+  else
+    #echo 'Silver balance verified.'
+    true
+  end
+
+end
+
+# ------------------------------------------------------------
+# HAND INSPECTION AND AUTOMATIC TICKET DEPOSIT
+# ------------------------------------------------------------
+
+deposit_held_ticket = lambda do
+
+  MAX_TICKET_DEPOSITS = 10
+
+  deposits = 0
+  completed = false
+
+  #echo 'Checking both hands for carousel tickets.'
+
+  while deposits < MAX_TICKET_DEPOSITS
+
+    waitrt?
+
+    carousel_capture_text = +''
+    carousel_capture_active = true
+
+    fput 'glance'
+    waitrt?
+
+    carousel_capture_active = false
+
+    hands = carousel_capture_text.dup
+
+    #echo "Hand inspection ##{deposits + 1}:"
+
+    # Check specifically for ticket objects in either hand.
+    # Empty hands and worn inventory do not count.
+
+    if hands =~ /<(?:right|left) exist="\d+" noun="ticket">|<(?:right|left) exist="\d+" noun="ticket"/i
+
+      #echo 'Ticket detected in hand. Depositing.'
+
+      carousel_capture_text = +''
+      carousel_capture_active = true
+
+      response = fput 'get ticket'
+      waitrt?
+
+      carousel_capture_active = false
+
+      deposit_response = carousel_capture_text.dup
+
+      ##echo "Deposit response: #{deposit_response}"
+
+      if deposit_response =~ /You pick up .*General ticket/i
+        deposits += 1
+        echo "Successful ticket deposits: #{deposits}"
+      else
+        #echo 'Ticket deposit was not confirmed.'
+        #echo 'Stopping ticket collection to avoid repeated commands.'
+        break
+      end
+
+    else
+
+      #echo 'Both hands are clear of tickets.'
+      completed = true
+      break
+
+    end
+
+  end
+
+  if deposits >= MAX_TICKET_DEPOSITS
+    #echo 'Maximum ticket deposit attempts reached.'
+  end
+
+  #echo "Total tickets deposited: #{deposits}"
+
+  completed || deposits > 0
+end
+
+# ------------------------------------------------------------
+# TRAVEL
+# ------------------------------------------------------------
+
+travel = lambda do |destination|
+  #echo "Traveling to #{destination}..."
+
+  start_script 'go2', [destination]
+  wait_while { running?('go2') }
+
+  true
+end
+
+# ------------------------------------------------------------
+# CAROUSEL ENTRY
+# ------------------------------------------------------------
+
+enter_carousel = lambda do
+  room = Room.current
+
+  if room && CAROUSEL_ROOMS.include?(room.id.to_s)
+    #echo 'Already inside the carousel.'
+    next true
+  end
+
+  unless room && room.id.to_s == START_ROOM
+    #echo "Not at carousel entrance. Current room: #{room&.id}"
+    next false
+  end
+
+  #echo 'Entering carousel.'
+
+  fput 'go carousel'
+  waitrt?
+
+  room = Room.current
+
+  if room && CAROUSEL_ROOMS.include?(room.id.to_s)
+    #echo "Carousel entrance confirmed: room #{room.id}."
+    true
+  else
+    current_room = room ? room.id.to_s : 'unknown'
+    #echo "Carousel entrance not confirmed: #{current_room}."
+    false
+  end
+end
+
+# ------------------------------------------------------------
+# BANKING ROUTINE
+# ------------------------------------------------------------
+
+get_money = lambda do
+
+  #echo '========================================'
+  #echo 'BANKROLL REPLENISHMENT'
+  #echo '========================================'
+
+  #echo 'Traveling to bank.'
+
+  start_script 'go2', ['bank', '--disable-confirm']
+  wait_while { running?('go2') }
+
+  waitrt?
+
+  #echo 'Depositing all carried silver.'
+
+  fput 'depo all'
+  waitrt?
+
+  #echo "Withdrawing #{bankroll} silver."
+
+  fput "withdraw #{bankroll} sil"
+  waitrt?
+
+  # Verify the resulting carried silver using Lich API.
+
+  actual_silver = Lich::Util.silver_count(5)
+
+  unless actual_silver == bankroll
+    #echo "Expected #{bankroll} silver, but found #{actual_silver}."
+    raise 'Bankroll verification failed.'
+  end
+
+  #echo "Verified bankroll: #{actual_silver} silver."
+
+  #echo 'Returning to carousel.'
+
+  travel.call(START_ROOM)
+
+  deposit_held_ticket.call
+
+  unless enter_carousel.call
+    raise 'Unable to re-enter carousel after banking.'
+  end
+
+  true
+end
+
+# ------------------------------------------------------------
+# INITIAL BANKROLL VERIFICATION
+# ------------------------------------------------------------
+
+verify_starting_bankroll = lambda do
+
+  #echo '========================================'
+  #echo 'VERIFYING STARTING BANKROLL'
+  #echo '========================================'
+
+  actual_silver = Lich::Util.silver_count(5)
+
+  #echo "Requested bankroll: #{bankroll} silver."
+  #echo "Currently carried: #{actual_silver} silver."
+
+  if actual_silver >= bankroll
+
+    #echo 'Required bankroll already available.'
+    next true
+
+  end
+
+  #echo 'Insufficient silver for requested bankroll.'
+  #echo 'Replenishing bankroll before starting.'
+
+  get_money.call
+
+  actual_silver = Lich::Util.silver_count(5)
+
+  unless actual_silver == bankroll
+
+    #echo "Bankroll verification failed: #{actual_silver}."
+    raise 'Starting bankroll verification failed.'
+
+  end
+
+  #echo "Starting bankroll verified: #{actual_silver} silver."
+
+  true
+
+end
+
+# ------------------------------------------------------------
+# DYNAMIC CAROUSEL ANIMAL SEARCH
+# ------------------------------------------------------------
+
+mount_animal = lambda do
+
+  #echo 'Searching for available carousel animals.'
+
+  waitrt?
+
+  carousel_capture_text = +''
+  carousel_capture_active = true
+
+  response = fput(
+    'look at creatures',
+    /You gaze around at the wooden carousel creatures/
+  )
+
+  if response.nil?
+    response = fput(
+      'look at beasts',
+      /Drifting globules|wooden beasts/i
+    )
+  end
+
+  unless response
+    carousel_capture_active = false
+    #echo 'Unable to retrieve carousel description.'
+    next false
+  end
+
+  unless carousel_capture_text =~ /yellow and red iron wire bin/i
+    wait_for_line.call(
+      /yellow and red iron wire bin.*middle of the creatures/i,
+      5
+    )
+  end
+
+  carousel_capture_active = false
+
+  description = carousel_capture_text.dup
+
+  description.gsub!(/<[^>]*>/, ' ')
+  description.gsub!(/\s+/, ' ')
+  description.strip!
+
+  description.sub!(
+    /\A.*?wooden carousel creatures in the area\.\s*/i,
+    ''
+  )
+
+  description.sub!(
+    /A yellow and red iron wire bin.*\z/i,
+    ''
+  )
+
+  animals = description.scan(
+    /\b(?:a|an)\s+(.+?)(?=\s+and\s+(?:a|an)\s+|\s*,|\s+while\s+|\s+are\s+|\s*[.;]|\z)/i
+  ).flatten
+
+  animals = animals.map do |animal|
+    animal.strip.sub(/[,.]+\z/, '')
+  end.reject do |animal|
+    animal.empty?
+  end.uniq
+
+  unless animals.any?
+    #echo 'Unable to extract carousel animal names.'
+    #echo "Captured description: #{description}"
+    next false
+  end
+
+  #echo "Discovered #{animals.length} carousel animals."
+
+  mounted = false
+
+  animals.each do |animal|
+    animal_noun = animal.split.last
+
+    #echo "Trying #{animal_noun} (#{animal})."
+
+    waitrt?
+
+    carousel_capture_text = +''
+    carousel_capture_active = true
+
+    fput(
+      "climb #{animal_noun}",
+      /You climb on top of|You are already sitting on|already on a|I could not find what you were referring to|Pick another animal|cannot find|cannot climb/i
+    )
+
+    carousel_capture_active = false
+
+    climb_response = carousel_capture_text.to_s
+
+    if climb_response =~ /You climb on top of/i
+      #echo "Successfully mounted: #{animal}!"
+      mounted = true
+      break
+    end
+
+    if climb_response =~ /You are already sitting on/i
+      #echo "Already mounted on #{animal}."
+      mounted = true
+      break
+    end
+
+    if climb_response =~ /already on a/i
+      #echo 'Animal is occupied by another player.'
+      #echo 'Trying the next available animal.'
+      next
+    end
+
+    if climb_response =~ /You are already on/i
+      #echo 'Already mounted on an animal.'
+      mounted = true
+      break
+    end
+
+    if climb_response =~ /already on a/i
+      #echo 'Animal is occupied by another player.'
+      #echo 'Trying the next available animal.'
+      next
+    end
+
+    #echo "#{animal_noun} unavailable. Trying next animal."
+  end
+
+  unless mounted
+    #echo 'No available carousel animal found.'
+  end
+
+  mounted
+end
+
+# ------------------------------------------------------------
+# REQUEST ONE GAME
+# ------------------------------------------------------------
+
+play_one_game = lambda do
+
+  waitrt?
+
+  if silver_spent + GAME_COST > bankroll
+    #echo 'Bankroll exhausted.'
+    next :limit
+  end
+
+  #echo 'Requesting carousel ticket.'
+
+  # Verify carried silver before requesting a game.
+
+  unless verify_silver.call
+    #echo 'Insufficient silver detected before game.'
+    next :money
+  end
+
+  carousel_capture_text = +''
+  carousel_capture_active = true
+
+  fput 'get ticket'
+
+  initial_deadline = Time.now + RESPONSE_TIMEOUT
+
+  until carousel_capture_text =~ /You motion to the game tickets|You need at least one hand free|You have too many items|You hand over the coins|Finding that you do not have the coins|You do not have enough silver to play this game|you need to be on an animal first/i || Time.now >= initial_deadline
+    sleep 0.2
+  end
+
+  # Detect failure to mount an animal.
+
+  if carousel_capture_text =~ /you need to be on an animal first/i
+    carousel_capture_active = false
+    #echo 'Not mounted. Attempting to mount an available animal.'
+    next :mount
+  end
+
+  if carousel_capture_text =~ /You need at least one hand free|You have too many items/i
+    carousel_capture_active = false
+    #echo 'Inventory issue. Free a hand and restart.'
+    next :inventory
+  end
+
+  unless carousel_capture_text =~ /You motion to the game tickets|You hand over the coins|Finding that you do not have the coins|You do not have enough silver to play this game/i
+    carousel_capture_active = false
+    #echo 'Ticket response not detected.'
+    next :timeout
+  end
+
+  # Wait for actual payment confirmation.
+
+  payment = nil
+  payment_deadline = Time.now + RESPONSE_TIMEOUT
+
+  until payment || Time.now >= payment_deadline
+
+    if carousel_capture_text =~ /You hand over the coins|Finding that you do not have the coins|You do not have enough silver to play this game|If you ain't paying|You need at least one hand free|You have too many items|unable to handle the additional load/i
+      payment = carousel_capture_text.dup
+    else
+      sleep 0.2
+    end
+
+  end
+
+  unless payment
+    carousel_capture_active = false
+    #echo 'Payment confirmation timed out.'
+    next :timeout
+  end
+
+  if payment =~ /You need at least one hand free|You have too many items|unable to handle the additional load/i
+    carousel_capture_active = false
+    #echo 'Inventory issue: free a hand or reduce carried items.'
+    next :inventory
+  end
+
+  if payment =~ PAYMENT_FAILURE
+    carousel_capture_active = false
+    #echo 'Insufficient silver confirmed.'
+    next :money
+  end
+
+  unless payment =~ PAYMENT_SUCCESS
+    carousel_capture_active = false
+    #echo "Unexpected response: #{payment.inspect}"
+    next :timeout
+  end
+
+  silver_spent += GAME_COST
+
+  #echo "Payment confirmed: #{GAME_COST} silver."
+  #echo "Total confirmed spending: #{silver_spent}."
+
+  # Establish a fresh boundary for the current game's result.
+  # Discard messages from previous games received before payment.
+  # Preserve anything already received after payment confirmation.
+
+  payment_match = carousel_capture_text.match(PAYMENT_SUCCESS)
+
+  if payment_match
+    carousel_capture_text =
+      carousel_capture_text[payment_match.end(0)..-1].to_s
+  else
+    carousel_capture_text = +''
+  end
+
+  #echo 'Waiting for current carousel game result.'
+
+  # Only examine messages received after payment confirmation.
+  # Clear previous game text before beginning result detection.
+
+  result = nil
+  result_deadline = Time.now + 90
+
+  result_patterns = /
+    Great\ job|
+    miss\ the\ rings\ by\ several\ feet|
+    lose\ your\ balance\ and\ go\ tumbling\ off|
+    pick\ up\ some\ Ebon\ Gate\ prize\ tickets|
+    need\ at\ least\ one\ hand\ free|
+    have\ too\ many\ items|
+    unable\ to\ handle\ the\ additional\ load
+  /ix
+
+  until result || Time.now >= result_deadline
+
+    captured = carousel_capture_text.to_s
+
+    if captured =~ result_patterns
+      result = captured
+    else
+      sleep 0.2
+    end
+
+  end
+
+  carousel_capture_active = false
+
+  unless result
+    #echo 'Game result timed out.'
+    next :timeout
+  end
+
+  if result =~ /need at least one hand free|have too many items|unable to handle the additional load/i
+    #echo 'Inventory issue encountered.'
+    next :inventory
+  end
+
+  
+  if result =~ /lose your balance and go tumbling off|miss the rings by several feet/i
+
+    carousel_capture_text = +''
+    carousel_capture_active = true
+
+    stand_response = fput "stand"
+
+    stand_confirmed = stand_response.to_s =~ /You stand back up|You are already standing/i
+
+    stand_deadline = Time.now + 15
+
+    until stand_confirmed || Time.now >= stand_deadline
+
+      stand_confirmed = carousel_capture_text =~ /You stand back up|You are already standing/i
+
+      sleep 0.2 unless stand_confirmed
+
+    end
+
+    carousel_capture_active = false
+
+    unless stand_confirmed
+      next :timeout
+    end
+
+    next :mount
+
+  end
+
+
+  if result =~ /Great job|pick up some Ebon Gate prize tickets/i
+    #echo 'Prize result confirmed.'
+    next :continue
+  end
+
+  if result =~ /Since you fell off your carousel animal/i
+    #echo 'Fell off carousel animal. Need to remount.'
+    next :mount
+  end
+
+  :continue
+end
+
+# ------------------------------------------------------------
+# FINAL TICKET COLLECTION
+# ------------------------------------------------------------
+
+collect_final_tickets = lambda do
+  #echo 'Finishing carousel ticket collection.'
+
+  waitrt?
+
+  travel.call(START_ROOM)
+
+  unless Room.current && Room.current.id.to_s == START_ROOM
+    raise 'Unable to reach starting room for final ticket collection.'
+  end
+
+  # Inspect hands and deposit any held ticket.
+  deposit_held_ticket.call
+
+  #echo 'Final ticket collection completed.'
+end
+
+# ------------------------------------------------------------
+# AUTOMATIC INVENTORY RECOVERY
+# ------------------------------------------------------------
+
+consecutive_recovery_failures = 0
+MAX_CONSECUTIVE_RECOVERY_FAILURES = 3
+
+recover_inventory = lambda do
+
+  #echo '========================================'
+  #echo 'AUTOMATIC INVENTORY RECOVERY'
+  #echo '========================================'
+
+  # Return to carousel entrance.
+
+  travel.call(START_ROOM)
+
+  unless Room.current && Room.current.id.to_s == START_ROOM
+    #echo 'Unable to reach carousel entrance.'
+    consecutive_recovery_failures += 1
+    next false
+  end
+
+  # Inspect both hands and deposit held tickets.
+
+  deposit_held_ticket.call
+
+  # Verify hands are clear before re-entering.
+
+  # Re-enter carousel.
+
+  unless enter_carousel.call
+    #echo 'Unable to re-enter carousel.'
+    consecutive_recovery_failures += 1
+    next false
+  end
+
+  # Find and mount an available animal.
+
+  unless mount_animal.call
+    #echo 'Unable to remount carousel animal.'
+    consecutive_recovery_failures += 1
+    next false
+  end
+
+  # Successful recovery resets consecutive failures.
+
+  consecutive_recovery_failures = 0
+
+  #echo 'Inventory recovery successful.'
+  true
+end
+
+# ------------------------------------------------------------
+# MAIN SCRIPT
+# ------------------------------------------------------------
+
+begin
+
+  #echo '========================================'
+  #echo 'EBON GATE CAROUSEL SCRIPT V7.2'
+  #echo '========================================'
+
+  #echo "Starting bankroll: #{bankroll} silver."
+
+  if bankroll
+    echo "Starting bankroll: #{bankroll} silver."
+  else
+    echo 'Default 10000 coin limit'
+  end
+
+  # Verify and obtain the full requested bankroll
+  # before traveling to the carousel.
+
+  verify_starting_bankroll.call
+
+  # Travel to starting room.
+
+  unless Room.current && Room.current.id.to_s == START_ROOM
+    travel.call(START_ROOM)
+  end
+
+  unless Room.current && Room.current.id.to_s == START_ROOM
+    raise 'Did not reach carousel starting room 36869.'
+  end
+
+  # Inspect hands and deposit any starting ticket.
+
+  #echo 'Checking hands for accumulated carousel tickets.'
+  deposit_held_ticket.call
+
+  # Enter carousel.
+
+  unless enter_carousel.call
+    raise 'Unable to enter carousel.'
+  end
+
+  # Mount an available animal.
+
+  unless mount_animal.call
+    raise 'Unable to mount a carousel animal.'
+  end
+
+  # ----------------------------------------------------------
+  # MAIN GAME LOOP
+  # ----------------------------------------------------------
+
+  loop do
+
+    waitrt?
+
+    result = play_one_game.call
+
+    case result
+
+    when :money
+
+      get_money.call
+
+      unless mount_animal.call
+        raise 'Unable to remount after banking.'
+      end
+
+
+    when :mount
+
+      waitrt?
+      fput 'stand'
+      waitrt?
+
+      unless mount_animal.call
+        raise 'Unable to remount.'
+      end
+
+    
+    when :inventory
+
+      #echo 'Inventory issue detected.'
+
+      if recover_inventory.call
+        #echo 'Resuming carousel games.'
+      else
+
+        #echo 'Automatic recovery failed.'
+        #echo "Consecutive failures: #{consecutive_recovery_failures}/#{MAX_CONSECUTIVE_RECOVERY_FAILURES}"
+
+        if consecutive_recovery_failures >= MAX_CONSECUTIVE_RECOVERY_FAILURES
+
+          #echo 'Maximum consecutive recovery failures reached.'
+          #echo 'Stopping to prevent additional silver loss.'
+
+          collect_final_tickets.call
+          break
+
+        else
+
+          #echo 'Will attempt recovery again.'
+          next
+
+        end
+      end
+
+
+    when :limit
+
+      #echo '========================================'
+      #echo 'SPENDING LIMIT REACHED'
+      #echo "Total spent: #{silver_spent}"
+      #echo '========================================'
+
+      collect_final_tickets.call
+
+      break
+
+    when :timeout
+
+      #echo 'Response timeout.'
+      #echo 'Stopping to prevent duplicate commands.'
+
+      collect_final_tickets.call
+
+      break
+
+    when :continue
+
+      if silver_spent >= bankroll
+
+        #echo 'Spending limit reached.'
+
+        collect_final_tickets.call
+
+        break
+      end
+
+    else
+
+      #echo "Unexpected state: #{result.inspect}"
+
+      collect_final_tickets.call
+
+      break
+
+    end
+
+  end
+
+rescue Interrupt
+
+  #echo 'Script interrupted.'
+
+  begin
+    collect_final_tickets.call
+  rescue StandardError => error
+    #echo "Final ticket collection failed: #{error.message}"
+  end
+
+rescue StandardError => error
+
+  #echo "Carousel error: #{error.class}: #{error.message}"
+  echo error.backtrace.first(8).join("\n")
+
+ensure
+
+  carousel_capture_active = false
+  DownstreamHook.remove(hook_name)
+
+  #echo '========================================'
+  #echo "Total confirmed silver spent: #{silver_spent}"
+  #echo 'Carousel V7.2 stopped.'
+  #echo '========================================'
+
+end
