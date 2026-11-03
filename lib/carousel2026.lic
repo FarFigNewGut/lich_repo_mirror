@@ -1,10 +1,11 @@
 =begin  
   ============================================================
   EBON GATE 2026 CAROUSEL RIDING SCRIPT
-  VERSION 1.2
+  VERSION 1.4
   ============================================================
   Original script Kaldonis
   New version by Tenaro
+  
   Usage:
   ;carousel2026 (one run spending 10000 is the default behavior)
   ;carousel2026 15000 (limits spending to this number)
@@ -31,6 +32,7 @@ GAME_COST = 500
 
 RESPONSE_TIMEOUT = 20
 MAX_MOUNT_ATTEMPTS = 7
+MAX_CONSECUTIVE_TIMEOUTS = 3
 
 CAROUSEL_ROOMS = %w[23169 23166 23165]
 
@@ -47,10 +49,18 @@ if args[1].to_s.downcase == 'help'
   help_lines = [
     '''============================================================
     EBON GATE 2026 CAROUSEL RIDING SCRIPT
-    VERSION 1.2
+    VERSION 1.4
     ============================================================
     Original script Kaldonis
     New version by Tenaro
+    Changes in v1.3:
+      - TICKET DEPOSIT command works while mounted on carousel
+      - Tickets redeemed immediately after each win (hands stay clear)
+    Changes in v1.4:
+      - Deposit counter now accumulates across the whole run
+      - End-of-run summary restored (silver spent + tickets redeemed)
+      - :inventory now redeems in place instead of leaving the ride
+      - :timeout retries up to 3 times instead of ending the run
     Usage:
     ;carousel2026 (one run spending 10000 is the default behavior)
     ;carousel2026 15000 (limits spending to this number)
@@ -65,19 +75,17 @@ end
 
 bankroll_arg = args[1]
 
-begin
-  bankroll = if bankroll_arg.nil? || bankroll_arg.empty?
-               DEFAULT_BANKROLL
-             else
-               Integer(bankroll_arg, 10)
-             end
-rescue ArgumentError
-  #echo 'Invalid bankroll amount.'
-  exit
-end
+unlimited_mode = !!(bankroll_arg && bankroll_arg.to_s.downcase == '--unlimited')
 
-if bankroll <= 0
-  #echo 'Bankroll must be greater than zero.'
+bankroll = if unlimited_mode
+             Float::INFINITY
+           elsif bankroll_arg.nil? || bankroll_arg.empty?
+             DEFAULT_BANKROLL
+           else
+             Integer(bankroll_arg, 10)
+           end
+
+if bankroll <= 0 && !unlimited_mode
   exit
 end
 
@@ -90,6 +98,7 @@ end
 bankroll = (bankroll / GAME_COST) * GAME_COST
 
 silver_spent = 0
+total_ticket_deposits = 0
 hook_name = 'carousel2026_v72'
 
 # ------------------------------------------------------------
@@ -184,25 +193,51 @@ deposit_held_ticket = lambda do
 
     hands = carousel_capture_text.dup
 
-    # Check specifically for ticket objects in either hand.
-    # Empty hands and worn inventory do not count.
-
     if hands =~ /<(?:right|left) exist="\d+" noun="ticket">|<(?:right|left) exist="\d+" noun="ticket"/i
       carousel_capture_text = +''
       carousel_capture_active = true
 
-      response = fput 'get ticket'
-      waitrt?
+      # Use TICKET DEPOSIT command - works while mounted on carousel
+      response = fput 'TICKET DEPOSIT'
+
+      # Capture response with extended deadline for delayed confirmations
+      deadline = Time.now + 10
+      until carousel_capture_text =~ /redeem|deposit|converted|picked up|ticket/i || Time.now >= deadline
+        sleep 0.2
+      end
 
       carousel_capture_active = false
 
       deposit_response = carousel_capture_text.dup
 
-      if deposit_response =~ /You pick up .*General ticket/i
+      if deposit_response =~ /redeem|deposit|converted|picked up|ticket/i
         deposits += 1
-        echo "Successful ticket deposits: #{deposits}"
+        total_ticket_deposits += 1
+        echo "Successful ticket deposits: #{total_ticket_deposits}"
       else
-        break
+        # Fallback: try get ticket if TICKET DEPOSIT didn't register
+        carousel_capture_text = +''
+        carousel_capture_active = true
+        
+        response = fput 'get ticket'
+        unless response =~ /You pick up .*General ticket/i
+          response = fput 'get my ticket'
+        end
+        
+        deadline = Time.now + 10
+        until carousel_capture_text =~ /You pick up .*General ticket/i || Time.now >= deadline
+          sleep 0.2
+        end
+        
+        carousel_capture_active = false
+        
+        if carousel_capture_text =~ /You pick up .*General ticket/i
+          deposits += 1
+          total_ticket_deposits += 1
+          echo "Successful ticket deposits (fallback): #{total_ticket_deposits}"
+        else
+          break
+        end
       end
     else
       completed = true
@@ -426,7 +461,7 @@ end
 play_one_game = lambda do
   waitrt?
 
-  if silver_spent + GAME_COST > bankroll
+  if !unlimited_mode && (silver_spent + GAME_COST > bankroll)
     next :limit
   end
 
@@ -560,6 +595,10 @@ play_one_game = lambda do
   end
 
   if result =~ /Great job|pick up some Ebon Gate prize tickets/i
+    # Deposit tickets immediately after winning while still mounted
+    if carousel_capture_text =~ /violet-edged ebon luminary ticket|Ebon Gate prize ticket/i
+      deposit_held_ticket.call
+    end
     next :continue
   end
 
@@ -625,6 +664,8 @@ end
 # MAIN SCRIPT
 # ------------------------------------------------------------
 
+consecutive_timeouts = 0
+
 begin
   echo "Starting bankroll: #{bankroll} silver."
 
@@ -676,7 +717,43 @@ begin
       end
 
     when :inventory
+      # Hands are full of tickets. TICKET DEPOSIT works while mounted,
+      # so redeem in place and stay on the ride instead of leaving.
+      carousel_capture_text = +''
+      carousel_capture_active = true
+
+      fput 'TICKET DEPOSIT'
+
+      redeem_deadline = Time.now + 10
+      until carousel_capture_text =~ /You redeem your .*General ticket/i || Time.now >= redeem_deadline
+        sleep 0.2
+      end
+
+      carousel_capture_active = false
+
+      if carousel_capture_text =~ /You redeem your .*General ticket/i
+        total_ticket_deposits += 1
+        echo "Redeemed tickets in place. Staying on the ride."
+        consecutive_timeouts = 0
+        next :continue
+      end
+
+      # Legacy fallback: convert prize tickets to General tickets.
+      carousel_capture_text = +''
+      carousel_capture_active = true
+
+      clear_response = fput('get ticket')
+
+      carousel_capture_active = false
+
+      if clear_response =~ /You pick up .*General ticket/i
+        #echo 'Tickets cleared on carousel. Continuing.'
+        next :continue
+      end
+
+      # Last resort: leave the ride, deposit, re-enter, remount.
       if recover_inventory.call
+        consecutive_timeouts = 0
         # Recovery succeeded; continue playing.
       else
         if consecutive_recovery_failures >= MAX_CONSECUTIVE_RECOVERY_FAILURES
@@ -692,11 +769,21 @@ begin
       break
 
     when :timeout
-      collect_final_tickets.call
-      break
+      # Do not abandon the bankroll on a single delayed response.
+      consecutive_timeouts += 1
+
+      if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS
+        collect_final_tickets.call
+        break
+      end
+
+      echo "Transient timeout (#{consecutive_timeouts}/#{MAX_CONSECUTIVE_TIMEOUTS}); staying on the ride."
+      next
 
     when :continue
-      if silver_spent >= bankroll
+      consecutive_timeouts = 0
+
+      if !unlimited_mode && silver_spent >= bankroll
         collect_final_tickets.call
         break
       end
@@ -721,4 +808,10 @@ rescue StandardError => error
 ensure
   carousel_capture_active = false
   DownstreamHook.remove(hook_name)
+
+  echo '========================================'
+  echo "Total confirmed silver spent: #{silver_spent}"
+  echo "Total tickets redeemed: #{total_ticket_deposits}"
+  echo 'Carousel V1.4 stopped.'
+  echo '========================================'
 end
