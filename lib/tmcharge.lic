@@ -1,0 +1,542 @@
+=begin
+  tmcharge - recharge low enhancive items with bounty points at the treasure master.
+  Companion to enhancives.lic.
+
+  Walks to the nearest Adventurer's Guild treasure master and recharges, with
+  bounty points, every worn or held enhancive at or below your enhancives.lic
+  threshold. Then puts everything back and walks home. Each recharge adds about
+  10 charges. Requires go2. enhancives.lic is optional: without a saved threshold
+  this uses 5.
+
+  Usage:
+    ;tmcharge               recharge everything due
+    ;tmcharge list          show what is due, no travel, no spending
+    ;tmcharge quote         go get real prices, spends nothing
+    ;tmcharge quote full    price every item, ignoring the threshold, spends nothing
+    ;tmcharge max 50000     stop spending at this many points for the run
+    ;tmcharge depleted      also recharge items showing (depleted)
+
+  Change the threshold through enhancives: ;e Enhancives.threshold(NUM)
+
+  Skipped on purpose:
+    - time-charged items: a recharge adds charges, not time
+    - tattoos: they recharge with motes, not bounty points
+    - depleted items, unless you ask: they cost real points and may be retired
+    - items stored in an armoire or container: the game does not list them
+
+      author: Rysk
+      game: Gemstone
+      tags: enhancive, enhancives, recharge, bounty, bounty points, advguild, treasure master, utility
+      version: 0.1.7
+
+  changelog:
+    0.1.7 (2026-11-03)
+      add a description to help, and more search tags
+    0.1.6 (2026-11-03)
+      recognize the reply for an item you can't afford, which was stopping the run
+    0.1.5 (2026-11-03)
+      items the treasure master can't recharge are now skipped, not a reason to stop
+      drop the leading "some" from item names
+    0.1.4 (2026-11-03)
+      help now follows the ;repository layout
+      unknown words now stop with an error, so a typo can never start a real recharge
+    0.1.3 (2026-11-03)
+      add quote full, which prices every item regardless of threshold
+    0.1.2 (2026-11-03)
+      cancel each unconfirmed quote, which was blocking quotes for later items
+      print the summary after arriving home so it does not scroll away
+    0.1.1 (2026-11-03)
+      quote and charge runs end with an eloot-style cost summary table
+      quote now applies the same points and max rules as a real run
+    0.1.0 (2026-11-03)
+      initial version
+=end
+
+module TMCharge
+  DEFAULT_THRESHOLD = 5
+  ORDER_TAG = 'treasuremaster'.freeze
+
+  ITEM_RX    = %r{<a exist="(?<id>[^"]+)" noun="(?<noun>[^"]+)">(?<name>[^<]+)</a>(?<rest>.*)$}
+  CHARGES_RX = %r{\((?:<pushBold/>)?(?<current>\d+)(?:<popBold/>)?/(?<max>\d+) charges\)}
+  UNSPENT_RX = /You currently have ([\d,]+) unspent bounty points/
+
+  # Game text confirmed from real logs. Anything else is reported, never guessed at.
+  QUOTE_RX   = /You have chosen to recharge .*The cost is ([\d,]+) points/
+  REFUSED_RX = /I don't know what you think you're enhancing/
+  CANT_RX    = /I can't recharge this/
+  SHORT_RX   = /It'll cost ([\d,]+) of your bounty points, though\.\s+You only have/
+  NO_TM_RX   = /There is no merchant here to order anything from/
+  PENDING_RX = /You already have an order outstanding/
+
+  @stashed = false
+  @current = nil
+  @swapped = false
+  @order_open = false
+
+  class << self
+    def info(text)
+      Lich::Messaging.msg('info', "[tmcharge] #{text}")
+    end
+
+    def warn(text)
+      Lich::Messaging.msg('warn', "[tmcharge] #{text}")
+    end
+
+    def threshold
+      DB_Store.read('enhancives')[:threshold] || DEFAULT_THRESHOLD
+    end
+
+    # Plural items keep "some" inside their link text: "some coal black boots".
+    def clean_name(name)
+      name.sub(/\A(?:an?|some)\s+/i, '')
+    end
+
+    # Reads INVENTORY ENHANCIVE LIST. Every later command uses the id from here,
+    # because nouns repeat: two pins and two stickpins on one character.
+    def scan
+      section = nil
+      items = []
+      lines = Lich::Util.issue_command('inventory enhancive list', /You are/, silent: true, quiet: true)
+      lines.each do |line|
+        section = :held if line =~ /You are (?:not )?holding/
+        section = :worn if line =~ /You are (?:not )?wearing/
+        match = line.match(ITEM_RX)
+        if match.nil?
+          warn("Could not read an item id, skipping: #{line.gsub(/<[^>]+>/, '').strip}") if line =~ /charges\)|\(depleted\)/
+          next
+        end
+        rest = match[:rest]
+        charges = rest.match(CHARGES_RX)
+        items.push(
+          id: match[:id], noun: match[:noun], name: clean_name(match[:name]), where: section,
+          tucked: rest.include?('(tucked)'),
+          depleted: rest.include?('(depleted)'),
+          timed: rest.include?('charged until'),
+          current: charges && charges[:current].to_i,
+          max: charges && charges[:max].to_i
+        )
+      end
+      items
+    end
+
+    def charged_due?(item, limit)
+      item[:current] && item[:current] <= limit && item[:current] < item[:max] && item[:noun] != 'tattoo'
+    end
+
+    def fully_charged?(item)
+      !item[:current].nil? && item[:current] >= item[:max]
+    end
+
+    # For quote full. Items with no charge count are still asked about, because
+    # a time-charged clip did get a real quote and the price can be useful.
+    def quotable?(item)
+      item[:noun] != 'tattoo' && !fully_charged?(item)
+    end
+
+    def bounty_points
+      lines = Lich::Util.issue_command('bounty', /Guild information is as follows/, silent: true, quiet: true)
+      found = lines.map { |line| line.gsub(/<[^>]+>/, '')[UNSPENT_RX, 1] }.compact.first
+      found&.delete(',')&.to_i
+    end
+
+    def go(room_id)
+      return if Room.current&.id == room_id
+      start_script('go2', [room_id.to_s])
+      wait_while { running?('go2') }
+    end
+
+    def in_right?(item)
+      GameObj.right_hand&.id == item[:id]
+    end
+
+    def in_left?(item)
+      GameObj.left_hand&.id == item[:id]
+    end
+
+    def swap_hands
+      waitrt?
+      dothistimeout('swap', 3, /^You don't have anything to swap!|^You swap/)
+    end
+
+    def wait_briefly(seconds = 3)
+      deadline = Time.now + seconds
+      sleep 0.1 until yield || Time.now > deadline
+    end
+
+    # ORDER 5 only looks at the right hand. With a weapon in the right hand and
+    # the item in the left, the treasure master turns down the weapon.
+    def to_right_hand(item)
+      @current = item
+      return true if in_right?(item)
+      if in_left?(item)
+        swap_hands
+        @swapped = true
+      else
+        unless GameObj.right_hand&.id.nil?
+          empty_right_hand
+          @stashed = true
+          unless GameObj.right_hand&.id.nil?
+            warn('Could not free your right hand.')
+            return false
+          end
+        end
+        waitrt?
+        fput "remove ##{item[:id]}"
+        wait_briefly { in_right?(item) || in_left?(item) }
+        if in_left?(item)
+          swap_hands
+          @swapped = false
+        end
+      end
+      in_right?(item)
+    end
+
+    # Returns false if the item is stuck in a hand, which stops the run.
+    def put_back(item)
+      @current = nil
+      if item[:where] == :worn
+        waitrt?
+        fput "wear ##{item[:id]}"
+        wait_briefly { !in_right?(item) && !in_left?(item) }
+        if in_right?(item) || in_left?(item)
+          warn("Could not put #{item[:name]} back on. It is still in your hand.")
+          return false
+        end
+        fput "tuck ##{item[:id]}" if item[:tucked]
+      elsif @swapped
+        swap_hands
+      end
+      @swapped = false
+      true
+    end
+
+    # A quote stays open for 30 seconds and blocks any new ORDER until then.
+    def cancel_order
+      return unless @order_open
+      @order_open = false
+      fput 'order cancel'
+    end
+
+    # A leftover order, say from a run just before this one, gets cancelled and
+    # retried once. A later confirm can then only ever apply to this item's quote.
+    # Returns the cost, :cannot_recharge, or nil for a reply it doesn't know.
+    def get_quote
+      2.times do |attempt|
+        waitrt?
+        clear
+        put 'order 5'
+        @order_open = false
+        line = matchtimeout(5, QUOTE_RX, SHORT_RX, REFUSED_RX, CANT_RX, NO_TM_RX, PENDING_RX)
+        if line && line =~ QUOTE_RX
+          @order_open = true
+          return line[QUOTE_RX, 1].delete(',').to_i
+        end
+        # Too few points: the game prices it but opens no order. The cost still
+        # lets the summary show it, and the normal points check then skips it.
+        return line[SHORT_RX, 1].delete(',').to_i if line && line =~ SHORT_RX
+        return :cannot_recharge if line && line =~ CANT_RX
+        if line && line =~ PENDING_RX && attempt.zero?
+          @order_open = true
+          cancel_order
+          next
+        end
+        warn(line ? "Treasure master said: #{line}" : 'No recognized reply to ORDER 5. Please report this part of your log to the author.')
+        return nil
+      end
+      nil
+    end
+
+    # Flavor text differs by treasure master, so success means the balance dropped.
+    # Sent once with put, never retried, because this command spends points.
+    def confirm_and_check(before)
+      waitrt?
+      put 'order 5 confirm'
+      5.times do
+        sleep 1
+        now = bounty_points
+        return now if now && now < before
+      end
+      nil
+    end
+
+    KNOWN_ARGS = %w[list quote full depleted max help].freeze
+
+    # With no command this script spends points, so a mistyped command must never
+    # fall through to a real run. The word right after max is its number.
+    def unknown_args(args)
+      number_at = args.index('max')&.succ
+      args.each_with_index.reject { |arg, index| KNOWN_ARGS.include?(arg) || index == number_at }.map(&:first)
+    end
+
+    def help_text(script_name)
+      <<~HELP
+
+        description:
+
+           Recharges your low enhancive items with bounty points. Walks you to the nearest
+           Adventurer's Guild treasure master, recharges every worn or held item at or below
+           your threshold, puts it all back on, walks you home, and shows what it cost.
+           Each recharge adds about 10 charges. Use quote to see prices before spending.
+
+        usage:
+
+           #{$clean_lich_char}#{script_name}
+           #{$clean_lich_char}#{script_name} COMMAND OPTIONS
+
+        commands:
+
+           (none)                    recharge everything at or below your threshold
+           list                      show what is due, no travel, no spending
+           quote                     get real prices at the treasure master, spends nothing
+                                     shows what a real run would buy with your points
+           quote full                price every item, ignoring your threshold, spends nothing
+           help                      show this message
+
+        options:
+
+           max NUMBER                stop spending at NUMBER points for the run
+                                     (ignored by quote full)
+           depleted                  also include items showing (depleted)
+
+        threshold:
+
+           uses the threshold saved by enhancives (default #{DEFAULT_THRESHOLD})
+           #{$clean_lich_char}e Enhancives.threshold(NUM)
+
+        not recharged:
+
+           time-charged items        a recharge adds charges, not time
+           tattoos                   they recharge with motes, not bounty points
+           armoire or container      only worn and held items are listed by the game
+
+      HELP
+    end
+
+    def charges_text(item)
+      return 'depleted' if item[:depleted]
+      return 'timed' if item[:timed]
+      item[:current] ? "#{item[:current]}/#{item[:max]}" : '-'
+    end
+
+    # Each result: { item:, cost:, counted:, note:, after: }. Only counted costs
+    # add to the total, so a skipped item shows its price without being summed.
+    def summary_table(results, start_points, budget, quote_only, quote_full = false)
+      total = results.sum { |result| result[:counted] ? result[:cost] : 0 }
+      left = start_points - total
+      rows = results.map do |result|
+        name = result[:item][:name].split.map(&:capitalize).join(' ')
+        charges = charges_text(result[:item])
+        charges += " -> #{charges_text(result[:after])}" if result[:after]
+        [name, charges, result[:cost] ? result[:cost].with_commas : '-', result[:note].to_s]
+      end
+      rows << :separator
+      rows << ['Starting Points', '', start_points.with_commas, '']
+      rows << ['Spending Limit', '', budget.with_commas, ''] if budget
+      rows << [quote_only ? 'Would Spend' : 'Total Spent', '', total.with_commas, '']
+      if left.negative?
+        rows << ['Short By', '', left.abs.with_commas, '']
+      else
+        rows << [quote_only ? 'Would Have Left' : 'Points Left', '', left.with_commas, '']
+      end
+
+      title = if quote_full
+                'Tmcharge Full Quote (nothing spent)'
+              else
+                quote_only ? 'Tmcharge Quote (nothing spent)' : 'Tmcharge Breakdown'
+              end
+      table = Terminal::Table.new(title: title, headings: ['Item', 'Charges', 'Points', 'Note'], rows: rows)
+      table.align_column(1, :right)
+      table.align_column(2, :right)
+      table
+    end
+
+    def cleanup
+      put_back(@current) if @current
+      return unless @stashed
+      @stashed = false
+      fill_right_hand
+    end
+  end
+end
+
+before_dying { TMCharge.cleanup }
+
+args        = Script.current.vars[1..].to_a.map(&:downcase)
+quote_only  = args.include?('quote')
+quote_full  = quote_only && args.include?('full')
+list_only   = args.include?('list')
+do_depleted = args.include?('depleted')
+max_index   = args.index('max')
+budget      = max_index && args[max_index + 1].to_s.delete(',').to_i
+
+script_name = Script.current.name
+try_help = "Try #{$clean_lich_char}#{script_name} help"
+
+if args.include?('help')
+  respond TMCharge.help_text(script_name)
+  exit
+end
+
+unknown = TMCharge.unknown_args(args)
+unless unknown.empty?
+  echo "error: unrecognized command: #{unknown.join(' ')}. #{try_help}"
+  exit
+end
+
+if max_index && budget.to_i <= 0
+  echo "error: max needs a number of points. #{try_help}"
+  exit
+end
+
+# "full" alone must never reach the spending path, so it only works with quote.
+if args.include?('full') && !quote_only
+  echo "error: full only works with quote. #{try_help}"
+  exit
+end
+budget = nil if quote_full
+
+limit = TMCharge.threshold
+items = TMCharge.scan
+due   = if quote_full
+          items.select { |item| TMCharge.quotable?(item) }
+        else
+          items.select { |item| TMCharge.charged_due?(item, limit) || (do_depleted && item[:depleted]) }
+        end
+# Held items go first, before the right hand may be stashed for a worn item.
+# Lowest charges next, so a points limit is spent on the most urgent item.
+due   = due.sort_by { |item| [item[:where] == :held ? 0 : 1, item[:current].to_i] }
+
+items.select { |item| item[:depleted] && !do_depleted && !quote_full }.each do |item|
+  TMCharge.info("Skipping depleted #{item[:name]}. Use ;tmcharge depleted to include it.")
+end
+items.select { |item| item[:noun] == 'tattoo' && (quote_full || item[:current].to_i <= limit) }.each do |item|
+  TMCharge.info("Skipping #{item[:name]}. Tattoos do not recharge with bounty points.")
+end
+
+if due.empty?
+  TMCharge.info(quote_full ? 'Nothing to quote.' : "Nothing at or below your threshold of #{limit} charges.")
+  exit
+end
+
+TMCharge.info(quote_full ? 'Quoting every item:' : "Due at threshold #{limit}:")
+due.each do |item|
+  TMCharge.info("  #{item[:name]} (#{TMCharge.charges_text(item)})")
+end
+exit if list_only
+
+points = TMCharge.bounty_points
+if points.nil?
+  TMCharge.warn('Could not read your bounty points. Nothing was spent.')
+  exit
+end
+
+home = Room.current&.id
+if home.nil?
+  TMCharge.warn('This room is not on the map, so I cannot find a route. Nothing was spent.')
+  exit
+end
+
+master_room = Room.current.find_nearest_by_tag(TMCharge::ORDER_TAG)
+if master_room.nil?
+  TMCharge.warn('No treasure master can be reached from here. Nothing was spent.')
+  exit
+end
+
+TMCharge.info("Heading to the treasure master in room #{master_room}. You have #{points.with_commas} points.")
+TMCharge.go(master_room)
+unless Room.current&.id == master_room
+  TMCharge.warn('Did not reach the treasure master. Nothing was spent.')
+  exit
+end
+
+start_points = points
+total = 0
+results = []
+
+due.each do |item|
+  unless TMCharge.to_right_hand(item)
+    TMCharge.warn("Could not get #{item[:name]} into your right hand, skipping it.")
+    results.push(item: item, note: 'Could not get into hand')
+    break unless TMCharge.put_back(item)
+    next
+  end
+
+  cost = TMCharge.get_quote
+  stop = false
+
+  if cost == :cannot_recharge
+    # No order was opened, so there is nothing to cancel, and later items are fine.
+    results.push(item: item, note: 'Cannot be recharged')
+  elsif cost.nil?
+    results.push(item: item, note: 'No quote')
+    # A full quote asks about items that may not be rechargeable, so one refusal
+    # is expected there. Nothing can be spent, so it is safe to carry on.
+    stop = true unless quote_full
+  elsif quote_full
+    # Prices everything, even past your points, so there are no skips here.
+    TMCharge.cancel_order
+    total += cost
+    results.push(item: item, cost: cost, counted: true)
+  elsif cost > points
+    TMCharge.cancel_order
+    results.push(item: item, cost: cost, note: 'Skipped: not enough points')
+  elsif budget && total + cost > budget
+    TMCharge.cancel_order
+    results.push(item: item, cost: cost, note: 'Skipped: over limit')
+  elsif quote_only
+    # Runs the same checks as a real recharge, so this total predicts ;tmcharge.
+    TMCharge.cancel_order
+    total += cost
+    points -= cost
+    results.push(item: item, cost: cost, counted: true)
+  else
+    balance = TMCharge.confirm_and_check(points)
+    if balance.nil?
+      TMCharge.warn("Your points did not change after confirming #{item[:name]}. Stopping here.")
+      TMCharge.cancel_order
+      results.push(item: item, cost: cost, note: 'Failed: points unchanged')
+      stop = true
+    else
+      paid = points - balance
+      total += paid
+      points = balance
+      results.push(item: item, cost: paid, counted: true)
+      TMCharge.wait_briefly(5) { TMCharge.in_right?(item) || TMCharge.in_left?(item) }
+    end
+  end
+
+  stop = true unless TMCharge.put_back(item)
+  break if stop
+end
+
+TMCharge.cleanup
+
+attempted = results.map { |result| result[:item][:id] }
+due.reject { |item| attempted.include?(item[:id]) }.each do |item|
+  results.push(item: item, note: 'Not attempted')
+end
+if quote_full
+  items.select { |item| TMCharge.fully_charged?(item) && item[:noun] != 'tattoo' }.each do |item|
+    results.push(item: item, note: 'Already full')
+  end
+end
+
+unless quote_only
+  after = TMCharge.scan
+  results.select { |result| result[:counted] }.each do |result|
+    result[:after] = after.find { |entry| entry[:id] == result[:item][:id] }
+  end
+  begin
+    Enhancives.rescan! if defined?(Enhancives)
+  rescue StandardError
+    nil
+  end
+end
+
+TMCharge.go(home)
+
+# go2's closing LOOK prints just after it exits. Let it land so the table comes last.
+sleep 1
+respond
+respond TMCharge.summary_table(results, start_points, budget, quote_only, quote_full)
+respond
