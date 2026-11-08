@@ -4,7 +4,7 @@
     author: Mystienne
    credits: Peggyanne - preset-colored report style inspiration
       game: GemStone
-   version: 1.8.1
+   version: 1.8.2
       tags: utility, experience, lumnis, tutelage
 
   Watches your live experience gains in the background and records each pulse.
@@ -405,6 +405,8 @@ tutelog_changelog_text = proc do
   output.concat "10-20-2026\n"
   output.concat "   1.8.0 feat(experience): track the Enlightened base experience bonus in pulse calculations.\n"
   output.concat "   1.8.1 fix(experience): stop the Enlightened expiration parser at the time-zone text.\n"
+  output.concat "11-08-2026\n"
+  output.concat "   1.8.2 fix(tutelage): account for base experience bonuses when estimating Tutelage bonus progress.\n"
   output
 end
 if [ 'help', '--help', '-h', '?' ].include?(command)
@@ -867,6 +869,10 @@ tutelage_bonus_percent = proc do |bonus|
   value = [(bonus.to_f / 100_000.0) * 100.0, 0.0].max
   bonus.to_i > 100_000 ? format('%.1f%%', value) : percent_text.call(value)
 end
+tutelage_bonus_fraction = proc do
+  base_bonus_extra = [Vars['xp2_base_exp_bonus_rate'].to_f / 100.0, 0.0].max
+  4.0 / (5.0 + base_bonus_extra)
+end
 
 format_duration = proc do |seconds|
   seconds = [ seconds.to_i, 0 ].max
@@ -1289,7 +1295,7 @@ if preview_command
     threshold = average + 50.0
     unusual_values = values.select { |value| value > threshold }
     unusual_exp = unusual_values.inject(0) { |sum, value| sum + value }
-    unusual_bonus = unusual_values.inject(0) { |sum, value| sum + (value * 0.8).round }
+    unusual_bonus = unusual_values.inject(0) { |sum, value| sum + (value * tutelage_bonus_fraction.call).round }
     {
       'average_pulse' => count > 0 ? format('%.1f', average) : '0',
       'median_pulse' => median,
@@ -1547,6 +1553,30 @@ read_log_totals = proc do |text_path, sheet_path|
     next text_totals
   end
   { 'session_exp_total' => 0, 'session_bonus_total' => 0, 'reward_exp_total' => 0, 'reward_count' => 0, 'pulses' => 0, 'pulse_values' => [], 'saw_tutelage_data' => false, 'saw_log_request' => false }
+end
+recalculate_csv_bonus_total = proc do |path|
+  next nil unless File.exist?(path)
+  total = 0
+  saw_cycle = false
+  begin
+    lines = File.readlines(path)
+    headers = parse_csv_line.call(lines.shift || '')
+    lines.each do |line|
+      values = parse_csv_line.call(line)
+      fields = {}
+      headers.each_with_index { |key, index| fields[key] = values[index] if key && !key.empty? }
+      event = fields['event'].to_s
+      if event == 'tutelage_start_message'
+        total = 0
+        saw_cycle = true
+      elsif saw_cycle && %w[pulse offline_absorb].include?(event)
+        total += (fields['pulse'].to_i * tutelage_bonus_fraction.call).round
+      end
+    end
+  rescue
+    next nil
+  end
+  saw_cycle ? total : nil
 end
 text_log_file = nil
 csv_log_file = nil
@@ -2289,7 +2319,7 @@ decode_absorb_pulse = proc do |pulse, reward_pulse, tutelage_state|
                base + logic_piece + pool_bonus + group_bonus + super_bonus
              end
   absorb_multiplier = tutelage_state.to_s == 'active' ? 5.0 : lumnis_total_multiplier.call
-  known_multiplier = absorb_multiplier * base_exp_bonus_multiplier.call
+  known_multiplier = absorb_multiplier + [base_exp_bonus_multiplier.call - 1.0, 0.0].max
   observed_multiplier = expected && expected > 0 ? (pulse.to_f / expected.to_f) : nil
   expected_known = expected && expected > 0 ? expected.to_f * known_multiplier.to_f : nil
   extra_multiplier = expected_known && expected_known > 0 ? (pulse.to_f / expected_known) : nil
@@ -2636,6 +2666,8 @@ else
   reward_count = 0
   pulse_values = []
 end
+corrected_bonus_total = log_has_totals ? recalculate_csv_bonus_total.call(csv_path) : nil
+session_bonus_total = corrected_bonus_total.to_i if corrected_bonus_total
 last_pulse_at = nil
 pulse_window = []
 drop_refresh_sent = false
@@ -2647,6 +2679,14 @@ sync_lumnis_est.call
 tutelog_state['started_at'] = Time.now.to_i.to_s
 tutelog_state['log_path'] = log_path
 tutelog_state['csv_path'] = csv_path
+tutelog_state['session_bonus_total'] = session_bonus_total.to_i.to_s if corrected_bonus_total
+if corrected_bonus_total
+  Vars['xp2_tutelage_bonus_used'] = session_bonus_total.to_i.to_s
+  Vars['xp2_tutelage_source'] = 'tutelog'
+  Vars['xp2_tutelage_tutelog_at'] = Time.now.to_i.to_s
+  Vars['xp2_tutelage_tutelog_cycle'] = cycle_label.to_s
+  Vars['xp2_tutelage_tutelog_reset_at'] = cycle_reset_at.to_i.to_s
+end
 save_tutelog_state.call
 
 save_next_checkpoint = proc do |text, value, mode|
@@ -2671,7 +2711,7 @@ end
 save_totals = proc do
   tutelog_state['cycle_label'] = cycle_label
   tutelog_state['session_exp_total'] = session_exp_total.to_i.to_s
-  tutelog_state['session_bonus_total'] = session_bonus_total.to_i.to_s
+  tutelog_state['session_bonus_total'] = session_bonus_total.to_s
   tutelog_state['pulse_count'] = pulse_count.to_i.to_s
   tutelog_state['reward_exp_total'] = reward_exp_total.to_i.to_s
   tutelog_state['reward_count'] = reward_count.to_i.to_s
@@ -2724,7 +2764,7 @@ elsif Vars['xp2_tutelage_state'].to_s == 'active' && saved_totals_match_cycle &&
                   old_value - saved_next_value
                 end
   if offline_exp && offline_exp > 0
-    offline_bonus = (offline_exp * 0.8).round
+    offline_bonus = (offline_exp * tutelage_bonus_fraction.call).round
     session_exp_total += offline_exp
     session_bonus_total += offline_bonus
     saw_tutelage_data = true
@@ -2804,7 +2844,7 @@ summary_pulse_stats = proc do
   threshold = average + 50.0
   unusual_values = values.select { |value| value > threshold }
   unusual_exp = unusual_values.inject(0) { |sum, value| sum + value }
-  unusual_bonus = unusual_values.inject(0) { |sum, value| sum + (value * 0.8).round }
+    unusual_bonus = unusual_values.inject(0) { |sum, value| sum + (value * tutelage_bonus_fraction.call).round }
   {
     'average_pulse' => count > 0 ? format('%.1f', average) : '0',
     'median_pulse' => median,
@@ -3037,7 +3077,7 @@ loop do
   mind_before = last_mind_state.to_s
   mind_now = current_mind_state.call
   reward_pulse = valid_pulse && mind_before.downcase != 'saturated' && mind_now.to_s.downcase == 'saturated'
-  bonus_est = valid_pulse && !reward_pulse ? (pulse * 0.8).round : 0
+  bonus_est = valid_pulse && !reward_pulse ? (pulse * tutelage_bonus_fraction.call).round : 0
   tutelage_state_now = Vars['xp2_tutelage_state'].to_s
   decode = valid_pulse ? decode_absorb_pulse.call(pulse, reward_pulse, tutelage_state_now) : {}
   if valid_pulse
@@ -3075,7 +3115,7 @@ loop do
       sync_lumnis_est.call
       lumnis_before = lumnis_remaining_est
       if lumnis_before > 0
-        lumnis_multiplier = [ lumnis_total_multiplier.call.to_f * base_exp_bonus_multiplier.call, 1.0 ].max
+        lumnis_multiplier = [ lumnis_total_multiplier.call.to_f + [base_exp_bonus_multiplier.call - 1.0, 0.0].max, 1.0 ].max
         lumnis_spent = [ (pulse.to_f / lumnis_multiplier).round, 1 ].max
         lumnis_remaining_est = [ lumnis_remaining_est - lumnis_spent, 0 ].max
         save_lumnis_est.call
