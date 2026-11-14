@@ -1,0 +1,1277 @@
+=begin
+  calendar_sagapanel.lic
+
+  Saga-only panel for the GemStone IV live events calendar shown on
+  play.net/gs4, plus the TownCrier GS Calendar (gstowncrier.com). Reads seven
+  public Google calendars (Prime, Premium, Platinum, General, Cooperative
+  Houses, Meeting Hall Organizations, TownCrier), expands recurring events,
+  and shows them in your local time. Toggle between Upcoming, Week and Month
+  views; click a day or an event for details. Click the + beside an event to
+  set an alarm that echoes warnings before it starts; about a minute after
+  login, every alarm you have set is listed once, soonest first.
+
+  Each calendar can be switched on or off; the defaults follow your game
+  instance (Prime/Premium or Platinum). Feeds are cached in data/calendar_cache
+  and re-downloaded every 6 hours or on *cal refresh.
+
+  Commands:
+    *cal                        - Show the Upcoming view.
+    *cal alarm <n>              - Set/clear an alarm on an event (the + / alarm clock does this).
+    *cal alarms                 - List alarms that are set.
+    *cal alarmtest              - Echo a sample alarm for a random upcoming event (nothing is saved).
+    *cal back                   - Return from an event or day to the previous view.
+    *cal combine                - Mix all calendars into one list (the default).
+    *cal day <YYYY-MM-DD>       - Show one day's events.
+    *cal event <n>              - Show an event's details.
+    *cal goto <room>            - Copy a room number to the clipboard and go2 there.
+    *cal group                  - Separate the lists into one section per calendar.
+    *cal help                   - List commands.
+    *cal month                  - Show the Month view.
+    *cal next / *cal prev       - Move forward/back a week, month or day.
+    *cal refresh                - Re-download all calendars now.
+    *cal show <calendar>        - Toggle a calendar (prime, premium, platinum, general, houses, mho, towncrier).
+    *cal today                  - Jump back to the current week/month/day.
+    *cal up <calendar>          - Move a calendar up in the grouped list (the up arrow).
+    *cal upcoming               - Show the Upcoming view.
+    *cal week                   - Show the Week view.
+
+  Author: Claude Code(Creator and Feature Additions), Codex(Bug Fixes and Review), RuseofFools (Very Little)
+  Required: Lich >= 5.20.0
+  Tags: saga, frontend, mod, window, panel, calendar, events, schedule
+  Version: 1.8.0
+
+  Recently changed:
+    v1.8.0  (2026-11-13)
+      - Added *cal alarmtest; *calendar works as well as *cal; fixed alarms failing to save on some Lich versions.
+    v1.7.0  (2026-11-13)
+      - Up arrows reorder grouped calendars; room numbers in event details copy and go2.
+    v1.6.0  (2026-11-13)
+      - Added *cal group / *cal combine to list events by calendar or all together (default).
+    v1.5.0  (2026-11-13)
+      - Calendars download in parallel in the background; fixed cut-off descriptions from the cache.
+    v1.4.0  (2026-11-13)
+      - Lists all alarmed events, soonest first, once about a minute after login.
+    v1.3.0  (2026-11-13)
+      - Click + beside an event to set an alarm; echoes warnings at 60/45/30/15/5 minutes.
+    v1.2.0  (2026-11-13)
+      - Every entry shows one [key] for its calendar ([TC] for TownCrier); existing keys merged, never doubled.
+    v1.1.0  (2026-11-13)
+      - Added the TownCrier GS Calendar (gstowncrier.com) as a seventh calendar, on by default.
+    v1.0.0  (2026-11-13)
+      - Initial release.
+=end
+
+require 'net/http'
+require 'uri'
+require 'date'
+require 'time'
+require 'cgi'
+require 'fileutils'
+require 'tzinfo'
+
+no_kill_all
+
+# --- BEGIN CALENDAR ENGINE --- (pure Ruby, no Lich calls)
+module CalendarEngine
+  Event = Struct.new(:uid, :cal, :summary, :description, :location, :start, :finish, :all_day,
+                     :tzid, :rrule, :exdates, :recurrence_id, :cancelled)
+  Occurrence = Struct.new(:event, :start, :finish, :all_day)
+
+  WEEKDAYS = { 'SU' => 0, 'MO' => 1, 'TU' => 2, 'WE' => 3, 'TH' => 4, 'FR' => 5, 'SA' => 6 }.freeze
+  MAX_STEPS = 6000
+
+  # ---------- ICS parsing ----------
+
+  # Any run of CRs before a newline counts as one line break, and stray CRs are
+  # dropped: a cache saved by an older version in Windows text mode has
+  # "\r\r\n" endings, which left a CR mid-description that cut the text off.
+  def self.unfold(text)
+    text.gsub(/\r*\n/, "\n").delete("\r").gsub(/\n[ \t]/, '').split("\n")
+  end
+
+  def self.unescape(value)
+    value.gsub(/\\([nN,;\\])/) do
+      ch = Regexp.last_match(1)
+      ch.casecmp?('n') ? "\n" : ch
+    end
+  end
+
+  # Returns [kind, value]: [:date, Date], [:utc, Time] or [:local, [y, m, d, h, mi, s], tzid]
+  def self.parse_time(params, value)
+    value = value.strip
+    if params['VALUE'] == 'DATE' || value =~ /\A\d{8}\z/
+      [:date, Date.strptime(value[0, 8], '%Y%m%d')]
+    elsif value.end_with?('Z')
+      [:utc, Time.utc(*value.scan(/\A(\d{4})(\d\d)(\d\d)T(\d\d)(\d\d)(\d\d)/).first.map(&:to_i))]
+    else
+      parts = value.scan(/\A(\d{4})(\d\d)(\d\d)T(\d\d)(\d\d)(\d\d)/).first.map(&:to_i)
+      [:local, parts, params['TZID']]
+    end
+  end
+
+  def self.zone(tzid)
+    @zones ||= {}
+    @zones[tzid] ||= (TZInfo::Timezone.get(tzid) rescue nil)
+  end
+
+  # Wall-clock time in a zone -> UTC Time.
+  def self.local_to_utc(parts, tzid)
+    tz = tzid && zone(tzid)
+    naive = Time.utc(*parts)
+    return naive unless tz
+
+    tz.local_to_utc(naive, true) rescue tz.local_to_utc(naive)
+  rescue StandardError
+    naive
+  end
+
+  def self.to_time(parsed)
+    case parsed[0]
+    when :date  then Time.local(parsed[1].year, parsed[1].month, parsed[1].day)
+    when :utc   then parsed[1]
+    else local_to_utc(parsed[1], parsed[2])
+    end
+  end
+
+  def self.parse_ics(text, cal)
+    events = []
+    cur = nil
+    unfold(text.dup.force_encoding('UTF-8').scrub('?')).each do |line|
+      if line == 'BEGIN:VEVENT'
+        cur = { exdates: [] }
+        next
+      elsif line == 'END:VEVENT'
+        ev = build_event(cur, cal)
+        events << ev if ev
+        cur = nil
+        next
+      end
+      next unless cur && line =~ /\A([A-Z-]+)((?:;[^:]*)?):(.*)\z/
+
+      name = Regexp.last_match(1)
+      params = Regexp.last_match(2).split(';').reject(&:empty?).map { |p| p.split('=', 2) }.to_h
+      value = Regexp.last_match(3)
+      case name
+      when 'UID', 'SUMMARY', 'DESCRIPTION', 'LOCATION', 'STATUS', 'RRULE' then cur[name] = value
+      when 'DTSTART', 'DTEND', 'RECURRENCE-ID' then cur[name] = parse_time(params, value)
+      when 'EXDATE' then value.split(',').each { |v| cur[:exdates] << parse_time(params, v) }
+      end
+    end
+    events
+  end
+
+  def self.build_event(h, cal)
+    return nil unless h['DTSTART']
+
+    start = h['DTSTART']
+    all_day = start[0] == :date
+    finish = h['DTEND']
+    s = to_time(start)
+    f = finish ? to_time(finish) : (all_day ? s + 86_400 : s)
+    Event.new(h['UID'], cal, unescape(h['SUMMARY'].to_s), unescape(h['DESCRIPTION'].to_s),
+              unescape(h['LOCATION'].to_s), start, f - s, all_day,
+              start[0] == :local ? start[2] : nil, h['RRULE'],
+              h[:exdates].map { |x| to_time(x) },
+              h['RECURRENCE-ID'] ? to_time(h['RECURRENCE-ID']) : nil,
+              h['STATUS'] == 'CANCELLED')
+  end
+
+  # ---------- recurrence ----------
+
+  def self.parse_rrule(str)
+    str.split(';').map { |p| p.split('=', 2) }.to_h
+  end
+
+  # The event's start as wall-clock [Date, h, mi, s] in its own zone, so
+  # recurrences keep their local time across daylight-saving changes.
+  def self.wall_start(ev)
+    case ev.start[0]
+    when :date  then [ev.start[1], 0, 0, 0]
+    when :utc   then t = ev.start[1]; [Date.new(t.year, t.month, t.day), t.hour, t.min, t.sec]
+    else p = ev.start[1]; [Date.new(p[0], p[1], p[2]), p[3], p[4], p[5]]
+    end
+  end
+
+  def self.occurrence_time(ev, date, h, mi, s)
+    case ev.start[0]
+    when :date  then Time.local(date.year, date.month, date.day)
+    when :utc   then Time.utc(date.year, date.month, date.day, h, mi, s)
+    else local_to_utc([date.year, date.month, date.day, h, mi, s], ev.tzid)
+    end
+  end
+
+  # nth weekday of a month: nth 1..5 or -1..-5; nil if it doesn't exist.
+  def self.nth_weekday(year, month, wday, nth)
+    if nth > 0
+      first = Date.new(year, month, 1)
+      d = first + ((wday - first.wday) % 7) + 7 * (nth - 1)
+      d.month == month ? d : nil
+    else
+      last = Date.new(year, month, -1)
+      d = last - ((last.wday - wday) % 7) - 7 * (-nth - 1)
+      d.month == month ? d : nil
+    end
+  end
+
+  def self.byday_dates(year, month, byday, fallback_day)
+    return [Date.new(year, month, fallback_day)] if byday.nil? && Date.valid_date?(year, month, fallback_day)
+    return [] if byday.nil?
+
+    byday.split(',').flat_map do |token|
+      m = token.match(/\A([+-]?\d+)?([A-Z]{2})\z/)
+      next [] unless m && WEEKDAYS[m[2]]
+
+      wday = WEEKDAYS[m[2]]
+      if m[1]
+        [nth_weekday(year, month, wday, m[1].to_i)].compact
+      else
+        (1..Date.new(year, month, -1).day).map { |d| Date.new(year, month, d) }.select { |d| d.wday == wday }
+      end
+    end.sort
+  end
+
+  # Yields each candidate date of the rule, in order, starting at the event's first date.
+  def self.each_rule_date(rule, first)
+    interval = [rule['INTERVAL'].to_i, 1].max
+    case rule['FREQ']
+    when 'DAILY'
+      MAX_STEPS.times { |k| yield first + k * interval }
+    when 'WEEKLY'
+      wkst = WEEKDAYS[rule['WKST'] || 'MO']
+      days = (rule['BYDAY'] || %w[SU MO TU WE TH FR SA][first.wday]).split(',').map { |d| WEEKDAYS[d[-2, 2]] }.compact
+      week0 = first - ((first.wday - wkst) % 7)
+      MAX_STEPS.times do |k|
+        ws = week0 + 7 * interval * k
+        days.map { |wd| ws + ((wd - wkst) % 7) }.sort.each { |d| yield d if d >= first }
+      end
+    when 'MONTHLY'
+      MAX_STEPS.times do |k|
+        m = first >> (interval * k)
+        dates = if rule['BYMONTHDAY']
+                  rule['BYMONTHDAY'].split(',').map(&:to_i).filter_map do |md|
+                    md = Date.new(m.year, m.month, -1).day + md + 1 if md.negative?
+                    Date.valid_date?(m.year, m.month, md) ? Date.new(m.year, m.month, md) : nil
+                  end
+                else
+                  byday_dates(m.year, m.month, rule['BYDAY'], first.day)
+                end
+        dates.sort.each { |d| yield d if d >= first }
+      end
+    when 'YEARLY'
+      months = rule['BYMONTH'] ? rule['BYMONTH'].split(',').map(&:to_i) : [first.month]
+      (MAX_STEPS / 12).times do |k|
+        year = first.year + interval * k
+        months.sort.each do |mo|
+          byday_dates(year, mo, rule['BYDAY'], first.day).each { |d| yield d if d >= first }
+        end
+      end
+    end
+  end
+
+  def self.expand(ev, from, to, overridden)
+    return [] if ev.cancelled
+
+    duration = ev.finish
+    unless ev.rrule
+      s = to_time(ev.start)
+      return s < to && s + duration > from ? [Occurrence.new(ev, s, s + duration, ev.all_day)] : []
+    end
+
+    rule = parse_rrule(ev.rrule)
+    until_t = rule['UNTIL'] ? to_time(parse_time({}, rule['UNTIL'])) : nil
+    count = rule['COUNT'] ? rule['COUNT'].to_i : nil
+    exset = ev.exdates.map(&:to_i)
+    first, h, mi, sec = wall_start(ev)
+    out = []
+    n = 0
+    each_rule_date(rule, first) do |date|
+      t = occurrence_time(ev, date, h, mi, sec)
+      break if until_t && t > until_t
+      break if count && n >= count
+      break if t >= to
+
+      n += 1
+      next if exset.include?(t.to_i)
+      next if overridden.include?([ev.uid, t.to_i])
+
+      out << Occurrence.new(ev, t, t + duration, ev.all_day) if t + duration > from
+    end
+    out
+  end
+
+  # All occurrences overlapping [from, to), sorted by start.
+  def self.occurrences(events, from, to)
+    overridden = {}
+    events.each { |e| overridden[[e.uid, e.recurrence_id.to_i]] = true if e.recurrence_id }
+    events.flat_map { |e| expand(e, from, to, e.recurrence_id ? {} : overridden) }
+          .sort_by { |o| [o.start, o.all_day ? 0 : 1, o.event.summary] }
+  end
+
+  # ---------- text ----------
+
+  # Codepoints, not literals, so this file stays pure ASCII (repository.lic
+  # rejects non-ASCII source).
+  ASCII_MAP = {
+    0x2018 => "'", 0x2019 => "'", 0x201C => '"', 0x201D => '"', 0x2013 => '-', 0x2014 => '--',
+    0x2026 => '...', 0x00A0 => ' ', 0x2022 => '*', 0x00D7 => 'x', 0x200B => '', 0xFEFF => ''
+  }.freeze
+
+  def self.to_ascii(text)
+    text.to_s.dup.force_encoding('UTF-8').scrub('?').gsub(/[^\x00-\x7F]/) do |c|
+      ASCII_MAP[c.ord] || begin
+        plain = c.unicode_normalize(:nfkd).gsub(/[^\x00-\x7F]/, '')
+        plain.empty? ? '?' : plain
+      end
+    end
+  end
+
+  # Google Calendar descriptions are HTML fragments.
+  def self.plain_text(html)
+    text = html.gsub(%r{<br\s*/?>}i, "\n").gsub(%r{</(p|div|li)>}i, "\n").gsub(/<li[^>]*>/i, '- ')
+               .gsub(/<a [^>]*href="([^"]*)"[^>]*>(.*?)<\/a>/im) do
+                 href = Regexp.last_match(1)
+                 label = Regexp.last_match(2).gsub(/<[^>]+>/, '').strip
+                 label.empty? || label == href || href.include?(label) ? href : "#{label} (#{href})"
+               end
+               .gsub(/<[^>]+>/, '')
+    CGI.unescapeHTML(text).gsub(/[ \t]+\n/, "\n").gsub(/\n{3,}/, "\n\n").strip
+  end
+end
+# --- END CALENDAR ENGINE ---
+
+module CalendarPanel
+  WINDOW_ID = 'calendar_sagapanel'.freeze
+  # tag: the [key] shown in front of every entry from that calendar.
+  # same: matches an existing leading [key] that already names this calendar
+  # (including the typos and variants found in the feeds), so it isn't doubled.
+  CALENDARS = [
+    { key: 'prime',     name: 'Prime',     id: 'pcab6kb6qe76j3fl2afq9q699s', tag: 'Prime',    same: /\bprime\b/i },
+    { key: 'premium',   name: 'Premium',   id: 'j6q1n0lq7vf222o6kltaupa01s', tag: 'Premium',  same: /\bpremi/i },
+    { key: 'platinum',  name: 'Platinum',  id: 'jv19jhbr7fepl3rfh474l5udgc', tag: 'Platinum', same: /\b(plat|patinum)/i },
+    { key: 'general',   name: 'General',   id: 't1vglkquofrk91qkbo8stl756g', tag: 'General',  same: /\Ageneral\z/i },
+    { key: 'houses',    name: 'Houses',    id: 'n058u7qetmcm2p49p7s650v5e0', tag: 'CHEs',     same: /\bches?\b/i },
+    { key: 'mho',       name: 'MHO',       id: 'j92j2chtbqu5bob9scv0u2hlfo', tag: 'MHOs',     same: /\bmhos?\b/i },
+    { key: 'towncrier', name: 'TownCrier', id: 'eg1304nmvgiad028n96rnqqb2c', tag: 'TC',       same: /\A(tc|towncrier)\z/i }
+  ].freeze
+  FEED_URL = 'https://calendar.google.com/calendar/ical/%s%%40group.calendar.google.com/public/basic.ics'.freeze
+  USER_AGENT = 'Lich5-calendar-panel/1.0'.freeze
+  REFRESH_SECONDS = 6 * 60 * 60
+  UPCOMING_DAYS = 7
+  UPCOMING_MAX = 40
+  MONTH_CELL = 8 # widest cell is "[30](12)"
+
+  @queue = Queue.new
+  @events = {}       # cal key => [Event]
+  @loaded_at = nil
+  @downloading = false
+  @arrived = 0
+  @view = :upcoming  # :upcoming, :week, :month, :day, :event
+  @anchor = Date.today
+  @stack = []       # previous [view, anchor, detail] for *cal back
+  @shown = []        # occurrences linked from the current screen, by index
+  @detail = nil
+
+  class << self
+    attr_reader :queue
+  end
+
+  # ---------- settings ----------
+
+  def self.default_enabled
+    if XMLData.game.to_s =~ /plat/i
+      %w[platinum general houses mho towncrier]
+    else
+      %w[prime premium general houses mho towncrier]
+    end
+  end
+
+  def self.enabled
+    list = plain(CharSettings['calendars'])
+    list.is_a?(Array) ? list : default_enabled
+  end
+
+  def self.toggle_calendar(key)
+    cal = CALENDARS.find { |c| c[:key] == key.downcase || c[:name].casecmp?(key) }
+    return respond("Calendar: There is no calendar named '#{key}'. The calendars are #{sentence_list(CALENDARS.map { |c| c[:key] })}.") unless cal
+
+    list = enabled.dup
+    list.include?(cal[:key]) ? list.delete(cal[:key]) : list << cal[:key]
+    CharSettings['calendars'] = list
+    render
+  end
+
+  # ---------- feeds ----------
+
+  def self.cache_dir
+    dir = File.join($data_dir, 'calendar_cache')
+    FileUtils.mkdir_p(dir)
+    dir
+  end
+
+  def self.cache_file(cal)
+    File.join(cache_dir, "#{cal[:key]}.ics")
+  end
+
+  def self.http_get(url, limit = 4)
+    uri = URI(url)
+    response = Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 10, read_timeout: 30) do |http|
+      req = Net::HTTP::Get.new(uri)
+      req['User-Agent'] = USER_AGENT
+      http.request(req)
+    end
+    if response.is_a?(Net::HTTPRedirection) && limit > 0
+      return http_get(URI.join(url, response['location']).to_s, limit - 1)
+    end
+    raise "HTTP #{response.code}" unless response.is_a?(Net::HTTPSuccess)
+
+    response.body.to_s.dup.force_encoding('UTF-8')
+  end
+
+  KEEP_HISTORY = 400 * 86_400 # one-time events that ended longer ago than this are dropped
+
+  def self.parse(body, cal)
+    cutoff = Time.now - KEEP_HISTORY
+    CalendarEngine.parse_ics(body, cal[:key]).select do |e|
+      e.rrule || CalendarEngine.to_time(e.start) + e.finish > cutoff
+    end
+  end
+
+  def self.load_cached!
+    CALENDARS.each do |cal|
+      path = cache_file(cal)
+      next unless File.exist?(path)
+
+      @events[cal[:key]] = parse(File.binread(path).force_encoding('UTF-8'), cal)
+      @loaded_at = [@loaded_at, File.mtime(path)].compact.min
+    end
+  end
+
+  def self.stale?
+    !@downloading && (@loaded_at.nil? || Time.now - @loaded_at > REFRESH_SECONDS)
+  end
+
+  def self.downloading?
+    @downloading
+  end
+
+  # Downloads every calendar at once on background threads, so the panel stays
+  # clickable. Results are handed back through @arrivals and applied by
+  # poll_refresh! on the script's own thread.
+  def self.start_refresh!(announce: false)
+    return respond('Calendar: The calendars are already being updated.') if @downloading && announce
+    return if @downloading
+
+    @downloading = true
+    @announce = announce
+    @errors = []
+    @arrived = 0
+    @arrivals = Queue.new
+    @first_load = @events.empty?
+    render if @first_load
+    arrivals = @arrivals
+    Thread.new do
+      workers = CALENDARS.map do |cal|
+        Thread.new do
+          body = http_get(format(FEED_URL, cal[:id]))
+          raise 'not a calendar' unless body.include?('BEGIN:VCALENDAR')
+
+          arrivals << [cal, body, nil] # reported as soon as this one finishes
+        rescue StandardError => e
+          arrivals << [cal, nil, e.message]
+        end
+      end
+      workers.each(&:join)
+      arrivals << :done
+    end
+  end
+
+  def self.poll_refresh!
+    return unless @downloading
+
+    while (item = (@arrivals.pop(true) rescue nil))
+      if item == :done
+        @downloading = false
+        if @errors.size == CALENDARS.size
+          @loaded_at = Time.now - REFRESH_SECONDS + 600 # all failed: try again in 10 minutes
+        else
+          @loaded_at = Time.now
+        end
+        unless @errors.empty?
+          noun = @errors.size == 1 ? 'calendar' : 'calendars'
+          respond("Calendar: The #{sentence_list(@errors)} #{noun} could not be updated, so the saved copies are being used.")
+        end
+        respond('Calendar: All calendars have been updated.') if @announce && @errors.empty?
+        render
+        return
+      end
+
+      cal, body, error = item
+      @arrived += 1
+      if body
+        File.binwrite(cache_file(cal), body) # binary: never rewrite the feed's CRLF line endings
+        @events[cal[:key]] = parse(body, cal)
+      else
+        @errors << "#{cal[:name]} (#{error})"
+      end
+      render if @first_load # fill the panel in as each calendar arrives on a first run
+    end
+  end
+
+  # ["a", "b", "c"] -> "a, b and c"
+  def self.sentence_list(items)
+    items = items.map(&:to_s)
+    return items.join if items.size < 2
+
+    "#{items[0..-2].join(', ')} and #{items[-1]}"
+  end
+
+  def self.events
+    enabled.flat_map { |k| @events[k] || [] }
+  end
+
+  # ---------- formatting ----------
+
+  def self.xml(text)
+    CalendarEngine.to_ascii(text).gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;').gsub("'", '&apos;').gsub('"', '&quot;')
+  end
+
+  def self.dlink(cmd, label)
+    "<d cmd='#{xml(cmd)}'>#{xml(label)}</d>"
+  end
+
+  def self.write(lines)
+    _respond("<clearStream id='#{WINDOW_ID}'/>")
+    _respond("<pushStream id='#{WINDOW_ID}'/>#{lines.join("\n")}\n<popStream/>\r\n")
+  end
+
+  # Windows spells zones out ("Central Standard Time"); shorten to "CST".
+  def self.zone_abbr(time)
+    name = time.getlocal.strftime('%Z')
+    name.size > 5 ? name.scan(/\b[A-Z]/).join : name
+  end
+
+  def self.local(time)
+    time.getlocal
+  end
+
+  def self.time_label(occ)
+    return 'All day ' if occ.all_day
+
+    local(occ.start).strftime('%l:%M %p').rjust(8)
+  end
+
+  def self.day_bounds(date)
+    [Time.local(date.year, date.month, date.day), Time.local((date + 1).year, (date + 1).month, (date + 1).day)]
+  end
+
+  # Every entry gets exactly one leading [key] naming its calendar:
+  #   "Rogue Guild Night"            -> "[General] Rogue Guild Night"
+  #   "[Prime] Crimson Legion"       -> unchanged (already names its calendar)
+  #   "[Cysaegir] Moot" (Prime)      -> "[Prime: Cysaegir] Moot"
+  #   "[Prime] [EG] Script Swap"     -> "[Prime: EG] Script Swap"
+  # All leading keys are merged into one, so there is never a "[ ] [ ]" pair.
+  # "[Prime}" (a typo in the feed) counts as a key too.
+  def self.title(ev)
+    cal = CALENDARS.find { |c| c[:key] == ev.cal }
+    rest = ev.summary.strip
+    return rest unless cal
+
+    keys = []
+    while (m = rest.match(/\A\[([^\]\}]*)[\]\}]\s*/))
+      keys << m[1].strip
+      rest = m.post_match
+    end
+    keys = keys.reject(&:empty?).uniq { |k| k.downcase }
+    own = keys.find { |k| k =~ cal[:same] }
+    others = keys.reject { |k| k =~ cal[:same] }
+    key = own || cal[:tag]
+    key += ": #{others.join(', ')}" unless others.empty?
+    "[#{key}] #{rest}"
+  end
+
+  def self.event_line(occ)
+    @shown << occ
+    n = @shown.size - 1
+    "#{alarm_marker(occ, n)} #{time_label(occ)}  #{dlink("*cal event #{n}", title(occ.event))}"
+  end
+
+  def self.day_header(date)
+    label = date.strftime('%a %b %-d')
+    label += ' (today)' if date == Date.today
+    dlink("*cal day #{date.iso8601}", label)
+  end
+
+  def self.header(nav)
+    lines = ['<pushBold/>GemStone IV Calendar<popBold/>']
+    views = { upcoming: 'Upcoming', week: 'Week', month: 'Month' }.map do |v, name|
+      @view == v ? "[#{name}]" : dlink("*cal #{v}", name)
+    end
+    lines << views.join('  ')
+    if %i[upcoming week day].include?(@view)
+      lines << (grouped? ? "#{dlink('*cal combine', 'Combined')}  [By calendar]" : "[Combined]  #{dlink('*cal group', 'By calendar')}")
+    end
+    lines << "#{dlink('*cal prev', '< prev')}  #{dlink('*cal today', 'today')}  #{dlink('*cal next', 'next >')}" if nav
+    lines << CALENDARS.map { |c| dlink("*cal show #{c[:key]}", "#{enabled.include?(c[:key]) ? '[x]' : '[ ]'} #{c[:name]}") }.join(' ')
+    updated = if @downloading
+                "downloading calendars (#{@arrived}/#{CALENDARS.size})..."
+              elsif @loaded_at
+                "updated #{((Time.now - @loaded_at) / 60).round} min ago"
+              else
+                'not loaded yet'
+              end
+    lines << "Local time (#{zone_abbr(Time.now)}), #{updated}  #{dlink('*cal refresh', '[refresh]')}"
+    lines << ''
+    lines
+  end
+
+  # ---------- section order (grouped view) ----------
+
+  UP_ARROW = '&#x2191;'.freeze # as an entity so this file stays ASCII
+
+  # Calendar keys in the player's chosen order; new calendars go at the end.
+  def self.order
+    keys = CALENDARS.map { |c| c[:key] }
+    saved = plain(CharSettings['order'])
+    list = saved.is_a?(Array) ? (saved & keys) : []
+    list + (keys - list)
+  end
+
+  # Moves a calendar above the section currently shown just before it, so a
+  # click always visibly moves it even when hidden or empty calendars sit between.
+  def self.move_up(key)
+    key = key.to_s.downcase
+    cal = CALENDARS.find { |c| c[:key] == key }
+    return respond("Calendar: There is no calendar named '#{key}'.") unless cal
+
+    visible = @visible_sections || []
+    pos = visible.index(key)
+    return respond("Calendar: #{cal[:name]} is already at the top of the list.") if pos.nil? || pos.zero?
+
+    list = order
+    list.delete(key)
+    list.insert(list.index(visible[pos - 1]), key)
+    CharSettings['order'] = list
+    render
+  end
+
+  # ---------- room links ----------
+
+  # Room numbers as the calendars write them. Bare numbers need 6+ digits (game
+  # room UIDs), so years like (2026) and street numbers are never linked.
+  # :auto means 6+ digits is a game room UID, fewer is a Lich room ID.
+  ROOM_PATTERNS = [
+    [/\bLich\s*(?:ID|Room)?\s*[#:]?\s*#?\s*(\d{2,6})\b/i, :lich], # Lich 1234, Lich#1234, Lich ID: 1234, Lich Room #1234
+    [/\brn\s*[#:]?\s*(\d{2,8})\b/i,                     :auto], # (rn 1438) -- TownCrier's style
+    [/\broom\s*#\s*(\d{2,8})\b/i,                       :auto], # room #1234
+    [/\(Room\s*#?\s*(\d{2,8})\)/i,                      :auto], # (Room 1234)
+    [/\bu(\d{4,8})\b/,                                  :uid],  # u7132103
+    [/\((\d{6,8})\)/,                                   :uid],  # (3209357)
+    [/\]\s*(\d{6,8})\b/,                                :uid],  # [Place] 3209357
+    [/\s-\s(\d{6,8})\s*\z/,                             :uid]   # Place - 3209357
+  ].freeze
+
+  # Wraps each room number in already-escaped panel text with a *cal goto link.
+  def self.link_rooms(escaped)
+    out = escaped.dup
+    ROOM_PATTERNS.each do |pattern, kind|
+      out = out.gsub(pattern) do |match|
+        num = Regexp.last_match(1)
+        next match if match.include?('<d cmd=') # already linked by an earlier pattern
+
+        ref = case kind
+              when :lich then num
+              when :uid then "u#{num}"
+              else num.size >= 6 ? "u#{num}" : num
+              end
+        match.sub(num, "<d cmd='*cal goto #{ref}'>#{num}</d>")
+      end
+    end
+    out
+  end
+
+  # Same approach as exitwindow.lic: write Unicode text straight to the Windows
+  # clipboard through user32/kernel32 (no gems needed), then fall back to the
+  # platform's clipboard command.
+  def self.copy_to_windows_clipboard(text)
+    return false unless Gem.win_platform?
+
+    require 'fiddle'
+    user32 = Fiddle.dlopen('user32.dll')
+    kernel32 = Fiddle.dlopen('kernel32.dll')
+    fn = ->(lib, name, args, ret) { Fiddle::Function.new(lib[name], args, ret) }
+    open_clipboard  = fn.call(user32, 'OpenClipboard', [Fiddle::TYPE_VOIDP], Fiddle::TYPE_INT)
+    close_clipboard = fn.call(user32, 'CloseClipboard', [], Fiddle::TYPE_INT)
+    empty_clipboard = fn.call(user32, 'EmptyClipboard', [], Fiddle::TYPE_INT)
+    set_data        = fn.call(user32, 'SetClipboardData', [Fiddle::TYPE_UINT, Fiddle::TYPE_VOIDP], Fiddle::TYPE_VOIDP)
+    global_alloc    = fn.call(kernel32, 'GlobalAlloc', [Fiddle::TYPE_UINT, Fiddle::TYPE_SIZE_T], Fiddle::TYPE_VOIDP)
+    global_free     = fn.call(kernel32, 'GlobalFree', [Fiddle::TYPE_VOIDP], Fiddle::TYPE_VOIDP)
+    global_lock     = fn.call(kernel32, 'GlobalLock', [Fiddle::TYPE_VOIDP], Fiddle::TYPE_VOIDP)
+    global_unlock   = fn.call(kernel32, 'GlobalUnlock', [Fiddle::TYPE_VOIDP], Fiddle::TYPE_INT)
+
+    opened = false
+    5.times do
+      break if (opened = open_clipboard.call(0) != 0)
+
+      sleep 0.02
+    end
+    return false unless opened
+
+    handle = nil
+    transferred = false
+    begin
+      return false if empty_clipboard.call.zero?
+
+      data = text.to_s.encode('UTF-16LE').b + "\x00\x00".b
+      handle = global_alloc.call(0x0042, data.bytesize) # GMEM_MOVEABLE | GMEM_ZEROINIT
+      return false if handle.to_i.zero?
+
+      locked = global_lock.call(handle)
+      return false if locked.to_i.zero?
+
+      begin
+        Fiddle::Pointer.new(locked.to_i)[0, data.bytesize] = data
+      ensure
+        global_unlock.call(handle)
+      end
+      transferred = !set_data.call(13, handle).to_i.zero? # CF_UNICODETEXT
+    ensure
+      global_free.call(handle) if handle && !transferred
+      close_clipboard.call
+    end
+    transferred
+  rescue StandardError
+    false
+  end
+
+  def self.copy_to_clipboard(text)
+    return true if copy_to_windows_clipboard(text)
+
+    cmd = if RUBY_PLATFORM =~ /mingw|mswin|cygwin/ then 'clip'
+          elsif RUBY_PLATFORM =~ /darwin/ then 'pbcopy'
+          else 'xclip -selection clipboard'
+          end
+    IO.popen(cmd, 'w') { |io| io.write(text.to_s) }
+    $?.nil? || $?.success?
+  rescue StandardError
+    false
+  end
+
+  # *cal goto u3209357 (game room UID) or *cal goto 1234 (Lich room ID).
+  def self.goto_room(ref)
+    uid = ref.start_with?('u')
+    num = ref.delete('u').to_i
+    label = uid ? "u#{num}" : num.to_s # u-prefixed like exitwindow, so it pastes straight into ;go2
+    copied = copy_to_clipboard(label)
+    ids = if uid
+            (Map.ids_from_uid(num) rescue []) || []
+          else
+            (Room[num] rescue nil) ? [num] : []
+          end
+    copy_note = copied ? "Room #{label} has been copied to your clipboard" : "Room #{label} could not be copied to your clipboard"
+    if ids.empty?
+      respond "Calendar: #{copy_note}, but it is not in your map database, so go2 cannot travel there."
+    elsif running?('go2')
+      respond "Calendar: #{copy_note}. go2 is already running, so stop it first if you want to travel there."
+    else
+      respond "Calendar: #{copy_note}. Starting go2 to travel there."
+      start_script('go2', [uid ? "u#{num}" : num.to_s])
+    end
+  end
+
+  # ---------- combined / grouped ----------
+
+  # Combined (default): every calendar mixed into one list.
+  # Grouped: one section per calendar, in the order of the checkboxes.
+  def self.grouped?
+    CharSettings['grouped'] == true
+  end
+
+  def self.set_grouped(value)
+    CharSettings['grouped'] = value
+    respond(value ? 'Calendar: Events are now grouped by calendar.' : 'Calendar: All calendars are now combined into one list.')
+    render
+  end
+
+  # One section per day.
+  def self.days_lines(occs)
+    lines = []
+    occs.group_by { |o| local(o.start).to_date }.each do |date, list|
+      lines << day_header(date)
+      list.each { |o| lines << event_line(o) }
+      lines << ''
+    end
+    lines
+  end
+
+  # One bold section per enabled calendar that has events; the block turns that
+  # calendar's events into lines. Calendars with nothing are named at the end.
+  def self.grouped_lines(occs, nothing_from)
+    lines = []
+    quiet = []
+    @visible_sections = []
+    order.map { |k| CALENDARS.find { |c| c[:key] == k } }.each do |cal|
+      next unless enabled.include?(cal[:key])
+
+      list = occs.select { |o| o.event.cal == cal[:key] }
+      if list.empty?
+        quiet << cal[:name]
+        next
+      end
+      arrow = @visible_sections.empty? ? '' : "  <d cmd='*cal up #{cal[:key]}'>#{UP_ARROW}</d>"
+      @visible_sections << cal[:key]
+      lines << "<pushBold/>#{xml(cal[:name])}<popBold/>#{arrow}"
+      lines.concat(yield(list))
+    end
+    lines << "Nothing #{nothing_from} from #{sentence_list(quiet)}." unless quiet.empty?
+    lines
+  end
+
+  # ---------- views ----------
+
+  def self.render
+    @shown = []
+    case @view
+    when :week then render_week
+    when :month then render_month
+    when :day then render_day
+    when :event then render_event
+    else render_upcoming
+    end
+  end
+
+  def self.render_upcoming
+    lines = header(false)
+    now = Time.now
+    occs = CalendarEngine.occurrences(events, now, now + UPCOMING_DAYS * 86_400).first(UPCOMING_MAX)
+    lines << (@events.empty? ? 'Downloading calendars, this takes a few seconds the first time...' : "Nothing scheduled in the next #{UPCOMING_DAYS} days.") if occs.empty?
+    if grouped? && !occs.empty?
+      all = CalendarEngine.occurrences(events, now, now + UPCOMING_DAYS * 86_400)
+      lines.concat(grouped_lines(all, "in the next #{UPCOMING_DAYS} days") { |list| days_lines(list.first(UPCOMING_MAX)) })
+    else
+      lines.concat(days_lines(occs))
+    end
+    write(lines)
+  end
+
+  def self.week_start(date)
+    date - date.wday
+  end
+
+  def self.render_week
+    lines = header(true)
+    first = week_start(@anchor)
+    lines << "<pushBold/>Week of #{first.strftime('%b %-d')} - #{(first + 6).strftime('%b %-d, %Y')}<popBold/>"
+    lines << ''
+    from, = day_bounds(first)
+    to, = day_bounds(first + 7)
+    occs = CalendarEngine.occurrences(events, from, to)
+    if grouped?
+      lines.concat(grouped_lines(occs, 'this week') { |list| days_lines(list) })
+      return write(lines)
+    end
+    7.times do |i|
+      date = first + i
+      ds, de = day_bounds(date)
+      list = occs.select { |o| o.start >= ds && o.start < de }
+      lines << day_header(date)
+      list.empty? ? lines << '    (nothing scheduled)' : list.each { |o| lines << event_line(o) }
+      lines << ''
+    end
+    write(lines)
+  end
+
+  def self.render_month
+    lines = header(true)
+    first = Date.new(@anchor.year, @anchor.month, 1)
+    last = Date.new(@anchor.year, @anchor.month, -1)
+    from, = day_bounds(first)
+    to, = day_bounds(last + 1)
+    counts = Hash.new(0)
+    CalendarEngine.occurrences(events, from, to).each { |o| counts[local(o.start).to_date] += 1 }
+
+    lines << "<pushBold/>#{first.strftime('%B %Y')}<popBold/>"
+    lines << '<output class="mono"/>'
+    lines << %w[Su Mo Tu We Th Fr Sa].map { |d| d.ljust(MONTH_CELL) }.join.rstrip
+    row = ' ' * (MONTH_CELL * first.wday)
+    (first..last).each do |date|
+      count = counts[date]
+      cell = date == Date.today ? "[#{date.day}]" : date.day.to_s
+      cell += "(#{count})" if count > 0
+      row += dlink("*cal day #{date.iso8601}", cell) + (' ' * [MONTH_CELL - cell.size, 1].max)
+      if date.wday == 6 || date == last
+        lines << row.rstrip
+        row = ''
+      end
+    end
+    lines << '<output class=""/>'
+    lines << '(n) = number of events. Click a day to see them.'
+    write(lines)
+  end
+
+  def self.render_day
+    lines = header(true)
+    lines << "<pushBold/>#{@anchor.strftime('%A, %B %-d, %Y')}<popBold/>"
+    lines << dlink('*cal back', '[back]') unless @stack.empty?
+    lines << ''
+    from, to = day_bounds(@anchor)
+    occs = CalendarEngine.occurrences(events, from, to).select { |o| o.start >= from }
+    lines << '  (nothing scheduled)' if occs.empty?
+    if grouped? && !occs.empty?
+      lines.concat(grouped_lines(occs, 'on this day') { |list| list.map { |o| event_line(o) } + [''] })
+    else
+      occs.each { |o| lines << event_line(o) }
+    end
+    write(lines)
+  end
+
+  def self.render_event
+    occ = @detail
+    ev = occ.event
+    cal = CALENDARS.find { |c| c[:key] == ev.cal }
+    lines = ['<pushBold/>GemStone IV Calendar<popBold/>', dlink('*cal back', '[back]'), '']
+    lines << "<pushBold/>#{xml(title(ev))}<popBold/>"
+    s = local(occ.start)
+    if occ.all_day
+      days = ((occ.finish - occ.start) / 86_400.0).round
+      lines << (days > 1 ? "#{s.strftime('%a %b %-d')} - #{(s.to_date + days - 1).strftime('%a %b %-d, %Y')} (all day)" : "#{s.strftime('%a %b %-d, %Y')} (all day)")
+    else
+      lines << "#{s.strftime('%a %b %-d, %Y  %l:%M %p').squeeze(' ')} - #{local(occ.finish).strftime('%l:%M %p').strip} #{zone_abbr(s)}"
+    end
+    lines << "Where: #{link_rooms(xml(ev.location))}" unless ev.location.empty?
+    lines << "Calendar: #{cal ? cal[:name] : ev.cal}#{ev.rrule ? '  (repeats)' : ''}"
+    if alarmable?(occ)
+      @shown << occ
+      idx = @shown.size - 1
+      lines << if alarm?(occ)
+                 "Alarm: #{ALARM_ICON} on  <d cmd='*cal alarm #{idx}'>[turn off]</d>"
+               else
+                 "Alarm: off  <d cmd='*cal alarm #{idx}'>[+ set alarm]</d>"
+               end
+    end
+    lines << ''
+    CalendarEngine.plain_text(ev.description).split("\n").each { |l| lines << link_rooms(xml(l)) }
+    write(lines)
+  end
+
+  # ---------- alarms ----------
+
+  ALARM_MINUTES = [60, 45, 30, 15, 5].freeze # warnings before an alarmed event starts
+  ALARM_ICON = '&#x23F0;'.freeze             # alarm clock, as an entity so this file stays ASCII
+
+  def self.alarm_key(occ)
+    "#{occ.event.uid}|#{occ.start.to_i}"
+  end
+
+  # A plain Ruby copy of a value read from CharSettings. Some Lich versions hand
+  # back settings proxies (and views of them from map/select/each); writing into
+  # one of those, e.g. a['fired'] = ..., makes Lich try to save it and fail with
+  # "this element of a view ... is not found in the settings". Built with each
+  # so no proxy survives, whatever version of Lich is running.
+  def self.plain(obj)
+    if obj.is_a?(Hash)
+      copy = {}
+      obj.each { |k, v| copy[plain(k)] = plain(v) }
+      copy
+    elsif obj.is_a?(Array)
+      copy = []
+      obj.each { |v| copy << plain(v) }
+      copy
+    elsif obj.is_a?(String) then String.new(obj.to_str)
+    elsif obj.is_a?(Integer) then obj.to_int
+    elsif obj.is_a?(Float) then obj.to_f
+    else obj
+    end
+  end
+
+  def self.alarms
+    list = plain(CharSettings['alarms'])
+    return [] unless list.is_a?(Array)
+
+    list.select { |a| a.is_a?(Hash) && a['start'] }.each do |a|
+      a['start'] = a['start'].to_i
+      a['fired'] = a['fired'].is_a?(Array) ? a['fired'] : []
+    end
+  end
+
+  def self.save_alarms(list)
+    CharSettings['alarms'] = list
+  end
+
+  def self.alarm?(occ)
+    key = alarm_key(occ)
+    alarms.any? { |a| a['key'] == key }
+  end
+
+  def self.alarmable?(occ)
+    !occ.all_day && occ.start > Time.now
+  end
+
+  # Clickable marker left of the start time: "+" to set an alarm, the alarm clock to clear it.
+  def self.alarm_marker(occ, index)
+    return ' ' unless alarmable?(occ)
+
+    label = alarm?(occ) ? ALARM_ICON : '+'
+    "<d cmd='*cal alarm #{index}'>#{label}</d>"
+  end
+
+  def self.toggle_alarm(index)
+    occ = @shown[index.to_i]
+    return respond('Calendar: That event is no longer on screen. Please select it again.') unless occ
+    return respond('Calendar: Alarms can only be set for timed events that have not started yet.') unless alarmable?(occ)
+
+    list = alarms
+    key = alarm_key(occ)
+    name = CalendarEngine.to_ascii(title(occ.event))
+    if list.any? { |a| a['key'] == key }
+      list.reject! { |a| a['key'] == key }
+      respond "Calendar: Your alarm for #{name} has been turned off."
+    else
+      list << { 'key' => key, 'title' => name, 'start' => occ.start.to_i, 'fired' => [] }
+      respond "Calendar: An alarm has been set for #{name} at #{local(occ.start).strftime('%-I:%M %p')}. " \
+              'You will be warned 1 hour, 45 minutes, 30 minutes, 15 minutes and 5 minutes before it starts.'
+    end
+    save_alarms(list)
+    render
+  end
+
+  # "Fri Nov 13, 8:00 PM" -- single spaces, no padded hour.
+  def self.alarm_when(alarm)
+    Time.at(alarm['start']).strftime('%a %b %-d, %-I:%M %p')
+  end
+
+  def self.list_alarms
+    list = alarms.sort_by { |a| a['start'] }
+    return respond('Calendar: You have no alarms set.') if list.empty?
+
+    respond((["Calendar: You have #{list.size} alarm#{list.size == 1 ? '' : 's'} set:"] + list.map { |a| "  #{alarm_when(a)} - #{a['title']}" }).join("
+"))
+  end
+
+  def self.minutes_text(mins)
+    mins >= 58 ? '1 hour' : "#{mins} minute#{mins == 1 ? '' : 's'}"
+  end
+
+  LOGIN_SUMMARY_DELAY = 60 # seconds after the script starts
+
+  def self.time_until(seconds)
+    mins = (seconds / 60.0).round
+    return "in #{mins} min" if mins < 60
+
+    hours = (mins / 60.0).round
+    return "in #{hours} hour#{hours == 1 ? '' : 's'}" if hours < 48
+
+    "in #{(hours / 24.0).round} days"
+  end
+
+  # Echoed once, about a minute after the script starts (i.e. after login):
+  # every event with an alarm set, soonest first. Says nothing if none are set.
+  def self.alarm_summary!
+    now = Time.now.to_i
+    list = alarms.select { |a| a['start'] > now }.sort_by { |a| a['start'] }
+    return if list.empty?
+
+    # One echo, so it shows as a single [calendar_sagapanel: ...] block.
+    lines = ["You have #{list.size} event alarm#{list.size == 1 ? '' : 's'} set:"]
+    list.each { |a| lines << "  #{alarm_when(a)} - #{a['title']} (#{time_until(a['start'] - now)})" }
+    echo lines.join("
+")
+  end
+
+  def self.alarm_message(title, mins, start)
+    "CALENDAR ALARM: #{title} starts in #{minutes_text(mins)} " \
+      "(#{Time.at(start).strftime('%-I:%M %p')})."
+  end
+
+  # *cal alarmtest: echoes one warning, exactly as a real alarm would, for a
+  # random upcoming event and a random warning time. Nothing is saved, so it is
+  # safe for trying out highlights and sounds.
+  def self.alarm_test
+    now = Time.now
+    picks = CalendarEngine.occurrences(events, now, now + 30 * 86_400).select { |o| alarmable?(o) }
+    return respond('Calendar: There are no upcoming timed events to test an alarm with.') if picks.empty?
+
+    occ = picks.sample
+    echo alarm_message(CalendarEngine.to_ascii(title(occ.event)), ALARM_MINUTES.sample, occ.start.to_i)
+  end
+
+  # Called from the main loop. Echoes each warning once; if Lich was not
+  # running when several warnings came due, only the latest one is echoed.
+  def self.check_alarms!
+    now = Time.now.to_i
+    list = alarms
+    return if list.empty?
+
+    changed = false
+    list.each do |a|
+      mins = (a['start'] - now) / 60.0
+      due = ALARM_MINUTES.select { |m| mins <= m && !a['fired'].include?(m) }
+      next if due.empty?
+
+      a['fired'] = a['fired'] + due
+      changed = true
+      next if mins <= 0
+
+      echo alarm_message(a['title'], mins.round, a['start'])
+    end
+    started = list.select { |a| a['start'] <= now }
+    list -= started
+    save_alarms(list) if changed || !started.empty?
+    render unless started.empty?
+  end
+
+  # ---------- navigation ----------
+
+  def self.show_view(view)
+    @view = view
+    @stack = []
+    @anchor = Date.today
+    render
+  end
+
+  def self.step(direction)
+    case @view
+    when :week then @anchor += 7 * direction
+    when :month then @anchor = @anchor >> direction
+    when :day then @anchor += direction
+    else return
+    end
+    render
+  end
+
+  def self.today!
+    @anchor = Date.today
+    render
+  end
+
+  def self.push_view
+    @stack << [@view, @anchor, @detail]
+    @stack.shift while @stack.size > 10
+  end
+
+  def self.show_day(str)
+    date = Date.iso8601(str) rescue nil
+    return respond('Calendar: Please enter the date as *cal day YYYY-MM-DD, for example *cal day 2026-11-14.') unless date
+
+    push_view unless @view == :day
+    @view = :day
+    @anchor = date
+    render
+  end
+
+  def self.show_event(index)
+    occ = @shown[index.to_i]
+    return respond('Calendar: That event is no longer on screen. Please select it again.') unless occ
+
+    push_view
+    @detail = occ
+    @view = :event
+    render
+  end
+
+  def self.back!
+    if @stack.empty?
+      @view = :upcoming
+      @anchor = Date.today
+    else
+      @view, @anchor, @detail = @stack.pop
+    end
+    render
+  end
+
+  HELP = [
+    '*cal / *cal upcoming   - Upcoming view',
+    '*cal alarm <n>         - set/clear an alarm (click the + or alarm clock)',
+    '*cal alarms            - list alarms',
+    '*cal alarmtest         - echo a sample alarm for a random event',
+    '*cal back              - back from an event or day',
+    '*cal combine           - mix all calendars into one list (default)',
+    '*cal day YYYY-MM-DD    - one day',
+    '*cal goto <room>       - copy a room number and go2 there (click it in event details)',
+    '*cal group             - separate the list into a section per calendar',
+    '*cal month             - Month view',
+    '*cal next / *cal prev  - move forward/back',
+    '*cal refresh           - re-download calendars',
+    '*cal show <calendar>   - toggle prime, premium, platinum, general, houses, mho, towncrier',
+    '*cal today             - jump to today',
+    '*cal up <calendar>     - move a calendar up in the grouped list (the up arrow)',
+    '*cal week              - Week view'
+  ].freeze
+
+  def self.handle(arg)
+    case arg
+    when '', /\Aupcoming\z/i then show_view(:upcoming)
+    when /\Aweek\z/i then show_view(:week)
+    when /\Amonth\z/i then show_view(:month)
+    when /\Aday\s+(\S+)\z/i then show_day(Regexp.last_match(1))
+    when /\Aevent\s+(\d+)\z/i then show_event(Regexp.last_match(1))
+    when /\Aback\z/i then back!
+    when /\Acombine\z/i then set_grouped(false)
+    when /\Agroup\z/i then set_grouped(true)
+    when /\Agoto\s+(u?\d+)\z/i then goto_room(Regexp.last_match(1).downcase)
+    when /\Aup\s+(\S+)\z/i then move_up(Regexp.last_match(1))
+    when /\Anext\z/i then step(1)
+    when /\Aprev\z/i then step(-1)
+    when /\Atoday\z/i then today!
+    when /\Ashow\s+(\S+)\z/i then toggle_calendar(Regexp.last_match(1))
+    when /\Arefresh\z/i then start_refresh!(announce: true)
+    when /\Aalarm\s+(\d+)\z/i then toggle_alarm(Regexp.last_match(1))
+    when /\Aalarms\z/i then list_alarms
+    when /\Aalarm\s*test\z/i then alarm_test
+    when /\Ahelp\z/i then HELP.each { |l| respond l }
+    else respond("Calendar: '#{arg}' is not a calendar command. Type *cal help to see the list of commands.")
+    end
+  end
+end
+
+hook_id = "#{Script.current.name}_upstream"
+UpstreamHook.remove(hook_id) rescue nil
+UpstreamHook.add(hook_id, proc do |command|
+  if command.strip =~ /\A(?:<c>)?\*cal(?:endar)?(?:\s+(.*))?\z/i
+    CalendarPanel.queue << Regexp.last_match(1).to_s.strip
+    nil
+  else
+    command
+  end
+end)
+
+_respond("<streamWindow id='#{CalendarPanel::WINDOW_ID}' title='Calendar' ifClosed='' resident='true'/>")
+sleep 0.05
+_respond("<exposeStream id='#{CalendarPanel::WINDOW_ID}'/>")
+
+before_dying do
+  UpstreamHook.remove(hook_id) rescue nil
+  _respond("<closeStream id='#{CalendarPanel::WINDOW_ID}'/>")
+end
+
+CalendarPanel.load_cached!
+CalendarPanel.render
+CalendarPanel.start_refresh! if CalendarPanel.stale?
+echo 'The calendar panel is now active. Type *cal help to see the list of commands.'
+
+last_minute = Time.now.min
+login_summary_at = Time.now + CalendarPanel::LOGIN_SUMMARY_DELAY
+loop do
+  begin
+    arg = CalendarPanel.queue.pop(true) rescue nil
+    if arg
+      CalendarPanel.handle(arg)
+    else
+      CalendarPanel.start_refresh! if CalendarPanel.stale?
+      CalendarPanel.poll_refresh!
+      CalendarPanel.check_alarms!
+      if login_summary_at && Time.now >= login_summary_at
+        login_summary_at = nil
+        CalendarPanel.alarm_summary!
+      end
+      # Keep the Upcoming list current (drops finished events) every 15 minutes.
+      if Time.now.min != last_minute && (Time.now.min % 15).zero?
+        CalendarPanel.render if CalendarPanel.instance_variable_get(:@view) == :upcoming
+      end
+      last_minute = Time.now.min
+      sleep 0.5
+    end
+  rescue StandardError => e
+    respond "Calendar: An error occurred in the calendar panel (#{e.message})."
+    sleep 1
+  end
+end

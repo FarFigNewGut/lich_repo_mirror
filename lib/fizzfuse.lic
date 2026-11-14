@@ -4,7 +4,7 @@
         game: gemstone
         tags: scroll infusion, infuse, unlock, runestone, scroll
     requires: Lich > 5.4.0
-     version: 2.0
+     version: 2.2
         note: Written with assistance from Claude (Anthropic).
 
 
@@ -12,7 +12,9 @@ Infuse!
 	
     This script will automatically unlock and infuse scrolls for you! 
 
-	The script always uses the quiss'fyn rune, and always attempts to fully unlock the scroll. 
+	The script always uses the quiss'fyn rune to unlock. By default it unlocks every
+	locked spell on the scroll; with --spells=<n,n> it unlocks only until the spells you
+	list are unlocked (see below) and ignores the rest.
 	
     You must first define your infuse and scroll sack (which can be the same):
 
@@ -38,7 +40,15 @@ Infuse!
 	Other assumptions:
 		- You have at least 20,000 silvers in your local bank (withdrawn as a flat
 		  amount whenever a rune needs to be made, to cover runestones/ink/cup/etc.)
+		- Ideally you have backroom access to the general store: a blank runestone is
+		  then made for about 6k instead of 10k by buying a "smooth stone" there and an
+		  aish'vrak potion from the alchemist, and pouring one on the other (the stone
+		  is still a runestone for rummage purposes, just with the noun "stone"). With
+		  no backroom access it buys the alchemist's premade runestone instead, and
+		  ;vars set infuse_smooth_stone=false skips the extra general store stop.
 		- You can read all scrolls
+		- If you die (a scroll can kill you outright), the script stops itself at once
+		  instead of carrying on with a dead character
 		- You're not carrying a heavy load of silvers: if your encumbrance is 25% or more
 		  and you have silvers on hand, the script runs to the bank, deposits them all and
 		  comes back before doing anything else (change the 25 with
@@ -50,10 +60,11 @@ Infuse!
     Once you have the variables set, you can activate the script in the following ways:
 	
 		;infuse
-			- Fully unlock & infuse the scroll in your right hand
+			- Unlock (all locked spells, or just the --spells ones) & infuse the scroll in your right hand
 	
 		;infuse unlock 
-			- Fully unlock the scroll in your right hand
+			- Unlock the scroll in your right hand: every locked spell, or only until the
+			  --spells ones are unlocked
 		
 		;infuse infuse
 			- Fully infuse an unlocked scroll in your right hand. This does not check whether the scroll has been unlocked.
@@ -161,6 +172,13 @@ Infuse!
           with silvers on hand, runs to the bank, deposits everything and returns first, so
           too many silvers can't stop the runestone purchase (;vars set
           infuse_max_encumbrance=0 turns it off).
+        - Cheaper runestones: buys a smooth stone from the general store's backroom and an
+          aish'vrak potion from the alchemist and pours one on the other, instead of the
+          10k premade runestone (about 6k). Falls back to the premade one when the stone
+          or potion isn't for sale (no backroom access); infuse_smooth_stone=false skips
+          the general store stop. Hands are also cleared before the bank run now.
+        - Stops itself if you die. A waved stone once exploded a scroll and killed the
+          character, and the script kept going (rummaging, waving, buying) while dead.
 
 =end
 
@@ -223,6 +241,14 @@ def open_container(name)
 	$opened_containers << name if result =~ /^You (?:open|carefully|unfasten)/
 end
 
+# Make blank runestones from a general-store smooth stone + alchemist aish'vrak
+# potion instead of buying the premade one? On by default; it needs backroom
+# access to the general store (it falls back by itself when the stone isn't for
+# sale). ;vars set infuse_smooth_stone=false to skip the extra stop.
+def smooth_stone_enabled?
+	UserVars.infuse_smooth_stone.to_s !~ /\A(?:false|no|off|0)\z/i
+end
+
 # Make the rune_name rune
 #
 # Preconditions:
@@ -254,6 +280,36 @@ def make_rune (rune_name)
 		buy_result
 	end
 	
+	# Both hands are needed (brush + cup/ink, or stone + potion), so clear
+	# anything held first - otherwise "get cup" fails with "You need a free hand"
+	# and the brush ends up stowed by mistake. Remember what was held so it can be
+	# picked back up when we're done.
+	original_hands = [GameObj.right_hand, GameObj.left_hand].compact.map { |o| o.id.to_s }.select { |id| id =~ /\A\d+\z/ }
+	if !original_hands.empty?
+		fput "stow all"
+		sleep 1
+	end
+
+	# The first item in either hand (matching /match/ by noun if given), once the
+	# game has caught up - GameObj lags what the game just handed us.
+	hand_item = lambda do |match = nil, timeout = 5|
+		end_time = Time.now.to_f + timeout
+		item = nil
+		loop do
+			item = [GameObj.right_hand, GameObj.left_hand].compact.find { |o| o.id.to_s =~ /\A\d+\z/ && (match.nil? || o.noun =~ match) }
+			break if item || Time.now.to_f > end_time
+			sleep 0.1
+		end
+		item
+	end
+
+	# Does this shop's catalog list something matching pattern? Looks without
+	# ordering, so a shop that doesn't stock it (or a general store whose backroom
+	# we can't enter) can't leave "order" waiting forever for a line that never comes.
+	shop_sells = lambda do |pattern|
+		collect_lines("order", /You can APPRAISE, INSPECT or DESCRIBE/, 8).any? { |l| l =~ pattern }
+	end
+
 	# Withdraw money
 	start_script('go2',['bank'])
 	wait_while {running?('go2')}
@@ -265,19 +321,57 @@ def make_rune (rune_name)
 		echo "You don't have enough money for runestones! You need at least 20,000 silvers in your bank account."
 		exit
 	end
-	
+
+	# Cheaper blank runestone: a "smooth stone" from the general store's backroom plus
+	# an aish'vrak potion from the alchemist, poured together, make the same blank
+	# runestone the alchemist sells premade (about 6k instead of 10k). The stone is
+	# bought first and stowed; stone_id stays nil if any of it isn't available, and we
+	# fall back to buying the premade runestone.
+	stone_id = nil
+	if smooth_stone_enabled?
+		start_script('go2',['general store'])
+		wait_while {running?('go2')}
+		if shop_sells.call(/smooth stone/)
+			order.("smooth stone")
+			stone = hand_item.call(/stone/)
+			if stone
+				stone_id = stone.id
+				fput "stow ##{stone_id}"
+				sleep 1
+			end
+		else
+			echo "No smooth stone for sale here (no backroom access?) - buying the premade runestone instead."
+		end
+	end
+
 	# It's just easier to withdraw money and go to the alchemist for this step
 	start_script('go2',['alchemist'])
 	wait_while {running?('go2')}
 
-	# Both hands are needed (brush + cup/ink), so clear anything held first -
-	# otherwise "get cup" fails with "You need a free hand" and the brush ends
-	# up stowed by mistake. Remember what was held so it can be picked back up
-	# when we're done.
-	original_hands = [GameObj.right_hand, GameObj.left_hand].compact.map { |o| o.id.to_s }.select { |id| id =~ /\A\d+\z/ }
-	if !original_hands.empty?
-		fput "stow all"
-		sleep 1
+	if stone_id
+		if shop_sells.call(/aish'vrak/)
+			fput "get ##{stone_id}"
+			if hand_item.call(/stone/)
+				order.("aish'vrak")
+				poured = collect_lines("pour potion on stone", /shatters into twinkling dust|What were you referring to|Pour what/, 8)
+				if poured.any? { |l| l =~ /shatters into twinkling dust/ }
+					sleep 1
+					blank = hand_item.call(/stone/)          # pouring can swap the item's id
+					stone_id = blank ? blank.id : nil
+				else
+					echo "Pouring the potion didn't work - buying the premade runestone instead."
+					stone_id = nil
+				end
+			else
+				stone_id = nil
+			end
+			fput "stow ##{stone_id}" if stone_id
+			fput "stow all" unless stone_id        # a leftover potion/stone from a failed attempt
+			sleep 1
+		else
+			echo "No aish'vrak potion for sale here - buying the premade runestone instead."
+			stone_id = nil
+		end
 	end
 
 	fput "get my brush in my #{UserVars.infusesack}"
@@ -309,11 +403,17 @@ def make_rune (rune_name)
 		fput "put #{ink_noun} in my #{UserVars.infusesack}"
 	end
 	
-	# Order the runestone
-	order.("runestone")
-	
+	# Get the blank stone: the one we made, or the alchemist's premade runestone
+	blank_noun = "runestone"
+	if stone_id
+		fput "get ##{stone_id}"
+		blank_noun = "stone"
+	else
+		order.("runestone")
+	end
+
 	# Draw rune
-	draw = dothistimeout "draw #{rune_name} rune on runestone", 5, /cleaned off first|will need ink|Roundtime/
+	draw = dothistimeout "draw #{rune_name} rune on #{blank_noun}", 5, /cleaned off first|will need ink|Roundtime/
 	if !draw.include? 'Roundtime'
 		echo "Something went wrong"
 		exit
@@ -617,7 +717,7 @@ def infuse
 			# No runestone in hand to channel through. Only fetch one if the left hand
 			# really isn't holding a runestone (find_rune would stall on a full hand).
 			left = GameObj.left_hand
-			find_rune("ag'loenar") unless left && left.noun =~ /runestone/
+			find_rune("ag'loenar") unless left && left.noun =~ /runestone|stone/
 		elsif infuse_line.include? 'glows dimly for a moment'
 			relinked = false
 		elsif infuse_line.include? 'grows cold'
@@ -734,8 +834,24 @@ end
 # scrollsack/vibrantscrollsack/--cont are opened when a scroll is stowed in them.
 if args[0] != 'help'
 	before_dying {
-		$opened_containers.each { |c| fput "close my #{c}" }
+		# Nothing to close once you're dead (the game just refuses everything).
+		$opened_containers.each { |c| fput "close my #{c}" } unless dead?
 	}
+
+	# A scroll can kill you outright (waving a quiss'fyn stone over a scroll once made it
+	# explode: "Fire burns through neck and destroys carotid artery", then "It seems you
+	# have died, my friend"). The script used to carry on regardless - rummaging, waving
+	# and buying with a dead character - so stop it the moment the game says you're dead.
+	my_name = Script.current.name
+	Thread.new do
+		loop do
+			sleep 0.5
+			next unless dead?
+			echo "You have died - stopping #{my_name}."
+			Script.kill(my_name)
+			break
+		end
+	end
 	open_container(UserVars.infusesack)
 	deposit_if_encumbered unless args[0] == 'check'
 end
@@ -780,6 +896,7 @@ elsif args[0] == 'help'
 	respond "    infusesack:        #{UserVars.infusesack || '(not set)'}"
 	respond "    scrollsack:        #{UserVars.scrollsack || '(not set)'}"
 	respond "    vibrantscrollsack: #{UserVars.vibrantscrollsack || '(not set)'}"
+	respond "    infuse_smooth_stone: #{smooth_stone_enabled?} (make runestones from a general-store smooth stone + aish'vrak potion; false = buy premade)"
 	respond "    infuse_max_encumbrance: #{max_encumbrance} (deposit silvers at the bank first at or above this %; 0 = off)"
 	respond "    infuse_safe:       #{infuse_safe?} (;vars set infuse_safe=false to never pause for a nod)"
 	respond ""
@@ -790,8 +907,10 @@ elsif args[0] == 'help'
 	respond "USAGE:"
 	respond "    ;infuse [unlock|infuse|check|rune <rune name>] [--cont=<container>] [--spells=<n,n>]"
 	respond ""
-	respond "    ;infuse                    - Unlock & infuse scroll in your right hand"
-	respond "    ;infuse unlock             - Unlock the scroll in your right hand"
+	respond "    ;infuse                    - Unlock & infuse scroll in your right hand (unlocks every"
+	respond "                                 locked spell unless --spells is given)"
+	respond "    ;infuse unlock             - Unlock the scroll in your right hand (all locked spells,"
+	respond "                                 or just the --spells ones)"
 	respond "    ;infuse infuse             - Infuse scroll in your right hand"
 	respond "    ;infuse rune <rune name>   - Make a runestone with rune <rune name>"
     respond "    ;infuse check              - Check for charges of a scroll in your right hand"

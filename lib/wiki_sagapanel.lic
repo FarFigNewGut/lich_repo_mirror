@@ -1,0 +1,962 @@
+=begin
+  wiki_sagapanel.lic
+
+  Saga-only panel that brings the GemStone IV wiki (gswiki.play.net) into the
+  frontend. Opens on a search prompt and command list; searches with several
+  matches list every page to pick from, spell numbers jump straight to the
+  spell, and pages show their infobox stats, intro, last-edit date, and
+  clickable links and expandable sections. Text is folded to plain ASCII.
+
+  Optional auto target lookup (off by default) loads the page for whatever
+  creature you target, unless you looked something up in the last 2 minutes.
+  Pages are cached in data/wiki_cache for 24 hours.
+
+  Commands:
+    *wiki                       - Show the home screen (search prompt and commands).
+    *wiki <term>                - Search; lists all matches. Spell numbers open the spell.
+    *wiki auto                  - Toggle auto lookup on target change (off by default).
+    *wiki back                  - Return to the previous page or result list.
+    *wiki clearcache            - Delete all cached wiki pages.
+    *wiki find <term>           - Search for a term that matches a command word.
+    *wiki go <title>            - Open an exact page title.
+    *wiki hand                  - Look up the item in your right hand.
+    *wiki help / *wiki home     - Show the home screen.
+    *wiki more                  - Show the next page of search results.
+    *wiki open                  - Open the current page in your web browser.
+    *wiki refresh               - Re-fetch the current page, ignoring the cache.
+    *wiki section <n|all|none>  - Expand/collapse page sections.
+    *wiki target                - Look up your current target.
+
+  Author: Claude Code(Creator and Feature Additions), Codex(Bug Fixes and Review), RuseofFools (Very Little)
+  Required: Lich >= 5.20.0
+  Tags: saga, frontend, mod, window, panel, wiki, gswiki, reference, lookup
+  Version: 1.2.0
+
+  Recently changed:
+    v1.2.0  (2026-11-13)
+      - Opens on a search prompt and command list; auto target lookup off by default.
+    v1.1.0  (2026-11-13)
+      - Multi-match searches list every page to pick from; categories list members.
+    v1.0.0  (2026-11-13)
+      - Initial release.
+=end
+
+require 'net/http'
+require 'json'
+require 'time'
+require 'uri'
+require 'digest'
+require 'cgi'
+require 'fileutils'
+
+no_kill_all
+
+# --- BEGIN TEXT ENGINE --- (pure Ruby, no Lich calls)
+module WikiPanelText
+  LINK_OPEN  = "\u0001".freeze
+  LINK_CLOSE = "\u0002".freeze
+  LINK_END   = "#{LINK_OPEN}e#{LINK_CLOSE}".freeze
+  SKIP_INFO_KEYS = /\A(picture|image|caption|navigation|bcs|level[mp]\d)\z/i.freeze
+  # Creature template field prefixes (PA1, ABA, IMM2...) -> readable labels.
+  CREATURE_KEYS = { 'PA' => 'Attack', 'BT' => 'Bolt', 'WD' => 'Warding', 'OS' => 'Spell', 'MN' => 'Maneuver',
+                    'AB' => 'Ability', 'DSP' => 'Defensive spell', 'SDA' => 'Special defense',
+                    'IMM' => 'Immunity' }.freeze
+
+  Page = Struct.new(:title, :timestamp, :info, :intro, :sections, :links)
+
+  def self.parse(title, timestamp, wikitext)
+    links = []
+    info = []
+    text = preclean(wikitext.to_s)
+    text = expand_templates(text, info)
+    text = convert_links(text, links)
+    text = convert_tables(text)
+    text = convert_markup(text)
+    info = info.map { |k, v| [k, convert_markup(convert_links(v, links)).gsub(/\s+/, ' ').strip] }
+               .reject { |_, v| v.empty? }.uniq
+    intro, sections = split_sections(text)
+    Page.new(title, timestamp, info, intro, sections, links)
+  end
+
+  def self.preclean(text)
+    text.gsub(/<!--.*?-->/m, '')
+        .gsub(%r{<ref[^>]*/>}i, '')
+        .gsub(%r{<ref[^>]*>.*?</ref>}mi, '')
+        .gsub(%r{<includeonly>.*?</includeonly>}mi, '')
+        .gsub(%r{</?(noinclude|onlyinclude)>}i, '')
+        .gsub(%r{<section[^>]*/?>}i, '')
+        .gsub(/__[A-Z]+__/, '')
+        .gsub(/<pre\{\{[^}]*\}\}>/i, '<pre>')
+        .gsub(%r{<br\s*/?>}i, "\n")
+  end
+
+  # Replaces every top-level {{template}}. Infobox-style templates (3+ filled
+  # named params) are moved into +info+ as [key, value] pairs; other templates
+  # become their first positional param, or nothing.
+  def self.expand_templates(text, info)
+    out = +''
+    i = 0
+    while (start = text.index('{{', i))
+      out << text[i...start]
+      finish = match_braces(text, start)
+      if finish.nil?
+        out << text[start..-1]
+        i = text.length
+        break
+      end
+      out << render_template(text[(start + 2)...(finish - 2)], info)
+      i = finish
+    end
+    out << text[i..-1] if i < text.length
+    out
+  end
+
+  def self.match_braces(text, start)
+    depth = 0
+    i = start
+    while i < text.length - 1
+      two = text[i, 2]
+      if two == '{{'
+        depth += 1
+        i += 2
+      elsif two == '}}'
+        depth -= 1
+        i += 2
+        return i if depth.zero?
+      else
+        i += 1
+      end
+    end
+    nil
+  end
+
+  def self.split_top(str, sep = '|')
+    parts = []
+    buf = +''
+    depth = 0
+    i = 0
+    while i < str.length
+      two = str[i, 2]
+      if two == '{{' || two == '[['
+        depth += 1
+        buf << two
+        i += 2
+      elsif (two == '}}' || two == ']]') && depth > 0
+        depth -= 1
+        buf << two
+        i += 2
+      elsif str[i] == sep && depth.zero?
+        parts << buf
+        buf = +''
+        i += 1
+      else
+        buf << str[i]
+        i += 1
+      end
+    end
+    parts << buf
+  end
+
+  def self.meaningful?(value)
+    v = value.to_s.strip
+    !v.empty? && v !~ /\A\?+\z/
+  end
+
+  def self.label_for(key)
+    if key =~ /\A(PA|BT|WD|OS|MN|AB|DSP|SDA|IMM)(\d+|[A-Z])\z/
+      CREATURE_KEYS[Regexp.last_match(1)]
+    elsif key.casecmp?('asg')
+      'ASG'
+    else
+      key.tr('_', ' ')
+    end
+  end
+
+  def self.render_template(inner, info)
+    parts = split_top(inner)
+    parts.shift # template name
+    named = []
+    positional = []
+    parts.each do |p|
+      if p =~ /\A\s*([^=\[\]{}|]+?)\s*=(.*)\z/m
+        named << [Regexp.last_match(1).strip, Regexp.last_match(2).strip]
+      else
+        positional << p.strip
+      end
+    end
+
+    if info && named.count { |_, v| meaningful?(v) } >= 2
+      named.each do |key, value|
+        next if key =~ SKIP_INFO_KEYS
+        value = expand_templates(value, nil).gsub(/\s*\n\s*/, ' ').strip
+        info << [label_for(key), value] if meaningful?(value)
+      end
+      return ''
+    end
+    return '' if positional.empty? || !meaningful?(positional.first)
+
+    expand_templates(positional.first, nil)
+  end
+
+  def self.convert_links(text, links)
+    text = text.gsub(/\[\[\s*(?:File|Image|Category|Media)\s*:(?:[^\[\]]|\[\[[^\]]*\]\])*\]\]/i, '')
+    text = text.gsub(/\[\[([^\[\]|]+)(?:\|([^\[\]]*))?\]\]([a-z]*)/) do
+      target = Regexp.last_match(1).strip
+      label = Regexp.last_match(2).to_s.strip
+      label = target if label.empty?
+      label += Regexp.last_match(3)
+      target = target.sub(/#.*/, '').strip
+      if target.empty?
+        label
+      else
+        links << target
+        "#{LINK_OPEN}#{links.size - 1}#{LINK_CLOSE}#{label}#{LINK_END}"
+      end
+    end
+    text.gsub(%r{\[(?:https?:)?//\S+\s+([^\]]+)\]}, '\1').gsub(%r{\[(?:https?:)?//\S+\]}, '')
+  end
+
+  def self.strip_cell_attr(cell)
+    c = cell.strip
+    c = Regexp.last_match(1) if c =~ /\A[^|]*=[^|]*\|(.*)\z/
+    c.strip
+  end
+
+  def self.table_lines(rows, caption)
+    lines = []
+    lines << caption if caption
+    rows = rows.reject(&:empty?)
+    return lines if rows.empty?
+
+    # Wide 2-3 row tables (rank breakpoint tables) read better turned sideways.
+    if rows.size.between?(2, 3) && rows.first.size > 6
+      lines << rows.map(&:first).join(' / ')
+      (1...rows.map(&:size).max).each do |j|
+        lines << '  ' + rows.map { |r| r[j].to_s.empty? ? '-' : r[j] }.join(' -> ')
+      end
+    else
+      rows.each { |r| lines << '  ' + r.map { |c| c.empty? ? '-' : c }.join(' | ') }
+    end
+    lines
+  end
+
+  def self.convert_tables(text)
+    out = []
+    depth = 0
+    rows = []
+    row = []
+    caption = nil
+    text.split("\n", -1).each do |line|
+      l = line.sub(/\A:+/, '').strip
+      if l.start_with?('{|')
+        depth += 1
+        rows = []
+        row = []
+        caption = nil
+        next
+      end
+      if depth.zero?
+        out << line
+        next
+      end
+
+      if l.start_with?('|}')
+        rows << row unless row.empty?
+        depth -= 1
+        out.concat(table_lines(rows, caption))
+        out << ''
+        rows = []
+        row = []
+      elsif l.start_with?('|+')
+        caption = strip_cell_attr(l[2..-1])
+      elsif l.start_with?('|-')
+        rows << row unless row.empty?
+        row = []
+      elsif l.start_with?('!', '|')
+        l[1..-1].split(/\|\||!!/).each { |c| row << strip_cell_attr(c) }
+      elsif !l.empty? && !row.empty?
+        row[-1] = "#{row[-1]} #{l}".strip
+      end
+    end
+    out.concat(table_lines(rows << row, caption)) if depth > 0 # unterminated table
+    out.join("\n")
+  end
+
+  def self.convert_markup(text)
+    text = text.gsub(/'{2,5}/, '')
+               .gsub(%r{</?[a-zA-Z][^>]*>}, '')
+    text = CGI.unescapeHTML(text.gsub('&nbsp;', ' '))
+    lines = text.split("\n").map do |line|
+      case line
+      when /\A(\*+)\s*(.*)\z/ then ('  ' * (Regexp.last_match(1).size - 1)) + "- #{Regexp.last_match(2)}"
+      when /\A(#+)\s*(.*)\z/  then ('  ' * (Regexp.last_match(1).size - 1)) + "- #{Regexp.last_match(2)}"
+      when /\A;\s*(.*)\z/     then "#{Regexp.last_match(1)}:"
+      when /\A:+\s*(.*)\z/    then "  #{Regexp.last_match(1)}"
+      else line.rstrip
+      end
+    end
+    lines.join("\n").gsub(/\n{3,}/, "\n\n").strip
+  end
+
+  # The game connection shows UTF-8 as Windows-1252 mojibake (a curly quote
+  # turns into three junk characters), so panel text is folded to plain ASCII
+  # like game text. Everything below is written as codepoints so this file
+  # stays pure ASCII -- repository.lic rejects non-ASCII source (same fix as
+  # the emoji panels).
+  ASCII_MAP = {
+    0x2018 => "'", 0x2019 => "'", 0x201A => "'", 0x201B => "'", 0x2032 => "'",
+    0x201C => '"', 0x201D => '"', 0x201E => '"', 0x2033 => '"', 0x00AB => '"', 0x00BB => '"',
+    0x2010 => '-', 0x2011 => '-', 0x2012 => '-', 0x2013 => '-', 0x2212 => '-',
+    0x2014 => '--', 0x2015 => '--', 0x2026 => '...', 0x00A0 => ' ', 0x2009 => ' ',
+    0x2022 => '*', 0x00B7 => '*', 0x2192 => '->', 0x2190 => '<-', 0x21D2 => '=>',
+    0x00D7 => 'x', 0x2264 => '<=', 0x2265 => '>=', 0x00B1 => '+/-', 0x2248 => '~',
+    0x00BD => '1/2', 0x00BC => '1/4', 0x00BE => '3/4', 0x00B0 => ' deg',
+    0x2122 => '(TM)', 0x00A9 => '(c)', 0x00AE => '(R)', 0x200B => '', 0xFEFF => ''
+  }.freeze
+
+  # The characters Windows-1252 shows for bytes 0x80-0x9F, which is what UTF-8
+  # continuation bytes turn into when mis-decoded.
+  CP1252_HIGH = [0x0152, 0x0153, 0x0160, 0x0161, 0x0178, 0x017D, 0x017E, 0x0192, 0x02C6, 0x02DC,
+                 0x2013, 0x2014, 0x2018, 0x2019, 0x201A, 0x201C, 0x201D, 0x201E, 0x2020, 0x2021,
+                 0x2022, 0x2026, 0x2030, 0x2039, 0x203A, 0x20AC, 0x2122].freeze
+
+  # A mis-decoded UTF-8 lead byte (U+00C2-U+00F4) followed by 1-3 mis-decoded
+  # continuation bytes.
+  MOJIBAKE = Regexp.new(
+    '[\u00C2-\u00F4][\u0080-\u00BF' + CP1252_HIGH.map { |cp| format('\u%04X', cp) }.join + ']{1,3}'
+  ).freeze
+
+  # How the first two bytes of a curly quote (E2 80) look once mis-decoded.
+  MOJIBAKE_QUOTE_START = [0x00E2, 0x20AC].pack('U*').freeze
+
+  # Undoes one round of mis-decoding, turning the junk back into the real character.
+  def self.unmojibake(run)
+    bytes = run.each_char.map do |c|
+      next c.ord if c.ord < 0x100
+
+      (c.encode('Windows-1252').ord rescue nil)
+    end
+    fixed = bytes.include?(nil) ? nil : bytes.pack('C*').force_encoding('UTF-8')
+    return fixed if fixed && fixed.valid_encoding?
+
+    # A curly quote whose last byte was lost: almost always a closing quote.
+    run.start_with?(MOJIBAKE_QUOTE_START) ? '"' : run
+  end
+
+  def self.to_ascii(text)
+    s = text.to_s.dup.force_encoding('UTF-8').scrub('?')
+    s = s.gsub(MOJIBAKE) { |run| unmojibake(run) }
+    s.gsub(/[^\x00-\x7F]/) do |c|
+      ASCII_MAP[c.ord] || begin
+        plain = c.unicode_normalize(:nfkd).gsub(/[^\x00-\x7F]/, '') # accented letter -> plain letter
+        plain.empty? ? '?' : plain
+      end
+    end
+  end
+
+  def self.strip_link_markers(text)
+    text.gsub(/#{LINK_OPEN}[^#{LINK_CLOSE}]*#{LINK_CLOSE}/o, '')
+  end
+
+  def self.split_sections(text)
+    intro = []
+    sections = []
+    current = nil
+    text.split("\n").each do |line|
+      if line =~ /\A(={2,6})\s*(.+?)\s*\1\s*\z/
+        current = { title: strip_link_markers(Regexp.last_match(2)), level: Regexp.last_match(1).size, body: [] }
+        sections << current
+      elsif current
+        current[:body] << line
+      else
+        intro << line
+      end
+    end
+    sections.each { |s| s[:body] = s[:body].join("\n").gsub(/\n{3,}/, "\n\n").strip }
+    [intro.join("\n").strip, sections]
+  end
+end
+# --- END TEXT ENGINE ---
+
+module WikiPanel
+  WINDOW_ID   = 'wiki_sagapanel'.freeze
+  API         = URI('https://gswiki.play.net/api.php')
+  SITE        = 'https://gswiki.play.net/'.freeze
+  USER_AGENT  = 'Lich5-wiki-panel/1.0'.freeze
+  CACHE_TTL   = 24 * 60 * 60
+  MANUAL_HOLD = 120 # seconds a manual lookup is protected from auto target lookups
+  INTRO_LINES = 40
+  SECTION_LINES = 150
+  MIN_REQUEST_GAP = 1.0
+
+  @queue = Queue.new
+  @history = []
+  @page = nil
+  @view = nil      # { type: :page, title: } or { type: :results, term:, offset:, mode: }
+  @results = nil
+  @members = []
+  @expanded = []
+  @manual_at = Time.at(0)
+  @last_request_at = Time.at(0)
+  @last_target_id = nil
+  @last_auto_name = nil
+
+  class << self
+    attr_reader :queue
+  end
+
+  # ---------- settings / cache ----------
+
+  def self.auto?
+    CharSettings['auto'] == true
+  end
+
+  def self.auto=(value)
+    CharSettings['auto'] = value
+  end
+
+  def self.cache_dir
+    dir = File.join($data_dir, 'wiki_cache')
+    FileUtils.mkdir_p(dir)
+    dir
+  end
+
+  def self.cache_path(key)
+    File.join(cache_dir, "#{Digest::MD5.hexdigest(key.downcase)}.json")
+  end
+
+  def self.cache_read(key)
+    path = cache_path(key)
+    return nil unless File.exist?(path)
+    return nil if Time.now - File.mtime(path) > CACHE_TTL
+
+    JSON.parse(File.read(path, encoding: 'UTF-8'))
+  rescue StandardError
+    nil
+  end
+
+  def self.cache_write(key, data)
+    File.write(cache_path(key), JSON.generate(data), encoding: 'UTF-8')
+  rescue StandardError => e
+    respond "Wiki: could not write cache (#{e.message})"
+  end
+
+  def self.clear_cache!
+    count = Dir.glob(File.join(cache_dir, '*.json')).each { |f| File.delete(f) }.size
+    respond "Wiki: cleared #{count} cached page(s)."
+  end
+
+  # ---------- HTTP ----------
+
+  def self.api_get(params)
+    gap = MIN_REQUEST_GAP - (Time.now - @last_request_at)
+    sleep gap if gap > 0
+    @last_request_at = Time.now
+
+    uri = API.dup
+    uri.query = URI.encode_www_form(params.merge(format: 'json', formatversion: 2))
+    response = Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 8, read_timeout: 15) do |http|
+      request = Net::HTTP::Get.new(uri)
+      request['User-Agent'] = USER_AGENT
+      http.request(request)
+    end
+    raise "HTTP #{response.code}" unless response.is_a?(Net::HTTPSuccess)
+
+    JSON.parse(response.body.to_s.dup.force_encoding('UTF-8'))
+  end
+
+  # Returns {'title' =>, 'timestamp' =>, 'content' =>} or nil if the page doesn't exist.
+  def self.fetch_page(title, force: false)
+    key = "page:#{title}"
+    cached = force ? nil : cache_read(key)
+    return cached if cached
+
+    data = api_get(action: 'query', prop: 'revisions', titles: title, redirects: 1,
+                   rvprop: 'timestamp|content', rvslots: 'main')
+    page = data.dig('query', 'pages', 0)
+    return nil if page.nil? || page['missing'] || page['invalid']
+
+    rev = page.dig('revisions', 0) || {}
+    result = { 'title' => page['title'], 'timestamp' => rev['timestamp'],
+               'content' => rev.dig('slots', 'main', 'content').to_s }
+    cache_write(key, result)
+    cache_write("page:#{page['title']}", result) unless page['title'].casecmp?(title)
+    result
+  end
+
+  RESULTS_PER_PAGE = 50
+  NOISE_TITLE = %r{/(saved posts|previous version)\z|\(saved posts\)\z}i.freeze
+
+  # Ranked title search with redirects resolved and de-duplicated. Falls back
+  # to a full-text search when no title matches. Returns
+  # {'titles' => [...], 'next' => next offset or nil, 'mode' => 'title'|'text'}.
+  def self.search(term, offset = 0, mode = nil)
+    key = "search:#{mode}:#{offset}:#{term}"
+    cached = cache_read(key)
+    return cached if cached
+
+    run = lambda do |m|
+      params = { action: 'query', generator: 'search', gsrsearch: term, gsrnamespace: 0,
+                 gsrlimit: RESULTS_PER_PAGE, gsroffset: offset, redirects: 1 }
+      params[:gsrwhat] = 'title' if m == 'title'
+      data = api_get(params)
+      titles = Array(data.dig('query', 'pages')).sort_by { |p| p['index'] || 9999 }
+                                                .map { |p| p['title'] }.uniq.reject { |t| t =~ NOISE_TITLE }
+      # A title typed exactly may be a redirect (Lore -> Category:Lores); keep the target as the exact match.
+      redirect = Array(data.dig('query', 'redirects')).find { |r| exact_match?(r['from'].to_s, term) }
+      { 'titles' => titles, 'next' => data.dig('continue', 'gsroffset'), 'mode' => m,
+        'exact' => redirect && redirect['to'] }
+    end
+    result = run.call(mode || 'title')
+    result = run.call('text') if mode.nil? && result['titles'].empty? && result['next'].nil?
+    cache_write(key, result)
+    result
+  end
+
+  def self.category_members(title)
+    key = "cat:#{title}"
+    cached = cache_read(key)
+    return cached if cached
+
+    data = api_get(action: 'query', list: 'categorymembers', cmtitle: title, cmlimit: 200, cmnamespace: '0|14')
+    members = Array(data.dig('query', 'categorymembers')).map { |m| m['title'] }.reject { |t| t =~ NOISE_TITLE }
+    cache_write(key, members)
+    members
+  rescue StandardError
+    []
+  end
+
+  # ---------- lookups ----------
+
+  def self.spell_titles(term)
+    return [] unless term =~ /\A\d{3,4}\z/
+
+    spell = (Spell[term.to_i] rescue nil)
+    spell && spell.name ? ["#{spell.name} (#{term})", spell.name] : []
+  end
+
+  # Manual lookup. A spell number goes straight to its page; anything else is
+  # searched, and when more than one page matches, the choices are listed.
+  def self.lookup(term)
+    term = term.to_s.strip
+    return false if term.empty?
+
+    status("Searching the wiki for #{term}...")
+    spell_titles(term).each do |title|
+      page = fetch_page(title)
+      return show(page) if page
+    end
+
+    result = search(term)
+    titles = result['titles']
+    if titles.empty?
+      page = fetch_page(term) # the search index can lag behind brand-new pages
+      return show(page) if page
+
+      status("No wiki page found for \"#{term}\".")
+      return false
+    end
+    if titles.size == 1 && result['next'].nil?
+      page = fetch_page(titles.first)
+      return show(page) if page
+    end
+    show_results(term, result, 0)
+    false
+  rescue StandardError => e
+    status("Wiki lookup failed: #{e.message}")
+    false
+  end
+
+  # Auto target lookup: exact page title only, never lists choices or errors.
+  def self.lookup_exact(title)
+    page = fetch_page(title)
+    page ? show(page) : false
+  rescue StandardError
+    false
+  end
+
+  # Opens an exact title -- used by clicked links and search result choices.
+  def self.go(title)
+    status("Loading #{title}...")
+    page = fetch_page(title)
+    page ? show(page) : status("No wiki page named \"#{title}\".")
+  rescue StandardError => e
+    status("Wiki lookup failed: #{e.message}")
+  end
+
+  def self.remember_view
+    return unless @view
+
+    @history << @view
+    @history.shift while @history.size > 20
+  end
+
+  def self.show(raw, push_history: true)
+    same = @view && @view[:type] == :page && @view[:title].casecmp?(raw['title'])
+    remember_view if push_history && !same
+    @page = WikiPanelText.parse(raw['title'], raw['timestamp'], raw['content'])
+    @members = raw['title'].start_with?('Category:') ? category_members(raw['title']) : []
+    @expanded = []
+    @view = { type: :page, title: @page.title }
+    render
+    true
+  end
+
+  def self.show_results(term, result, offset, push_history: true)
+    remember_view if push_history
+    @results = result
+    @view = { type: :results, term: term, offset: offset, mode: result['mode'] }
+    render_results
+  end
+
+  def self.more!
+    return respond('Wiki: no more results.') unless @view && @view[:type] == :results && @results['next']
+
+    offset = @results['next']
+    show_results(@view[:term], search(@view[:term], offset, @view[:mode]), offset)
+  rescue StandardError => e
+    status("Wiki search failed: #{e.message}")
+  end
+
+  def self.refresh!
+    return status('Nothing to refresh.') unless @view && @view[:type] == :page
+
+    raw = fetch_page(@view[:title], force: true)
+    raw ? show(raw, push_history: false) : status("#{@view[:title]} no longer exists.")
+  rescue StandardError => e
+    status("Wiki refresh failed: #{e.message}")
+  end
+
+  def self.back!
+    view = @history.pop
+    return respond('Wiki: nothing to go back to.') unless view
+
+    if view[:type] == :home
+      @view = view
+      render_home
+    elsif view[:type] == :results
+      show_results(view[:term], search(view[:term], view[:offset], view[:mode]), view[:offset], push_history: false)
+    else
+      raw = fetch_page(view[:title])
+      raw ? show(raw, push_history: false) : status("#{view[:title]} could not be loaded.")
+    end
+  rescue StandardError => e
+    status("Wiki: could not go back (#{e.message})")
+  end
+
+  def self.toggle_section(arg)
+    return unless @page && @view && @view[:type] == :page
+
+    case arg
+    when 'all'  then @expanded = (0...@page.sections.size).to_a
+    when 'none' then @expanded = []
+    else
+      idx = arg.to_i
+      return unless idx.between?(0, @page.sections.size - 1)
+
+      @expanded.include?(idx) ? @expanded.delete(idx) : @expanded << idx
+    end
+    render
+  end
+
+  def self.page_url(title)
+    SITE + title.tr(' ', '_').gsub(%r{[^A-Za-z0-9_\-.,()':/]}) { |c| c.bytes.map { |b| format('%%%02X', b) }.join }
+  end
+
+  def self.open_in_browser!
+    return respond('Wiki: no page loaded.') unless @page
+
+    url = page_url(@page.title)
+    Thread.new do
+      if RUBY_PLATFORM =~ /mingw|mswin|cygwin/
+        system('cmd', '/c', 'start', '', url)
+      elsif RUBY_PLATFORM =~ /darwin/
+        system('open', url)
+      else
+        system('xdg-open', url)
+      end
+    end
+    respond "Wiki: opening #{url}"
+  end
+
+  def self.target_name
+    target = GameObj.target
+    target && GameObj.npcs.any? { |n| n.id == target.id } ? target.name : nil
+  end
+
+  # Called from the main loop about once a second.
+  def self.check_target!
+    id = XMLData.current_target_id
+    return if id == @last_target_id
+
+    @last_target_id = id
+    return unless auto?
+    return if Time.now - @manual_at < MANUAL_HOLD
+
+    name = target_name
+    return if name.nil? || name == @last_auto_name
+
+    @last_auto_name = name
+    lookup_exact(name)
+  end
+
+  def self.manual!
+    @manual_at = Time.now
+  end
+
+  # ---------- rendering ----------
+
+  def self.xml(text)
+    text.to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;').gsub("'", '&apos;').gsub('"', '&quot;')
+  end
+
+  def self.dlink(cmd, label)
+    "<d cmd='#{xml(cmd)}'>#{xml(label)}</d>"
+  end
+
+  # Escapes wiki text, then turns link markers into clickable *wiki go links.
+  def self.rich(text)
+    links = @page ? @page.links : []
+    xml(text)
+      .gsub(/#{WikiPanelText::LINK_OPEN}(\d+)#{WikiPanelText::LINK_CLOSE}/o) { "<d cmd='#{xml("*wiki go #{links[Regexp.last_match(1).to_i]}")}'>" }
+      .gsub(WikiPanelText::LINK_END, '</d>')
+  end
+
+  def self.capped(text, max)
+    lines = text.split("\n")
+    return lines if lines.size <= max
+
+    lines.first(max) + ["... (#{lines.size - max} more lines -- *wiki open for the full page)"]
+  end
+
+  def self.write(lines)
+    _respond("<clearStream id='#{WINDOW_ID}'/>")
+    _respond("<pushStream id='#{WINDOW_ID}'/>#{WikiPanelText.to_ascii(lines.join("\n"))}\n<popStream/>\r\n")
+  end
+
+  def self.status(message)
+    write([xml(message)])
+  end
+
+  def self.exact_match?(title, term)
+    title.casecmp?(term) || title.sub(/\s*\(\d+\)\z/, '').casecmp?(term)
+  end
+
+  def self.render_results
+    term = @view[:term]
+    offset = @view[:offset]
+    titles = @results['titles']
+    exact = nil
+    if offset.zero?
+      exact = titles.find { |t| exact_match?(t, term) }
+      exact ||= @results['exact'] if titles.include?(@results['exact'])
+    end
+    others = titles - [exact]
+    kind = @results['mode'] == 'text' ? 'mention' : 'match'
+
+    lines = ["<pushBold/>Wiki pages that #{kind} \"#{xml(term)}\"<popBold/>"]
+    nav = ["page #{offset / RESULTS_PER_PAGE + 1}"]
+    nav << dlink('*wiki more', '[more results]') if @results['next']
+    nav << dlink('*wiki home', '[home]')
+    nav << dlink('*wiki back', '[back]') unless @history.empty?
+    lines << nav.join('  ')
+    lines << 'Click a page to open it.'
+    lines << ''
+    if exact
+      lines << "Exact match: #{dlink("*wiki go #{exact}", exact)}"
+      lines << ''
+    end
+    width = others.size.to_s.size
+    others.each_with_index do |t, i|
+      lines << "#{(i + 1).to_s.rjust(width)}. #{dlink("*wiki go #{t}", t)}"
+    end
+    if @results['next']
+      lines << ''
+      lines << dlink('*wiki more', '[more results]')
+    end
+    write(lines)
+  end
+
+  def self.render
+    page = @page
+    lines = []
+    lines << "<pushBold/>#{xml(page.title)}<popBold/>"
+    nav = []
+    if page.timestamp
+      edited = Time.parse(page.timestamp) rescue nil
+      if edited
+        age = edited < Time.now - 365 * 86_400 ? ' (over a year old)' : ''
+        nav << "edited #{edited.strftime('%Y-%m-%d')}#{age}"
+      end
+    end
+    nav << dlink('*wiki home', '[home]')
+    nav << dlink('*wiki open', '[browser]')
+    nav << dlink('*wiki back', '[back]') unless @history.empty?
+    nav << dlink('*wiki refresh', '[refresh]')
+    lines << nav.join('  ')
+    lines << ''
+
+    unless page.info.empty?
+      page.info.each { |k, v| lines << "#{xml(k)}: #{rich(v)}" }
+      lines << ''
+    end
+
+    unless page.intro.empty?
+      capped(page.intro, INTRO_LINES).each { |l| lines << rich(l) }
+      lines << ''
+    end
+
+    unless @members.empty?
+      lines << "Pages in this category (#{@members.size}):"
+      @members.each do |m|
+        label = m.start_with?('Category:') ? "[category] #{m.sub('Category:', '')}" : m
+        lines << "  #{dlink("*wiki go #{m}", label)}"
+      end
+      lines << ''
+    end
+
+    unless page.sections.empty?
+      lines << "#{dlink('*wiki section all', '[expand all]')}  #{dlink('*wiki section none', '[collapse all]')}"
+      page.sections.each_with_index do |section, idx|
+        open = @expanded.include?(idx)
+        indent = '  ' * [section[:level] - 2, 0].max
+        lines << indent + dlink("*wiki section #{idx}", "#{open ? '[-]' : '[+]'} #{section[:title]}")
+        next unless open
+
+        body = section[:body].empty? ? '(empty)' : section[:body]
+        capped(body, SECTION_LINES).each { |l| lines << "#{indent}  #{rich(l)}" }
+        lines << ''
+      end
+    end
+    write(lines)
+  end
+
+  # ---------- commands ----------
+
+  # [command shown, description, command run when clicked (nil = needs typed input)]
+  COMMANDS = [
+    ['*wiki <term>', 'search the wiki; lists every match if more than one', nil],
+    ['*wiki auto', 'toggle auto lookup when your target changes (off by default)', '*wiki auto'],
+    ['*wiki back', 'previous page or result list', '*wiki back'],
+    ['*wiki clearcache', 'delete cached pages', '*wiki clearcache'],
+    ['*wiki find <term>', 'search for a term that matches a command word', nil],
+    ['*wiki go <title>', 'open an exact page title', nil],
+    ['*wiki hand', 'look up the item in your right hand', '*wiki hand'],
+    ['*wiki help', 'show this screen (same as *wiki or *wiki home)', '*wiki help'],
+    ['*wiki more', 'next page of search results', '*wiki more'],
+    ['*wiki open', 'open the current page in your browser', '*wiki open'],
+    ['*wiki refresh', 're-fetch the current page', '*wiki refresh'],
+    ['*wiki section <n|all|none>', 'expand/collapse page sections', nil],
+    ['*wiki target', 'look up your current target', '*wiki target']
+  ].freeze
+
+  EXAMPLES = ['lore', '917', 'eyeless black valravn'].freeze
+
+  def self.show_home
+    remember_view if @view && @view[:type] != :home
+    @view = { type: :home }
+    render_home
+  end
+
+  def self.render_home
+    lines = ['<pushBold/>GemStone IV Wiki<popBold/>']
+    lines << dlink('*wiki back', '[back]') unless @history.empty?
+    lines << ''
+    lines << 'What would you like to look up?'
+    lines << 'Type  *wiki &lt;term&gt;  in the command bar.'
+    lines << 'Examples: ' + EXAMPLES.map { |e| dlink("*wiki #{e}", "*wiki #{e}") }.join('   ')
+    lines << ''
+    lines << "Auto target lookup: #{auto? ? 'ON' : 'OFF'}  " +
+             dlink('*wiki auto', auto? ? '[turn off]' : '[turn on]')
+    lines << ''
+    lines << '<pushBold/>Commands<popBold/>'
+    COMMANDS.each do |shown, desc, cmd|
+      label = cmd ? dlink(cmd, shown) : xml(shown)
+      lines << "  #{label} - #{xml(desc)}"
+    end
+    write(lines)
+  end
+
+  def self.lookup_target
+    name = target_name
+    return respond('Wiki: you have no creature targeted.') if name.nil?
+
+    lookup_exact(name) || lookup(name)
+  end
+
+  def self.handle(arg)
+    case arg
+    when '', /\A(help|home)\z/i then show_home
+    when /\Aauto\z/i
+      self.auto = !auto?
+      @last_target_id = nil
+      @last_auto_name = nil
+      respond "Wiki: auto target lookup #{auto? ? 'ON' : 'OFF'}."
+      render_home if @view && @view[:type] == :home
+    when /\Aback\z/i then back!
+    when /\Aclearcache\z/i then clear_cache!
+    when /\Afind\s+(.+)\z/i
+      manual!
+      lookup(Regexp.last_match(1))
+    when /\Ago\s+(.+)\z/i
+      manual!
+      go(Regexp.last_match(1).strip)
+    when /\Ahand\z/i
+      manual!
+      item = GameObj.right_hand
+      if item.nil? || item.name.to_s.empty? || item.name == 'Empty'
+        respond 'Wiki: your right hand is empty.'
+      else
+        lookup_exact(item.name) || lookup(item.noun)
+      end
+    when /\Amore\z/i then more!
+    when /\Aopen\z/i then open_in_browser!
+    when /\Arefresh\z/i then refresh!
+    when /\Asection\s+(\S+)\z/i then toggle_section(Regexp.last_match(1).downcase)
+    when /\Atarget\z/i
+      manual!
+      lookup_target
+    else
+      manual!
+      lookup(arg)
+    end
+  end
+end
+
+hook_id = "#{Script.current.name}_upstream"
+UpstreamHook.remove(hook_id) rescue nil
+UpstreamHook.add(hook_id, proc do |command|
+  if command.strip =~ /\A(?:<c>)?\*wiki(?:\s+(.*))?\z/i
+    WikiPanel.queue << Regexp.last_match(1).to_s.strip
+    nil
+  else
+    command
+  end
+end)
+
+_respond("<streamWindow id='#{WikiPanel::WINDOW_ID}' title='Wiki' ifClosed='' resident='true'/>")
+sleep 0.05
+_respond("<exposeStream id='#{WikiPanel::WINDOW_ID}'/>")
+WikiPanel.show_home
+
+before_dying do
+  UpstreamHook.remove(hook_id) rescue nil
+  _respond("<closeStream id='#{WikiPanel::WINDOW_ID}'/>")
+end
+
+echo "Wiki panel is active (auto target lookup #{WikiPanel.auto? ? 'ON' : 'OFF'})."
+
+loop do
+  begin
+    arg = WikiPanel.queue.pop(true) rescue nil
+    if arg
+      WikiPanel.handle(arg)
+    else
+      WikiPanel.check_target!
+      sleep 0.5
+    end
+  rescue StandardError => e
+    respond "Wiki panel error: #{e.message}"
+    sleep 1
+  end
+end
