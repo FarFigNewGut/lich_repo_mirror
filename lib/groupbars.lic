@@ -1,0 +1,175 @@
+=begin
+  Shows every character you're playing in one "Group" window: health, mana and mind bars, spirit, and dead / stunned / webbed / bleeding.
+  For people running several characters at once on one computer (for example a bigshot head and tails). Nothing is sent over the network.
+
+        author: Grhim
+          game: Gemstone
+          tags: group, window, health, mana, multibox, saga, wrayth, bigshot
+      required: Lich >= 5.0, all characters on the same computer, Wrayth or Saga
+       version: 2.0.1
+
+  Usage:
+    ;groupbars          on the character that should show the window (also shares that character's status)
+    ;groupbars report   on each of your other characters (shares their status, no window)
+    ;kill groupbars     close the window / stop sharing
+    ;groupbars help     show these commands
+
+  Notes:
+    - Shows you first, then your group members, then any other character of yours that is sharing its status.
+    - A character shows "(no data)" when its status is more than 10 seconds old.
+    - Tip: add ";groupbars report" to autostart on your other characters.
+    - In Saga you can drag the window's tab into another panel, such as combat.
+
+  Changelog:
+    2.0.1 (2026-11-17)  keeps working when Windows won't let a status file be replaced
+    2.0.0 (2026-11-17)  first public release
+=end
+
+require 'json'
+require 'tmpdir'
+require 'fileutils'
+
+module GroupBars
+  DIR    = File.join(Dir.tmpdir, 'lich_groupcare') # shared with groupcare.lic, if you use it
+  STATUS = File.join(DIR, 'status')
+  FRESH  = 10  # seconds before a character shows as "(no data)"
+  ROW_H  = 34
+  WIDTH  = 250
+
+  module_function
+
+  def my_status
+    {
+      'hp'         => Char.percent_health.to_i,
+      'mp'         => Char.percent_mana.to_i,
+      'spirit'     => Char.spirit.to_i,
+      'max_spirit' => Char.max_spirit.to_i,
+      'mind'       => Lich::Gemstone::Experience.percent_fxp.to_f.round,
+      'bleeding'   => bleeding? ? true : false,
+      'stunned'    => stunned? ? true : false,
+      'webbed'     => webbed? ? true : false,
+      'dead'       => dead? ? true : false,
+      'time'       => Time.now.to_f
+    }
+  end
+
+  def write_status
+    # groupcare.lic writes a fuller status to the same file; don't overwrite it
+    return if Script.running?('groupcare')
+    path = File.join(STATUS, "#{Char.name}.json")
+    tmp  = "#{path}.#{Process.pid}.tmp"
+    data = JSON.generate(my_status.merge('name' => Char.name))
+    File.write(tmp, data)
+    begin
+      File.rename(tmp, path)
+    rescue SystemCallError # Windows can refuse to replace a file another program has open
+      File.delete(tmp) rescue nil
+      begin
+        File.write(path, data)
+      rescue SystemCallError
+        File.write(File.join(STATUS, "#{Char.name}.2.json"), data)
+      end
+    end
+  rescue StandardError
+    nil
+  end
+
+  def read_all
+    Dir[File.join(STATUS, '*.json')].each_with_object({}) do |f, h|
+      s = (JSON.parse(File.read(f)) rescue nil)
+      next unless s
+      n = s['name'] || File.basename(f, '.json').sub(/\.\d+\z/, '')
+      h[n] = s if h[n].nil? || s['time'].to_f > h[n]['time'].to_f # newest copy wins
+    end
+  end
+
+  def fresh?(s)
+    s && Time.now.to_f - s['time'].to_f < FRESH
+  end
+
+  def names(all)
+    group  = (Lich::Gemstone::Group.members.map(&:noun) rescue [])
+    others = all.select { |_n, s| fresh?(s) }.keys.sort
+    ([Char.name] + group.sort + others).uniq
+  end
+
+  def esc(t)
+    t.to_s.gsub('&', '&amp;').gsub("'", '&apos;').gsub('<', '&lt;').gsub('>', '&gt;')
+  end
+
+  def bar(id, value, text, top, left)
+    "<progressBar id='#{id}' value='#{value.to_i.clamp(0, 100)}' text='#{esc(text)}' " \
+      "top='#{top}' left='#{left}' width='80' height='14' align='n'/>"
+  end
+
+  def open_window(rows)
+    _respond("<closeDialog id='GroupBars'/><openDialog type='dynamic' id='GroupBars' title='Group' " \
+             "target='GroupBars' scroll='manual' location='main' justify='3' height='#{rows * ROW_H + 6}' " \
+             "resident='true'><dialogData id='GroupBars'></dialogData></openDialog>")
+  end
+
+  def render(all, list)
+    out = +"<dialogData id='GroupBars' clear='t'>"
+    list.each_with_index do |name, i|
+      s   = all[name]
+      top = i * ROW_H + 2
+      ok  = fresh?(s)
+      state = if !ok then ' (no data)'
+              elsif s['dead'] then ' DEAD'
+              elsif s['stunned'] then ' stunned'
+              elsif s['webbed'] then ' webbed'
+              elsif s['bleeding'] then ' bleeding'
+              else ''
+              end
+      sp = ok && s['max_spirit'].to_i.positive? ? "  sp #{s['spirit']}/#{s['max_spirit']}" : ''
+      out << "<label id='n#{i}' value='#{esc(name + state + sp)}' top='#{top}' left='2' width='#{WIDTH}' align='n'/>"
+      next unless ok
+
+      out << bar("h#{i}", s['hp'],   "HP #{s['hp']}%",     top + 16, 2)
+      out << bar("m#{i}", s['mp'],   "Mana #{s['mp']}%",   top + 16, 85)
+      out << bar("x#{i}", s['mind'], "Mind #{s['mind']}%", top + 16, 168)
+    end
+    out << '</dialogData>'
+  end
+end
+
+mode = Script.current.vars[1].to_s.downcase
+if mode == 'help'
+  respond ';groupbars          show the Group window (and share this character)'
+  respond ';groupbars report   share this character only (run on your other characters)'
+  exit
+end
+
+FileUtils.mkdir_p(GroupBars::STATUS)
+
+# share this character's status 4x a second
+Thread.new do
+  loop do
+    GroupBars.write_status
+    sleep 0.25
+  end
+end
+
+if mode == 'report'
+  echo 'groupbars: sharing this character\'s status for the Group window.'
+  loop { sleep 60 }
+end
+
+before_dying { _respond("<closeDialog id='GroupBars'/>") }
+rows = 0
+last = nil
+loop do
+  all  = GroupBars.read_all
+  list = GroupBars.names(all)
+  if list.size != rows
+    rows = list.size
+    GroupBars.open_window(rows)
+    last = nil
+  end
+  out = GroupBars.render(all, list)
+  if out != last
+    _respond(out)
+    last = out
+  end
+  sleep 1
+end
