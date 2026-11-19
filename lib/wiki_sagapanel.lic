@@ -5,34 +5,33 @@
   frontend. Opens on a search prompt and command list; searches with several
   matches list every page to pick from, spell numbers jump straight to the
   spell, and pages show their infobox stats, intro, last-edit date, and
-  clickable links and expandable sections. Text is folded to plain ASCII.
+  clickable links and expandable sections. The home screen also lists the
+  wiki main page's Latest Announcements. Text is folded to plain ASCII.
 
-  Optional auto target lookup (off by default) loads the page for whatever
-  creature you target, unless you looked something up in the last 2 minutes.
-  Pages are cached in data/wiki_cache for 24 hours.
+  Pages are cached in data/wiki_cache for 24 hours, announcements for 1 hour.
 
   Commands:
     *wiki                       - Show the home screen (search prompt and commands).
     *wiki <term>                - Search; lists all matches. Spell numbers open the spell.
-    *wiki auto                  - Toggle auto lookup on target change (off by default).
     *wiki back                  - Return to the previous page or result list.
-    *wiki clearcache            - Delete all cached wiki pages.
-    *wiki find <term>           - Search for a term that matches a command word.
-    *wiki go <title>            - Open an exact page title.
-    *wiki hand                  - Look up the item in your right hand.
+    *wiki browser               - Open the current page in your web browser.
+    *wiki collapse              - Collapse all sections on the current page.
+    *wiki expand                - Expand all sections on the current page.
     *wiki help / *wiki home     - Show the home screen.
-    *wiki more                  - Show the next page of search results.
-    *wiki open                  - Open the current page in your web browser.
-    *wiki refresh               - Re-fetch the current page, ignoring the cache.
-    *wiki section <n|all|none>  - Expand/collapse page sections.
+    *wiki next                  - Show the next page of search results.
+    *wiki refresh               - Re-fetch the current page or announcements, ignoring the cache.
     *wiki target                - Look up your current target.
 
   Author: Claude Code(Creator and Feature Additions), Codex(Bug Fixes and Review), RuseofFools (Very Little)
   Required: Lich >= 5.20.0
   Tags: saga, frontend, mod, window, panel, wiki, gswiki, reference, lookup
-  Version: 1.2.0
+  Version: 2.0.0
 
   Recently changed:
+    v2.0.0  (2026-11-18)
+      - Panel renamed Gemstone IV Wiki; command list simplified and renamed.
+    v1.3.0  (2026-11-18)
+      - Home screen lists the wiki's Latest Announcements under the commands.
     v1.2.0  (2026-11-13)
       - Opens on a search prompt and command list; auto target lookup off by default.
     v1.1.0  (2026-11-13)
@@ -358,6 +357,23 @@ module WikiPanelText
     text.gsub(/#{LINK_OPEN}[^#{LINK_CLOSE}]*#{LINK_CLOSE}/o, '')
   end
 
+  # Rows under the rendered main page's Latest Announcements heading, each
+  # shaped like <p>summary | <a title="Page">subject</a></p>.
+  def self.parse_announcements(html)
+    block = html.to_s[/id="Latest_Announcements".*?(?=<h2\b|\z)/m].to_s
+    block.scan(%r{<p>(.*?)</p>}m).map do |(para)|
+      row = para.match(%r{\A(.*)\|\s*<a\b[^>]*?\btitle="([^"]+)"[^>]*>(.*?)</a>\s*\z}m)
+      next unless row
+
+      { 'summary' => html_text(row[1]), 'subject' => html_text(row[3]),
+        'title' => CGI.unescapeHTML(row[2]).sub(/ \(page does not exist\)\z/, '') }
+    end.compact
+  end
+
+  def self.html_text(fragment)
+    CGI.unescapeHTML(fragment.gsub(/<[^>]+>/, '')).gsub(/\s+/, ' ').strip
+  end
+
   def self.split_sections(text)
     intro = []
     sections = []
@@ -384,10 +400,12 @@ module WikiPanel
   SITE        = 'https://gswiki.play.net/'.freeze
   USER_AGENT  = 'Lich5-wiki-panel/1.0'.freeze
   CACHE_TTL   = 24 * 60 * 60
-  MANUAL_HOLD = 120 # seconds a manual lookup is protected from auto target lookups
   INTRO_LINES = 40
   SECTION_LINES = 150
   MIN_REQUEST_GAP = 1.0
+  ANNOUNCE_KEY = 'announcements:main-page'.freeze
+  ANNOUNCE_TTL = 60 * 60
+  ANNOUNCE_RETRY = 5 * 60 # seconds to wait after a failed announcements fetch
 
   @queue = Queue.new
   @history = []
@@ -396,24 +414,16 @@ module WikiPanel
   @results = nil
   @members = []
   @expanded = []
-  @manual_at = Time.at(0)
   @last_request_at = Time.at(0)
-  @last_target_id = nil
-  @last_auto_name = nil
+  @announcements = nil
+  @announce_failed = false
+  @announce_checked_at = Time.at(0)
 
   class << self
     attr_reader :queue
   end
 
   # ---------- settings / cache ----------
-
-  def self.auto?
-    CharSettings['auto'] == true
-  end
-
-  def self.auto=(value)
-    CharSettings['auto'] = value
-  end
 
   def self.cache_dir
     dir = File.join($data_dir, 'wiki_cache')
@@ -425,10 +435,11 @@ module WikiPanel
     File.join(cache_dir, "#{Digest::MD5.hexdigest(key.downcase)}.json")
   end
 
-  def self.cache_read(key)
+  # A nil ttl accepts a copy of any age.
+  def self.cache_read(key, ttl = CACHE_TTL)
     path = cache_path(key)
     return nil unless File.exist?(path)
-    return nil if Time.now - File.mtime(path) > CACHE_TTL
+    return nil if ttl && Time.now - File.mtime(path) > ttl
 
     JSON.parse(File.read(path, encoding: 'UTF-8'))
   rescue StandardError
@@ -439,11 +450,6 @@ module WikiPanel
     File.write(cache_path(key), JSON.generate(data), encoding: 'UTF-8')
   rescue StandardError => e
     respond "Wiki: could not write cache (#{e.message})"
-  end
-
-  def self.clear_cache!
-    count = Dir.glob(File.join(cache_dir, '*.json')).each { |f| File.delete(f) }.size
-    respond "Wiki: cleared #{count} cached page(s)."
   end
 
   # ---------- HTTP ----------
@@ -482,6 +488,39 @@ module WikiPanel
     cache_write(key, result)
     cache_write("page:#{page['title']}", result) unless page['title'].casecmp?(title)
     result
+  end
+
+  # Reads the rendered main page itself. Rendering {{:Announcements}} alone
+  # can swap rows that share a date, so it may not match what the site shows.
+  def self.fetch_announcements
+    data = api_get(action: 'parse', page: 'Main_Page', prop: 'text', disablelimitreport: 1)
+    rows = WikiPanelText.parse_announcements(data.dig('parse', 'text'))
+    raise 'no announcements found' if rows.empty?
+
+    cache_write(ANNOUNCE_KEY, rows)
+    rows
+  end
+
+  # Fetches when the saved copy is over an hour old, then redraws the home
+  # screen if it is still showing. A failure keeps any saved copy on screen.
+  def self.update_announcements(force: false)
+    unless force
+      fresh = cache_read(ANNOUNCE_KEY, ANNOUNCE_TTL)
+      if fresh
+        @announcements = fresh
+        return
+      end
+      return if Time.now - @announce_checked_at < ANNOUNCE_RETRY
+    end
+
+    @announce_checked_at = Time.now
+    begin
+      @announcements = fetch_announcements
+      @announce_failed = false
+    rescue StandardError
+      @announce_failed = true
+    end
+    render_home if @view && @view[:type] == :home
   end
 
   RESULTS_PER_PAGE = 50
@@ -567,7 +606,7 @@ module WikiPanel
     false
   end
 
-  # Auto target lookup: exact page title only, never lists choices or errors.
+  # Exact page title only, never lists choices or errors.
   def self.lookup_exact(title)
     page = fetch_page(title)
     page ? show(page) : false
@@ -609,7 +648,7 @@ module WikiPanel
     render_results
   end
 
-  def self.more!
+  def self.next_results!
     return respond('Wiki: no more results.') unless @view && @view[:type] == :results && @results['next']
 
     offset = @results['next']
@@ -619,6 +658,7 @@ module WikiPanel
   end
 
   def self.refresh!
+    return update_announcements(force: true) if @view && @view[:type] == :home
     return status('Nothing to refresh.') unless @view && @view[:type] == :page
 
     raw = fetch_page(@view[:title], force: true)
@@ -634,6 +674,7 @@ module WikiPanel
     if view[:type] == :home
       @view = view
       render_home
+      update_announcements
     elsif view[:type] == :results
       show_results(view[:term], search(view[:term], view[:offset], view[:mode]), view[:offset], push_history: false)
     else
@@ -644,17 +685,17 @@ module WikiPanel
     status("Wiki: could not go back (#{e.message})")
   end
 
-  def self.toggle_section(arg)
-    return unless @page && @view && @view[:type] == :page
+  # With no index, acts on every section. Clicked [+]/[-] links pass an index.
+  def self.change_sections(action, index = nil)
+    return respond('Wiki: open a page first.') unless @page && @view && @view[:type] == :page
 
-    case arg
-    when 'all'  then @expanded = (0...@page.sections.size).to_a
-    when 'none' then @expanded = []
-    else
-      idx = arg.to_i
+    if index
+      idx = index.to_i
       return unless idx.between?(0, @page.sections.size - 1)
 
-      @expanded.include?(idx) ? @expanded.delete(idx) : @expanded << idx
+      @expanded = action == 'expand' ? @expanded | [idx] : @expanded - [idx]
+    else
+      @expanded = action == 'expand' ? (0...@page.sections.size).to_a : []
     end
     render
   end
@@ -684,41 +725,26 @@ module WikiPanel
     target && GameObj.npcs.any? { |n| n.id == target.id } ? target.name : nil
   end
 
-  # Called from the main loop about once a second.
-  def self.check_target!
-    id = XMLData.current_target_id
-    return if id == @last_target_id
-
-    @last_target_id = id
-    return unless auto?
-    return if Time.now - @manual_at < MANUAL_HOLD
-
-    name = target_name
-    return if name.nil? || name == @last_auto_name
-
-    @last_auto_name = name
-    lookup_exact(name)
-  end
-
-  def self.manual!
-    @manual_at = Time.now
-  end
-
   # ---------- rendering ----------
 
   def self.xml(text)
     text.to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;').gsub("'", '&apos;').gsub('"', '&quot;')
   end
 
+  # Clicked page links use this private command; it is not meant to be typed.
+  def self.page_cmd(title)
+    "*wiki :page #{title}"
+  end
+
   def self.dlink(cmd, label)
     "<d cmd='#{xml(cmd)}'>#{xml(label)}</d>"
   end
 
-  # Escapes wiki text, then turns link markers into clickable *wiki go links.
+  # Escapes wiki text, then turns link markers into clickable page links.
   def self.rich(text)
     links = @page ? @page.links : []
     xml(text)
-      .gsub(/#{WikiPanelText::LINK_OPEN}(\d+)#{WikiPanelText::LINK_CLOSE}/o) { "<d cmd='#{xml("*wiki go #{links[Regexp.last_match(1).to_i]}")}'>" }
+      .gsub(/#{WikiPanelText::LINK_OPEN}(\d+)#{WikiPanelText::LINK_CLOSE}/o) { "<d cmd='#{xml(page_cmd(links[Regexp.last_match(1).to_i]))}'>" }
       .gsub(WikiPanelText::LINK_END, '</d>')
   end
 
@@ -726,7 +752,7 @@ module WikiPanel
     lines = text.split("\n")
     return lines if lines.size <= max
 
-    lines.first(max) + ["... (#{lines.size - max} more lines -- *wiki open for the full page)"]
+    lines.first(max) + ["... (#{lines.size - max} more lines -- *wiki browser for the full page)"]
   end
 
   def self.write(lines)
@@ -756,23 +782,23 @@ module WikiPanel
 
     lines = ["<pushBold/>Wiki pages that #{kind} \"#{xml(term)}\"<popBold/>"]
     nav = ["page #{offset / RESULTS_PER_PAGE + 1}"]
-    nav << dlink('*wiki more', '[more results]') if @results['next']
+    nav << dlink('*wiki next', '[next page]') if @results['next']
     nav << dlink('*wiki home', '[home]')
     nav << dlink('*wiki back', '[back]') unless @history.empty?
     lines << nav.join('  ')
     lines << 'Click a page to open it.'
     lines << ''
     if exact
-      lines << "Exact match: #{dlink("*wiki go #{exact}", exact)}"
+      lines << "Exact match: #{dlink(page_cmd(exact), exact)}"
       lines << ''
     end
     width = others.size.to_s.size
     others.each_with_index do |t, i|
-      lines << "#{(i + 1).to_s.rjust(width)}. #{dlink("*wiki go #{t}", t)}"
+      lines << "#{(i + 1).to_s.rjust(width)}. #{dlink(page_cmd(t), t)}"
     end
     if @results['next']
       lines << ''
-      lines << dlink('*wiki more', '[more results]')
+      lines << dlink('*wiki next', '[next page]')
     end
     write(lines)
   end
@@ -790,7 +816,7 @@ module WikiPanel
       end
     end
     nav << dlink('*wiki home', '[home]')
-    nav << dlink('*wiki open', '[browser]')
+    nav << dlink('*wiki browser', '[browser]')
     nav << dlink('*wiki back', '[back]') unless @history.empty?
     nav << dlink('*wiki refresh', '[refresh]')
     lines << nav.join('  ')
@@ -810,17 +836,17 @@ module WikiPanel
       lines << "Pages in this category (#{@members.size}):"
       @members.each do |m|
         label = m.start_with?('Category:') ? "[category] #{m.sub('Category:', '')}" : m
-        lines << "  #{dlink("*wiki go #{m}", label)}"
+        lines << "  #{dlink(page_cmd(m), label)}"
       end
       lines << ''
     end
 
     unless page.sections.empty?
-      lines << "#{dlink('*wiki section all', '[expand all]')}  #{dlink('*wiki section none', '[collapse all]')}"
+      lines << "#{dlink('*wiki expand', '[expand all]')}  #{dlink('*wiki collapse', '[collapse all]')}"
       page.sections.each_with_index do |section, idx|
         open = @expanded.include?(idx)
         indent = '  ' * [section[:level] - 2, 0].max
-        lines << indent + dlink("*wiki section #{idx}", "#{open ? '[-]' : '[+]'} #{section[:title]}")
+        lines << indent + dlink("*wiki #{open ? 'collapse' : 'expand'} #{idx}", "#{open ? '[-]' : '[+]'} #{section[:title]}")
         next unless open
 
         body = section[:body].empty? ? '(empty)' : section[:body]
@@ -836,45 +862,60 @@ module WikiPanel
   # [command shown, description, command run when clicked (nil = needs typed input)]
   COMMANDS = [
     ['*wiki <term>', 'search the wiki; lists every match if more than one', nil],
-    ['*wiki auto', 'toggle auto lookup when your target changes (off by default)', '*wiki auto'],
     ['*wiki back', 'previous page or result list', '*wiki back'],
-    ['*wiki clearcache', 'delete cached pages', '*wiki clearcache'],
-    ['*wiki find <term>', 'search for a term that matches a command word', nil],
-    ['*wiki go <title>', 'open an exact page title', nil],
-    ['*wiki hand', 'look up the item in your right hand', '*wiki hand'],
+    ['*wiki browser', 'open the current page in your browser', '*wiki browser'],
+    ['*wiki collapse', 'collapse all sections on the current page', '*wiki collapse'],
+    ['*wiki expand', 'expand all sections on the current page', '*wiki expand'],
     ['*wiki help', 'show this screen (same as *wiki or *wiki home)', '*wiki help'],
-    ['*wiki more', 'next page of search results', '*wiki more'],
-    ['*wiki open', 'open the current page in your browser', '*wiki open'],
-    ['*wiki refresh', 're-fetch the current page', '*wiki refresh'],
-    ['*wiki section <n|all|none>', 'expand/collapse page sections', nil],
+    ['*wiki next', 'next page of search results', '*wiki next'],
+    ['*wiki refresh', 're-fetch the current page or announcements', '*wiki refresh'],
     ['*wiki target', 'look up your current target', '*wiki target']
   ].freeze
 
   EXAMPLES = ['lore', '917', 'eyeless black valravn'].freeze
 
-  def self.show_home
+  # Draws at once from any saved announcements; update: false lets startup
+  # finish registering its cleanup before the first network call.
+  def self.show_home(update: true)
     remember_view if @view && @view[:type] != :home
     @view = { type: :home }
+    @announcements ||= cache_read(ANNOUNCE_KEY, nil)
     render_home
+    update_announcements if update
   end
 
   def self.render_home
-    lines = ['<pushBold/>GemStone IV Wiki<popBold/>']
-    lines << dlink('*wiki back', '[back]') unless @history.empty?
-    lines << ''
+    lines = []
+    lines.push(dlink('*wiki back', '[back]'), '') unless @history.empty?
     lines << 'What would you like to look up?'
     lines << 'Type  *wiki &lt;term&gt;  in the command bar.'
     lines << 'Examples: ' + EXAMPLES.map { |e| dlink("*wiki #{e}", "*wiki #{e}") }.join('   ')
-    lines << ''
-    lines << "Auto target lookup: #{auto? ? 'ON' : 'OFF'}  " +
-             dlink('*wiki auto', auto? ? '[turn off]' : '[turn on]')
     lines << ''
     lines << '<pushBold/>Commands<popBold/>'
     COMMANDS.each do |shown, desc, cmd|
       label = cmd ? dlink(cmd, shown) : xml(shown)
       lines << "  #{label} - #{xml(desc)}"
     end
+    lines << ''
+    lines.concat(announcement_lines)
     write(lines)
+  end
+
+  def self.announcement_lines
+    lines = ["<pushBold/>Latest Announcements<popBold/>  #{dlink('*wiki refresh', '[refresh]')}"]
+    rows = Array(@announcements)
+    if rows.empty?
+      lines << (@announce_failed ? '  Could not reach the wiki. Click [refresh] to try again.' : '  Loading...')
+      return lines
+    end
+
+    rows.each do |row|
+      summary = row['summary'].to_s
+      prefix = summary.empty? ? '' : "#{xml(summary)} | "
+      lines << "  #{prefix}#{dlink(page_cmd(row['title']), row['subject'].to_s)}"
+    end
+    lines << '  (Could not update. Showing the last saved list.)' if @announce_failed
+    lines
   end
 
   def self.lookup_target
@@ -887,38 +928,15 @@ module WikiPanel
   def self.handle(arg)
     case arg
     when '', /\A(help|home)\z/i then show_home
-    when /\Aauto\z/i
-      self.auto = !auto?
-      @last_target_id = nil
-      @last_auto_name = nil
-      respond "Wiki: auto target lookup #{auto? ? 'ON' : 'OFF'}."
-      render_home if @view && @view[:type] == :home
     when /\Aback\z/i then back!
-    when /\Aclearcache\z/i then clear_cache!
-    when /\Afind\s+(.+)\z/i
-      manual!
-      lookup(Regexp.last_match(1))
-    when /\Ago\s+(.+)\z/i
-      manual!
-      go(Regexp.last_match(1).strip)
-    when /\Ahand\z/i
-      manual!
-      item = GameObj.right_hand
-      if item.nil? || item.name.to_s.empty? || item.name == 'Empty'
-        respond 'Wiki: your right hand is empty.'
-      else
-        lookup_exact(item.name) || lookup(item.noun)
-      end
-    when /\Amore\z/i then more!
-    when /\Aopen\z/i then open_in_browser!
+    when /\Abrowser\z/i then open_in_browser!
+    when /\A(expand|collapse)(?:\s+(\d+))?\z/i
+      change_sections(Regexp.last_match(1).downcase, Regexp.last_match(2))
+    when /\Anext\z/i then next_results!
     when /\Arefresh\z/i then refresh!
-    when /\Asection\s+(\S+)\z/i then toggle_section(Regexp.last_match(1).downcase)
-    when /\Atarget\z/i
-      manual!
-      lookup_target
-    else
-      manual!
-      lookup(arg)
+    when /\Atarget\z/i then lookup_target
+    when /\A:page\s+(.+)\z/i then go(Regexp.last_match(1).strip)
+    else lookup(arg)
     end
   end
 end
@@ -934,27 +952,22 @@ UpstreamHook.add(hook_id, proc do |command|
   end
 end)
 
-_respond("<streamWindow id='#{WikiPanel::WINDOW_ID}' title='Wiki' ifClosed='' resident='true'/>")
+_respond("<streamWindow id='#{WikiPanel::WINDOW_ID}' title='Gemstone IV Wiki' ifClosed='' resident='true'/>")
 sleep 0.05
 _respond("<exposeStream id='#{WikiPanel::WINDOW_ID}'/>")
-WikiPanel.show_home
+WikiPanel.show_home(update: false)
 
 before_dying do
   UpstreamHook.remove(hook_id) rescue nil
   _respond("<closeStream id='#{WikiPanel::WINDOW_ID}'/>")
 end
 
-echo "Wiki panel is active (auto target lookup #{WikiPanel.auto? ? 'ON' : 'OFF'})."
+echo 'Gemstone IV Wiki panel is active.'
+WikiPanel.update_announcements
 
 loop do
   begin
-    arg = WikiPanel.queue.pop(true) rescue nil
-    if arg
-      WikiPanel.handle(arg)
-    else
-      WikiPanel.check_target!
-      sleep 0.5
-    end
+    WikiPanel.handle(WikiPanel.queue.pop)
   rescue StandardError => e
     respond "Wiki panel error: #{e.message}"
     sleep 1
