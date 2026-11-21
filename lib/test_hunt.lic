@@ -937,49 +937,144 @@ class Bigshot
   end
 end
 
-# Network transport for cross-internet head/tail communication via LNet or OOC whisper
 class Bigshot
   class NetTransport
     PREFIX = "BSNET:".freeze
+    MIN_LNET_GAP = 2.5 # Global gap across ALL targets to guarantee zero LNet flood kicks
+
+    def self.lnet_ready?
+      return false unless Script.running?('lnet')
+      return false unless defined?(LNet)
+
+      LNet.respond_to?(:connected?) ? !!LNet.connected? : true
+    rescue StandardError
+      false
+    end
+
+    def self.throttled_lnet_send(attr, text)
+      @lnet_mutex ||= Mutex.new
+      @lnet_mutex.synchronize do
+        @last_global_lnet ||= Time.at(0)
+        elapsed = Time.now - @last_global_lnet
+        sleep(MIN_LNET_GAP - elapsed) if elapsed < MIN_LNET_GAP
+        @last_global_lnet = Time.now
+        LNet.send_message(attr, text)
+      end
+    end
 
     def self.send_msg(target, hash)
       return if target.to_s.empty? || target.to_s.casecmp(Char.name).zero?
 
       payload = PREFIX + Base64.strict_encode64(hash.to_json)
+
+      # 1. Primary: Silent OOC whisper when target is in the same room (100% hidden by DownstreamHook, zero LNet traffic)
+      if defined?(checkpcs) && checkpcs.any? { |pc| pc.casecmp(target.to_s).zero? }
+        Game._puts("whisper ooc #{target} #{payload}")
+        return
+      end
+
+      # 2. Fallback: Globally rate-limited LNet private message when target is in a different room (cross-internet)
+      if lnet_ready? && LNet.respond_to?(:send_message)
+        begin
+          to_user = target.to_s.strip.downcase
+          throttled_lnet_send({ 'type' => 'private', 'to' => to_user }, payload)
+          return
+        rescue StandardError
+        end
+      end
+
+      # 3. Last resort: OOC whisper
       Game._puts("whisper ooc #{target} #{payload}")
     end
 
+    def self.announce_group(msg, target = nil)
+      # Prefer silent OOC whisper group when group members are in the room
+      if target.nil? && defined?(checkpcs) && Lich::Gemstone::Group.members.any? { |m| checkpcs.include?(m.noun) }
+        Lich::Util.issue_command("whisper ooc group #{msg}", /<pushStream id="speech"/, silent: true, quiet: true)
+        return
+      end
+
+      if lnet_ready? && LNet.respond_to?(:send_message)
+        begin
+          if target && !target.to_s.empty?
+            to_user = target.to_s.strip.downcase
+            throttled_lnet_send({ 'type' => 'private', 'to' => to_user }, msg)
+            return
+          else
+            members = Lich::Gemstone::Group.members.map(&:noun).reject { |n| n.to_s.empty? || n.casecmp(Char.name).zero? }
+            if members.any?
+              members.each do |m|
+                to_user = m.to_s.strip.downcase
+                throttled_lnet_send({ 'type' => 'private', 'to' => to_user }, msg)
+              end
+              return
+            end
+          end
+        rescue StandardError
+        end
+      end
+
+      Lich::Util.issue_command("whisper ooc group #{msg}", /<pushStream id="speech"/, silent: true, quiet: true)
+    end
 
     def self.start_listener(hook_name, &block)
       DownstreamHook.remove(hook_name)
-      before_dying { DownstreamHook.remove(hook_name) }
+      seen_packets = {}
 
+      dispatch_line = proc do |raw_line|
+        plain = raw_line.to_s.gsub(/<[^>]+>/, '')
+        if plain =~ /(?:\[Private\]-GS(?:IV|T|F|Plat):([A-Za-z]+):\s*"?|\(OOC\)\s+([A-Za-z]+)(?:'s player)?\s+whispers,\s*")BSNET:([A-Za-z0-9+\/=]+)/
+          sender = $1 || $2
+          encoded = $3
+          key = "#{sender}:#{encoded}"
+          unless seen_packets[key]
+            seen_packets[key] = Time.now
+            seen_packets.delete_if { |_k, t| (Time.now - t) > 20 }
+            begin
+              data = JSON.parse(Base64.strict_decode64(encoded))
+              block.call(sender, data)
+            rescue StandardError
+            end
+          end
+          true
+        else
+          false
+        end
+      end
+
+      # 1. DownstreamHook intercepts and completely hides OOC whisper packets from the screen
       listener = proc do |server_string|
-        # Suppress our own outgoing BSNET whisper echoes from the screen
         if server_string.include?(PREFIX) && server_string =~ /\(OOC\)\s+You\s+(?:quietly\s+)?whisper/i
           next nil
         end
 
-        # Strip XML tags so <a exist="..." noun="Danyn">Danyn</a> becomes Danyn
-        plain = server_string.gsub(/<[^>]+>/, '')
-
-        if plain =~ /(?:\[Private\]-GS(?:IV|T|F|Plat):([A-Za-z]+):\s*"?|\(OOC\)\s+([A-Za-z]+)(?:'s player)?\s+whispers,\s*")BSNET:([A-Za-z0-9+\/=]+)/
-          sender = $1 || $2
-          encoded = $3
-          begin
-            data = JSON.parse(Base64.strict_decode64(encoded))
-            block.call(sender, data)
-          rescue StandardError
-          end
-          next nil
-        end
+        next nil if dispatch_line.call(server_string)
         server_string
       end
-
       DownstreamHook.add(hook_name, listener)
+
+      # 2. Client buffer watcher catches LNet [Private] lines only when out-of-room fallback is used
+      lnet_thread = Thread.new do
+        loop do
+          break unless running?($current_script_name)
+          buf = reget(25)
+          if buf.is_a?(Array)
+            buf.each do |line|
+              next unless line.include?(PREFIX)
+              next if line.include?('[PrivateTo]-')
+              dispatch_line.call(line)
+            end
+          end
+          sleep 0.35
+        end
+      end
+
+      before_dying do
+        DownstreamHook.remove(hook_name)
+        lnet_thread.kill rescue nil
+      end
     end
   end
-
 
   class RemoteGroupProxy
     attr_reader :leader_name, :members
@@ -988,6 +1083,7 @@ class Bigshot
       @leader_name = leader_name
       @members = {}
       @joined = false
+      @bs_instance = nil
       @leader_state = {
         'a' => true,
         'r' => Room.current.id,
@@ -1003,10 +1099,23 @@ class Bigshot
 
     def update_leader_state(data)
       @leader_state.merge!(data)
-      if data['j']
+      if data['w_ack'] && data['r'].to_i > 0
+        @confirmed_room = data['r'].to_i
+      end
+      if data['j'] && !@joined
         @joined = true
         @members[Char.name] = true
+        start_heartbeat(@bs_instance) if @bs_instance
       end
+    end
+
+    def ask_leader_where
+      @confirmed_room = nil
+      NetTransport.send_msg(@leader_name, { 'o' => 'W' })
+    end
+
+    def confirmed_leader_room
+      @confirmed_room
     end
 
     def joined?
@@ -1060,8 +1169,8 @@ class Bigshot
     end
 
     def add_member(bs_instance)
+      @bs_instance = bs_instance
       NetTransport.send_msg(@leader_name, { 'o' => 'J' })
-      start_heartbeat(bs_instance)
     end
 
     def set_looting_active
@@ -1072,13 +1181,15 @@ class Bigshot
 
     def start_heartbeat(bs)
       @hb_thread ||= Thread.new do
+        last_payload = nil
+        last_keepalive = Time.at(0)
         loop do
           break unless running?($current_script_name)
 
-          NetTransport.send_msg(@leader_name, {
+          payload = {
             'o' => 'S',
             'r' => Room.current.id,
-            'rt' => checkrt,
+            'rt' => (checkrt > 0 ? checkrt : 0),
             'l' => $looting_inactive,
             'rp' => bs.rest_prep_done?,
             'rd' => bs.ready_to_hunt?,
@@ -1089,14 +1200,20 @@ class Bigshot
             'sn' => bs.sneaky_hunt?,
             'hd' => hidden?,
             'w' => bs.wounded?
-          })
-          sleep 1.5
+          }
+
+          if payload != last_payload || (Time.now - last_keepalive) >= 12
+            NetTransport.send_msg(@leader_name, payload)
+            last_payload = payload
+            last_keepalive = Time.now
+          end
+          sleep 0.4
         end
       end
     end
-
   end
 end
+
 
 # Group class for head/tail
 class Bigshot
@@ -1109,13 +1226,15 @@ class Bigshot
   # be dropped from the group rather than being allowed to raise into the
   # leader's hunting loop.
   class Group
-    attr_accessor :leader, :members
+    attr_accessor :leader, :members, :expected_size
 
     # @return [void]
     def initialize
       @members = Hash.new
       @member_states = Hash.new
+      @expected_size = 0
     end
+
 
     def receive_packet(sender, data)
       case data['o']
@@ -1123,9 +1242,18 @@ class Bigshot
         @members[sender] = true
         @member_states[sender] ||= { 'last_seen' => Time.now, 'l' => true, 'rp' => true, 'rd' => 'ready' }
         send_leader_sync(sender, 'j' => true)
+      when 'W'
+        @members[sender] = true
+        @waiting_for ||= {}
+        @waiting_for[sender] = Time.now
+        @leader&.message("yellow", "#{sender} is separated! Holding position in room #{Room.current.id} until they rejoin...")
+        send_leader_sync(sender, 'w_ack' => true, 'r' => Room.current.id)
       when 'S'
         @members[sender] = true
         @member_states[sender] = data.merge('last_seen' => Time.now)
+        if @waiting_for && data['r'].to_i == Room.current.id
+          @waiting_for.delete(sender)
+        end
       when 'L'
         @member_states[sender] ||= {}
         @member_states[sender]['l'] = data['i']
@@ -1133,12 +1261,20 @@ class Bigshot
       end
     end
 
-    def send_leader_sync(target = nil, extra = {})
-      return if @members.empty? && target.nil?
+    def waiting_for_lost_follower?
+      return false if @waiting_for.nil? || @waiting_for.empty?
 
-      tgt = @leader&.leader_target?
-      payload = {
-        'o' => 'LS',
+      # Clear any follower that is now physically in our room or timed out after 45s
+      @waiting_for.delete_if do |name, since|
+        checkpcs.include?(name) || (Time.now - since) > 45
+      end
+      !@waiting_for.empty?
+    end
+
+
+     def build_leader_state(extra = {})
+       tgt = @leader&.instance_variable_get(:@active_target) || @leader&.leader_target?
+      {
         'a' => @leader ? @leader.active? : true,
         'r' => Room.current.id,
         'h' => @leader&.HUNTING_ROOM_ID,
@@ -1150,7 +1286,14 @@ class Bigshot
         't' => tgt&.id,
         'rst' => ($bigshot_status == :resting)
       }.merge(extra)
+    end
 
+    def send_leader_sync(target = nil, extra = {})
+      return if @members.empty? && target.nil?
+
+      payload = build_leader_state(extra).merge('o' => 'LS')
+      return if target.nil? && payload == @last_ls_payload
+      @last_ls_payload = payload if target.nil?
 
       if target
         NetTransport.send_msg(target, payload)
@@ -1159,11 +1302,11 @@ class Bigshot
       end
     end
 
-    # Yields each active member, pruning any that have not sent a heartbeat in 30s.
+    # Yields each active member (keep expected party members for 5 minutes before pruning)
     def member_online
       @members.keys.each do |name|
         state = @member_states[name] || {}
-        if state['last_seen'] && (Time.now - state['last_seen']) > 30
+        if state['last_seen'] && (Time.now - state['last_seen']) > 300
           @leader&.message("yellow", "Timed out waiting for #{name}. Removing!")
           @members.delete(name)
           @member_states.delete(name)
@@ -1237,12 +1380,17 @@ class Bigshot
 
     def add_event(type, room = Room.current.id)
       return if @members.empty?
+      return if type == :ATTACK && @last_attack_sent && (Time.now - @last_attack_sent) < 1.5
+      @last_attack_sent = Time.now if type == :ATTACK
 
-      send_leader_sync
+      state = build_leader_state('r' => room)
+      @last_ls_payload = state.merge('o' => 'LS')
+      packet = state.merge('o' => 'E', 'ev' => type.to_s, 'ts' => Time.now.to_i)
       @members.keys.each do |name|
-        NetTransport.send_msg(name, { 'o' => 'E', 't' => type.to_s, 'ts' => Time.now.to_i, 'r' => room })
+        NetTransport.send_msg(name, packet)
       end
     end
+
 
     def has_bounty?(bounty_regex)
       if !bounty_regex.is_a? Regexp
@@ -1276,14 +1424,15 @@ class Bigshot
     end
 
     def huntpro_move?
-      !!@leader_state['m']
+      !!@leader.HUNTPRO_MOVE
     end
 
     def leader_resting?
-      !!@leader_state['rst']
+      $bigshot_status == :resting
     end
 
     def rally_ids
+
       return @leader.RALLYPOINT_ROOM_IDS
     end
 
@@ -1331,9 +1480,11 @@ class Bigshot
         return false
       end
 
+      return false if @expected_size.to_i > 0 && @members.size < @expected_size
+
       $bigshot_group_status = {}
       member_online do |name, state|
-        reason = state['rd'] || 'ready'
+        reason = state['rd'] || 'waiting for status update.'
         $bigshot_group_status[name] = reason unless reason == "ready"
       end
 
@@ -1388,6 +1539,7 @@ class Bigshot
 
     def all_present?
       sleep(0.1) while Lich::Gemstone::Claim::Lock.locked?
+      return false if @expected_size.to_i > 0 && @members.size < @expected_size
 
       member_online do |name, _|
         return false unless checkpcs.include?(name)
@@ -4280,8 +4432,8 @@ class Bigshot
       cmd_sleep($1, $2, npc)
     elsif (command =~ /^stance\s+(.*)/i)
       change_stance($1)
-    elsif (command =~ /^wait\s+(\d+)/i)
-      wait_for_swing($1.to_i, npc)
+    elsif (command =~ /^wait(?:\s+(\d+))?$/i)
+      wait_for_swing(($1 || 5).to_i, npc)
       $stop_wait = true
     elsif (command =~ /^nudgeweapons?\s*/i)
       cmd_nudge_weapons
@@ -7608,6 +7760,9 @@ class Bigshot
   def rest()
     debug_msg(@DEBUG_COMBAT, "rest")
 
+    $bigshot_status = :resting
+    @followers.send_leader_sync(nil, 'rst' => true) if !solo? && leading?
+
     $bigshot_group_status[Char.name] = $rest_reason
     sorted_hash = $bigshot_group_status.sort_by { |key, _| [key == Char.name ? -1 : 0, key.to_s] }.to_h
     any_wounded = $bigshot_group_status.values.include?("wounded.")
@@ -7678,6 +7833,7 @@ class Bigshot
       @RETURN_WAYPOINT_IDS.each { |room| go2(room.to_i) }
       go2(@RESTING_ROOM_ID)
     else
+      regroup_followers
       @followers.add_event(:UNHIDE)
       @followers.add_event(:FOLLOW_NOW)
       Lich::Gemstone::Group.members.each do |pc|
@@ -7703,9 +7859,9 @@ class Bigshot
       }
 
       go2(@RESTING_ROOM_ID)
-      @followers.add_event(:FOLLOW_NOW) unless solo?
+      regroup_followers
     end
-
+    
     if (@QUIET_FOLLOWERS) && !any_wounded
 
       Lich::Util.quiet_command_xml("group open", /Your group status/) unless solo?
@@ -7918,9 +8074,9 @@ class Bigshot
     break_conditions = {
       "No Claim"                  => -> { !bigclaim?(check_disks: false) },
       "Invalid target"            => -> { !valid_target?(target) },
-      "Should Rest"               => -> { $bigshot_should_rest },
+      "Should Rest"               => -> { leading? && $bigshot_should_rest },
       "Ambusher present"          => -> { $ambusher_here },
-      "Should rest"               => -> { should_rest? },
+      "Should rest"               => -> { leading? ? should_rest? : @group&.leader_resting? },
       "Priority target available" => -> { !$bigshot_bandits && @PRIORITY && !priority(target) },
       "Event stack has PREP_REST" => -> { @event_stack.any? { |a| a.type == :PREP_REST } }
     }
@@ -7940,6 +8096,7 @@ class Bigshot
   # @param target [BigshotCreature, Lich::Common::GameObj] the creature to attack
   # @return [void]
   def attack(target) # Starts the process when a target is found
+    @active_target = target
     commands = find_routine(target)
     debug_msg(@DEBUG_COMBAT, "attack | commands #{commands}")
 
@@ -7951,6 +8108,7 @@ class Bigshot
 
     # Make sure followers are attacking
     @followers.add_event(:ATTACK)
+
 
     commands.each do |i|
       break if attack_break(target)
@@ -7978,12 +8136,15 @@ class Bigshot
       debug_note_death(target)
     end
 
+    @active_target = nil if dead_or_gone?(target)
+
     # Check for Roa'ter swallowing or Hinterwilds Ooze swallowing
     escape_rooms
 
     # run loot check after every command set
     need_to_loot?
   end
+
 
   # Whether there is anything worth looting.
   #
@@ -8121,16 +8282,23 @@ class Bigshot
     debug_msg(@DEBUG_COMMANDS, "goto | id: #{id} | cast_signs_moving: #{cast_signs_moving}")
 
     prepare_for_movement(cast_signs_moving)
+    regroup_followers unless @INDEPENDENT_TRAVEL
 
     5.times do
       run_script('go2', true, "#{id} --disable-confirm")
-      return if Room.current.id == id
+      if Room.current.id == id
+        regroup_followers
+        return
+      end
       escape_rooms
     end
 
     $bigshot_should_rest = true
     $rest_reason = "Could not reach #{id}"
   end
+
+  # Starts the hunt timer and records baseline experience.
+
 
   # Starts the hunt timer and records baseline experience.
   #
@@ -8448,13 +8616,13 @@ class Bigshot
     # These are raw GameObj objects, not CreatureInstances: they quack the
     # same for id/noun/name/status/type, and creature_backed? already reports
     # false for them so every native crtrStatus reader degrades safely.
-  using_huntpro = @HUNTPRO_MOVE || (@group && (@group.huntpro_move? rescue false))
+  using_huntpro = following? || @HUNTPRO_MOVE || (@group && (@group.huntpro_move? rescue false))
+  room_npc_ids = GameObj.npcs.map { |n| n.id.to_s }.to_set
   bridged = if using_huntpro
-              GameObj.targets.reject { |go| native.any? { |c| c.id.to_s == go.id.to_s } }
+              GameObj.targets.select { |go| room_npc_ids.include?(go.id.to_s) && native.none? { |c| c.id.to_s == go.id.to_s } }
             else
               GameObj.targets.reject { |go| Creature[go.id] }
             end
-
     native + bridged
   end
 
@@ -8870,7 +9038,7 @@ class Bigshot
     return false if $bigshot_bandits
 
     return true if @BOONS_FLEE.any? && bs_targets.any? { |c| c.type.include?("boon") } && should_flee_from_boons?
-    return true if !leading? && checkpcs.empty?
+    return false if !leading?
 
     # bs_targets always returns a fresh Array (never nil), so plain #reject
     # (not #reject!) is used here - no need for the `|| GameObj.targets`
@@ -8936,10 +9104,12 @@ class Bigshot
       return false
     end
 
-    if (@TARGETS.nil? || @TARGETS.keys.any? { |i| target.name =~ /#{i}/i || target.noun =~ /#{i}/i })
+    leader_assist = following? && @group && (@group.leader_target&.id.to_s == target.id.to_s || checkpcs.include?(@leader))
+    if (leader_assist || @TARGETS.nil? || @TARGETS.keys.any? { |i| target.name =~ /#{i}/i || target.noun =~ /#{i}/i })
       debug_msg(@DEBUG_COMBAT, "valid_target? | returning true for #{target.name}")
       return true
     else
+
       debug_msg(@DEBUG_COMBAT, "valid_target? | not sure what this is. returning false for #{target.name}")
       return false
     end
@@ -9247,6 +9417,7 @@ class Bigshot
   def ready_to_hunt?
     debug_msg(@DEBUG_STATUS, "ready_to_hunt?")
     $not_hunting_reason = nil
+    @CORRECT_PERCENT_MIND = Lich::Gemstone::Experience.percent_fxp
 
     # Array of [condition, reason] pairs
     not_hunting_checks = [
@@ -9345,6 +9516,7 @@ class Bigshot
   # @return [Boolean]
   def should_rest?()
     debug_msg(@DEBUG_STATUS, "should_rest?")
+    return ready_to_rest? if following?
 
     group_rest = @followers.group_should_rest?
     leader_rest = ready_to_rest?
@@ -9355,11 +9527,6 @@ class Bigshot
     # combine all the rest reasons
     rest_reasons = $bigshot_group_status.to_a.map { |_, reason| reason }.push($rest_reason)
     rest_reasons.compact!
-
-    # return false if some are fried but others aren't and no other issues
-    if rest_reasons.all? { |reason| reason =~ /fried/ } && (rest_reasons.length < @followers.size.to_i || @followers.size.to_i.zero?)
-      return false
-    end
 
     # wounded check
     if rest_reasons.any? { |reason| reason.match?(/wounded/) }
@@ -9629,30 +9796,51 @@ class Bigshot
     sleep 0.2
   end
 
-  # Gathers followers to the leader's room.
+  # Gathers followers to the leader's room by asking the leader for their exact location.
   #
   # @return [void]
   def group_all_followers
-    attempts = 0
+    # Allow brief room-feed settlement if moving together
+    3.times do
+      return rejoin_leader_in_room if checkpcs.include?(@leader)
+      sleep(0.2)
+    end
+
     until checkpcs.include?(@leader)
       waitrt?
-      is_resting = (@group.respond_to?(:leader_resting?) && @group.leader_resting?) || @group.instance_variable_get(:@leader_state)&.[]('rst')
-      dest = if (is_resting || attempts >= 2) && @group.resting_id.to_i > 0
-               @group.resting_id
-             else
-               @group.room_id
-             end
 
-      go2(dest) if dest.to_i > 0 && Room.current.id != dest.to_i
-      attempts += 1
-      sleep(0.5)
+      # Ask leader where they are and wait up to 4s for their confirmed room ID
+      @group.ask_leader_where
+      wait_start = Time.now
+      while @group.confirmed_leader_room.nil? && (Time.now - wait_start) < 4.0
+        break if checkpcs.include?(@leader)
+        sleep(0.2)
+      end
+
+      break if checkpcs.include?(@leader)
+
+      dest = @group.confirmed_leader_room || @group.room_id.to_i
+      if dest.to_i > 0 && Room.current.id != dest.to_i
+        message("yellow", "Rejoining #{@leader} in room #{dest}...")
+        go2(dest)
+      else
+        sleep(0.5)
+      end
     end
-    
+
+    rejoin_leader_in_room
+  end
+
+  def rejoin_leader_in_room
+    return unless checkpcs.include?(@leader)
+
+    Lich::Util.quiet_command_xml("group", /You are/)
     until Lich::Gemstone::Group.members.map(&:noun).include?(@leader)
+      break unless checkpcs.include?(@leader)
       result = dothistimeout("join #{@leader}", 3, /You are already a member|You join|What were you referring to/)
-      break if result =~ /What were you referring to/
-      groupcheck
-      sleep 0.1
+      break if result =~ /What were you referring to|You are already a member/
+      Lich::Util.quiet_command_xml("group", /You are/)
+      sleep 0.2
     end
   end
 
@@ -9777,16 +9965,47 @@ HUNTPRO_RESET_ROOMS = {
   3987 => 3982, 3989 => 3982, 4226 => 4238, 4252 => 4215, 4251 => 4238, 4225 => 4215
 }.freeze
 
-def huntpro_bounce(return_room)
-  go2(return_room)
-  if !solo? && leading? && !@followers.all_present?
-    @followers.add_event(:FOLLOW_NOW)
-    message("yellow", "Waiting for followers....")
-    sleep 0.5 while (!@followers.all_present?)
+def regroup_followers
+  return if solo? || !leading?
+
+  unless @followers.all_present? && !Lich::Gemstone::Group.broken?
+    Lich::Util.quiet_command_xml("group open", /Your group status/)
+    fput('unhide') if hidden?
+    message("yellow", "Regrouping followers...")
+    until @followers.all_present? && !Lich::Gemstone::Group.broken?
+      @followers.add_event(:FOLLOW_NOW)
+      sleep 1.5
+      groupcheck
+    end
   end
+  sleep 0.45
+  wait_while { @followers.roundtime? }
+  sleep 0.35
+  wait_while { @followers.roundtime? }
+end
+
+
+def huntpro_bounce(return_room)
+  if !solo? && leading?
+    @followers.add_event(:FOLLOW_NOW)
+    sleep 0.5
+    regroup_followers
+    wait_while { @followers.roundtime? }
+  end
+  go2(return_room)
+  regroup_followers
 end
 
 def huntpro_move
+  if !solo? && leading?
+    # Signal followers to break out of their attack loop so they don't start a new swing
+    @followers.add_event(:FOLLOW_NOW)
+    # Allow time for any mid-flight BSNET heartbeat with new RT to arrive
+    sleep 1.0
+    regroup_followers
+    wait_while { @followers.roundtime? }
+  end
+
   if (return_room = HUNTPRO_RESET_ROOMS[Room.current.id])
     huntpro_bounce(return_room)
     return
@@ -9820,6 +10039,7 @@ def huntpro_move
   check_for_deaders_prone
   cast_signs(true)
 end
+
 
 
 
@@ -9889,20 +10109,18 @@ def bs_move
         end
       end
 
-      # If still here the rest is preping to move to the next room
-      cast_signs unless fleeing
-      new_room = true
-
-      if !@followers.all_present? || Lich::Gemstone::Group.broken?
+      if @followers.waiting_for_lost_follower? || !@followers.all_present? || Lich::Gemstone::Group.broken?
         message("yellow", "Waiting for followers....")
 
-        # Keep prompting followers until all are present
-        until @followers.all_present?
-          @followers.add_event(:FOLLOW_NOW) # trigger rubber band
-          sleep 2
+        until !@followers.waiting_for_lost_follower? && @followers.all_present?
+          # If a creature enters the room while we wait, break out to fight it in place!
+          break if (bigclaim? || !new_room) && !should_flee?(true) && sort_npcs.any? { |i| valid_target?(i, false) }
+          @followers.add_event(:FOLLOW_NOW)
+          sleep 1.5
         end
 
         groupcheck
+        next if sort_npcs.any? { |i| valid_target?(i, false) }
       end
 
       # Wait for follower to finish looting if needed
@@ -9927,10 +10145,13 @@ def bs_move
         cmd_hide(1) unless hidden
         wait_rt
       end
-
+      
+      sleep 0.45
       wait_while { @followers.roundtime? }
 
       escape_rooms
+
+      regroup_followers
 
       if (Stats.prof == "Ranger") && !Effects::Cooldowns.active?("Tracking") && !@TRACKING_CREATURE.empty? && !fleeing
         return if ranger_track # true we skip the wander.call, false, we perform the wander.call
@@ -10412,7 +10633,7 @@ elsif (Script.current.vars[1] =~ /head|lead/i)
   group_started = false
   timeout = 60
   pause_time = 10
-  short_pause = 3
+  short_pause = 5
   current_count = 0
   respond
 
@@ -10479,7 +10700,7 @@ elsif (Script.current.vars[1] =~ /head|lead/i)
         last_sig = sig
         my_group.send_leader_sync
       end
-      sleep 0.35
+      sleep 1.0
     end
   end
 
@@ -10487,10 +10708,12 @@ elsif (Script.current.vars[1] =~ /head|lead/i)
 
   until my_group.size() > current_count
     respond
-    Lich::Util.issue_command("whisper ooc group Bigshot members (#{my_group.size - 1}/#{current_count}) rallying under #{Char.name}", /<pushStream id="speech"/, silent: true, quiet: false)
+    Bigshot::NetTransport.announce_group("Bigshot members (#{my_group.size - 1}/#{current_count}) rallying under #{Char.name}")
     respond
-    sleep short_pause
+    sleep 6
   end
+
+  my_group.expected_size = current_count
 
   Lich::Messaging.msg("text", " Group Members:")
   my_group.get_names.sort.each { |character| Lich::Messaging.msg("text", "  #{character}") }
@@ -10509,13 +10732,15 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
   retry_interval = 1.5
   attempts = 0
 
-  # Watch for rally announcement over OOC whisper
-  uri_status = proc { |server|
-    if server.to_s =~ /rallying under ([A-Za-z]+)/
-      leader_name = Regexp.last_match(1)
-    end
-    server
-  }
+# Watch for rally announcement over LNet (reget) or OOC whisper (DownstreamHook)
+uri_status = proc { |server|
+  next nil if server.to_s.include?('BSNET:')
+  plain = server.to_s.gsub(/<[^>]+>/, '')
+  if plain =~ /rallying under ([A-Za-z]+)/
+    leader_name = Regexp.last_match(1)
+  end
+  server
+}
   DownstreamHook.add('uri_status', uri_status)
   before_dying { DownstreamHook.remove('uri_status') }
 
@@ -10530,12 +10755,20 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
 
   while group.nil? || bs.nil? || !group.joined?
     loop do
+      if leader_name.nil?
+        recent = reget(15)
+        if recent.is_a?(Array)
+          match_line = recent.reverse.find { |l| l.gsub(/<[^>]+>/, '') =~ /rallying under ([A-Za-z]+)/ }
+          leader_name = Regexp.last_match(1) if match_line
+        end
+      end
+
       if leader_name
         DownstreamHook.remove('uri_status')
         break
       end
 
-      sleep retry_interval
+      sleep 0.4
     end
 
     if group.nil?
@@ -10549,7 +10782,9 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
         when 'LS'
           group.update_leader_state(data)
         when 'E'
-          bs.add_event(data['t'].to_sym, data['ts'].to_i, data['r'].to_i, data['c'])
+          group.update_leader_state(data)
+          ev_name = data['ev'] || data['t']
+          bs.add_event(ev_name.to_sym, data['ts'].to_i, data['r'].to_i, data['c'])
         when 'CE'
           bs.clear_events
         when 'SH'
@@ -10561,7 +10796,7 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
     end
 
     if attempts.zero?
-      Lich::Util.issue_command("whisper ooc group Joining group under #{leader_name}", /<pushStream id="speech"/, silent: true, quiet: false)
+      Bigshot::NetTransport.announce_group("Joining group under #{leader_name}", leader_name)
     end
     group.add_member(bs)
 
@@ -10575,9 +10810,22 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
   end
 
 
+  # Track the exact direction the leader moves whenever they leave the room
+  $bigshot_leader_last_dir = nil
+  leader_dir_hook = proc do |server_string|
+    plain = server_string.gsub(/<[^>]+>/, '')
+    if plain =~ /^#{Regexp.escape(leader_name)}(?:'s group)? just (?:went|climbed|swam|crawled|ran|walked|marched|hiked) (?:to the )?(\w+)\./i
+      $bigshot_leader_last_dir = $1.downcase
+    end
+    server_string
+  end
+  DownstreamHook.add('bigshot_leader_dir', leader_dir_hook)
+  before_dying { DownstreamHook.remove('bigshot_leader_dir') }
+
   # Participate
   bs.message("yellow", " Successfully joined group")
   bs.groupcheck unless checkpcs.nil?
+
 
   # Don't announce these events
   events_to_skip = [
@@ -10596,13 +10844,20 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
     begin
       bs.stand() if !standing? && $looting_inactive && $bigshot_status != :resting
 
+    # If separated from leader (e.g. left behind in RT), immediately ask leader where they are and rejoin
+    if !checkpcs.include?(leader_name) && checkrt == 0
+      bs.group_all_followers
+    end
+
     # grab event
     event = bs.grab_event
     unless event
       is_resting = (group.respond_to?(:leader_resting?) && group.leader_resting?) || group.instance_variable_get(:@leader_state)&.[]('rst')
-      if group.leader_active? && !is_resting && $bigshot_status != :resting && checkpcs.include?(leader_name)
+      $bigshot_status = :hunting unless is_resting
+      if group.leader_active? && !is_resting && checkpcs.include?(leader_name) && !Room.current.tags.any? { |t| t =~ /\A(?:town|supernode|node)\z/i }
         ltgt = group.leader_target
-        if !ltgt.nil? && !bs.dead_or_gone?(ltgt) && bs.still_targetable?(ltgt.id)
+        has_target = (!ltgt.nil? && !bs.dead_or_gone?(ltgt) && bs.still_targetable?(ltgt.id)) || !bs.find_target(nil).nil?
+        if has_target
           bs.add_event(:ATTACK, Time.now.to_i, Room.current.id)
         end
       end
@@ -10610,11 +10865,13 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
       next
     end
 
-
       # announce event
       bs.message("yellow", " Event: " + event.type.to_s) unless events_to_skip.include?(event.type)
 
       if (event.type == :HUNTING_PREP_COMMANDS)
+        $bigshot_status = :hunting
+        $bigshot_should_rest = false
+        $rest_reason = nil
         bs.stand() if !standing?
         bs.hunting_prep
       elsif (event.type == :FOLLOW_NOW)
@@ -10669,8 +10926,11 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
 
         # Scan for targets until leader says to move or loot
         loop do
-          # Break loop if moving/looting, or the leader stops hunting mid-cycle
+          # Break loop if moving/looting, leader starts resting, or leader stops hunting mid-cycle
+          is_resting = (group.respond_to?(:leader_resting?) && group.leader_resting?) || group.instance_variable_get(:@leader_state)&.[]('rst')
           break unless group.leader_active?
+          break if is_resting
+          break if Room.current.tags.any? { |t| t =~ /\A(?:town|supernode|node)\z/i }
           break if bs.event_stack.any? { |a| [:PREP_REST, :FOLLOW_NOW].include?(a.type) || (a.type == :LOOT && group.looter == Char.name) }
 
           # Make sure follower is joined
@@ -10685,12 +10945,11 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
           leader_tgt = group.leader_target
           if !leader_tgt.nil? && !bs.dead_or_gone?(leader_tgt) && bs.still_targetable?(leader_tgt.id)
             target = leader_tgt
-          elsif target && bs.dead_or_gone?(target)
-            # Leader has nothing usable and our own cached target has died -
-            # clear it so find_target below actually runs instead of being
-            # skipped by ||= on a stale, already-dead target.
+          elsif target && (bs.dead_or_gone?(target) || !bs.still_targetable?(target.id))
+            # Clear target if it died OR was left behind in another room when the group moved
             target = nil
           end
+
 
           target ||= bs.find_target(target)
 

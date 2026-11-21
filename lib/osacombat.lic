@@ -114,8 +114,11 @@
                          half max or more) to the Signs routine.
      November 19, 2026 - Support tab entries have an Only Use With No Enemies Present box, so each can run only
                          with an enemy present (default), only when the room is clear, or whenever ready.
-     November 21, 2026 - Weapon AOEs, weapon assaults, shield techniques and MSTRIKE are skipped while Celerity
-                         (506) is active; the routine moves on to its next entry.
+     November 21, 2026 - Weapon AOEs, assaults, shield techniques and MSTRIKE are skipped while Celerity is up.
+                         Roundtime waits round up to the next tenth of a second and most fixed pauses are gone (0.3s
+                         per Support entry). Cast RT is timed from its text line, since the XML can read a second short;
+                         each attack waits out RT first, and a "...wait N seconds" holds the next action. Blood Boil
+                         can activate with enemies present, with none present, or whenever ready.
 =end
 
 def osacombat_help_display
@@ -186,9 +189,31 @@ end
 
 # Roundtime rules: in hard RT nothing can be done; in cast RT you can change stance, but you
 # can't attack, cast or do anything else. Lich's RT can read 0 a moment before the game agrees,
-# so every wait runs 0.1 seconds past the end of the roundtime.
-_osa_const = 0.1
-COMBAT_RT_BUFFER = _osa_const unless defined?(COMBAT_RT_BUFFER) && COMBAT_RT_BUFFER == _osa_const
+# so waits are rounded up to the next tenth of a second (0.1356 -> 0.2, 2.652 -> 2.7).
+def combat_rt_round_up(secs)
+	((secs * 10).floor + 1) / 10.0
+end
+
+# When the game's timer and the XML roundtime disagree, the game answers "...wait 1 seconds."
+# (always "seconds", sometimes run onto another line) and drops the command. The downstream
+# hook sees that line and holds every roundtime wait until the game should be ready, the same
+# idea as bigshot's bs_put: "wait N" means at most N seconds are left, so it holds N - 1 seconds plus 0.2 (just 0.2 for "wait 1").
+# Lich's fput already resends after a "...wait"; this keeps osacombat's own waits from firing
+# the next command into the same wall.
+_osa_const = /(?:\.\.\.wait|^Wait) (\d+) seconds?\.?/
+COMBAT_RT_WAIT_LINE = _osa_const unless defined?(COMBAT_RT_WAIT_LINE) && COMBAT_RT_WAIT_LINE == _osa_const
+
+def combat_rt_hold_left
+	$osa_rt_hold_until ? ($osa_rt_hold_until - Time.now.to_f) : 0
+end
+
+# Lich's XML roundtimes are whole server seconds, so the time left can read up to a second short
+# (a 3 second cast read as 1.8). The "Cast Roundtime N Seconds." line is exact for cast RT, so
+# the downstream hook holds cast-RT waits until N seconds after it arrives. Hard RT keeps the XML
+# value: its text line shows the time before reductions such as Celerity.
+def combat_cast_hold_left
+	$osa_cast_hold_until ? ($osa_cast_hold_until - Time.now.to_f) : 0
+end
 
 # Seconds of roundtime left (negative once it has ended), from the same data checkrt uses
 def combat_rt_left(cast = false)
@@ -196,14 +221,16 @@ def combat_rt_left(cast = false)
 	ending - Time.now.to_f + XMLData.server_time_offset.to_f
 end
 
-# Waits until hard RT (and cast RT too, unless stance_only) ended at least COMBAT_RT_BUFFER ago.
-# Returns at once when the roundtime ended longer ago than that.
+# Waits out hard RT (and cast RT too, unless stance_only), rounded up to the next tenth of a
+# second. Checks again after each wait, so a roundtime the game extends is waited out too.
+# Returns at once when there is no roundtime.
 def combat_wait_until_rt_over(stance_only = false)
 	loop do
 		left = combat_rt_left
-		left = [left, combat_rt_left(true)].max unless stance_only
-		break if left <= -COMBAT_RT_BUFFER
-		sleep [left + COMBAT_RT_BUFFER, 0.05].max
+		left = [left, combat_rt_left(true), combat_cast_hold_left].max unless stance_only
+		left = [left, combat_rt_hold_left].max
+		break if left <= 0
+		sleep combat_rt_round_up(left)
 	end
 end
 
@@ -241,14 +268,12 @@ end
 
 # Right before a spell cast or magical activation
 def wait_castrt
-	pause 0.2 # let the last command's roundtime register first
 	combat_wait_full_rt
 end
 
-# After a cast/activation: lets its RT register, then waits it out (hard and cast RT)
+# After a cast/activation: waits out its RT (hard and cast RT)
 def wait_action_rt
 	return if $osa_next_forcert
-	pause 0.3
 	combat_wait_full_rt
 end
 
@@ -443,7 +468,8 @@ def get_target
 		end
 		return false unless valid
 		fput "target ##{valid.id}"
-		pause 0.2
+		deadline = Time.now + 1
+		sleep 0.05 until GameObj.target&.id == valid.id || Time.now > deadline
 	end
 	return false if GameObj.target.nil?
 	true
@@ -858,7 +884,6 @@ def kneel_check
 	if !checkkneeling && ((!stunned?) && (!webbed?) && (!bound?) && (!checkdead))
 		combat_wait_rt
 		fput "kneel"
-		pause 0.25
 		combat_wait_rt
 	end
 end
@@ -997,7 +1022,6 @@ def do_hurl(entry)
 	tgt = GameObj.target
 	if tgt.nil? || tgt.status.to_s =~ /dead|gone/
 		get_target
-		pause 0.2
 		tgt = GameObj.target
 		if tgt.nil? || tgt.status.to_s =~ /dead|gone/
 			# No live target yet -- return without stowing, weapon stays in hand for next call
@@ -1290,7 +1314,7 @@ def infuse_weapon
 		if Spell[infuse_spell].affordable?
 			fput "prep #{infuse_spell}"
 			fput "infuse ##{GameObj.right_hand.id}"
-			pause 5
+			wait_action_rt
 		else
 			echo "------==== Out Of Mana ==== ------"
 		end
@@ -1972,7 +1996,7 @@ def combat_weapon_assault(name, verb)
 	combat_stance_offensive
 	yield if block_given?
 	outcome = nil
-	2.times do
+	3.times do
 		outcome = combat_run_assault(verb)
 		break unless outcome == :wait
 		combat_wait_full_rt
@@ -2825,6 +2849,8 @@ def dispatch_attack_entry(entry)
 		if entry['use_quickstrike'] && !entry['quickstrike_value'].to_s.strip.empty?
 			fput "qstrike #{entry['quickstrike_value'].to_s.strip}"
 		end
+		# Anything cast since the last wait (health checks, support entries) may still be in RT
+		combat_wait_full_rt unless entry['use_forcert']
 		$osa_forcert_active = entry['use_forcert'] ? true : false
 		combat_opener_begin if entry['opener'] && !opener_marked
 		combat_once_begin if entry['once_per_target'] && !once_marked
@@ -3377,7 +3403,6 @@ def can_cast_spell(spell, cast_type, stam_min, mana_min, enemy_min, enemy_max, w
 			fput "incant 909 channel"
 		end
 		combat_wait_rt
-		pause 0.1
 		fput "stomp" if @combat_data["stomp"]
 		fput "pound" if @combat_data["pound"]
 		fput "tap"   if @combat_data["tap"]
@@ -3418,8 +3443,9 @@ def can_cast_spell(spell, cast_type, stam_min, mana_min, enemy_min, enemy_max, w
 			combat_lnet_crew($mana_message)
 			$osa_last_mana_share = Time.now
 		end
-		# Brief wait for mana to arrive - if still not affordable just skip
-		pause 2
+		# Brief wait (up to 2 seconds) for mana to arrive - if still not affordable just skip
+		deadline = Time.now + 2
+		sleep 0.1 until Spell[spell].affordable? || Time.now > deadline
 		return unless Spell[spell].affordable?
 	end
 
@@ -3698,7 +3724,6 @@ def do_sacrifice
 		# Cast 706 first for +15 bonus then sacrifice
 		if @combat_data["sacrifice_use_706"] && Spell[706].known? && Spell[706].affordable?
 			Spell[706].cast("##{prone_target.id}")
-			pause 0.3
 			combat_wait_full_rt
 		end
 		fput "sacrifice ##{prone_target.id}"
@@ -3707,7 +3732,6 @@ def do_sacrifice
 		# Cast 711 to weaken target first
 		if @combat_data["sacrifice_use_711"] && Spell[711].known? && Spell[711].affordable?
 			Spell[711].cast("##{prone_target.id}")
-			pause 0.3
 			combat_wait_full_rt
 		end
 	end
@@ -3724,7 +3748,7 @@ def do_sacrifice_mana
 	essence_to_spend = @combat_data["sacrifice_mana_essence"].to_i.clamp(1, 5)
 	spend = [essence_to_spend, available].min
 	combat_wait_full_rt
-	spend.times { fput "sacrifice mana"; pause 0.3 }
+	spend.times { fput "sacrifice mana"; combat_wait_full_rt }
 end
 
 def do_sacrifice_channel
@@ -3836,7 +3860,7 @@ def gemstone_effects
 	activate_gemstone_arcanists_ascendancy if @combat_data["gemstone_arcanists_ascendancy"] && has_enemies
 	activate_gemstone_arcanists_blade if @combat_data["gemstone_arcanists_blade"] && has_enemies
 	activate_gemstone_arcanists_will if @combat_data["gemstone_arcanists_will"] && has_enemies
-	activate_gemstone_blood_boil if @combat_data["gemstone_blood_boil"] && has_enemies
+	activate_gemstone_blood_boil(has_enemies) if @combat_data["gemstone_blood_boil"]
 	activate_gemstone_blood_siphon if @combat_data["gemstone_blood_siphon"] && has_enemies
 	activate_gemstone_blood_wellspring if @combat_data["gemstone_blood_wellspring"]
 	activate_gemstone_evanescent_possession if @combat_data["gemstone_evanescent_possession"] && has_enemies
@@ -3872,7 +3896,8 @@ def combat_spellup
 			combat_lnet_crew($mana_message)
 			$osa_last_mana_share = Time.now
 		end
-		pause 1
+		deadline = Time.now + 1
+		sleep 0.1 until Char.mana >= 50 || Time.now > deadline
 	end
 	wait_castrt
     result = dothistimeout "incant #{@combat_spell} #{@combat_cast_type}", 30, /Wait|...wait|Spell Hindrance|(Cast|Sing) Roundtime (.*) Seconds./
@@ -4023,7 +4048,6 @@ def cast_spell_rapid_fire
 			combat_spellup
 		end
 		wait_action_rt
-		pause 0.2
 	end
 end
 
@@ -4600,8 +4624,19 @@ def activate_gemstone_arcanists_will
 	end
 end
 
-def activate_gemstone_blood_boil
-	if (!Effects::Cooldowns.active? "Blood Boil") && (GameObj.targets.count > @combat_data["gemstone_activate_blood_boil_enemy_if"].to_i)
+# Blood Boil's "Activate" dropdown: With Enemies Present (default; uses the Enemy Threshold),
+# With No Enemies Present (only when the room is clear, to have it ready for the next fight) or
+# Whenever Ready (any time it's off cooldown).
+def activate_gemstone_blood_boil(has_enemies)
+	case @combat_data["gemstone_blood_boil_when"].to_s
+	when "With No Enemies Present"
+		return if has_enemies
+	when "Whenever Ready"
+		nil
+	else
+		return unless has_enemies && GameObj.targets.count > @combat_data["gemstone_activate_blood_boil_enemy_if"].to_i
+	end
+	if !Effects::Cooldowns.active?("Blood Boil")
 		wait_castrt
 		fput "gemstone activate bloodboil"
 		wait_action_rt
@@ -4837,7 +4872,6 @@ def check_for_poison
 	if (Effects::Debuffs.active? "Wall of Thorns Poison 1")||(Effects::Debuffs.active? "Wall of Thorns Poison 2")||(Effects::Debuffs.active? "Wall of Thorns Poison 3")||(Effects::Debuffs.active? "Wall of Thorns Poison 4")||(Effects::Debuffs.active? "Wall of Thorns Poison 5")||(checkpoison)
 		if Spell[114].known? && Spell[114].affordable? && (!Effects::Debuffs.active? "Mystic Impedance") && (!Effects::Debuffs.active? "Silenced")
 			Spell[114].cast
-			pause 0.3
 			return
 		end
 		if $osa_healing_status == "ignore"
@@ -4861,7 +4895,6 @@ def check_for_disease
 		end
 		if Spell[113].known? && Spell[114].affordable? && (!Effects::Debuffs.active? "Mystic Impedance") && (!Effects::Debuffs.active? "Silenced")
 			Spell[113].cast
-			pause 0.3
 			return
 		end
 		if $osa_healing_status == "ignore"
@@ -4878,13 +4911,11 @@ def check_for_injuries
 	if (Char.percent_health < @combat_data["percent_health"].to_i) && @combat_data["symbol_of_restore"]
 		fput "sym rest" until Char.percent_health > 90
 		combat_wait_rt
-		pause 0.5
 	end
 	if XMLData.injuries.any?{|key,value| value["wound"] > @combat_data["wound_level"].to_i}
 		if combat_osacrew_data["medicalofficer"].include? "#{checkname}"
 			wait_while { running?("ecure") }
 			combat_wait_rt
-			pause 0.5
 			start_script "ecure"
 			wait_while { running?("ecure") }
 		else
@@ -4909,7 +4940,6 @@ def check_for_popped
 	if Effects::Debuffs.active? "Overexerted"
 		if Spell[1107].known? && Spell[1107].affordable? && (!Effects::Debuffs.active? "Mystic Impedance") && (!Effects::Debuffs.active? "Silenced")
 			Spell[1107].cast
-			pause 0.3
 			return
 		end
 		if $osa_healing_status == "ignore"
@@ -4932,7 +4962,7 @@ def check_for_stunned
 					wait_castrt
 					fput "prep 108"
 					fput "cast " + p.noun
-					pause 3
+					wait_action_rt
 				end
 			end
 		end
@@ -5110,27 +5140,21 @@ end
 def set_shield
 	if ($energy_stored.to_i <= 20) && (($surged_flares && !$drained_flares) or (!$surged_flares && !$drained_flares))
 		combat_wait_rt
-		pause 0.1
 		if $surged_flares 
 			fput "push my pavis"
 			combat_wait_rt
-			pause 0.1
 		end
 		fput "pull my pavis"
 		combat_wait_rt
-		pause 0.1
 	end
 	if ($energy_stored.to_i >= 500) && ((!$surged_flares && $drained_flares) or (!$surged_flares && !$drained_flares))
 		combat_wait_rt
-		pause 0.1
 		if $drained_flares
 			fput "pull my pavis"
 			combat_wait_rt
-			pause 0.1
 		end
 		fput "push my pavis"
 		combat_wait_rt
-		pause 0.1
 	end
 end
 
@@ -5162,7 +5186,6 @@ def charge_eonake_spear
 	return unless status =~ /\AReady\z/i
 	return if stored >= stored_max
 	outdoors = (Room.current.outside? rescue false)
-	pause 0.5
 	if mode == "daybringer"
 		if eonake_sun_up? && outdoors
 			fput "raise ##{spear.id}"
@@ -5178,12 +5201,10 @@ def charge_eonake_spear
 			fput "turn ##{spear.id}"
 			pause 2
 			Spell[111].cast(spear)
-			pause 0.3
 			combat_wait_full_rt
 			fput "turn ##{spear.id}"
 		end
 	end
-	pause 0.3
 	combat_wait_full_rt
 end
 
@@ -6942,7 +6963,8 @@ def self.populate_gemstones1(rows)
 	combat_ui(rows, :ability, label: "Arcanist's Ascendancy", tip: "You enter a heightened state for 30 seconds. During this state, you gain Casting Strength and Magical SMR Strength equal to 30% of the Defensive Strength of spells on all creatures in the room, up to a maximum of 60. Additionally, all of your magical attacks have guaranteed dispel flares. Cooldown: 3 min.", var: 'gemstone_arcanists_ascendancy', fields: [{ label: "Enemy Threshold:", tip: "Only activates Arcanist's Ascendancy if the enemy count is above this amount. Default setting is 1.", var: 'gemstone_activate_arcanists_ascendancy_enemy_if', default: "1", entry_width: 90, chars: 4 }])
 	combat_ui(rows, :ability, label: "Arcanist's Blade", tip: "You enter a heightened state for 30 seconds. You gain 5/10/15/20/25 Attack Strength and 3/6/9/12/15% Damage Factor, but each attack costs 5 mana and 5 stamina. Upon activation you gain Mana Sever, preventing you from receiving mana from your fellow adventurers for 2 minutes.", var: 'gemstone_arcanists_blade', default: false, fields: [{ label: "Enemy Threshold:", tip: "Only activates Arcanist's Blade if the enemy count is above this amount. Default setting is 1.", var: 'gemstone_activate_arcanists_blade_enemy_if', default: "1", entry_width: 90, chars: 4 }, { label: "Mana Threshold:", tip: "Only activates Arcanist's Blade if your mana points are above this amount. Default setting is 50.", var: 'gemstone_activate_arcanists_blade_mana_if', default: "50", entry_width: 90, chars: 4 }, { label: "Stamina Threshold:", tip: "Only activates Arcanist's Blade if your stamina points are above this amount. Default setting is 50.", var: 'gemstone_activate_arcanists_blade_stamina_if', default: "50", entry_width: 90, chars: 4 }])
 	combat_ui(rows, :ability, label: "Arcanist's Will", tip: "You enter a heightened state for 30 seconds. You gain 3/6/9/12/15 Casting Strength and your successful warding spells receive an endroll bonus of 2/4/6/8/10, but each attack costs 5 mana and 5 stamina. Upon activation you gain Mana Sever, preventing you from receiving mana from your fellow adventurers for 2 minutes.", var: 'gemstone_arcanists_will', default: false, fields: [{ label: "Enemy Threshold:", tip: "Only activates Arcanist's Will if the enemy count is above this amount. Default setting is 1.", var: 'gemstone_activate_arcanists_will_enemy_if', default: "1", entry_width: 90, chars: 4 }, { label: "Mana Threshold:", tip: "Only activates Arcanist's Will if your mana points are above this amount. Default setting is 50.", var: 'gemstone_activate_arcanists_will_mana_if', default: "50", entry_width: 90, chars: 4 }, { label: "Stamina Threshold:", tip: "Only activates Arcanist's Will if your stamina points are above this amount. Default setting is 50.", var: 'gemstone_activate_arcanists_will_stamina_if', default: "50", entry_width: 90, chars: 4 }])
-	combat_ui(rows, :ability, label: "Blood Boil", tip: "Your attacks have a standard flare chance to boil the targets blood, dealing 20% of target's current health, up to 100, per tick for 5 ticks (2 second interval). This effect cannot occur on the same target more than once per minute. Activate to cause this ability to trigger on your next attack. Activation Cooldown: 1 min.", var: 'gemstone_blood_boil', default: false, fields: [{ label: "Enemy Threshold:", tip: "Only activates Blood Boil if the enemy count is above this amount. Default setting is 1.", var: 'gemstone_activate_blood_boil_enemy_if', default: "1", entry_width: 90, chars: 4 }])
+	bb_row = combat_ui(rows, :ability, label: "Blood Boil", tip: "Your attacks have a standard flare chance to boil the targets blood, dealing 20% of target's current health, up to 100, per tick for 5 ticks (2 second interval). This effect cannot occur on the same target more than once per minute. Activate to cause this ability to trigger on your next attack. Activation Cooldown: 1 min.", var: 'gemstone_blood_boil', default: false, fields: [{ label: "Enemy Threshold:", tip: "Only activates Blood Boil if the enemy count is above this amount. Default setting is 1.", var: 'gemstone_activate_blood_boil_enemy_if', default: "1", entry_width: 90, chars: 4 }])
+	combat_ui(bb_row, :dropdown, label: "Activate:", var: 'gemstone_blood_boil_when', options: "With Enemies Present,With No Enemies Present,Whenever Ready", combo_width: 200)
 	combat_ui(rows, :ability, label: "Blood Siphon", tip: "A vampiric aura surrounds you, siphoning blood from nearby enemy creatures with blood for 60 seconds. Every 10 seconds, up to 5 nearby enemy creatures are subject to an SMR test. On a failure, they take 10-20 hit point damage. 5/10/15/20/25% of the damage dealt is restored to you as health. Cooldown: 15 minutes.", var: 'gemstone_blood_siphon', default: false, fields: [{ label: "Enemy Threshold:", tip: "Only activates Blood Siphon if the enemy count is above this amount. Default setting is 1.", var: 'gemstone_activate_blood_siphon_enemy_if', default: "1", entry_width: 90, chars: 4 }])
 	combat_ui(rows, :ability, label: "Blood Wellspring", tip: "You instantly regain all of your health. Cooldown: 60/40/20 mins.", var: 'gemstone_blood_wellspring', default: false, fields: [{ label: "Health Threshold:", tip: "Only activates Blood Wellspring if your health points are below this amount. Default setting is 50.", var: 'gemstone_activate_blood_wellspring_health_if', default: "50", entry_width: 90, chars: 4 }])
 	combat_ui(rows, :ability, label: "Evanescent Possession", tip: "You invoke a friendly spirit to possess a foe. An enemy creature must make an SSR test. On a failure, it becomes afflicted with Sympathy for you. When the effect ends, the creature takes a standard disruption flare as it rejects the spirit. Cooldown: 5 mins.", var: 'gemstone_evanescent_possession', default: false, fields: [{ label: "Enemy Threshold:", tip: "Only activates Evanescent Possession if the enemy count is above this amount. Default setting is 1.", var: 'gemstone_activate_evanescent_possession_enemy_if', default: "1", entry_width: 90, chars: 4 }])
@@ -7518,21 +7540,18 @@ if @combat_data["use_gird_and_store"]
 	end
 end
 if (Spell[330].known?) && (Spell[330].affordable?)
-	pause 1
+	combat_wait_full_rt
 	if @combat_data["sanctrighthand"] && !GameObj.right_hand.id.nil?
-		pause 0.2
 		multifput "prep 330", "evoke ##{GameObj.right_hand.id}"
 		wait_action_rt
 	end
 	if @combat_data["sanctlefthand"] && !GameObj.left_hand.id.nil?
-		pause 0.2
 		multifput "prep 330", "evoke ##{GameObj.left_hand.id}"
 		wait_action_rt
 	end
 end
 if checkname == "Peggyanne"
 	combat_wait_rt
-	pause 0.1
 	energy_shield
 end
 $osacombat_auto_stow = nil
@@ -7567,7 +7586,6 @@ before_dying {
 		end
 		if checkname == "Peggyanne"
 				combat_wait_rt
-				pause 0.1
 				energy_shield
 		end
 		dothistimeout "store both", 3, /You store|You have nothing|already stored|stow/
@@ -7587,6 +7605,14 @@ $osa_animated_target = nil
 $osa_gem_leech_failed = {}
 DownstreamHook.remove("osa_downstream_monitor")
 DownstreamHook.add("osa_downstream_monitor", proc { |line|
+	# Game says the roundtime isn't over yet though the XML said it was: hold the RT waits
+	if line =~ COMBAT_RT_WAIT_LINE
+		$osa_rt_hold_until = Time.now.to_f + [$1.to_i - 1, 0].max + 0.2
+	end
+	# Cast RT from its text line (exact seconds; the XML can read up to a second short)
+	if line =~ /(?:Cast|Sing) Roundtime (\d+) Seconds?\./i
+		$osa_cast_hold_until = Time.now.to_f + $1.to_i
+	end
 	# 917 Earthen Fury - channel state
 	$earthen_fury_active = true  if line =~ /The ground beneath .+ begins to boil violently/
 	$earthen_fury_active = false if line =~ /The ground beneath .+ suddenly calms/
