@@ -1,0 +1,405 @@
+# Tastea - searchable Category / Name reference for scent, taste and undertones.
+# Version: 0.1.0-beta
+# Data source: published Google Sheets CSV (Maintained by Jocasta).
+# Research of ingredients and table maintenance by Jocasta
+# Base table created by Vannah
+# Scripting by Tenaro
+
+require 'csv'
+require 'net/http'
+require 'uri'
+
+TASTEA_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vTnb0tM8p9aFELyaN-EC64HiROaAdRxsf40eHpq0hY6yh8o8esD0UgaQKg7AwKLU4gBPlRj6uRq2ce3/pub?gid=617097906&single=true&output=csv'
+TASTEA_DATA_DIR = defined?(DATA_DIR) ? DATA_DIR : File.dirname(__FILE__)
+TASTEA_CACHE_FILE = File.join(TASTEA_DATA_DIR, 'tastea.csv')
+
+# Follow the Google Sheets publication redirect. This uses the same Net::HTTP
+# approach that was confirmed working in the user's in-game connectivity test.
+def tastea_fetch_csv(uri, redirects = 0)
+  raise 'Too many redirects while downloading the Tastea spreadsheet.' if redirects > 5
+
+  response = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https',
+                             open_timeout: 15, read_timeout: 30) do |http|
+    http.get(uri.request_uri)
+  end
+
+  if response.is_a?(Net::HTTPRedirection)
+    location = response['location']
+    raise 'The spreadsheet redirected without a destination.' if location.nil? || location.empty?
+
+    return tastea_fetch_csv(URI.join(uri.to_s, location), redirects + 1)
+  end
+
+  unless response.is_a?(Net::HTTPSuccess)
+    raise "Spreadsheet download failed: HTTP #{response.code} #{response.message}"
+  end
+
+  response.body.force_encoding(Encoding::UTF_8)
+end
+
+# Normalize the published rows into distinct category/name entries.
+# Numbered suffixes such as "(1)" and "(2)" are meaningful and are
+# retained as separate Name choices with their own descriptions.
+def tastea_parse_csv(csv_text)
+  table = CSV.parse(csv_text, headers: true)
+  headers = table.headers.map { |header| header.to_s.sub(/\A\uFEFF/, '').strip.downcase }
+  required = %w[category name scent taste undertones]
+  missing = required - headers
+  raise "CSV is missing required column(s): #{missing.join(', ')}" unless missing.empty?
+
+  indexes = {}
+  required.each { |header| indexes[header] = headers.index(header) }
+
+  categories = []
+  category_lookup = {}
+  accepted_rows = 0
+  skipped_rows = 0
+  distinct_values = { 'category' => {}, 'name' => {}, 'scent' => {}, 'taste' => {}, 'undertones' => {} }
+
+  table.each do |row|
+    category = row[indexes['category']].to_s.strip
+    raw_name = row[indexes['name']].to_s.strip
+
+    if category.empty? || raw_name.empty?
+      skipped_rows += 1
+      next
+    end
+
+    name = raw_name
+
+    distinct_values['category'][category.downcase] = true
+    distinct_values['name'][name.downcase] = true
+    %w[scent taste undertones].each do |field|
+      value = row[indexes[field]].to_s.strip
+      distinct_values[field][value.downcase] = true unless value.empty?
+    end
+
+    category_key = category.downcase
+    category_entry = category_lookup[category_key]
+    unless category_entry
+      category_entry = { name: category, names: [], name_lookup: {} }
+      category_lookup[category_key] = category_entry
+      categories << category_entry
+    end
+
+    name_key = name.downcase
+    name_entry = category_entry[:name_lookup][name_key]
+    unless name_entry
+      name_entry = { name: name, scent: [], taste: [], undertones: [] }
+      category_entry[:name_lookup][name_key] = name_entry
+      category_entry[:names] << name_entry
+    end
+
+    %w[scent taste undertones].each do |field|
+      value = row[indexes[field]].to_s.strip
+      name_entry[field.to_sym] << value unless value.empty? || name_entry[field.to_sym].include?(value)
+    end
+
+    accepted_rows += 1
+  end
+
+  {
+    categories: categories,
+    accepted_rows: accepted_rows,
+    skipped_rows: skipped_rows,
+    distinct_names: distinct_values['name'].length,
+    distinct_scents: distinct_values['scent'].length,
+    distinct_tastes: distinct_values['taste'].length,
+    distinct_undertones: distinct_values['undertones'].length
+  }
+end
+
+# Prefer a fresh sheet download. If that fails, use the last successfully
+# downloaded CSV so Tastea remains usable during a temporary network outage.
+tastea_data = nil
+tastea_data_source = nil
+tastea_download_error = nil
+
+begin
+  tastea_csv = tastea_fetch_csv(URI(TASTEA_CSV_URL))
+  tastea_data = tastea_parse_csv(tastea_csv)
+  begin
+    File.write(TASTEA_CACHE_FILE, tastea_csv)
+  rescue StandardError => cache_error
+    respond "Tastea: Loaded the live spreadsheet, but couldn't update the local cache: #{cache_error.message}"
+  end
+  tastea_data_source = 'Live spreadsheet'
+rescue StandardError => download_error
+  tastea_download_error = download_error.message
+  begin
+    if File.file?(TASTEA_CACHE_FILE)
+      tastea_data = tastea_parse_csv(File.read(TASTEA_CACHE_FILE, encoding: 'UTF-8'))
+      tastea_data_source = 'Saved cache (spreadsheet unavailable)'
+    end
+  rescue StandardError => cache_error
+    respond "Tastea: The live spreadsheet and saved cache both failed. Download: #{tastea_download_error}. Cache: #{cache_error.message}"
+    exit
+  end
+end
+
+unless tastea_data && !tastea_data[:categories].empty?
+  message = tastea_download_error ? "Tastea couldn't load the spreadsheet (#{tastea_download_error}) and no usable cache was found." : 'Tastea: The spreadsheet contains no complete Category/Name rows.'
+  respond message
+  exit
+end
+
+unless defined?(Gtk) && Gtk::Version::MAJOR == 3
+  respond 'Tastea: This version requires the GTK 3 interface available in Lich 5.'
+  exit
+end
+
+# Build fast lookup tables once. All live filtering below is local and does
+# not make additional network requests.
+tastea_categories = tastea_data[:categories]
+tastea_category_by_name = {}
+tastea_categories.each { |category| tastea_category_by_name[category[:name]] = category }
+tastea_finished = false
+tastea_window_open = false
+tastea_updating = false
+tastea_selected_category = nil
+tastea_selected_name = nil
+tastea_window = nil
+
+Gtk.queue do
+  tastea_window = Gtk::Window.new(:toplevel)
+  tastea_window.set_title('Tastea')
+  tastea_window.set_default_size(760, 560)
+  tastea_window.set_border_width(12)
+  tastea_window_open = true
+
+  root = Gtk::Box.new(:vertical, 10)
+  tastea_window.add(root)
+
+  selection_grid = Gtk::Grid.new
+  selection_grid.row_spacing = 8
+  selection_grid.column_spacing = 10
+  root.pack_start(selection_grid, false, false, 0)
+
+  category_label = Gtk::Label.new('Category:')
+  category_label.halign = Gtk::Align::START
+  selection_grid.attach(category_label, 0, 0, 1, 1)
+
+  category_combo = Gtk::ComboBoxText.new
+  category_combo.hexpand = true
+  selection_grid.attach(category_combo, 1, 0, 1, 1)
+
+  category_search = Gtk::Entry.new
+  category_search.placeholder_text = 'Optional search'
+  category_search.hexpand = true
+  selection_grid.attach(category_search, 2, 0, 1, 1)
+
+  name_label = Gtk::Label.new('Name:')
+  name_label.halign = Gtk::Align::START
+  selection_grid.attach(name_label, 0, 2, 1, 1)
+
+  name_combo = Gtk::ComboBoxText.new
+  name_combo.hexpand = true
+  name_combo.sensitive = false
+  selection_grid.attach(name_combo, 1, 2, 1, 1)
+
+  name_search = Gtk::Entry.new
+  name_search.placeholder_text = 'Optional search'
+  name_search.hexpand = true
+  selection_grid.attach(name_search, 2, 2, 1, 1)
+
+  details_frame = Gtk::Frame.new('Ingredient Details')
+  details_box = Gtk::Box.new(:vertical, 10)
+  details_box.set_border_width(10)
+  details_frame.add(details_box)
+  root.pack_start(details_frame, true, true, 0)
+
+  detail_labels = {}
+  [['Scent', :scent], ['Taste', :taste], ['Undertones', :undertones]].each do |caption, key|
+    section = Gtk::Box.new(:vertical, 3)
+    title = Gtk::Label.new("<b>#{caption}</b>")
+    title.use_markup = true
+    title.halign = Gtk::Align::START
+    section.pack_start(title, false, false, 0)
+
+    value = Gtk::Label.new('')
+    value.halign = Gtk::Align::START
+    value.valign = Gtk::Align::START
+    value.set_line_wrap(true)
+    value.set_selectable(true)
+    section.pack_start(value, false, false, 0)
+    details_box.pack_start(section, false, false, 0)
+    detail_labels[key] = value
+  end
+
+  status = Gtk::Label.new('')
+  status.halign = Gtk::Align::START
+  status.set_line_wrap(true)
+  root.pack_start(status, false, false, 0)
+
+  footer = Gtk::ButtonBox.new(:horizontal)
+  footer.layout = :end
+  print_button = Gtk::Button.new(label: 'Print to Game')
+  print_button.sensitive = false
+  footer.add(print_button)
+  close_button = Gtk::Button.new(label: 'Close')
+  footer.add(close_button)
+  root.pack_start(footer, false, false, 0)
+
+  clear_details = lambda do
+    detail_labels[:scent].text = ''
+    detail_labels[:taste].text = ''
+    detail_labels[:undertones].text = ''
+    print_button.sensitive = false
+  end
+
+  selected_item = lambda do
+    if tastea_selected_category && tastea_selected_name
+      category = tastea_category_by_name[tastea_selected_category]
+      category && category[:name_lookup][tastea_selected_name.downcase]
+    end
+  end
+
+  show_details = lambda do
+    item = selected_item.call
+    if item
+      detail_labels[:scent].text = item[:scent].empty? ? 'No scent description provided.' : item[:scent].join("\n\n")
+      detail_labels[:taste].text = item[:taste].empty? ? 'No taste description provided.' : item[:taste].join("\n\n")
+      detail_labels[:undertones].text = item[:undertones].empty? ? 'No undertones description provided.' : item[:undertones].join("\n\n")
+      print_button.sensitive = true
+    else
+      clear_details.call
+      print_button.sensitive = false
+    end
+  end
+
+  format_game_output = lambda do |item|
+    label_width = 12
+    value_width = 62
+    inner_width = label_width + value_width + 5
+    border = '+' + ('-' * inner_width) + '+'
+    lines = [border, '| ' + 'Tastea'.center(inner_width - 2) + ' |', border]
+
+    [
+      ['Category', tastea_selected_category],
+      ['Name', item[:name]],
+      ['Scent', item[:scent].empty? ? 'No scent description provided.' : item[:scent].join("\n\n")],
+      ['Taste', item[:taste].empty? ? 'No taste description provided.' : item[:taste].join("\n\n")],
+      ['Undertones', item[:undertones].empty? ? 'No undertones description provided.' : item[:undertones].join("\n\n")]
+    ].each do |label, value|
+      wrapped = []
+      value.to_s.split("\n", -1).each do |paragraph_line|
+        if paragraph_line.empty?
+          wrapped << ''
+        else
+          words = paragraph_line.split(/\s+/)
+          current = ''
+          words.each do |word|
+            if current.empty?
+              current = word
+            elsif current.length + word.length + 1 <= value_width
+              current += ' ' + word
+            else
+              wrapped << current
+              current = word
+            end
+          end
+          wrapped << current unless current.empty?
+        end
+      end
+      wrapped = [''] if wrapped.empty?
+      wrapped.each_with_index do |line, index|
+        left = index.zero? ? label : ''
+        lines << '| ' + left.ljust(label_width) + ' | ' + line[0, value_width].to_s.ljust(value_width) + ' |'
+      end
+      lines << border
+    end
+
+    lines.join("\n")
+  end
+
+  print_button.signal_connect('clicked') do
+    item = selected_item.call
+    respond(format_game_output.call(item)) if item
+  end
+
+  rebuild_names = lambda do
+    selected_before = tastea_selected_name
+    category = tastea_selected_category && tastea_category_by_name[tastea_selected_category]
+    search = name_search.text.to_s.strip.downcase
+    choices = category ? category[:names].select { |item| item[:name].downcase.include?(search) } : []
+
+    tastea_updating = true
+    name_combo.remove_all
+    choices.each { |item| name_combo.append_text(item[:name]) }
+    selected_index = choices.index { |item| item[:name].downcase == selected_before.to_s.downcase }
+    name_combo.active = selected_index || -1
+    tastea_updating = false
+
+    if selected_index
+      tastea_selected_name = choices[selected_index][:name]
+    else
+      tastea_selected_name = nil
+      clear_details.call
+    end
+    name_combo.sensitive = !category.nil? && !choices.empty?
+  end
+
+  rebuild_categories = lambda do
+    selected_before = tastea_selected_category
+    search = category_search.text.to_s.strip.downcase
+    choices = tastea_categories.select { |category| category[:name].downcase.include?(search) }
+
+    tastea_updating = true
+    category_combo.remove_all
+    choices.each { |category| category_combo.append_text(category[:name]) }
+    selected_index = choices.index { |category| category[:name].downcase == selected_before.to_s.downcase }
+    category_combo.active = selected_index || -1
+    tastea_updating = false
+
+    if selected_index
+      tastea_selected_category = choices[selected_index][:name]
+    else
+      tastea_selected_category = nil
+      tastea_selected_name = nil
+      rebuild_names.call
+      clear_details.call
+    end
+  end
+
+  category_search.signal_connect('changed') { rebuild_categories.call }
+  category_combo.signal_connect('changed') do
+    unless tastea_updating
+      chosen = category_combo.active_text
+      chosen = nil if chosen.nil?
+      if chosen != tastea_selected_category
+        tastea_selected_category = chosen
+        tastea_selected_name = nil
+        name_search.text = '' unless name_search.text.to_s.empty?
+        rebuild_names.call
+        clear_details.call
+      end
+    end
+  end
+
+  name_search.signal_connect('changed') { rebuild_names.call unless tastea_updating }
+  name_combo.signal_connect('changed') do
+    unless tastea_updating
+      chosen = name_combo.active_text
+      chosen = nil if chosen.nil?
+      tastea_selected_name = chosen
+      show_details.call
+    end
+  end
+
+  close_button.signal_connect('clicked') { tastea_window.destroy }
+  tastea_window.signal_connect('destroy') do
+    tastea_finished = true
+    tastea_window_open = false
+  end
+
+  rebuild_categories.call
+  status.text = "Categories: #{tastea_data[:categories].length}, Names: #{tastea_data[:distinct_names]}, Scents: #{tastea_data[:distinct_scents]}, Tastes: #{tastea_data[:distinct_tastes]}, Undertones: #{tastea_data[:distinct_undertones]}"
+  tastea_window.show_all
+  tastea_window.keep_above = true
+end
+
+before_dying do
+  Gtk.queue { tastea_window.destroy if tastea_window_open && tastea_window }
+end
+
+sleep 0.1 until tastea_finished
