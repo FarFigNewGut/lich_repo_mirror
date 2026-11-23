@@ -1,5 +1,6 @@
-# Tastea - searchable Category / Name reference for scent, taste and undertones.
-# Version: 0.1.0-beta
+
+# Tastea - searchable ingredient reference and blend builder.
+# Version: 0.2.4-beta
 # Data source: published Google Sheets CSV (Maintained by Jocasta).
 # Research of ingredients and table maintenance by Jocasta
 # Base table created by Vannah
@@ -10,39 +11,57 @@ require 'net/http'
 require 'uri'
 
 TASTEA_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vTnb0tM8p9aFELyaN-EC64HiROaAdRxsf40eHpq0hY6yh8o8esD0UgaQKg7AwKLU4gBPlRj6uRq2ce3/pub?gid=617097906&single=true&output=csv'
+TASTEA_BASES_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vTnb0tM8p9aFELyaN-EC64HiROaAdRxsf40eHpq0hY6yh8o8esD0UgaQKg7AwKLU4gBPlRj6uRq2ce3/pub?gid=652566581&single=true&output=csv'
 TASTEA_DATA_DIR = defined?(DATA_DIR) ? DATA_DIR : File.dirname(__FILE__)
 TASTEA_CACHE_FILE = File.join(TASTEA_DATA_DIR, 'tastea.csv')
+TASTEA_BASES_CACHE_FILE = File.join(TASTEA_DATA_DIR, 'tastea_bases.csv')
 
-# Follow the Google Sheets publication redirect. This uses the same Net::HTTP
-# approach that was confirmed working in the user's in-game connectivity test.
+# Download the published CSV while identifying the request as a browser.
+# Follow Google's publication redirects, including redirects to the CSV host.
 def tastea_fetch_csv(uri, redirects = 0)
-  raise 'Too many redirects while downloading the Tastea spreadsheet.' if redirects > 5
+  raise 'Too many redirects while downloading the Tastea spreadsheet.' if redirects > 8
 
-  response = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https',
-                             open_timeout: 15, read_timeout: 30) do |http|
-    http.get(uri.request_uri)
+  request = Net::HTTP::Get.new(uri.request_uri)
+  request['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
+  request['Accept'] = 'text/csv,text/plain,application/octet-stream,*/*'
+  request['Cache-Control'] = 'no-cache'
+
+  response = Net::HTTP.start(
+    uri.host,
+    uri.port,
+    use_ssl: uri.scheme == 'https',
+    open_timeout: 15,
+    read_timeout: 30
+  ) do |http|
+    http.request(request)
   end
 
   if response.is_a?(Net::HTTPRedirection)
     location = response['location']
     raise 'The spreadsheet redirected without a destination.' if location.nil? || location.empty?
 
-    return tastea_fetch_csv(URI.join(uri.to_s, location), redirects + 1)
+    next_uri = URI.join(uri.to_s, location)
+    return tastea_fetch_csv(next_uri, redirects + 1)
   end
 
   unless response.is_a?(Net::HTTPSuccess)
     raise "Spreadsheet download failed: HTTP #{response.code} #{response.message}"
   end
 
-  response.body.force_encoding(Encoding::UTF_8)
+  body = response.body.to_s.force_encoding(Encoding::UTF_8)
+  raise 'The spreadsheet returned an empty response.' if body.strip.empty?
+  raise 'Google returned a sign-in page instead of CSV data.' if body.include?('ServiceLogin') || body.include?('<html')
+
+  body
 end
 
-# Normalize the published rows into distinct category/name entries.
-# Numbered suffixes such as "(1)" and "(2)" are meaningful and are
-# retained as separate Name choices with their own descriptions.
+# Normalize rows into a distinct ingredient list. Repeated ingredient names
+# are merged, regardless of Category; Category is not part of the user-facing
+# selection.
 def tastea_parse_csv(csv_text)
   table = CSV.parse(csv_text, headers: true)
   headers = table.headers.map { |header| header.to_s.sub(/\A\uFEFF/, '').strip.downcase }
+
   required = %w[category name scent taste undertones]
   missing = required - headers
   raise "CSV is missing required column(s): #{missing.join(', ')}" unless missing.empty?
@@ -50,95 +69,140 @@ def tastea_parse_csv(csv_text)
   indexes = {}
   required.each { |header| indexes[header] = headers.index(header) }
 
-  categories = []
-  category_lookup = {}
+  ingredients = []
+  ingredient_lookup = {}
   accepted_rows = 0
   skipped_rows = 0
-  distinct_values = { 'category' => {}, 'name' => {}, 'scent' => {}, 'taste' => {}, 'undertones' => {} }
+  distinct_values = { 'scent' => {}, 'taste' => {}, 'undertones' => {} }
 
   table.each do |row|
-    category = row[indexes['category']].to_s.strip
     raw_name = row[indexes['name']].to_s.strip
-
-    if category.empty? || raw_name.empty?
+    if raw_name.empty?
       skipped_rows += 1
       next
     end
 
-    name = raw_name
+    # Numbered rows are variants: (1) supplies X; (2) supplies Y.
+    # Unnumbered legacy rows are treated as variant 1 until numbered.
+    match = raw_name.match(/\A(.+?)\s*\(([12])\)\s*\z/)
+    name = match ? match[1].strip : raw_name
+    variant = match ? match[2].to_i : 1
+    key = name.downcase
 
-    distinct_values['category'][category.downcase] = true
-    distinct_values['name'][name.downcase] = true
+    ingredient = ingredient_lookup[key]
+    unless ingredient
+      ingredient = {
+        name: name,
+        variants: {},
+        scent: [],
+        taste: [],
+        undertones: []
+      }
+      ingredient_lookup[key] = ingredient
+      ingredients << ingredient
+    end
+
+    variant_data = ingredient[:variants][variant] ||= {
+      scent: [], taste: [], undertones: []
+    }
+
     %w[scent taste undertones].each do |field|
       value = row[indexes[field]].to_s.strip
-      distinct_values[field][value.downcase] = true unless value.empty?
-    end
+      next if value.empty?
 
-    category_key = category.downcase
-    category_entry = category_lookup[category_key]
-    unless category_entry
-      category_entry = { name: category, names: [], name_lookup: {} }
-      category_lookup[category_key] = category_entry
-      categories << category_entry
-    end
-
-    name_key = name.downcase
-    name_entry = category_entry[:name_lookup][name_key]
-    unless name_entry
-      name_entry = { name: name, scent: [], taste: [], undertones: [] }
-      category_entry[:name_lookup][name_key] = name_entry
-      category_entry[:names] << name_entry
-    end
-
-    %w[scent taste undertones].each do |field|
-      value = row[indexes[field]].to_s.strip
-      name_entry[field.to_sym] << value unless value.empty? || name_entry[field.to_sym].include?(value)
+      distinct_values[field][value.downcase] = true
+      field_key = field.to_sym
+      variant_data[field_key] << value unless variant_data[field_key].include?(value)
+      ingredient[field_key] << value unless ingredient[field_key].include?(value)
     end
 
     accepted_rows += 1
   end
 
   {
-    categories: categories,
+    ingredients: ingredients,
     accepted_rows: accepted_rows,
     skipped_rows: skipped_rows,
-    distinct_names: distinct_values['name'].length,
+    distinct_names: ingredients.length,
     distinct_scents: distinct_values['scent'].length,
     distinct_tastes: distinct_values['taste'].length,
     distinct_undertones: distinct_values['undertones'].length
   }
 end
 
-# Prefer a fresh sheet download. If that fails, use the last successfully
-# downloaded CSV so Tastea remains usable during a temporary network outage.
-tastea_data = nil
-tastea_data_source = nil
-tastea_download_error = nil
+# Parse the Bases tab. A drink type is eligible only when BOTH templates
+# contain standalone X and Y placeholders; incomplete templates are ignored.
+def tastea_parse_bases_csv(csv_text)
+  table = CSV.parse(csv_text, headers: true)
+  headers = table.headers.map { |header| header.to_s.sub(/\A\uFEFF/, '').strip.downcase }
+  required = ['drink type', 'scent', 'taste']
+  missing = required - headers
+  raise "Bases CSV is missing required column(s): #{missing.join(', ')}" unless missing.empty?
 
-begin
-  tastea_csv = tastea_fetch_csv(URI(TASTEA_CSV_URL))
-  tastea_data = tastea_parse_csv(tastea_csv)
-  begin
-    File.write(TASTEA_CACHE_FILE, tastea_csv)
-  rescue StandardError => cache_error
-    respond "Tastea: Loaded the live spreadsheet, but couldn't update the local cache: #{cache_error.message}"
-  end
-  tastea_data_source = 'Live spreadsheet'
-rescue StandardError => download_error
-  tastea_download_error = download_error.message
-  begin
-    if File.file?(TASTEA_CACHE_FILE)
-      tastea_data = tastea_parse_csv(File.read(TASTEA_CACHE_FILE, encoding: 'UTF-8'))
-      tastea_data_source = 'Saved cache (spreadsheet unavailable)'
+  indexes = {}
+  required.each { |header| indexes[header] = headers.index(header) }
+  bases = []
+  skipped = 0
+
+  table.each do |row|
+    drink_type = row[indexes['drink type']].to_s.strip
+    scent = row[indexes['scent']].to_s.strip
+    taste = row[indexes['taste']].to_s.strip
+
+    if drink_type.empty? || scent.empty? || taste.empty? ||
+       !scent.match?(/\bX\b/i) || !scent.match?(/\bY\b/i) ||
+       !taste.match?(/\bX\b/i) || !taste.match?(/\bY\b/i)
+      skipped += 1
+      next
     end
-  rescue StandardError => cache_error
-    respond "Tastea: The live spreadsheet and saved cache both failed. Download: #{tastea_download_error}. Cache: #{cache_error.message}"
-    exit
+
+    bases << { name: drink_type, scent: scent, taste: taste }
+  end
+
+  { bases: bases, skipped_rows: skipped }
+end
+
+# Fetch Vannah and Bases concurrently. Previously these two network requests
+# ran one after the other, doubling the time spent waiting on Google redirects.
+tastea_load_source = lambda do |url, cache_file, parser|
+  begin
+    csv = tastea_fetch_csv(URI(url))
+    data = parser.call(csv)
+    begin
+      File.write(cache_file, csv)
+    rescue StandardError
+      # A cache write failure should not prevent use of live spreadsheet data.
+    end
+    [data, 'Live spreadsheet', nil]
+  rescue StandardError => download_error
+    begin
+      if File.file?(cache_file)
+        data = parser.call(File.read(cache_file, encoding: 'UTF-8'))
+        [data, 'Saved cache (spreadsheet unavailable)', download_error.message]
+      else
+        [nil, nil, download_error.message]
+      end
+    rescue StandardError => cache_error
+      [nil, nil, "#{download_error.message}; cache: #{cache_error.message}"]
+    end
   end
 end
 
-unless tastea_data && !tastea_data[:categories].empty?
-  message = tastea_download_error ? "Tastea couldn't load the spreadsheet (#{tastea_download_error}) and no usable cache was found." : 'Tastea: The spreadsheet contains no complete Category/Name rows.'
+tastea_vannah_thread = Thread.new do
+  tastea_load_source.call(TASTEA_CSV_URL, TASTEA_CACHE_FILE, method(:tastea_parse_csv))
+end
+tastea_bases_thread = Thread.new do
+  tastea_load_source.call(TASTEA_BASES_CSV_URL, TASTEA_BASES_CACHE_FILE, method(:tastea_parse_bases_csv))
+end
+
+tastea_data, tastea_data_source, tastea_download_error = tastea_vannah_thread.value
+tastea_bases_data, tastea_bases_source, tastea_bases_error = tastea_bases_thread.value
+tastea_bases_data ||= { bases: [], skipped_rows: 0 }
+
+unless tastea_data && !tastea_data[:ingredients].empty?
+  message = tastea_download_error ?
+    "Tastea couldn't load the spreadsheet (#{tastea_download_error}) and no usable cache was found." :
+    'Tastea: The spreadsheet contains no usable ingredient rows.'
   respond message
   exit
 end
@@ -148,241 +212,202 @@ unless defined?(Gtk) && Gtk::Version::MAJOR == 3
   exit
 end
 
-# Build fast lookup tables once. All live filtering below is local and does
-# not make additional network requests.
-tastea_categories = tastea_data[:categories]
-tastea_category_by_name = {}
-tastea_categories.each { |category| tastea_category_by_name[category[:name]] = category }
+# One case-insensitive, distinct ingredient list is shared by all selectors.
+# Keep the initial dropdown small for fast GUI startup. Search still checks
+# the complete ingredient list, while the blank-search dropdown shows a
+# manageable alphabetical sample that can be used immediately.
+tastea_ingredients = tastea_data[:ingredients].sort_by { |ingredient| ingredient[:name].downcase }
+TASTEA_INITIAL_DROPDOWN_LIMIT = 50
+
 tastea_finished = false
 tastea_window_open = false
-tastea_updating = false
-tastea_selected_category = nil
-tastea_selected_name = nil
 tastea_window = nil
 
 Gtk.queue do
   tastea_window = Gtk::Window.new(:toplevel)
   tastea_window.set_title('Tastea')
-  tastea_window.set_default_size(760, 560)
+  tastea_window.set_default_size(900, 780)
   tastea_window.set_border_width(12)
   tastea_window_open = true
 
   root = Gtk::Box.new(:vertical, 10)
   tastea_window.add(root)
 
-  selection_grid = Gtk::Grid.new
-  selection_grid.row_spacing = 8
-  selection_grid.column_spacing = 10
-  root.pack_start(selection_grid, false, false, 0)
+  blend_frame = Gtk::Frame.new('Blend Builder')
+  blend_box = Gtk::Box.new(:vertical, 8)
+  blend_box.set_border_width(10)
+  blend_frame.add(blend_box)
+  root.pack_start(blend_frame, true, true, 0)
 
-  category_label = Gtk::Label.new('Category:')
-  category_label.halign = Gtk::Align::START
-  selection_grid.attach(category_label, 0, 0, 1, 1)
+  blend_grid = Gtk::Grid.new
+  blend_grid.row_spacing = 7
+  blend_grid.column_spacing = 10
+  blend_box.pack_start(blend_grid, false, false, 0)
 
-  category_combo = Gtk::ComboBoxText.new
-  category_combo.hexpand = true
-  selection_grid.attach(category_combo, 1, 0, 1, 1)
+  # Each ingredient selector filters the shared list as the user types.
+  make_ingredient_selector = lambda do |caption, row, variant|
+    label = Gtk::Label.new(caption)
+    label.halign = Gtk::Align::START
+    blend_grid.attach(label, 0, row, 1, 1)
 
-  category_search = Gtk::Entry.new
-  category_search.placeholder_text = 'Optional search'
-  category_search.hexpand = true
-  selection_grid.attach(category_search, 2, 0, 1, 1)
+    search = Gtk::Entry.new
+    search.placeholder_text = 'Search all ingredients (dropdown starts with first 50)...'
+    search.hexpand = true
+    blend_grid.attach(search, 1, row, 1, 1)
 
-  name_label = Gtk::Label.new('Name:')
-  name_label.halign = Gtk::Align::START
-  selection_grid.attach(name_label, 0, 2, 1, 1)
+    combo = Gtk::ComboBoxText.new
+    combo.hexpand = true
+    blend_grid.attach(combo, 2, row, 1, 1)
 
-  name_combo = Gtk::ComboBoxText.new
-  name_combo.hexpand = true
-  name_combo.sensitive = false
-  selection_grid.attach(name_combo, 1, 2, 1, 1)
+    state = { choices: [], selected: nil, updating: false }
+    refresh = lambda do
+      query = search.text.to_s.strip.downcase
+      # With no search term, show every ingredient that has this variant.
+      # Typing narrows the list, but the dropdown is usable immediately.
+      matching = tastea_ingredients.select do |ingredient|
+        (query.empty? || ingredient[:name].downcase.include?(query)) &&
+          ingredient[:variants].key?(variant)
+      end
+      # Avoid constructing a GTK row for every ingredient at startup. With
+      # no search, show the first 50 alphabetically; a search scans all rows.
+      state[:choices] = query.empty? ? matching.first(TASTEA_INITIAL_DROPDOWN_LIMIT) : matching
 
-  name_search = Gtk::Entry.new
-  name_search.placeholder_text = 'Optional search'
-  name_search.hexpand = true
-  selection_grid.attach(name_search, 2, 2, 1, 1)
+      state[:updating] = true
+      combo.remove_all
+      state[:choices].each { |ingredient| combo.append_text(ingredient[:name]) }
+      combo.active = -1
+      state[:selected] = nil
+      state[:updating] = false
+    end
 
-  details_frame = Gtk::Frame.new('Ingredient Details')
-  details_box = Gtk::Box.new(:vertical, 10)
-  details_box.set_border_width(10)
-  details_frame.add(details_box)
-  root.pack_start(details_frame, true, true, 0)
+    search.signal_connect('changed') { refresh.call }
+    combo.signal_connect('changed') do
+      unless state[:updating]
+        index = combo.active
+        ingredient = index >= 0 ? state[:choices][index] : nil
+        if ingredient
+          variant_data = ingredient[:variants][variant]
+          state[:selected] = {
+            name: ingredient[:name],
+            scent: variant_data[:scent],
+            taste: variant_data[:taste],
+            undertones: variant_data[:undertones],
+            variant: variant
+          }
+        else
+          state[:selected] = nil
+        end
+      end
+    end
 
-  detail_labels = {}
-  [['Scent', :scent], ['Taste', :taste], ['Undertones', :undertones]].each do |caption, key|
-    section = Gtk::Box.new(:vertical, 3)
-    title = Gtk::Label.new("<b>#{caption}</b>")
-    title.use_markup = true
-    title.halign = Gtk::Align::START
-    section.pack_start(title, false, false, 0)
-
-    value = Gtk::Label.new('')
-    value.halign = Gtk::Align::START
-    value.valign = Gtk::Align::START
-    value.set_line_wrap(true)
-    value.set_selectable(true)
-    section.pack_start(value, false, false, 0)
-    details_box.pack_start(section, false, false, 0)
-    detail_labels[key] = value
+    refresh.call
+    [search, combo, state]
   end
 
-  status = Gtk::Label.new('')
-  status.halign = Gtk::Align::START
-  status.set_line_wrap(true)
-  root.pack_start(status, false, false, 0)
+  ingredient_one_search, ingredient_one_combo, ingredient_one_state =
+    make_ingredient_selector.call('Ingredient 1 (X):', 0, 1)
+  ingredient_two_search, ingredient_two_combo, ingredient_two_state =
+    make_ingredient_selector.call('Ingredient 2 (Y):', 1, 2)
+
+  base_combo = Gtk::ComboBoxText.new
+  tastea_bases_data[:bases].each { |base| base_combo.append_text(base[:name]) }
+  base_combo.active = -1
+  blend_grid.attach(Gtk::Label.new('Drink Type:'), 0, 2, 1, 1)
+  blend_grid.attach(base_combo, 1, 2, 2, 1)
+
+  preview_frame = Gtk::Frame.new('Blend Preview')
+  preview_box = Gtk::Box.new(:vertical, 5)
+  preview_box.set_border_width(8)
+  preview_frame.add(preview_box)
+  blend_box.pack_start(preview_frame, true, true, 0)
+
+  blend_preview_labels = {}
+  [['Scent', :scent], ['Taste', :taste], ['Undertones (Under Construction)', :undertones]].each do |caption, key|
+    heading = Gtk::Label.new("<b>#{caption}</b>")
+    heading.use_markup = true
+    heading.halign = Gtk::Align::START
+    preview_box.pack_start(heading, false, false, 0)
+    value = Gtk::Label.new('Select both ingredients and a drink type to preview the blend.')
+    value.halign = Gtk::Align::START
+    value.set_margin_start(18)
+    value.set_line_wrap(true)
+    value.set_selectable(true)
+    preview_box.pack_start(value, false, false, 0)
+    blend_preview_labels[key] = value
+  end
+
+  blend_footer = Gtk::ButtonBox.new(:horizontal)
+  blend_footer.layout = :end
+  print_blend_button = Gtk::Button.new(label: 'Print Blend to Game')
+  print_blend_button.sensitive = false
+  blend_footer.add(print_blend_button)
+  blend_box.pack_start(blend_footer, false, false, 0)
 
   footer = Gtk::ButtonBox.new(:horizontal)
   footer.layout = :end
-  print_button = Gtk::Button.new(label: 'Print to Game')
-  print_button.sensitive = false
-  footer.add(print_button)
   close_button = Gtk::Button.new(label: 'Close')
   footer.add(close_button)
   root.pack_start(footer, false, false, 0)
 
-  clear_details = lambda do
-    detail_labels[:scent].text = ''
-    detail_labels[:taste].text = ''
-    detail_labels[:undertones].text = ''
-    print_button.sensitive = false
+  selected_blend = lambda do
+    first = ingredient_one_state[:selected]
+    second = ingredient_two_state[:selected]
+    base = tastea_bases_data[:bases][base_combo.active] if base_combo.active >= 0
+    first && second && base ? [first, second, base] : nil
   end
 
-  selected_item = lambda do
-    if tastea_selected_category && tastea_selected_name
-      category = tastea_category_by_name[tastea_selected_category]
-      category && category[:name_lookup][tastea_selected_name.downcase]
-    end
-  end
-
-  show_details = lambda do
-    item = selected_item.call
-    if item
-      detail_labels[:scent].text = item[:scent].empty? ? 'No scent description provided.' : item[:scent].join("\n\n")
-      detail_labels[:taste].text = item[:taste].empty? ? 'No taste description provided.' : item[:taste].join("\n\n")
-      detail_labels[:undertones].text = item[:undertones].empty? ? 'No undertones description provided.' : item[:undertones].join("\n\n")
-      print_button.sensitive = true
+  build_blend = lambda do
+    selection = selected_blend.call
+    if selection
+      first, second, base = selection
+      first_scent = first[:scent].first || 'No scent description provided.'
+      second_scent = second[:scent].first || 'No scent description provided.'
+      first_taste = first[:taste].first || 'No taste description provided.'
+      second_taste = second[:taste].first || 'No taste description provided.'
+      scent = base[:scent].gsub(/\bX\b/i) { first_scent }.gsub(/\bY\b/i) { second_scent }
+      taste = base[:taste].gsub(/\bX\b/i) { first_taste }.gsub(/\bY\b/i) { second_taste }
+      undertones = first[:undertones].empty? ? 'No undertones description provided.' : first[:undertones].join("\n\n")
+      blend_preview_labels[:scent].text = scent
+      blend_preview_labels[:taste].text = taste
+      blend_preview_labels[:undertones].text = undertones
+      print_blend_button.sensitive = true
+      { first: first, second: second, base: base, scent: scent, taste: taste, undertones: undertones }
     else
-      clear_details.call
-      print_button.sensitive = false
+      blend_preview_labels.each_value { |label| label.text = 'Select both ingredients and a drink type to preview the blend.' }
+      print_blend_button.sensitive = false
+      nil
     end
   end
 
-  format_game_output = lambda do |item|
-    label_width = 12
-    value_width = 62
-    inner_width = label_width + value_width + 5
-    border = '+' + ('-' * inner_width) + '+'
-    lines = [border, '| ' + 'Tastea'.center(inner_width - 2) + ' |', border]
-
-    [
-      ['Category', tastea_selected_category],
-      ['Name', item[:name]],
-      ['Scent', item[:scent].empty? ? 'No scent description provided.' : item[:scent].join("\n\n")],
-      ['Taste', item[:taste].empty? ? 'No taste description provided.' : item[:taste].join("\n\n")],
-      ['Undertones', item[:undertones].empty? ? 'No undertones description provided.' : item[:undertones].join("\n\n")]
-    ].each do |label, value|
-      wrapped = []
-      value.to_s.split("\n", -1).each do |paragraph_line|
-        if paragraph_line.empty?
-          wrapped << ''
-        else
-          words = paragraph_line.split(/\s+/)
-          current = ''
-          words.each do |word|
-            if current.empty?
-              current = word
-            elsif current.length + word.length + 1 <= value_width
-              current += ' ' + word
-            else
-              wrapped << current
-              current = word
-            end
-          end
-          wrapped << current unless current.empty?
-        end
-      end
-      wrapped = [''] if wrapped.empty?
-      wrapped.each_with_index do |line, index|
-        left = index.zero? ? label : ''
-        lines << '| ' + left.ljust(label_width) + ' | ' + line[0, value_width].to_s.ljust(value_width) + ' |'
-      end
-      lines << border
-    end
-
-    lines.join("\n")
+  [ingredient_one_combo, ingredient_two_combo, base_combo].each do |combo|
+    combo.signal_connect('changed') { build_blend.call }
   end
 
-  print_button.signal_connect('clicked') do
-    item = selected_item.call
-    respond(format_game_output.call(item)) if item
-  end
-
-  rebuild_names = lambda do
-    selected_before = tastea_selected_name
-    category = tastea_selected_category && tastea_category_by_name[tastea_selected_category]
-    search = name_search.text.to_s.strip.downcase
-    choices = category ? category[:names].select { |item| item[:name].downcase.include?(search) } : []
-
-    tastea_updating = true
-    name_combo.remove_all
-    choices.each { |item| name_combo.append_text(item[:name]) }
-    selected_index = choices.index { |item| item[:name].downcase == selected_before.to_s.downcase }
-    name_combo.active = selected_index || -1
-    tastea_updating = false
-
-    if selected_index
-      tastea_selected_name = choices[selected_index][:name]
-    else
-      tastea_selected_name = nil
-      clear_details.call
-    end
-    name_combo.sensitive = !category.nil? && !choices.empty?
-  end
-
-  rebuild_categories = lambda do
-    selected_before = tastea_selected_category
-    search = category_search.text.to_s.strip.downcase
-    choices = tastea_categories.select { |category| category[:name].downcase.include?(search) }
-
-    tastea_updating = true
-    category_combo.remove_all
-    choices.each { |category| category_combo.append_text(category[:name]) }
-    selected_index = choices.index { |category| category[:name].downcase == selected_before.to_s.downcase }
-    category_combo.active = selected_index || -1
-    tastea_updating = false
-
-    if selected_index
-      tastea_selected_category = choices[selected_index][:name]
-    else
-      tastea_selected_category = nil
-      tastea_selected_name = nil
-      rebuild_names.call
-      clear_details.call
-    end
-  end
-
-  category_search.signal_connect('changed') { rebuild_categories.call }
-  category_combo.signal_connect('changed') do
-    unless tastea_updating
-      chosen = category_combo.active_text
-      chosen = nil if chosen.nil?
-      if chosen != tastea_selected_category
-        tastea_selected_category = chosen
-        tastea_selected_name = nil
-        name_search.text = '' unless name_search.text.to_s.empty?
-        rebuild_names.call
-        clear_details.call
-      end
-    end
-  end
-
-  name_search.signal_connect('changed') { rebuild_names.call unless tastea_updating }
-  name_combo.signal_connect('changed') do
-    unless tastea_updating
-      chosen = name_combo.active_text
-      chosen = nil if chosen.nil?
-      tastea_selected_name = chosen
-      show_details.call
+  print_blend_button.signal_connect('clicked') do
+    blend = build_blend.call
+    if blend
+      divider = '============================================================'
+      section = '------------------------------------------------------------'
+      output = [
+        divider,
+        '                         TASTEA BLEND',
+        divider,
+        "DRINK TYPE : #{blend[:base][:name]}",
+        section,
+        "INGREDIENT 1 (X): #{blend[:first][:name]}",
+        "INGREDIENT 2 (Y): #{blend[:second][:name]}",
+        section,
+        'SCENT',
+        blend[:scent],
+        section,
+        'TASTE',
+        blend[:taste],
+        section,
+        'UNDERTONES (UNDER CONSTRUCTION)',
+        blend[:undertones],
+        divider
+      ].join("\n")
+      respond(output)
     end
   end
 
@@ -392,8 +417,6 @@ Gtk.queue do
     tastea_window_open = false
   end
 
-  rebuild_categories.call
-  status.text = "Categories: #{tastea_data[:categories].length}, Names: #{tastea_data[:distinct_names]}, Scents: #{tastea_data[:distinct_scents]}, Tastes: #{tastea_data[:distinct_tastes]}, Undertones: #{tastea_data[:distinct_undertones]}"
   tastea_window.show_all
   tastea_window.keep_above = true
 end
